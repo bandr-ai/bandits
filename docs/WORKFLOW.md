@@ -26,7 +26,7 @@ Three artifacts carry the alignment, and they are ordinary markdown files:
 They are diffable and reviewable in a pull request, which is how an ML team will actually
 use them: the diff is the record of what a person decided and when.
 
-The agent-facing version of this same loop is `tracegym/skill/SKILL.md`. Install that in
+The agent-facing version of this same loop is `bandits/skill/SKILL.md`. Install that in
 Claude Code or Codex and it runs the procedure with you.
 
 ---
@@ -66,7 +66,7 @@ Everything below is real output from `tests/fixtures/traces.otlp.jsonl` — a sm
 support agent, 7 episodes, 9 declared tools.
 
 ```bash
-.venv/bin/python -m tracegym.cli run tests/fixtures/traces.otlp.jsonl \
+.venv/bin/python -m bandits.cli run tests/fixtures/traces.otlp.jsonl \
     --source otlp --tools tests/fixtures/tools.json -o work/
 ```
 
@@ -147,8 +147,8 @@ Scaffold the workspace from the artifacts:
 
 ```python
 from pathlib import Path
-from tracegym.contracts import StateSchema, ToolSurface
-from tracegym.skill.scaffold import scaffold_workspace
+from bandits.contracts import StateSchema, ToolSurface
+from bandits.skill.scaffold import scaffold_workspace
 
 scaffold_workspace(
     "workspace",
@@ -200,7 +200,7 @@ and we need write evidence rather than a plausible schema.
 Read the edits back:
 
 ```python
-from tracegym.skill.scaffold import read_back
+from bandits.skill.scaffold import read_back
 o = read_back("workspace")
 o.tool_classes          # {'get_customer': ToolClass.WRITE}
 o.declared_blind_writes # ('get_customer',)
@@ -216,7 +216,7 @@ human override in ENVIRONMENT.md: read -> write
   (declared a blind write: mutates without any follow-up read in the corpus)
 ```
 
-A changed tool class changes the schema, so re-run `tracegym schema` after applying.
+A changed tool class changes the schema, so re-run `bandits schema` after applying.
 
 ## Step 3 — `TASKS.md`, and the label problem
 
@@ -331,7 +331,7 @@ Read it against four questions:
    a judge to cover the gap — the task gets a narrower reward or gets dropped.
 
 Then **sign it**. `reviewed_by` is unset on every synthesized verifier and
-`tracegym.verify.evaluate` raises `UnreviewedVerifierError` rather than grading with one.
+`bandits.verify.evaluate` raises `UnreviewedVerifierError` rather than grading with one.
 An unedited workspace reads back as:
 
 ```python
@@ -381,7 +381,7 @@ tuned to pass.
 
 ## Step 6 — Put a real agent in it
 
-Serve the environment (`tracegym.serve` for HTTP and MCP, `tracegym.rl` for `TraceEnv` and
+Serve the environment (`bandits.serve` for HTTP and MCP, `bandits.rl` for `TraceEnv` and
 `TaskSuite`), point a capable agent at the included tasks, and read the transcripts rather
 than the score. A lot of what is wrong is only discoverable by running:
 
@@ -389,7 +389,7 @@ than the score. A lot of what is wrong is only discoverable by running:
 - every rollout fails identically — the task is unsolvable, usually a missing pre-state row
   or a blind write from Step 1 that got through;
 - one tool call solves it — a search tool returns only the answer; not enough filler;
-- the agent wins without doing the work — run `tracegym.verify.check_rollout` and add the
+- the agent wins without doing the work — run `bandits.verify.check_rollout` and add the
   domain-specific exploits to `VERIFIER.md` §3;
 - the environment answers something production would have refused — a missing error mode.
 

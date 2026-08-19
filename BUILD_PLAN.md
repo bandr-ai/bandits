@@ -5,7 +5,7 @@ what gets written, by whom, and the rules that keep parallel work from colliding
 
 ## Rules for every contributor (human or agent)
 
-1. **`tracegym/contracts.py` is frozen.** Every stage speaks these types and only
+1. **`bandits/contracts.py` is frozen.** Every stage speaks these types and only
    these types. If you believe a contract is wrong, say so — do not edit it.
 2. **Own your directory, touch nothing else.** Do not edit `pyproject.toml`,
    another module's files, or the fixtures.
@@ -25,31 +25,31 @@ what gets written, by whom, and the rules that keep parallel work from colliding
 
 | # | Directory | Owns | Consumes | Produces |
 |---|---|---|---|---|
-| 1 | `tracegym/ingest/` | OTLP + chat-json adapters, tool-call recovery, registry loading | raw files | `TraceCorpus`, `ToolProfile.declared_schema` |
-| 2 | `tracegym/surface/` | argument/response profiling, error modes, read/write/external classification | `TraceCorpus` | `ToolSurface` |
-| 3 | `tracegym/state/` | entity discovery by ID recurrence, keys, foreign keys, write→read relations | `TraceCorpus` + `ToolSurface` | `StateSchema` |
-| 4 | `tracegym/env/` | SQLite materialization, tool reimplementation, effect ledger, session API | `StateSchema` + `TaskCase` | live env + `EnvManifest` |
-| 5 | `tracegym/task/` + `tracegym/verify/` | pre-state reconstruction, task mining, verifier synthesis, anti-cheat | `TraceCorpus` + `StateSchema` | `TaskCase`, `Verifier` |
-| 6 | `tracegym/fidelity/` + `tracegym/cli.py` | trace replay, per-tool divergence, accept/reject, CLI wiring | everything | `FidelityReport` |
+| 1 | `bandits/ingest/` | OTLP + chat-json adapters, tool-call recovery, registry loading | raw files | `TraceCorpus`, `ToolProfile.declared_schema` |
+| 2 | `bandits/surface/` | argument/response profiling, error modes, read/write/external classification | `TraceCorpus` | `ToolSurface` |
+| 3 | `bandits/state/` | entity discovery by ID recurrence, keys, foreign keys, write→read relations | `TraceCorpus` + `ToolSurface` | `StateSchema` |
+| 4 | `bandits/env/` | SQLite materialization, tool reimplementation, effect ledger, session API | `StateSchema` + `TaskCase` | live env + `EnvManifest` |
+| 5 | `bandits/task/` + `bandits/verify/` | pre-state reconstruction, task mining, verifier synthesis, anti-cheat | `TraceCorpus` + `StateSchema` | `TaskCase`, `Verifier` |
+| 6 | `bandits/fidelity/` + `bandits/cli.py` | trace replay, per-tool divergence, accept/reject, CLI wiring | everything | `FidelityReport` |
 
 Stage 4 defines the environment session interface that stage 6 replays against.
-That contract is `tracegym/env/interface.py` and stage 4 owns it.
+That contract is `bandits/env/interface.py` and stage 4 owns it.
 
 ## The loop, end to end
 
 ```
-tracegym ingest   traces.otlp.jsonl --tools tools.json   ->  corpus.json
-tracegym surface  corpus.json                            ->  surface.json
-tracegym schema   corpus.json surface.json               ->  schema.json
-tracegym tasks    corpus.json schema.json                ->  tasks.json
-tracegym verify   tasks.json corpus.json schema.json     ->  verifiers.json
-tracegym fidelity corpus.json schema.json tasks.json     ->  fidelity.json   # ACCEPT/REJECT
-tracegym export   --harbor out/                          ->  Harbor tasks
+bandits ingest   traces.otlp.jsonl --tools tools.json   ->  corpus.json
+bandits surface  corpus.json                            ->  surface.json
+bandits schema   corpus.json surface.json               ->  schema.json
+bandits tasks    corpus.json schema.json                ->  tasks.json
+bandits verify   tasks.json corpus.json schema.json     ->  verifiers.json
+bandits fidelity corpus.json schema.json tasks.json     ->  fidelity.json   # ACCEPT/REJECT
+bandits export   --harbor out/                          ->  Harbor tasks
 ```
 
 ## Definition of done for v0
 
-- `tracegym fidelity` on the golden corpus reports **per-tool** rates and an
+- `bandits fidelity` on the golden corpus reports **per-tool** rates and an
   overall figure, and rejects environments below threshold.
 - Tool classes, entities, primary keys and error modes match `expected.json`.
 - `store_policy` comes out as a **static snapshot**, not an invented table.

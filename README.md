@@ -1,4 +1,4 @@
-# tracegym
+# bandits
 
 **Turn production agent traces into executable, verifiable RL environments.**
 
@@ -50,7 +50,7 @@ or the agent learns collateral damage is free.
 
 Anyone can generate an environment. The question is whether it's a model of anything.
 
-`tracegym fidelity` replays a trace against the environment rebuilt from it and reports
+`bandits fidelity` replays a trace against the environment rebuilt from it and reports
 agreement **per tool**:
 
 ```
@@ -75,13 +75,13 @@ statement about *their* system, not about a model.
 ## Pipeline
 
 ```
-tracegym ingest   traces.otlp.jsonl --tools tools.json   ->  corpus.json
-tracegym surface  corpus.json                            ->  surface.json    # action space + read/write/external
-tracegym schema   corpus.json surface.json               ->  schema.json     # the inferred database
-tracegym tasks    corpus.json schema.json                ->  tasks.json      # instruction + starting state
-tracegym verify   tasks.json corpus.json schema.json     ->  verifiers.json  # reward, as code
-tracegym fidelity corpus.json schema.json tasks.json     ->  fidelity.json   # ACCEPT / REJECT
-tracegym export   --harbor out/                          ->  Harbor tasks
+bandits ingest   traces.otlp.jsonl --tools tools.json   ->  corpus.json
+bandits surface  corpus.json                            ->  surface.json    # action space + read/write/external
+bandits schema   corpus.json surface.json               ->  schema.json     # the inferred database
+bandits tasks    corpus.json schema.json                ->  tasks.json      # instruction + starting state
+bandits verify   tasks.json corpus.json schema.json     ->  verifiers.json  # reward, as code
+bandits fidelity corpus.json schema.json tasks.json     ->  fidelity.json   # ACCEPT / REJECT
+bandits export   --harbor out/                          ->  Harbor tasks
 ```
 
 Ingest through fidelity is **fully deterministic** — no model calls, no API keys, no
@@ -127,6 +127,6 @@ Full design rationale, including the benchmark-first path and what we expect to 
   deficit. Their table is the argument for targeting: generic synthetic envs (AWM) 38.4 on
   τ²-Bench, capability-targeted 48.2.
 
-tracegym takes ingestion discipline from the first, executable state-diff verification from
+bandits takes ingestion discipline from the first, executable state-diff verification from
 the second, capability targeting from the third — and adds the fidelity gate, which none of
 them have, because none of them rebuild a world that something real can be compared against.

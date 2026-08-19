@@ -276,8 +276,8 @@ def to_otlp(eps):
                 "gen_ai.system": "openai",
                 "gen_ai.prompt": json.dumps([{"role": "user", "content": instruction}]),
                 "gen_ai.completion": json.dumps([{"role": "assistant", "content": answer}]),
-                "tracegym.episode_id": eid,
-                "tracegym.outcome": outcome,
+                "bandits.episode_id": eid,
+                "bandits.outcome": outcome,
             },
         }]
         for si, (tool, args, resp, status, _err) in enumerate(calls):
