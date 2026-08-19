@@ -20,6 +20,7 @@ Run:  python tests/fixtures/make_corpus.py
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -331,6 +332,66 @@ def to_chat(eps):
     return out
 
 
+def to_langsmith(eps):
+    """The SAME episodes as LangSmith run trees.
+
+    A root chain run with an llm child carrying the transcript and one
+    ``run_type="tool"`` child per call. This is the good case for us -- the tool
+    calls are recorded explicitly -- so a correct ingest must produce invocation
+    points identical to the OTLP ones, and ``ingest_test`` asserts exactly that.
+    """
+    out = []
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for ti, (eid, instruction, calls, answer, outcome) in enumerate(eps):
+        start = base + timedelta(seconds=ti)
+
+        def stamp(offset_ms, start=start):
+            return (start + timedelta(milliseconds=offset_ms)).isoformat().replace("+00:00", "Z")
+
+        children = [{
+            "id": f"llm_{eid}",
+            "name": "ChatOpenAI",
+            "run_type": "llm",
+            "start_time": stamp(0),
+            "end_time": stamp(500),
+            "inputs": {"messages": [[
+                {"type": "system", "content": "You are a retail support agent."},
+                {"type": "human", "content": instruction},
+            ]]},
+            "outputs": {"generations": [[
+                {"text": answer, "message": {"type": "ai", "content": answer}},
+            ]]},
+            "error": None,
+        }]
+        for si, (tool, args, resp, status, _err) in enumerate(calls):
+            children.append({
+                "id": f"call_{eid}_{si}",
+                "name": tool,
+                "run_type": "tool",
+                "start_time": stamp(1000 + si * 10),
+                "end_time": stamp(1000 + si * 10 + 5),
+                # The LangChain single-key envelope, which ingest must unwrap.
+                "inputs": {"input": args},
+                "outputs": {"output": resp},
+                "error": "ToolException" if status == "error" else None,
+            })
+
+        out.append({
+            "id": eid,
+            "trace_id": eid,
+            "name": "AgentExecutor",
+            "run_type": "chain",
+            "start_time": stamp(0),
+            "end_time": stamp(2000),
+            "inputs": {"input": instruction},
+            "outputs": {"output": answer},
+            "error": None,
+            "extra": {"metadata": {"outcome": outcome}},
+            "child_runs": children,
+        })
+    return out
+
+
 def main():
     eps = episodes()
     (HERE / "tools.json").write_text(json.dumps(TOOLS, indent=2) + "\n")
@@ -339,6 +400,9 @@ def main():
             f.write(json.dumps(rec) + "\n")
     with (HERE / "traces.chat.jsonl").open("w") as f:
         for rec in to_chat(eps):
+            f.write(json.dumps(rec) + "\n")
+    with (HERE / "traces.langsmith.jsonl").open("w") as f:
+        for rec in to_langsmith(eps):
             f.write(json.dumps(rec) + "\n")
 
     expected = {

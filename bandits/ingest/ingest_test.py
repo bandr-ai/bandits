@@ -455,9 +455,9 @@ def test_unknown_source_raises() -> None:
         load_corpus(OTLP_PATH, "auto")
 
 
-def test_canonical_sources_are_the_two_adapters() -> None:
-    """CANONICAL_SOURCES is the contract callers dispatch on."""
-    assert CANONICAL_SOURCES == ("otlp", "chat-json")
+def test_canonical_sources_are_the_supported_adapters() -> None:
+    """CANONICAL_SOURCES is the contract callers dispatch on. Declared, never sniffed."""
+    assert CANONICAL_SOURCES == ("otlp", "chat-json", "langsmith")
 
 
 def test_declared_source_is_recorded_on_every_trace(

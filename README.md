@@ -87,6 +87,8 @@ bandits export   --harbor out/                          ->  Harbor tasks
 Ingest through fidelity is **fully deterministic** — no model calls, no API keys, no
 network. That isn't a limitation, it's what makes the fidelity number mean something.
 
+Adapters: `otlp`, `chat-json`, `langsmith`. Declared with `--source`, never sniffed.
+
 ## Design commitments
 
 **Reward is code.** State assertions plus an effect ledger. If we ever can't verify

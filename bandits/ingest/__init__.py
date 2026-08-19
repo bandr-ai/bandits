@@ -9,6 +9,10 @@ invocation points"). Two adapters are supported today:
 ``chat-json``
     OpenAI-style transcripts, where they must be recovered from ``tool_calls``
     blocks paired with ``tool``-role replies (PLAN.md Step 6).
+``langsmith``
+    LangSmith run trees, where ``run_type="tool"`` runs are invocation points
+    recorded explicitly and llm runs carry the transcript. This is the adapter a
+    real customer's telemetry usually needs (docs/PRODUCT.md, "Who this is for").
 
 **The source is always declared, never sniffed.** Format detection is a silent
 failure waiting to happen: a chat export misread as OTLP would yield zero
@@ -34,11 +38,19 @@ from bandits.contracts import (
 )
 from bandits.ingest.chat_json import parse_chat_record
 from bandits.ingest.errors import infer_error_kind, looks_like_error, normalize_error_kind
+from bandits.ingest.langsmith import parse_langsmith_record
 from bandits.ingest.otlp import normalize_attributes, parse_otlp_record
 from bandits.ingest.registry import RegistryError, load_registry, load_registry_with_issues
 
 #: The only adapter names :func:`load_corpus` accepts. Declared, never inferred.
-CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json")
+CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "langsmith")
+
+#: Adapter name -> record parser. The single dispatch point for ingest.
+_PARSERS = {
+    "otlp": parse_otlp_record,
+    "chat-json": parse_chat_record,
+    "langsmith": parse_langsmith_record,
+}
 
 
 class UnknownSourceError(ValueError):
@@ -106,7 +118,7 @@ def load_corpus(
             "Formats are never sniffed."
         )
     path = Path(path)
-    parse = parse_otlp_record if source == "otlp" else parse_chat_record
+    parse = _PARSERS[source]
 
     traces: list[Trace] = []
     issues: list[IngestIssue] = []
