@@ -62,6 +62,7 @@ from bandits.ingest import CANONICAL_SOURCES, load_corpus_and_registry
 from bandits.state import infer_schema
 from bandits.surface import build_surface
 from bandits.task import mine_tasks
+from bandits.triage import Verdict, render_report, triage_corpus
 from bandits.verify import UnlabeledTraceError, synthesize_verifier
 
 app = typer.Typer(
@@ -262,6 +263,32 @@ ToolsOpt = Annotated[
     Path | None,
     typer.Option("--tools", help="Declared tool registry JSON. Optional but strongly advised."),
 ]
+
+
+@app.command()
+def triage(
+    traces: Annotated[Path, typer.Argument(help="Raw export, JSONL or a JSON array.")],
+    source: SourceOpt,
+    tools: ToolsOpt = None,
+    out: Annotated[Path | None, typer.Option("-o", "--out", help="Write the report as JSON.")] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit nonzero on PARTIAL as well as NO_GO."),
+    ] = False,
+) -> None:
+    """Can an environment be built from this telemetry at all? Run this first.
+
+    EXITS NONZERO ON NO_GO. This is the cheap upstream check, not the fidelity
+    gate: a GO says reconstruction is worth attempting, never that it will pass.
+    """
+    _check_source(source)
+    corpus, _registry = load_corpus_and_registry(traces, source, tools_path=tools)
+    report = triage_corpus(corpus)
+    render_report(report, console)
+    if out is not None:
+        out.write_text(json.dumps(report.to_json(), indent=2) + "\n", encoding="utf-8")
+    if report.verdict is Verdict.NO_GO or (strict and report.verdict is not Verdict.GO):
+        raise typer.Exit(code=1)
 
 
 @app.command()

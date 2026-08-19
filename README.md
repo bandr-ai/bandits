@@ -75,6 +75,7 @@ statement about *their* system, not about a model.
 ## Pipeline
 
 ```
+bandits triage   traces.jsonl --source langsmith        ->  GO / PARTIAL / NO_GO
 bandits ingest   traces.otlp.jsonl --tools tools.json   ->  corpus.json
 bandits surface  corpus.json                            ->  surface.json    # action space + read/write/external
 bandits schema   corpus.json surface.json               ->  schema.json     # the inferred database
@@ -84,10 +85,31 @@ bandits fidelity corpus.json schema.json tasks.json     ->  fidelity.json   # AC
 bandits export   --harbor out/                          ->  Harbor tasks
 ```
 
-Ingest through fidelity is **fully deterministic** — no model calls, no API keys, no
+Triage through fidelity is **fully deterministic** — no model calls, no API keys, no
 network. That isn't a limitation, it's what makes the fidelity number mean something.
 
 Adapters: `otlp`, `chat-json`, `langsmith`. Declared with `--source`, never sniffed.
+
+## Run triage first
+
+Everything above assumes the tool calls were retained. `bandits triage` asks that
+question against a real export before anything is promised, and takes a position:
+
+```
+signal              observed   what it buys
+invocation_points   yes  7/7   no action space without them; reward falls back to a judge
+arguments           yes 21/23  replay, and the write semantics a verifier needs
+responses           yes 23/23  the evidence the database is inferred from
+identifiers         yes  6/8   recurrence is what turns responses into rows of a table
+state_changes       yes 11/12  the change a verifier asserts on
+error_modes         yes  2/23  an env that only succeeds trains an agent that never saw adversity
+
+GO — reconstruction can proceed to the fidelity gate.
+```
+
+A `NO_GO` says the export is a transcript log, not a tool-call log, and no amount of
+downstream work recovers that. It exits nonzero. A `GO` is a claim about the *data* and
+never a promise about the gate — the gate is still the only number that means anything.
 
 ## Design commitments
 
