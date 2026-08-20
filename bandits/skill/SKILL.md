@@ -351,7 +351,7 @@ without trusting us, and it stops meaning anything the moment it is tuned to pas
 ## Step 6 — Put a real agent in it and watch it break
 
 A lot of what is wrong is only discoverable by running. Serve the environment (see
-`bandits.serve` for the HTTP and MCP endpoints, and `bandits.rl` for `TraceEnv` /
+`bandits.serve` for the HTTP and MCP endpoints, and `bandits.rl` for `BanditsEnv` /
 `TaskSuite`), point a capable agent at a handful of included tasks, and read the
 transcripts yourself. Do not read the score.
 

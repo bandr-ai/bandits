@@ -1,9 +1,9 @@
-"""``TraceEnv`` -- the gym-style RL environment over a rebuilt world.
+"""``BanditsEnv`` -- the gym-style RL environment over a rebuilt world.
 
 This is the layer that turns the deterministic reconstruction pipeline into
 something a trainer can actually roll out against::
 
-    env = TraceEnv(schema=schema, task=task, verifier=verifier,
+    env = BanditsEnv(schema=schema, task=task, verifier=verifier,
                    tool_classes=classes, surface=surface)
     obs = env.reset(seed=0)
     while True:
@@ -63,7 +63,7 @@ unexpected out of the runtime)
 
 The boundary rule
 -----------------
-``TraceEnv`` drives the session through :meth:`EnvSession.execute` and nothing
+``BanditsEnv`` drives the session through :meth:`EnvSession.execute` and nothing
 else. It holds no handle it hands out, mutates no snapshot, and builds the
 ``RolloutRecord`` from the actions it actually dispatched -- which is what makes
 guard 1 in :mod:`bandits.verify.anticheat` able to notice a rollout that
@@ -101,7 +101,13 @@ from bandits.verify.run import UnreviewedVerifierError
 
 from .spec import EnvSpec
 
-__all__ = ["DEFAULT_FINISH_TOOL", "DEFAULT_MAX_STEPS", "StepResult", "TraceEnv"]
+__all__ = [
+    "BanditsEnv",
+    "DEFAULT_FINISH_TOOL",
+    "DEFAULT_MAX_STEPS",
+    "StepResult",
+    "TraceEnv",
+]
 
 DEFAULT_MAX_STEPS = 30
 DEFAULT_FINISH_TOOL = "respond"
@@ -137,10 +143,10 @@ class StepResult:
 
 
 class EpisodeNotStartedError(RuntimeError):
-    """Raised when :meth:`TraceEnv.step` is called before :meth:`TraceEnv.reset`."""
+    """Raised when :meth:`BanditsEnv.step` is called before :meth:`BanditsEnv.reset`."""
 
 
-class TraceEnv:
+class BanditsEnv:
     """A gym-style environment for exactly one :class:`TaskCase`.
 
     Parameters
@@ -322,7 +328,7 @@ class TraceEnv:
             self.session.close()
             self.session = None
 
-    def __enter__(self) -> TraceEnv:
+    def __enter__(self) -> BanditsEnv:
         return self
 
     def __exit__(
@@ -561,3 +567,9 @@ class TraceEnv:
             "tool_calls": len(self._actions),
             "graded_reward": None if result is None else result.reward,
         }
+
+
+# Compatibility for callers that adopted the original public name. New code
+# should use BanditsEnv: the environment is reconstructed from traces, but it
+# is a runnable world rather than the trace itself.
+TraceEnv = BanditsEnv

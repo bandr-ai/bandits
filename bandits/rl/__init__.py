@@ -34,6 +34,7 @@ from .batch import SuiteEntry, TaskSuite
 from .episode import (
     DEFAULT_FINISH_TOOL,
     DEFAULT_MAX_STEPS,
+    BanditsEnv,
     EpisodeNotStartedError,
     StepResult,
     TraceEnv,
@@ -43,6 +44,7 @@ from .spec import EnvSpec, ToolSpec, json_schema_for
 __all__ = [
     "DEFAULT_FINISH_TOOL",
     "DEFAULT_MAX_STEPS",
+    "BanditsEnv",
     "EnvSpec",
     "EpisodeNotStartedError",
     "StepResult",
@@ -67,14 +69,14 @@ def make_env(
     allow_unreviewed: bool = False,
     finish_tool: str = DEFAULT_FINISH_TOOL,
     **kwargs,
-) -> TraceEnv:
-    """Build one :class:`TraceEnv`. Call ``reset()`` to materialize the world.
+) -> BanditsEnv:
+    """Build one :class:`BanditsEnv`. Call ``reset()`` to materialize the world.
 
     ``tool_classes`` may be omitted when ``surface`` is given -- stage 2 already
     decided which tool reads, writes and reaches outside, and re-deriving that
     here would be a second, weaker classifier.
     """
-    return TraceEnv(
+    return BanditsEnv(
         schema=schema,
         task=task,
         verifier=verifier,

@@ -381,7 +381,7 @@ tuned to pass.
 
 ## Step 6 — Put a real agent in it
 
-Serve the environment (`bandits.serve` for HTTP and MCP, `bandits.rl` for `TraceEnv` and
+Serve the environment (`bandits.serve` for HTTP and MCP, `bandits.rl` for `BanditsEnv` and
 `TaskSuite`), point a capable agent at the included tasks, and read the transcripts rather
 than the score. A lot of what is wrong is only discoverable by running:
 

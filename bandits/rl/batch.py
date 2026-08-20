@@ -30,6 +30,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from bandits.contracts import (
+    FidelityReport,
     JsonObject,
     StateSchema,
     TaskCase,
@@ -42,7 +43,7 @@ from bandits.contracts import (
 from bandits.verify import synthesize_verifier
 from bandits.verify.synthesize import UnlabeledTraceError
 
-from .episode import DEFAULT_FINISH_TOOL, DEFAULT_MAX_STEPS, TraceEnv
+from .episode import DEFAULT_FINISH_TOOL, DEFAULT_MAX_STEPS, BanditsEnv
 from .spec import EnvSpec
 
 __all__ = ["SuiteEntry", "TaskSuite"]
@@ -214,12 +215,12 @@ class TaskSuite:
             return self._entries[0]
         return self._entries[random.Random(seed).randrange(len(self._entries))]
 
-    def make_env(self, seed: int | None = None, **kwargs) -> TraceEnv:
+    def make_env(self, seed: int | None = None, **kwargs) -> BanditsEnv:
         """Build (but do not reset) the environment for the task ``seed`` selects."""
         entry = self.sample(seed)
         return self.env_for(entry, **kwargs)
 
-    def env_for(self, entry: SuiteEntry | str, **kwargs) -> TraceEnv:
+    def env_for(self, entry: SuiteEntry | str, **kwargs) -> BanditsEnv:
         if isinstance(entry, str):
             found = self.by_id(entry)
             if found is None:
@@ -232,7 +233,7 @@ class TaskSuite:
             "allow_unreviewed": self.allow_unreviewed,
         }
         options.update(kwargs)
-        return TraceEnv(
+        return BanditsEnv(
             schema=self.schema,
             task=entry.task,
             verifier=entry.verifier,
@@ -267,6 +268,8 @@ class TaskSuite:
         surface: ToolSurface | None = None,
         tool_classes: Mapping[str, ToolClass] | None = None,
         reviewed_by: Mapping[str, str] | None = None,
+        fidelity_by_trace: Mapping[str, FidelityReport] | None = None,
+        require_fidelity: bool = False,
         allow_unreviewed: bool = False,
         max_steps: int = DEFAULT_MAX_STEPS,
         reward_mode: str = "all_or_nothing",
@@ -283,6 +286,10 @@ class TaskSuite:
         (however it is stored: a review file, a ticket, a signature) enters the
         suite. Anything not in that map stays unreviewed and is excluded unless
         ``allow_unreviewed=True``.
+
+        With ``require_fidelity=True``, every task must also have an accepted
+        per-trace replay report. A rejected reconstruction is useful for
+        debugging, never a silent member of a training suite.
         """
         if tool_classes is None and surface is not None:
             tool_classes = {p.name: p.tool_class for p in surface.tools}
@@ -293,10 +300,36 @@ class TaskSuite:
         )
         traces: dict[str, Trace] = {t.trace_id: t for t in corpus.traces}
         signed = dict(reviewed_by or {})
+        fidelity = dict(fidelity_by_trace or {})
 
         entries: list[SuiteEntry] = []
         excluded: list[JsonObject] = []
         for task in tasks:
+            report = fidelity.get(task.trace_id)
+            if require_fidelity and report is None:
+                excluded.append(
+                    {
+                        "task_id": task.task_id,
+                        "reason": "missing_fidelity",
+                        "detail": (
+                            f"task trace {task.trace_id!r} has no per-trace fidelity report; "
+                            "a reconstruction must be replay-checked before training"
+                        ),
+                    }
+                )
+                continue
+            if require_fidelity and not report.accepted:
+                excluded.append(
+                    {
+                        "task_id": task.task_id,
+                        "reason": "rejected_fidelity",
+                        "detail": (
+                            f"task trace {task.trace_id!r} failed its fidelity gate: "
+                            + "; ".join(report.notes)
+                        ),
+                    }
+                )
+                continue
             trace = traces.get(task.trace_id)
             if trace is None:
                 excluded.append(
@@ -348,4 +381,3 @@ class TaskSuite:
             finish_tool=finish_tool,
             excluded=excluded,
         )
-

@@ -3,7 +3,7 @@
 Why this module exists
 ----------------------
 ``backend.SessionBackend`` grades an episode by calling
-:func:`bandits.verify.run.evaluate` directly. :class:`bandits.rl.TraceEnv`
+:func:`bandits.verify.run.evaluate` directly. :class:`bandits.rl.BanditsEnv`
 grades it by calling ``evaluate`` **and then** ``check_rollout`` + ``enforce``,
 so a rollout that reached around ``session.execute`` scores zero.
 
@@ -14,7 +14,7 @@ that discovers a hack is then *rewarded* for it during distributed training and
 punished for it in evaluation -- which reads as an unreproducible eval gap, not
 as a reward bug.
 
-So the wire path delegates to ``TraceEnv`` rather than reimplementing it. There
+So the wire path delegates to ``BanditsEnv`` rather than reimplementing it. There
 is exactly one reward function in this repo and this module does not add a
 second.
 """
@@ -135,10 +135,10 @@ def _to_wire_spec(spec: Any, task_ids: tuple[str, ...]) -> WireSpec:
 
 
 class SuiteEpisode:
-    """One rollout, driven by a :class:`bandits.rl.TraceEnv`.
+    """One rollout, driven by a :class:`bandits.rl.BanditsEnv`.
 
     Mirrors the attribute surface the HTTP and MCP transports use, but owns a
-    ``TraceEnv`` instead of a raw session so reward, truncation and anti-cheat
+    ``BanditsEnv`` instead of a raw session so reward, truncation and anti-cheat
     all come from the single implementation in ``bandits.rl``.
     """
 

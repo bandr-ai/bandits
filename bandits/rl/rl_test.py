@@ -18,10 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from bandits.contracts import ToolClass
+from bandits.contracts import FidelityReport, ToolClass
 from bandits.fidelity.replay import tool_classes_from_surface
 from bandits.ingest import load_corpus_and_registry
-from bandits.rl import EnvSpec, StepResult, TaskSuite, TraceEnv, make_env
+from bandits.rl import BanditsEnv, EnvSpec, StepResult, TaskSuite, make_env
 from bandits.rl.episode import EpisodeNotStartedError
 from bandits.rl.spec import digest_of
 from bandits.state import infer_schema
@@ -99,7 +99,7 @@ def golden_env(pipeline):
     env.close()
 
 
-def _run(env: TraceEnv, actions, *, message="done", seed=0):
+def _run(env: BanditsEnv, actions, *, message="done", seed=0):
     """reset -> actions -> finish. Returns ``(steps, terminal_step)``."""
     env.reset(seed=seed)
     steps = []
@@ -581,6 +581,42 @@ def test_suite_serializes(pipeline):
     assert payload["task_count"] == 1
     assert payload["tasks"][0]["task_id"] == GOLDEN_TASK
     assert payload["excluded"]
+
+
+def test_suite_requires_an_accepted_fidelity_report_when_requested(pipeline):
+    """A reviewed verifier is not enough: its rebuilt world must also replay."""
+    task = _task(pipeline, GOLDEN_TASK)
+    report = FidelityReport(
+        env_id="env-test",
+        trace_id=task.trace_id,
+        accepted=False,
+        notes=("REJECTED: refund_order mismatch",),
+    )
+    suite = TaskSuite.from_pipeline(
+        corpus=pipeline["corpus"],
+        schema=pipeline["schema"],
+        tasks=(task,),
+        surface=pipeline["surface"],
+        reviewed_by={task.task_id: REVIEWER},
+        fidelity_by_trace={task.trace_id: report},
+        require_fidelity=True,
+    )
+    assert len(suite) == 0
+    assert suite.excluded[0]["reason"] == "rejected_fidelity"
+
+
+def test_suite_requires_a_report_for_every_task_when_requested(pipeline):
+    task = _task(pipeline, GOLDEN_TASK)
+    suite = TaskSuite.from_pipeline(
+        corpus=pipeline["corpus"],
+        schema=pipeline["schema"],
+        tasks=(task,),
+        surface=pipeline["surface"],
+        reviewed_by={task.task_id: REVIEWER},
+        require_fidelity=True,
+    )
+    assert len(suite) == 0
+    assert suite.excluded[0]["reason"] == "missing_fidelity"
 
 
 # ------------------------------------------------------------------ step tuple

@@ -4,7 +4,7 @@ The HTTP layer (:mod:`bandits.serve.server`) and the MCP layer
 (:mod:`bandits.serve.mcp`) both drive an :class:`EnvBackend`. Keeping that
 seam explicit means the wire protocol never reaches into
 :class:`~bandits.env.session.BanditsSession` directly, and a different
-episode source -- ``bandits.rl.TraceEnv``, a task suite, a remote pool -- can
+episode source -- ``bandits.rl.BanditsEnv``, a task suite, a remote pool -- can
 be plugged in without touching either transport.
 
 Two guarantees this module owns:
