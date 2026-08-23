@@ -109,7 +109,7 @@ def build_surface(
     cross_tool_arg_values = index_argument_values(
         (inv.tool, inv.arguments) for calls in by_tool.values() for inv in calls
     )
-    verdicts = classify_tools(corpus, names)
+    verdicts = classify_tools(corpus, names, declared)
 
     profiles: list[ToolProfile] = []
     for name in names:

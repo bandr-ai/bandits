@@ -1,0 +1,128 @@
+[
+  {
+    "name": "calculate",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "cancel_pending_order",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "exchange_delivered_order_items",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "find_user_id_by_name_zip",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "find_user_id_by_email",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "get_order_details",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "get_product_details",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "get_item_details",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "get_user_details",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "list_all_product_types",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "read"
+  },
+  {
+    "name": "modify_pending_order_address",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "modify_pending_order_items",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "modify_pending_order_payment",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "modify_user_address",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "return_delivered_order_items",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "tool_class": "write"
+  },
+  {
+    "name": "transfer_to_human_agents",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]

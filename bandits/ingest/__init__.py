@@ -13,6 +13,8 @@ invocation points"). Two adapters are supported today:
     LangSmith run trees, where ``run_type="tool"`` runs are invocation points
     recorded explicitly and llm runs carry the transcript. This is the adapter a
     real customer's telemetry usually needs (docs/PRODUCT.md, "Who this is for").
+``tau2``
+    τ²-bench evaluation JSONL, including published third-party trajectories.
 
 **The source is always declared, never sniffed.** Format detection is a silent
 failure waiting to happen: a chat export misread as OTLP would yield zero
@@ -40,16 +42,18 @@ from bandits.ingest.chat_json import parse_chat_record
 from bandits.ingest.errors import infer_error_kind, looks_like_error, normalize_error_kind
 from bandits.ingest.langsmith import parse_langsmith_record
 from bandits.ingest.otlp import normalize_attributes, parse_otlp_record
+from bandits.ingest.tau2 import parse_tau2_record
 from bandits.ingest.registry import RegistryError, load_registry, load_registry_with_issues
 
 #: The only adapter names :func:`load_corpus` accepts. Declared, never inferred.
-CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "langsmith")
+CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "langsmith", "tau2")
 
 #: Adapter name -> record parser. The single dispatch point for ingest.
 _PARSERS = {
     "otlp": parse_otlp_record,
     "chat-json": parse_chat_record,
     "langsmith": parse_langsmith_record,
+    "tau2": parse_tau2_record,
 }
 
 

@@ -214,9 +214,12 @@ def _profile(surface: ToolSurface | None, tool: str) -> ToolProfile | None:
 def observed_response_projection(surface: ToolSurface | None, tool: str) -> tuple[str, ...] | None:
     """The field set ``tool`` was observed to return, from stage 2's profile.
 
-    Only top-level scalar/object keys are kept: profilers record nested paths
-    (``order_ids[]``, ``a.b``) as their own entries, and those are shapes inside
-    a value, not keys of the response object.
+    The projection is the *top-level* keys of the response object, so a nested
+    path is reduced to the key that holds it rather than dropped. The profiler
+    records a nested object only by its leaves -- ``address.city`` exists,
+    ``address`` does not -- so filtering dotted paths out entirely deletes the
+    whole ``address`` key from every replayed read, which reads as a missing
+    field rather than as the shape inside a value that it is.
 
     Returns ``None`` when there is no surface, no profile, or no observed
     response at all -- "we do not know" is never the same as "empty".
@@ -224,8 +227,9 @@ def observed_response_projection(surface: ToolSurface | None, tool: str) -> tupl
     profile = _profile(surface, tool)
     if profile is None:
         return None
+    # dict.fromkeys: first-seen order, deduplicated -- `a.b` and `a.c` are one key.
     names = tuple(
-        f.name for f in profile.response_fields if "[" not in f.name and "." not in f.name
+        dict.fromkeys(f.name.split(".")[0].split("[")[0] for f in profile.response_fields)
     )
     return names or None
 

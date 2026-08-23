@@ -265,18 +265,36 @@ def _gather(corpus: TraceCorpus, tools: Iterable[str]) -> dict[str, _ToolEvidenc
     return evidence
 
 
+def _record_key(inv: InvocationPoint) -> str:
+    """Which record a call is about: its own identifier arguments, canonically.
+
+    Two calls to the same reader tool are only comparable when they addressed the
+    same record. ``get_order_details(#W1)`` and ``get_order_details(#W2)`` differ in
+    every field by construction, and nothing that happened between them caused it.
+    """
+    ids = identifier_values(inv.arguments)
+    return canonical({path: ids[path] for path in sorted(ids)})
+
+
 def _readers_for(
     ordered: Sequence[InvocationPoint], id_value: JsonValue, exclude_tool: str
-) -> dict[str, list[InvocationPoint]]:
-    """Other tools' successful calls whose *response* mentions `id_value`."""
-    readers: dict[str, list[InvocationPoint]] = {}
+) -> dict[tuple[str, str], list[InvocationPoint]]:
+    """Other tools' successful calls whose response is *about* the record `id_value` keys.
+
+    "About", not "mentions": the id has to sit at an identifier-named path in the
+    response, the same conservative rule :func:`identifier_values` already applies to
+    arguments. A record that merely lists the id somewhere else -- a user body
+    carrying ``orders: [...]`` -- is not a reader of that order, and counting it as
+    one makes every read sitting between two of its calls look like a write.
+    """
+    readers: dict[tuple[str, str], list[InvocationPoint]] = {}
     for other in ordered:
         if other.tool == exclude_tool or other.status is not CallStatus.OK:
             continue
         if not isinstance(other.response, Mapping):
             continue
-        if contains_value(other.response, id_value):
-            readers.setdefault(other.tool, []).append(other)
+        if id_value in identifier_values(other.response).values():
+            readers.setdefault((other.tool, _record_key(other)), []).append(other)
     return readers
 
 
@@ -289,7 +307,7 @@ def _check_state_change(
     trace_id: str,
 ) -> None:
     """The primary WRITE test: same reader, same id, different body across the call."""
-    for reader, calls in sorted(_readers_for(ordered, id_value, inv.tool).items()):
+    for (reader, _record), calls in sorted(_readers_for(ordered, id_value, inv.tool).items()):
         before = [c for c in calls if c.step < inv.step]
         after = [c for c in calls if c.step > inv.step]
         if not before or not after:
@@ -321,7 +339,7 @@ def _check_echo(
     """Secondary WRITE test: the tool's own response contradicts an earlier read."""
     if not isinstance(inv.response, Mapping):
         return
-    for reader, calls in sorted(_readers_for(ordered, id_value, inv.tool).items()):
+    for (reader, _record), calls in sorted(_readers_for(ordered, id_value, inv.tool).items()):
         before = [c for c in calls if c.step < inv.step]
         if not before:
             continue
@@ -454,7 +472,27 @@ def classify_tool(name: str, ev: _ToolEvidence) -> Classification:
     )
 
 
-def classify_tools(corpus: TraceCorpus, tools: Iterable[str]) -> dict[str, Classification]:
-    """Classify every tool in `tools` plus anything observed in `corpus`."""
+def classify_tools(
+    corpus: TraceCorpus,
+    tools: Iterable[str],
+    declared_tools: Mapping[str, JsonValue] | None = None,
+) -> dict[str, Classification]:
+    """Classify tools, honoring an explicit trusted operational declaration."""
     evidence = _gather(corpus, tools)
-    return {name: classify_tool(name, ev) for name, ev in sorted(evidence.items())}
+    declared_tools = declared_tools or {}
+    result: dict[str, Classification] = {}
+    for name, ev in sorted(evidence.items()):
+        declared = declared_tools.get(name)
+        hint = declared.get("tool_class") if isinstance(declared, Mapping) else None
+        if isinstance(hint, str):
+            try:
+                klass = ToolClass(hint)
+            except ValueError:
+                klass = None
+            if klass is not None:
+                result[name] = Classification(
+                    klass, 1.0, ("trusted tool registry declares tool_class=" + klass.value,)
+                )
+                continue
+        result[name] = classify_tool(name, ev)
+    return result

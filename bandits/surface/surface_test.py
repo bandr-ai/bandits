@@ -69,6 +69,19 @@ def test_every_classification_has_evidence(surface):
         assert all(isinstance(e, str) and e for e in tool.class_evidence)
 
 
+def test_trusted_registry_class_overrides_incomplete_trace_evidence():
+    corpus = _corpus_with([
+        ("get_order", {"order_id": 1}, {"order_id": 1, "status": "pending"}, CallStatus.OK, None),
+    ])
+    surface = build_surface(corpus, declared_tools={
+        "get_order": {"tool_class": "read", "input_schema": {"type": "object"}},
+    })
+    profile = surface.by_name("get_order")
+    assert profile.tool_class is ToolClass.READ
+    assert profile.class_confidence == 1.0
+    assert profile.class_evidence == ("trusted tool registry declares tool_class=read",)
+
+
 def test_escalate_to_human_is_unknown_declared_only(surface):
     profile = surface.by_name("escalate_to_human")
     assert profile.tool_class is ToolClass.UNKNOWN

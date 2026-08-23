@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from bandits.contracts import IngestIssue, JsonObject
+from bandits.contracts import IngestIssue, JsonObject, ToolClass
 
 
 class RegistryError(ValueError):
@@ -42,6 +42,15 @@ def _entry_schema(entry: JsonObject) -> JsonObject:
     description = entry.get("description")
     if isinstance(description, str):
         declared["description"] = description
+    raw_class = entry.get("tool_class")
+    if raw_class is not None:
+        try:
+            declared["tool_class"] = ToolClass(raw_class).value
+        except ValueError as exc:
+            raise RegistryError(
+                f"tool_class for {entry.get('name')!r} must be one of "
+                f"{[c.value for c in ToolClass]}, got {raw_class!r}"
+            ) from exc
     return declared
 
 
