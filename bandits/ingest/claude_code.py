@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
@@ -44,6 +45,35 @@ _WRAPPER = re.compile(
     r"<(" + "|".join(_WRAPPER_TAGS) + r")>.*?</\1>|</?(" + "|".join(_WRAPPER_TAGS) + r")>",
     re.DOTALL,
 )
+
+
+_CONTEXT_KEYS = ("cwd", "model", "permissionMode", "version", "gitBranch")
+"""Session configuration, spread across the init record and the turn records."""
+
+
+def _session_context(records: list[dict]) -> tuple[object, str | None, dict]:
+    """The toolset and configuration the session declared, where it declared them.
+
+    A session log written by the CLI opens with an ``init`` record naming every
+    tool the run was started with; a log exported without one says nothing about
+    the toolset, and that stays unknown rather than being reconstructed from the
+    calls that happen to appear.
+    """
+    init = next(
+        (r for r in records if r.get("type") == "system" and r.get("subtype") == "init"),
+        None,
+    )
+    system_prompt = (init or {}).get("systemPrompt")
+    context: dict = {}
+    for record in (init, *records):
+        for key in _CONTEXT_KEYS:
+            if isinstance(record, dict) and record.get(key) is not None:
+                context.setdefault(key, record[key])
+    return (
+        parse_toolset((init or {}).get("tools")),
+        system_prompt if isinstance(system_prompt, str) else None,
+        context,
+    )
 
 
 def _timestamp(record: dict, ordinal: int) -> datetime:
@@ -244,12 +274,16 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
             redaction_ruleset=source.ruleset,
         )
 
+    tools_available, system_prompt, context = _session_context(records)
     trace = Trace(
         trace_id=path.stem,
         source="claude-code",
         source_digest=source.source_digest,
         task=task,
         lineage_id=session_id,
+        tools_available=tools_available,  # type: ignore[arg-type]
+        system_prompt=system_prompt,
+        runtime_context=context,
         user_turns=tuple(user_turns),
         spans=tuple(spans),
     )

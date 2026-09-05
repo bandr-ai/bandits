@@ -66,6 +66,16 @@ class Span(Contract):
     """Anything else the source declared that doesn't have a dedicated field."""
 
 
+class ToolSchema(Contract):
+    """One tool as it was offered to the agent, not as it was called."""
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    """The parameter schema the source declared. None means the tool was named
+    without a definition, so a call to it may not be reproducible anywhere."""
+
+
 class UserTurn(Contract):
     """One user message, and the point in the trajectory it arrived at."""
 
@@ -103,6 +113,23 @@ class Trace(Contract):
     means the source declared no grouping, which is recorded rather than assumed
     to mean independence.
     """
+
+    tools_available: tuple[ToolSchema, ...] | None = None
+    """The toolset offered at the start of the episode, when the source says.
+
+    Not the same fact as the tools this episode called: which tool to reach for,
+    out of what was on offer, is most of the decision a demonstration is meant to
+    teach, and a row showing a call carries neither the alternatives nor the
+    schema to reproduce it. None means the source declared no toolset, which is
+    recorded as unknown — never as an empty toolset.
+    """
+
+    system_prompt: str | None = None
+    """The system or developer instruction the episode ran under, when recorded."""
+
+    runtime_context: dict[str, Any] = Field(default_factory=dict)
+    """Configuration the episode ran under: model, sampling settings, working
+    directory, scaffold version. Empty means the source declared none."""
 
     user_turns: tuple[UserTurn, ...] = ()
     """Every user message the source recorded, in order, with its position.

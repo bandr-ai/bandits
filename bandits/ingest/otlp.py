@@ -30,6 +30,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
 
@@ -43,6 +44,21 @@ _LINEAGE_KEYS = (
     "thread_id",
 )
 """Attribute names carrying a session grouping, in decreasing order of standardness."""
+
+_TOOLSET_KEYS = ("gen_ai.request.tools", "gen_ai.request.functions", "llm.request.functions")
+"""Attribute names carrying the toolset offered to the model, across exporters."""
+
+_SYSTEM_PROMPT_KEYS = ("gen_ai.system_instructions", "gen_ai.request.system", "system_prompt")
+
+_CONTEXT_KEYS = (
+    "gen_ai.request.model",
+    "gen_ai.request.temperature",
+    "gen_ai.request.top_p",
+    "gen_ai.request.max_tokens",
+    "gen_ai.system",
+)
+"""Settings the run used. Recorded because a demonstration is only reproducible
+against the configuration that produced it."""
 
 _OPERATION_TO_KIND = {
     "chat": SpanKind.MODEL,
@@ -61,6 +77,10 @@ def _parse_timestamp(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _first(attributes: dict, keys: tuple[str, ...]) -> object | None:
+    return next((attributes[key] for key in keys if attributes.get(key) is not None), None)
 
 
 def _parse_record(record: dict, *, location: str) -> tuple[Span, str, str | None, str | None]:
@@ -130,6 +150,26 @@ def _parse_record(record: dict, *, location: str) -> tuple[Span, str, str | None
     return span, trace_id, task, lineage_id
 
 
+def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
+    """The toolset, system prompt and settings declared on the episode's root span.
+
+    Read from the root only. A tool listed on a later span is the toolset as it
+    stood by then, which is not the same claim as what the episode was offered at
+    the start, and treating the two as one would hand a new attempt a toolset
+    that had already been narrowed by what the agent learned.
+    """
+    root = next((span for span in spans if span.parent_span_id is None), None)
+    if root is None:
+        return None, None, {}
+    attributes = root.attributes
+    system_prompt = _first(attributes, _SYSTEM_PROMPT_KEYS)
+    return (
+        parse_toolset(_first(attributes, _TOOLSET_KEYS)),
+        system_prompt if isinstance(system_prompt, str) else None,
+        {key: attributes[key] for key in _CONTEXT_KEYS if attributes.get(key) is not None},
+    )
+
+
 class _RecordError(Exception):
     def __init__(self, detail: str, location: str) -> None:
         super().__init__(detail)
@@ -179,26 +219,31 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
         if lineage_id is not None:
             lineage_by_trace.setdefault(trace_id, lineage_id)
 
-    traces = tuple(
-        Trace(
-            trace_id=trace_id,
-            source="otlp",
-            source_digest=source_digest,
-            task=task_by_trace.get(trace_id),
-            lineage_id=lineage_by_trace.get(trace_id),
-            # Source order breaks ties, not span_id: exporters often stamp a
-            # whole episode with one coarse timestamp, and sorting those
-            # lexicographically puts 's10' before 's2' and picks the wrong
-            # terminal span.
-            spans=tuple(
-                span for _, span in sorted(spans, key=lambda pair: (pair[1].started_at, pair[0]))
-            ),
+    traces = []
+    for trace_id, collected in sorted(spans_by_trace.items()):
+        # Source order breaks ties, not span_id: exporters often stamp a whole
+        # episode with one coarse timestamp, and sorting those lexicographically
+        # puts 's10' before 's2' and picks the wrong terminal span.
+        ordered = tuple(
+            span for _, span in sorted(collected, key=lambda pair: (pair[1].started_at, pair[0]))
         )
-        for trace_id, spans in sorted(spans_by_trace.items())
-    )
+        tools, system_prompt, context = _declared_context(ordered)
+        traces.append(
+            Trace(
+                trace_id=trace_id,
+                source="otlp",
+                source_digest=source_digest,
+                task=task_by_trace.get(trace_id),
+                lineage_id=lineage_by_trace.get(trace_id),
+                tools_available=tools,  # type: ignore[arg-type]
+                system_prompt=system_prompt,
+                runtime_context=context,
+                spans=ordered,
+            )
+        )
     return TraceCorpus(
         source="otlp",
-        traces=traces,
+        traces=tuple(traces),
         issues=tuple(issues),
         redaction_ruleset=source.ruleset,
     )

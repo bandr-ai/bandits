@@ -16,7 +16,7 @@ from bandits.analyze.models import EvidenceKind, Visibility
 from bandits.analyze.outcomes import extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
-from bandits.traces import Span, SpanKind, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
@@ -247,3 +247,67 @@ def test_span_order_breaks_ties_on_source_order_not_span_id() -> None:
     trace = next(t for t in corpus.traces if t.trace_id == "addr-1")
 
     assert trace.spans[-1].name == "override_address_policy"
+
+
+def test_a_recorded_toolset_becomes_prompt_evidence_and_closes_the_gap() -> None:
+    """The tools on offer are prompt context; the tools called never are."""
+    trace = Trace(
+        trace_id="offered",
+        source="chat-json",
+        source_digest="a" * 64,
+        task="Refund it",
+        tools_available=(
+            ToolSchema(name="refund_order", parameters={"type": "object"}),
+            ToolSchema(name="lookup_order"),
+        ),
+        system_prompt="You are a support agent.",
+        runtime_context={"model": "gpt-5"},
+        spans=(
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ended_at=datetime(2026, 1, 1, tzinfo=UTC),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    offered = next(e for e in evidence if e.claim == "available_tools")
+    assert offered.visibility is Visibility.AT_START
+    assert [tool["name"] for tool in offered.value] == ["refund_order", "lookup_order"]
+    assert offered.evidence_id in task.prompt_evidence_ids
+    assert not any("available toolset is not recorded" in item for item in task.limitations)
+    assert any("without a schema" in item for item in task.limitations), (
+        "lookup_order was offered without a definition, so a call to it is not reproducible"
+    )
+    assert next(e for e in evidence if e.claim == "system_prompt").visibility is Visibility.AT_START
+    assert next(e for e in evidence if e.claim == "runtime_context").value == {"model": "gpt-5"}
+
+
+def test_an_undeclared_toolset_is_still_reported_as_missing() -> None:
+    trace = Trace(
+        trace_id="unknown-tools",
+        source="otlp",
+        source_digest="b" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ended_at=datetime(2026, 1, 1, tzinfo=UTC),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    assert not any(e.claim == "available_tools" for e in evidence)
+    assert any("available toolset is not recorded" in item for item in task.limitations)
+    assert any("no system prompt is recorded" in item for item in task.limitations)

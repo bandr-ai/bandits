@@ -26,3 +26,28 @@ def test_a_record_carrying_only_a_tool_result_is_not_a_user_turn() -> None:
 
     assert len(trace.user_turns) == 2
     assert any(span.kind is SpanKind.TOOL for span in trace.spans)
+
+
+def test_an_init_record_declares_the_toolset_the_session_started_with(tmp_path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        '{"type":"system","subtype":"init","cwd":"/repo","model":"claude",'
+        '"tools":["Bash","Read"]}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"fix the test"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+
+    trace = load_claude_code(path).traces[0]
+
+    assert trace.tools_available is not None
+    assert [tool.name for tool in trace.tools_available] == ["Bash", "Read"]
+    assert all(tool.parameters is None for tool in trace.tools_available)
+    assert trace.runtime_context["cwd"] == "/repo"
+
+
+def test_a_log_without_an_init_record_says_nothing_about_the_toolset() -> None:
+    """Never reconstructed from the calls that happen to appear."""
+    trace = load_claude_code(MULTI_TURN).traces[0]
+
+    assert trace.tools_available is None

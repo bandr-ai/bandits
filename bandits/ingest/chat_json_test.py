@@ -95,3 +95,32 @@ def test_a_user_turn_that_is_not_text_is_counted_rather_than_dropped(tmp_path) -
 
     assert corpus.traces[0].unrepresented_user_turns == 1
     assert any(issue.kind == "unrepresentable_user_turn" for issue in corpus.issues)
+
+
+def test_a_declared_toolset_and_system_prompt_are_captured(tmp_path) -> None:
+    path = tmp_path / "wrapped.json"
+    path.write_text(
+        '[{"session_id": "sess-1", "model": "gpt-5", "temperature": 0.2,'
+        ' "tools": [{"type": "function", "function": {"name": "refund_order",'
+        ' "parameters": {"type": "object"}}}],'
+        ' "messages": ['
+        '{"role": "system", "content": "You are a support agent."},'
+        '{"role": "user", "content": "Refund order 7741"},'
+        '{"role": "assistant", "content": "Done."}]}]'
+    )
+
+    trace = load_chat_json(path).traces[0]
+
+    assert trace.tools_available is not None
+    assert [tool.name for tool in trace.tools_available] == ["refund_order"]
+    assert trace.system_prompt == "You are a support agent."
+    assert trace.runtime_context == {"model": "gpt-5", "temperature": 0.2}
+
+
+def test_an_undeclared_toolset_stays_unknown() -> None:
+    """A bare message array has nowhere to say what was on offer."""
+    trace = load_chat_json(FIXTURE).traces[0]
+
+    assert trace.tools_available is None
+    assert trace.system_prompt is None
+    assert trace.runtime_context == {}
