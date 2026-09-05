@@ -43,6 +43,21 @@ def analyze_corpus(corpus: TraceCorpus) -> CorpusAnalysis:
             "their success cannot be judged from the trace alone"
         )
 
+    truncated = {e.trace_id for e in evidence if e.claim == "truncated_outcome_fields"}
+    if truncated:
+        limitations.append(
+            f"{len(truncated)} trace(s) recorded a terminal result too large or too deeply "
+            "nested to read in full; a field absent from a truncated read is unknown, "
+            "not missing"
+        )
+    unstructured = {e.trace_id for e in evidence if e.claim == "unstructured_final_result"}
+    if unstructured:
+        limitations.append(
+            f"{len(unstructured)} trace(s) recorded a terminal result holding no comparable "
+            "field; whatever those results mean is domain knowledge this extractor does "
+            "not have"
+        )
+
     return CorpusAnalysis(
         corpus_id=compute_artifact_id(corpus),
         source=corpus.source,

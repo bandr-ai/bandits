@@ -334,9 +334,15 @@ def draft_verifiers(
 
     unresolved: list[str] = []
     if not proposals:
-        unresolved.append(
-            "no deterministic terminal exit code or structured final-state field was recorded"
-        )
+        if any(item.claim == "unstructured_final_result" for item in evidence):
+            unresolved.append(
+                "terminal results were recorded but hold no comparable field; deciding what "
+                "they mean needs a judge or a domain extractor, not another replay check"
+            )
+        else:
+            unresolved.append(
+                "no deterministic terminal exit code or structured final-state field was recorded"
+            )
     elif len(proposals) == 1:
         unresolved.append("only one independent deterministic verifier pattern was supported")
     if proposals and all(spec.rests_only_on_self_report for spec in proposals[:limit]):

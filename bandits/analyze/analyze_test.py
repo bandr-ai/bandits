@@ -311,3 +311,96 @@ def test_an_undeclared_toolset_is_still_reported_as_missing() -> None:
     assert not any(e.claim == "available_tools" for e in evidence)
     assert any("available toolset is not recorded" in item for item in task.limitations)
     assert any("no system prompt is recorded" in item for item in task.limitations)
+
+
+def _tool_trace(trace_id: str, output: object) -> Trace:
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    return Trace(
+        trace_id=trace_id,
+        source="otlp",
+        source_digest="c" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="lookup",
+                kind=SpanKind.TOOL,
+                name="lookup_order",
+                started_at=moment,
+                ended_at=moment,
+                output={"order": {"charge": {"amount": 48.0}}},
+            ),
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=moment + timedelta(seconds=1),
+                ended_at=moment + timedelta(seconds=1),
+                output=output,
+            ),
+        ),
+    )
+
+
+def test_a_nested_result_is_read_down_to_its_comparable_leaves() -> None:
+    """A source answering with an object produced no terminal evidence at all."""
+    trace = _tool_trace("nested", {"order": {"status": "refunded", "totals": {"refunded": 48.0}}})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {
+        "refund_order.order.status": "refunded",
+        "refund_order.order.totals.refunded": 48.0,
+    }
+
+
+def test_an_array_contributes_its_length_and_not_its_positions() -> None:
+    """Position in a list is not stable between runs of the same task."""
+    trace = _tool_trace("arrays", {"warnings": [], "items": [{"sku": "a"}, {"sku": "b"}]})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {"refund_order.warnings[].count": 0, "refund_order.items[].count": 2}
+
+
+def test_an_initial_state_field_is_read_from_a_nested_result_too() -> None:
+    trace = _tool_trace("nested-initial", {"refund": {"amount": 48.0}})
+
+    initial = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "initial_state_field"
+    }
+
+    assert initial == {"lookup_order.order.charge.amount": 48.0}
+
+
+def test_a_result_read_only_in_part_says_so() -> None:
+    """A field absent from a truncated read is unknown, not missing."""
+    trace = _tool_trace("wide", {f"field_{index}": index for index in range(100)})
+
+    evidence = extract_outcome_evidence(trace)
+
+    assert any(e.claim == "truncated_outcome_fields" for e in evidence)
+    assert len([e for e in evidence if e.claim == "final_state_field"]) == 64
+    analysis = analyze_corpus(TraceCorpus(source="otlp", traces=(trace,)))
+    assert any("truncated read is unknown" in item for item in analysis.limitations)
+
+
+def test_a_result_holding_nothing_comparable_is_named_rather_than_silent() -> None:
+    """Prose is a recorded outcome; it is just not one a replay check can read."""
+    trace = _tool_trace("prose", "I told the customer to try again later.")
+
+    evidence = extract_outcome_evidence(trace)
+
+    assert any(e.claim == "unstructured_final_result" for e in evidence)
+    assert not any(e.claim == "final_state_field" for e in evidence)
+    analysis = analyze_corpus(TraceCorpus(source="otlp", traces=(trace,)))
+    assert any("domain knowledge this extractor does not have" in i for i in analysis.limitations)
