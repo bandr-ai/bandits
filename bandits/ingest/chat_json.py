@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -104,6 +104,8 @@ def _convert_conversation(
         return None
 
     spans: list[Span] = []
+    user_turns: list[UserTurn] = []
+    unrepresented = 0
     pending_calls: dict[
         str, str
     ] = {}  # tool_call_id -> span_id of the MODEL span that requested it
@@ -112,6 +114,25 @@ def _convert_conversation(
     for index, message in enumerate(messages):
         role = message.get("role")
         timestamp = _EPOCH + timedelta(seconds=ordinal)
+
+        if role in ("user", "human"):
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                # Anchored to the last span, because a correction is only an
+                # instruction for what comes after it.
+                user_turns.append(
+                    UserTurn(text=content, after_span_id=spans[-1].span_id if spans else None)
+                )
+            elif content:
+                unrepresented += 1
+                issues.append(
+                    TraceIssue(
+                        kind="unrepresentable_user_turn",
+                        detail=f"message {index}: user content is {type(content).__name__}, not text",
+                        location=location,
+                    )
+                )
+            continue
 
         if role == "assistant":
             calls = _tool_calls(message)
@@ -214,6 +235,8 @@ def _convert_conversation(
         source_digest=source_digest,
         task=task,
         lineage_id=lineage_id,
+        user_turns=tuple(user_turns),
+        unrepresented_user_turns=unrepresented,
         spans=tuple(spans),
     )
 

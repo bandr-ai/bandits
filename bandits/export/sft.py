@@ -28,7 +28,7 @@ from bandits.export.models import (
     ToolFunction,
     TrainingMessage,
 )
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, UserTurn
 from bandits.verify.execute import execute_verifier
 from bandits.verify.review import ReviewedVerifier
 
@@ -78,6 +78,11 @@ def build_transcript(
     happened inside that span, not that they were issued together. Batching them
     would teach an agent to commit to its second action before reading the result
     of its first.
+
+    Every user turn the source recorded is replayed where it arrived. A run whose
+    user said "use 1.9 instead" halfway through is a demonstration of following
+    that correction, and a transcript holding only the opening instruction would
+    teach the final action as the answer to a question nobody asked.
     """
     by_id = {span.span_id: span for span in trace.spans}
     children = {span.parent_span_id for span in trace.spans if span.parent_span_id}
@@ -94,13 +99,37 @@ def build_transcript(
             carriers[span.span_id] = parent
     carrier_ids = {carrier.span_id for carrier in carriers.values()}
 
-    messages: list[TrainingMessage] = [
-        TrainingMessage(role="user", content=trace.task if trace.task is not None else "")
-    ]
     defects: list[str] = []
     warnings: list[str] = []
+    turns = trace.user_turns or (UserTurn(text=trace.task if trace.task is not None else ""),)
+    anchored: dict[str | None, list[UserTurn]] = {}
+    for turn in turns:
+        anchored.setdefault(turn.after_span_id, []).append(turn)
+    unplaceable = sorted(
+        {turn.after_span_id for turn in turns if turn.after_span_id not in by_id} - {None}
+    )
+    if unplaceable:
+        defects.append("a recorded user turn does not sit anywhere in the trajectory")
+    if trace.unrepresented_user_turns:
+        defects.append(
+            f"the source recorded {trace.unrepresented_user_turns} user turn(s) this "
+            "trace does not represent"
+        )
+
+    messages: list[TrainingMessage] = [
+        TrainingMessage(role="user", content=turn.text) for turn in anchored.get(None, ())
+    ]
     open_text_span: str | None = None
     """The span behind the last message, when that message is assistant text."""
+
+    def close_turn(span_id: str) -> None:
+        """Replay any user turn that arrived after this span."""
+        nonlocal open_text_span
+        for turn in anchored.get(span_id, ()):
+            messages.append(TrainingMessage(role="user", content=turn.text))
+            # What the user said next is not part of the turn before it, so the
+            # next action cannot ride on that assistant message.
+            open_text_span = None
 
     for span in trace.spans:
         if span.kind is SpanKind.TOOL:
@@ -144,6 +173,7 @@ def build_transcript(
                     content=_content(span.output),
                 )
             )
+            close_turn(span.span_id)
             continue
 
         if span.output is not None:
@@ -153,8 +183,16 @@ def build_transcript(
             open_text_span = span.span_id
         elif span.span_id not in carrier_ids and span.arguments and span.span_id not in children:
             defects.append("a recorded model action has neither a completion nor a tool result")
+        close_turn(span.span_id)
 
-    if messages[-1].role == "tool":
+    if not messages:
+        defects.append("the trace records no messages to rebuild")
+    elif messages[-1].role == "user":
+        # The last thing recorded is an instruction nobody answered. There is no
+        # behavior to imitate after it, and training on it would teach the model
+        # that a request can end a conversation.
+        defects.append("episode ends on a user turn with no recorded response")
+    elif messages[-1].role == "tool":
         # Not a defect. The actions are still exactly what the agent did, and the
         # verifier has already established the outcome; what is missing is the
         # agent's own closing turn, which most exporters simply do not record.

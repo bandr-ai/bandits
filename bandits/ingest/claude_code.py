@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -122,6 +122,7 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
     issues: list[TraceIssue] = list(source.issues)
 
     spans: list[Span] = []
+    user_turns: list[UserTurn] = []
     pending: dict[str, str] = {}
     results: dict[str, dict] = {}
     task: str | None = None
@@ -157,10 +158,15 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
         blocks = _blocks(record)
         started = _timestamp(record, ordinal)
 
-        if record.get("type") == "user" and task is None and not record.get("isSidechain"):
+        if record.get("type") == "user" and not record.get("isSidechain"):
+            # Only turns a human actually wrote: a user record carrying nothing
+            # but tool results is the harness answering the agent.
             text = _text(blocks)
             if text:
-                task = text
+                task = task if task is not None else text
+                user_turns.append(
+                    UserTurn(text=text, after_span_id=spans[-1].span_id if spans else None)
+                )
 
         for block in blocks:
             if block.get("type") == "text" and record.get("type") == "assistant":
@@ -244,6 +250,7 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
         source_digest=source.source_digest,
         task=task,
         lineage_id=session_id,
+        user_turns=tuple(user_turns),
         spans=tuple(spans),
     )
     return TraceCorpus(

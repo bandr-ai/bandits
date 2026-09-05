@@ -66,6 +66,14 @@ class Span(Contract):
     """Anything else the source declared that doesn't have a dedicated field."""
 
 
+class UserTurn(Contract):
+    """One user message, and the point in the trajectory it arrived at."""
+
+    text: str
+    after_span_id: str | None = None
+    """The span this turn followed. None means it opened the episode."""
+
+
 class TraceIssue(Contract):
     """One source record that could not be normalized. Never silently dropped."""
 
@@ -94,6 +102,23 @@ class Trace(Contract):
     same request on both sides of the boundary leaks the answer across it. None
     means the source declared no grouping, which is recorded rather than assumed
     to mean independence.
+    """
+
+    user_turns: tuple[UserTurn, ...] = ()
+    """Every user message the source recorded, in order, with its position.
+
+    A conversation is not one instruction followed by a monologue: a correction
+    or an approval halfway through is why the rest of the episode looks the way
+    it does. Empty means the source was not read for turns at all, not that the
+    episode had one — ``task`` still carries the opening instruction either way.
+    """
+
+    unrepresented_user_turns: int = 0
+    """User messages the source recorded and this trace could not represent.
+
+    Above zero, any transcript rebuilt from this trace omits something the agent
+    was actually told, so it must be refused rather than exported as if the
+    later actions answered only the first instruction.
     """
 
     spans: tuple[Span, ...]

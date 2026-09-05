@@ -23,9 +23,11 @@ from bandits.export import (
     write_jsonl,
 )
 from bandits.export.sft import _quality_reasons
+from bandits.ingest.chat_json import load_chat_json
+from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, UserTurn
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
@@ -335,6 +337,79 @@ def test_transcript_puts_the_action_on_the_assistant_turn(export_case) -> None:
     assert not messages[2].tool_calls
 
 
+def test_a_later_user_turn_is_replayed_where_it_arrived() -> None:
+    """The correction has to sit before the action it caused, not be dropped."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+
+    messages, defects, warnings = build_transcript(trace)
+
+    assert not defects and not warnings
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[2].content == "Use version 1.9 instead"
+    assert json.loads(messages[3].tool_calls[0].function.arguments) == {"version": "1.9"}
+
+
+def test_a_multi_turn_session_log_replays_its_correction_too() -> None:
+    messages, defects, _ = build_transcript(load_claude_code(MULTI_TURN_SESSION).traces[0])
+
+    assert not defects
+    assert [message.content for message in messages if message.role == "user"] == [
+        "Update the dependency",
+        "Use version 1.9 instead",
+    ]
+
+
+def test_a_trace_that_lost_a_user_turn_is_refused() -> None:
+    """Fail closed: the actions answered something this transcript cannot show."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+
+    _, defects, _ = build_transcript(trace.replace(unrepresented_user_turns=1))
+
+    assert any("does not represent" in defect for defect in defects)
+
+
+def test_a_user_turn_with_no_recorded_response_is_refused() -> None:
+    """A dangling instruction has no behavior to imitate after it."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+    dangling = trace.replace(
+        user_turns=(
+            *trace.user_turns,
+            UserTurn(text="also bump the lockfile", after_span_id=trace.spans[-1].span_id),
+        )
+    )
+
+    _, defects, _ = build_transcript(dangling)
+
+    assert any("no recorded response" in defect for defect in defects)
+
+
+def test_a_user_turn_anchored_to_no_span_is_refused() -> None:
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+    orphaned = trace.replace(
+        user_turns=(*trace.user_turns, UserTurn(text="and pin it", after_span_id="not-a-span"))
+    )
+
+    _, defects, _ = build_transcript(orphaned)
+
+    assert any("does not sit anywhere" in defect for defect in defects)
+
+
+def test_a_single_turn_transcript_is_unchanged_by_recorded_turns() -> None:
+    """A source that records its one user turn must export what it always did."""
+    trace = _trace("good-1", 100, "changed")
+
+    recorded = trace.replace(user_turns=(UserTurn(text=trace.task),))
+
+    assert build_transcript(recorded) == build_transcript(trace)
+
+
 @pytest.mark.parametrize("carrier_args", [False, True])
 def test_both_recorded_call_shapes_yield_the_same_transcript(carrier_args: bool) -> None:
     """OTLP puts arguments on the tool span; chat JSON puts them on the model span."""
@@ -473,12 +548,10 @@ def test_step_count_gate_quarantines_a_long_episode(export_case) -> None:
     assert any("family quality limit" in reason for reason in rejected["good-1"])
 
 
-SUPPORT_FIXTURE = (
-    Path(__file__).resolve().parent.parent.parent
-    / "tests"
-    / "fixtures"
-    / "traces.support.otlp.jsonl"
-)
+FIXTURES = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures"
+SUPPORT_FIXTURE = FIXTURES / "traces.support.otlp.jsonl"
+MULTI_TURN_FIXTURE = FIXTURES / "traces.multiturn.chat.json"
+MULTI_TURN_SESSION = FIXTURES / "session.multiturn.jsonl"
 
 
 def test_a_real_corpus_still_yields_trainable_rows() -> None:

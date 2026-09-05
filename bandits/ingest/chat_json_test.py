@@ -5,7 +5,9 @@ from pathlib import Path
 from bandits.ingest.chat_json import load_chat_json
 from bandits.traces import SpanKind
 
-FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "traces.chat.jsonl"
+FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURE = FIXTURES / "traces.chat.jsonl"
+MULTI_TURN = FIXTURES / "traces.multiturn.chat.json"
 
 
 def test_pairs_tool_call_with_tool_result() -> None:
@@ -64,3 +66,32 @@ def test_wrapped_conversation_carries_its_session_id(tmp_path) -> None:
     corpus = load_chat_json(source)
 
     assert corpus.traces[0].lineage_id == "sess-9"
+
+
+def test_every_user_turn_is_recorded_in_order_with_its_position() -> None:
+    """A correction halfway through is why the rest of the episode looks as it does."""
+    trace = load_chat_json(MULTI_TURN).traces[0]
+
+    assert trace.task == "Update the dependency"
+    assert [turn.text for turn in trace.user_turns] == [
+        "Update the dependency",
+        "Use version 1.9 instead",
+    ]
+    assert trace.user_turns[0].after_span_id is None
+    assert trace.user_turns[1].after_span_id == trace.spans[0].span_id
+    assert trace.unrepresented_user_turns == 0
+
+
+def test_a_user_turn_that_is_not_text_is_counted_rather_than_dropped(tmp_path) -> None:
+    """Counted, so an export refuses the trace instead of losing the instruction."""
+    path = tmp_path / "blocks.json"
+    path.write_text(
+        '[{"role": "user", "content": "Update the dependency"},'
+        '{"role": "assistant", "content": "done"},'
+        '{"role": "user", "content": [{"type": "image", "source": "x"}]}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    assert corpus.traces[0].unrepresented_user_turns == 1
+    assert any(issue.kind == "unrepresentable_user_turn" for issue in corpus.issues)
