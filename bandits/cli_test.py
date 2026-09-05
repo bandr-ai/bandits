@@ -564,7 +564,7 @@ def _reviewed_refund_verifier(tmp_path: Path) -> tuple[str, str]:
     spec = next(
         item
         for item in draft.verifiers
-        if item.checks[0].claim == "final_state_field:status"
+        if item.checks[0].claim == "final_state_field:refund_order.status"
         and item.checks[0].expected == "refunded"
     )
     draft_id = save_verifier_draft(draft, store).artifact_id

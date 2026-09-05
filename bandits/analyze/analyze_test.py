@@ -161,6 +161,7 @@ def test_tool_result_before_final_model_is_terminal_state_evidence() -> None:
     assert task.terminal_span_ids == ("tool", "reply")
     assert final_state.span_id == "tool"
     assert final_state.visibility is Visibility.TERMINAL
+    assert final_state.value["field"] == "refund_order.status"
 
 
 def test_a_closing_claim_is_recorded_as_self_report_and_ranked_last() -> None:

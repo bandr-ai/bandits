@@ -34,7 +34,20 @@ def _unknown(reason: str) -> _Outcome:
 
 
 def _field(evidence: tuple[Evidence, ...], claim: str, key: str) -> Evidence | None:
-    return next((e for e in evidence if e.claim == claim and e.value.get("key") == key), None)
+    """Find the state field a check names.
+
+    Matched on the tool-qualified name first, then on the bare key, because a
+    spec accepted before fields carried their tool names asks for the key alone
+    and must keep executing exactly as it did when it was measured.
+    """
+    return next(
+        (
+            e
+            for e in evidence
+            if e.claim == claim and key in (e.value.get("field"), e.value.get("key"))
+        ),
+        None,
+    )
 
 
 def _keyed_equality(check: CheckSpec, evidence: tuple[Evidence, ...], claim: str) -> _Outcome:

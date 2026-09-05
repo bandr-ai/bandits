@@ -70,6 +70,22 @@ def test_structured_field_check_executes() -> None:
     assert execute_verifier(spec, (evidence,)).score == 1.0
 
 
+def test_a_check_is_not_answered_by_another_tools_field_of_the_same_name() -> None:
+    """Two tools both reporting `status` are two facts, not one shared one."""
+    spec = _spec(CheckOperator.EQUALS, "final_state_field:refund_order.status", "refunded")
+    other_tool = _evidence(
+        "final_state_field",
+        {
+            "key": "status",
+            "field": "lookup_order.status",
+            "value": "refunded",
+            "tool": "lookup_order",
+        },
+    )
+
+    assert execute_verifier(spec, (other_tool,)).score is None
+
+
 def test_missing_required_evidence_is_unknown() -> None:
     spec = _spec(CheckOperator.EQUALS, "final_state_field:status", "refunded")
 

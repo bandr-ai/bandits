@@ -123,6 +123,11 @@ def _top_values_per_key(
     return kept
 
 
+def _field_name(item: Evidence) -> str:
+    """A state field's name, qualified by the tool that reported it."""
+    return str(item.value.get("field") or item.value.get("key"))
+
+
 def _invariants(
     family: TaskFamily, task_set_id: str, evidence: list[Evidence]
 ) -> list[VerifierSpec]:
@@ -137,7 +142,7 @@ def _invariants(
     for item in evidence:
         if item.claim in ("final_state_field", "initial_state_field"):
             side = "final" if item.claim == "final_state_field" else "initial"
-            by_trace.setdefault(item.trace_id, {})[(side, str(item.value.get("key")))] = item
+            by_trace.setdefault(item.trace_id, {})[(side, _field_name(item))] = item
 
     candidates: dict[tuple[str, str], list[Evidence]] = {}
     disproved: set[tuple[str, str]] = set()
@@ -219,7 +224,7 @@ def draft_verifiers(
     states = [item for item in evidence if item.claim == "final_state_field"]
     grouped: dict[tuple[str, str], list[Evidence]] = {}
     for item in states:
-        key = str(item.value.get("key"))
+        key = _field_name(item)
         value = item.value.get("value")
         grouped.setdefault((key, _stable_value(value)), []).append(item)
     for key in _identifier_keys(grouped):

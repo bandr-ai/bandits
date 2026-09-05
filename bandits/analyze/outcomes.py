@@ -59,6 +59,16 @@ def _first_key(payload: Any, keys: tuple[str, ...]) -> tuple[str, Any] | None:
     return None
 
 
+def _qualified(span: Span, key: str) -> str:
+    """The field name a check refers to: the reporting tool, then the key.
+
+    Two tools both reporting ``status: "done"`` are two different facts. Named by
+    the key alone they group as one candidate and draft as one check, which then
+    passes on whichever tool happened to answer first.
+    """
+    return f"{span.name}.{key}"
+
+
 def _scalar_fields(payload: Any) -> list[tuple[str, Any]]:
     if not isinstance(payload, dict):
         return []
@@ -141,8 +151,13 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                         span,
                         trace_id=trace.trace_id,
                         claim="final_state_field",
-                        detail=key,
-                        value={"key": key, "value": value, "tool": span.name},
+                        detail=_qualified(span, key),
+                        value={
+                            "key": key,
+                            "field": _qualified(span, key),
+                            "value": value,
+                            "tool": span.name,
+                        },
                         visibility=Visibility.TERMINAL,
                         strength="moderate",
                         kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
@@ -159,8 +174,13 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
                         span,
                         trace_id=trace.trace_id,
                         claim="initial_state_field",
-                        detail=key,
-                        value={"key": key, "value": value, "tool": span.name},
+                        detail=_qualified(span, key),
+                        value={
+                            "key": key,
+                            "field": _qualified(span, key),
+                            "value": value,
+                            "tool": span.name,
+                        },
                         visibility=Visibility.DURING,
                         strength="moderate",
                         kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,

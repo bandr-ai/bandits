@@ -243,7 +243,7 @@ def _forged(claim: str, key: str, value: object) -> Evidence:
     return Evidence(
         evidence_id=f"ev-forged-{claim}-{key}",
         claim=claim,
-        value={"key": key, "value": value, "tool": "forged"},
+        value={"key": key, "field": key, "value": value, "tool": "forged"},
         visibility=Visibility.TERMINAL,
         provenance="derived",
         strength="weak",

@@ -52,7 +52,7 @@ def test_support_family_proposes_structured_state_check() -> None:
     draft = draft_verifiers(task_set, "taskset-test", analysis, family.family_id)
 
     checks = [v.checks[0] for v in draft.verifiers]
-    assert any(check.claim == "final_state_field:status" for check in checks)
+    assert any(check.claim == "final_state_field:refund_order.status" for check in checks)
     assert all(check.supporting_evidence_ids for check in checks)
 
 
@@ -203,7 +203,7 @@ def test_an_invariant_is_drafted_from_the_before_and_after_pair(tmp_path) -> Non
         for check in spec.checks
     }
 
-    assert "invariant:refunded_amount==charged_amount" in claims
+    assert "invariant:refund_order.refunded_amount==lookup_order.charged_amount" in claims
 
 
 def test_a_field_that_differs_every_run_gets_no_equality_check(tmp_path) -> None:
@@ -214,12 +214,47 @@ def test_a_field_that_differs_every_run_gets_no_equality_check(tmp_path) -> None
         for check in spec.checks
     }
 
-    assert "final_state_field:refunded_amount" not in claims
-    assert "final_state_field:status" in claims, "a real status must survive"
+    assert "final_state_field:refund_order.refunded_amount" not in claims
+    assert "final_state_field:refund_order.status" in claims, "a real status must survive"
 
 
-def test_competing_values_for_one_field_are_both_drafted() -> None:
+def _competing_statuses(tmp_path) -> Path:
+    """One tool, one field, two values across runs — a real pair of hypotheses."""
+    rows = []
+    for i in range(1, 7):
+        base = f"2026-05-02T00:0{i}"
+        status = "resolved" if i % 2 else "escalated"
+        rows += [
+            f'{{"trace_id": "c-{i}", "span_id": "c-{i}-0", "parent_span_id": null,'
+            f' "name": "gpt-5", "start_time": "{base}:00Z", "end_time": "{base}:10Z",'
+            f' "attributes": {{"gen_ai.operation.name": "chat", "task": "Close ticket {7000 + i}"}}}}',
+            f'{{"trace_id": "c-{i}", "span_id": "c-{i}-1", "parent_span_id": "c-{i}-0",'
+            f' "name": "close_ticket", "start_time": "{base}:11Z", "end_time": "{base}:12Z",'
+            f' "attributes": {{"gen_ai.operation.name": "execute_tool",'
+            f' "gen_ai.tool.call.arguments": {{}},'
+            f' "gen_ai.tool.call.result": {{"status": "{status}"}}}}}}',
+        ]
+    path = tmp_path / "competing.jsonl"
+    path.write_text("\n".join(rows) + "\n")
+    return path
+
+
+def test_competing_values_for_one_field_are_both_drafted(tmp_path) -> None:
     """Two hypotheses for what success looks like is the question worth asking."""
+    draft = _drafted(_competing_statuses(tmp_path))
+
+    expected = {
+        check.expected
+        for spec in draft.verifiers
+        for check in spec.checks
+        if check.claim == "final_state_field:close_ticket.status"
+    }
+
+    assert expected == {"resolved", "escalated"}
+
+
+def test_two_tools_reporting_one_key_are_drafted_as_different_checks() -> None:
+    """`status` from a lookup and `status` from an override are not one field."""
     fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
     analysis = analyze_corpus(load_corpus(fixtures / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(
@@ -228,11 +263,8 @@ def test_competing_values_for_one_field_are_both_drafted() -> None:
     address = next(f for f in task_set.families if "address" in f.descriptor)
 
     draft = draft_verifiers(task_set, "ts-1", analysis, address.family_id, limit=6)
-    expected = {
-        check.expected
-        for spec in draft.verifiers
-        for check in spec.checks
-        if check.claim == "final_state_field:status"
-    }
+    drafted = {(check.claim, check.expected) for spec in draft.verifiers for check in spec.checks}
 
-    assert expected == {"overridden", "paid"}
+    assert ("final_state_field:lookup_order.status", "paid") in drafted
+    assert ("final_state_field:override_address_policy.status", "overridden") in drafted
+    assert not any(claim == "final_state_field:status" for claim, _ in drafted)
