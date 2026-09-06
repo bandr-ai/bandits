@@ -164,6 +164,12 @@ def start_review(
 
     Each round is its own artifact. ``prior_interview_id`` chains it to the
     round before so a later round can read what earlier ones decided.
+
+    No stop condition is enforced across rounds: the loop ends when the owner
+    ends it. Candidate rules exist — a round proposing nothing already decided,
+    or every survivor reaching calibration — but which one matches a real review
+    is unknown until one has been run, and a rule guessed now would be enforced
+    before anyone had watched the loop behave. Out of scope for #14.
     """
     pending = tuple(
         (spec.verifier_id, check.check_id) for spec in draft.verifiers for check in spec.checks
@@ -293,6 +299,17 @@ def apply_decision(interview: VerifierInterview, review: CheckReview) -> Verifie
 
     The decision is the human's. ``review.interpretation`` is what the model
     proposed, recorded whether or not it was followed.
+
+    Four decisions, not six. An earlier draft of #14 also offered
+    ``insufficient`` and ``unauthoritative``. ``insufficient`` is what
+    ``reject`` already means once review runs more than once — the check returns
+    in a later round with more evidence behind it, and there is no state to
+    carry in between. ``unauthoritative`` had no machinery behind it: nothing
+    here routes a check to another reviewer, so it would have been a state
+    nobody acts on, and its real content is a rejection with a reason. Keeping
+    either would also have meant widening ``VerifierStatus`` with values that
+    are review outcomes rather than lifecycle positions, putting the promotion
+    invariants in ``models.py::validate_lifecycle`` at risk for no gain.
     """
     if (review.verifier_id, review.check_id) not in interview.pending:
         raise ValueError(f"check {review.check_id!r} is not awaiting a decision")
@@ -307,6 +324,10 @@ def apply_decision(interview: VerifierInterview, review: CheckReview) -> Verifie
     if review.decision is InterviewDecision.ACCEPT:
         verifiers[index] = _with_extractions(spec, interpretation)
     elif review.decision is InterviewDecision.REJECT:
+        # Marked, not dropped. #14 asks that rejected proposals stay auditable
+        # with their rationale, and a verifier removed from the draft takes the
+        # reason it was rejected with it — leaving a later round free to redraft
+        # the same check with nothing recording that it was already refused.
         verifiers[index] = _with_extractions(spec, interpretation).replace(
             status=VerifierStatus.REJECTED
         )

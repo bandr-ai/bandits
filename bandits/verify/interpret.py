@@ -30,6 +30,20 @@ DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
 TEMPERATURE = 0.0
 """Deterministic: the same reply and evidence should read the same way twice."""
 
+# Deliberately absent, per #14's out-of-scope list:
+#
+# Prompt pinning. ``judge.py`` digests its rubric wording, model and scale, and
+# refuses verdicts produced under a superseded one. The same belongs here so a
+# later round cannot silently mix interpretations made under two prompts —
+# ``analyze/audit.py::prompt_digest`` is the nine-line version to copy. Left out
+# until the prompt below has stabilised: pinning a wording still being edited
+# invalidates every stored interview on each edit, for no reader's benefit.
+#
+# Length caps. The summary and reply both enter the prompt unbounded. A cap
+# guessed before any real interview has run would be guessed wrong, and a
+# too-small one silently truncates the evidence a decision rests on. Revisit
+# with real transcripts, and cap the evidence summary before the reply.
+
 Interpreter = Callable[[str, str, float], str]
 """(model, prompt, temperature) -> the model's reply text.
 

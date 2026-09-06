@@ -914,7 +914,12 @@ def judge(
 
 
 _INTERPRETER: object | None = None
-"""Overridden by tests so the interview never reaches the network."""
+"""Overridden by tests so the interview never reaches the network.
+
+None means ``interpret_reply`` resolves its own default client. Injecting here
+rather than threading a parameter through the command keeps the CLI signature
+about the review and not about which model client is in use.
+"""
 
 
 def _interpreter():
@@ -970,6 +975,13 @@ def _probe_hypotheses(spec, check, interpretation) -> None:
     """
     if interpretation is None or not interpretation.gaming_hypotheses:
         return
+    # Out of scope for #14: synthesising forged evidence for a hypothesis no
+    # template matches. ``_attack()`` dispatches on the operator, so a novel
+    # attack against an operator that already has a template gets that
+    # template's canned attack rather than the one the reviewer described. The
+    # gap is reported below rather than hidden; closing it means teaching
+    # ``_attack`` to build evidence from an interpreted hypothesis, which is a
+    # change to the attack machinery and deserves its own issue.
     single = spec.replace(checks=(check,))
     results = probe_gameability(single)
     for hypothesis in interpretation.gaming_hypotheses:
@@ -991,6 +1003,12 @@ def _manual_decision(reason: str) -> InterviewDecision | None:
     return _DECISION_KEYS.get(raw.strip().lower()[:1])
 
 
+# Named ``interview-review`` rather than ``review-verifier``: that name is
+# already the acceptance command above, which promotes a calibrated verifier to
+# reviewed. Two commands whose names differ only by word order, one refining a
+# hypothesis and one promoting it past validation, is a mistake waiting to be
+# typed. ``interview-verifier`` keeps the older fixed-question flow, which still
+# works and is still tested.
 @app.command(name="interview-review")
 def interview_review_command(
     verifier_draft_id: str,
@@ -1015,6 +1033,13 @@ def interview_review_command(
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+    # Each invocation opens a new round rather than extending an existing
+    # interview. ``DerivedStore.write`` is content-addressed, so appending to one
+    # record would mint a fresh id on every save regardless — the chain exists
+    # either way, and ``prior_interview_id`` makes it explicit instead of
+    # leaving a series of ids that each claim to be the whole history. It also
+    # keeps a round's payload from re-serialising every earlier round on each
+    # per-decision save.
     run = run_draft(draft, analysis, task_set)
     interview = start_review(
         draft,

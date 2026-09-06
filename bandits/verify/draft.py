@@ -35,6 +35,12 @@ def _spec_id(family_id: str, claim: str, expected: Any) -> str:
     return f"verifier-{hashlib.sha256(payload.encode()).hexdigest()[:16]}"
 
 
+# Not filtered by label. Once an earlier round has produced a LabelSet, mining
+# only success-labelled traces would draft checks that discriminate by
+# construction, instead of checks that merely hold across the corpus — which is
+# most of what a reviewer currently prunes by hand. Out of scope for #14: this
+# is a drafting change, and round one has no labels to filter by. See the
+# success/failure split already tracked in ``validate.py::Validation``.
 def _eligible(family: TaskFamily, analysis: CorpusAnalysis) -> list[Evidence]:
     """Everything a verifier may read about the family's fit traces.
 
