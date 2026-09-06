@@ -501,6 +501,11 @@ def draft_verifier_command(
     task_set_id: str,
     family_id: str = typer.Option(..., "--family", help="Family to draft checks for."),
     limit: int = typer.Option(3, "--limit", help="Maximum independent verifier drafts."),
+    labels_id: str = typer.Option(
+        None,
+        "--labels",
+        help="Adjudicated labels to rank candidates against, and to compose from.",
+    ),
     interview: bool = typer.Option(
         False, "--interview", help="Immediately run the bounded owner-review interview."
     ),
@@ -511,7 +516,10 @@ def draft_verifier_command(
     task_set = _load_task_set(task_set_id, project)
     try:
         analysis = load_analysis(task_set.analysis_id, store)
-        draft = draft_verifiers(task_set, task_set_id, analysis, family_id, limit=limit)
+        labels = load_label_set(labels_id, store) if labels_id else None
+        draft = draft_verifiers(
+            task_set, task_set_id, analysis, family_id, limit=limit, labels=labels
+        )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -533,6 +541,7 @@ def draft_verifier_command(
                 check.evidence_kind.value,
             )
     console.print(table)
+    _show_candidates(draft)
     for unresolved in draft.unresolved:
         console.print(f"[yellow]unresolved:[/yellow] {unresolved}")
 
@@ -543,6 +552,28 @@ def draft_verifier_command(
 
     if interview:
         _run_verifier_interview(draft, envelope.artifact_id, store)
+
+
+def _show_candidates(draft) -> None:
+    """How each proposal behaved, next to what it proposes.
+
+    A ranked list with nothing behind it invites the top row to be taken as the
+    answer. The numbers are what let an owner disagree with the ranking.
+    """
+    if not draft.candidates:
+        return
+    table = Table("verifier_id", "from", "successes", "failures", "false pos", "coverage", "why")
+    for stats in draft.candidates:
+        table.add_row(
+            stats.verifier_id,
+            stats.derivation,
+            f"{stats.success_support}/{stats.labeled_successes}" if stats.calibrated else "—",
+            f"{stats.failure_rejection}/{stats.labeled_failures}" if stats.calibrated else "—",
+            str(stats.false_positives) if stats.calibrated else "—",
+            f"{stats.coverage:.0%} ({stats.unknown} unknown)",
+            stats.rationale,
+        )
+    console.print(table)
 
 
 def _show_draft_run(run) -> None:

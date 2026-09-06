@@ -90,9 +90,34 @@ def test_the_held_out_side_is_not_spent_on_the_draft(context) -> None:
 
 
 def test_a_run_nothing_can_score_is_unscorable_not_failed(context) -> None:
-    """The two failed refunds recorded no terminal state at all."""
+    """The two failed refunds recorded no terminal state at all.
+
+    Drafted here from state-field checks alone rather than from whatever
+    ``draft_verifiers`` ranks highest. A draft containing a check that reads the
+    episode itself — no_span_error scores every trace in the family — has no
+    unscorable trace in it by construction, and this is a test about what
+    ``run_draft`` does when nothing can see the evidence it needs.
+    """
     analysis, task_set, family = context
-    draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id)
+    draft = VerifierDraft(
+        task_set_id="ts-1",
+        analysis_id="analysis-1",
+        family_id=family.family_id,
+        verifiers=(
+            _spec(
+                "verifier-status",
+                family.family_id,
+                claim="final_state_field:refund_order.status",
+                expected="refunded",
+            ),
+            _spec(
+                "verifier-amount",
+                family.family_id,
+                claim="final_state_field:refund_order.refunded_amount",
+                expected=100,
+            ),
+        ),
+    )
 
     run = run_draft(draft, analysis, task_set)
 
