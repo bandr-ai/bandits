@@ -7,6 +7,12 @@ from bandits.verify.draft import (
     save_verifier_draft,
 )
 from bandits.verify.execute import execute_verifier
+from bandits.verify.interpret import (
+    InterpretationFailure,
+    Interpreter,
+    interpret_reply,
+    render_interview_prompt,
+)
 from bandits.verify.interview import (
     answer_question,
     compute_interview_id,
@@ -75,6 +81,10 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "render_interview_prompt",
+    "interpret_reply",
+    "Interpreter",
+    "InterpretationFailure",
     "Interpretation",
     "InterviewDecision",
     "CheckReview",
