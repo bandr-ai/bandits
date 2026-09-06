@@ -866,6 +866,17 @@ _ORPHANED_CONVERSATION = (
     ' {"role": "assistant", "content": "completed"}]'
 )
 
+_DUPLICATE_RESULT_CONVERSATION = (
+    '[{"role": "user", "content": "Change order 100"},'
+    ' {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function":'
+    '  {"name": "change_order", "arguments": "{\\"order_id\\": 100}"}}]},'
+    ' {"role": "tool", "tool_call_id": "c1", "name": "change_order",'
+    '  "content": "{\\"status\\": \\"changed\\", \\"order_id\\": 100}"},'
+    ' {"role": "tool", "tool_call_id": "c1", "name": "change_order",'
+    '  "content": "{\\"status\\": \\"changed-again\\", \\"order_id\\": 100}"},'
+    ' {"role": "assistant", "content": "completed"}]'
+)
+
 
 def _export_with(trace: Trace):
     """The standard four-trace family, with ``good-1`` swapped for one under test."""
@@ -919,6 +930,18 @@ def test_an_orphaned_result_is_excluded_from_verifier_gated_sft(
         for call in message.tool_calls
         if row.trace_id == "good-1"
     )
+
+
+def test_a_repeated_result_id_is_excluded_from_verifier_gated_sft(tmp_path) -> None:
+    """One recorded call cannot authorize two result-and-call transcript pairs."""
+    trace = _chat_trace(tmp_path, "duplicate-result", _DUPLICATE_RESULT_CONVERSATION, "good-1")
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(trace)
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("has no recorded assistant call" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
 
 
 def test_a_paired_chat_call_and_result_still_exports(tmp_path) -> None:
