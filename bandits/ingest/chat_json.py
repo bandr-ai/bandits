@@ -15,13 +15,17 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 _LINEAGE_KEYS = ("session_id", "conversation_id", "thread_id", "lineage_id")
+
+_SETTING_KEYS = ("model", "temperature", "top_p", "max_tokens", "scaffold", "agent_version")
+"""Configuration a wrapper may declare around its messages, when it declares any."""
 
 
 def _lineage_of(container: dict) -> str | None:
@@ -35,22 +39,27 @@ def _lineage_of(container: dict) -> str | None:
     )
 
 
-def _conversations(payload: object) -> list[tuple[list[dict], str | None]]:
+def _settings_of(container: dict) -> dict:
+    return {key: container[key] for key in _SETTING_KEYS if container.get(key) is not None}
+
+
+def _conversations(payload: object) -> list[tuple[list[dict], str | None, dict]]:
     """A file is either one conversation (a bare message array) or a list of them.
 
-    Each is paired with its declared session id, when the wrapper carries one; a
-    bare message array has nowhere to declare one and yields None.
+    Each is paired with its declared session id and whatever else the wrapper
+    declared around the messages — the offered toolset and the settings the run
+    used. A bare message array has nowhere to declare any of that.
     """
     if (
         isinstance(payload, list)
         and payload
         and all(isinstance(item, dict) and "role" in item for item in payload)
     ):
-        return [(payload, None)]
+        return [(payload, None, {})]
     if isinstance(payload, list):
-        return [(c.get("messages", []), _lineage_of(c)) for c in payload if isinstance(c, dict)]
+        return [(c.get("messages", []), _lineage_of(c), c) for c in payload if isinstance(c, dict)]
     if isinstance(payload, dict):
-        return [(payload.get("messages", []), _lineage_of(payload))]
+        return [(payload.get("messages", []), _lineage_of(payload), payload)]
     return []
 
 
@@ -84,26 +93,23 @@ def _convert_conversation(
     trace_id: str,
     source_digest: str,
     lineage_id: str | None,
+    wrapper: dict,
     location: str,
     issues: list[TraceIssue],
 ) -> Trace | None:
-    task = next(
-        (
-            m.get("content")
-            for m in messages
-            if m.get("role") in ("user", "human") and m.get("content")
-        ),
-        None,
-    )
-    if task is None:
-        issues.append(
-            TraceIssue(
-                kind="no_user_message", detail="conversation has no user message", location=location
-            )
-        )
-        return None
+    # Every system and developer message, in order. Keeping only the first
+    # dropped the developer instruction that narrowed it, which is the half that
+    # usually carries the constraint the run was actually held to.
+    declared = [
+        m["content"]
+        for m in messages
+        if m.get("role") in ("system", "developer") and isinstance(m.get("content"), str)
+    ]
+    system_prompt = "\n\n".join(declared) if declared else None
 
     spans: list[Span] = []
+    user_turns: list[UserTurn] = []
+    unrepresented = 0
     pending_calls: dict[
         str, str
     ] = {}  # tool_call_id -> span_id of the MODEL span that requested it
@@ -112,6 +118,29 @@ def _convert_conversation(
     for index, message in enumerate(messages):
         role = message.get("role")
         timestamp = _EPOCH + timedelta(seconds=ordinal)
+
+        if role in ("user", "human"):
+            content = message.get("content")
+            if isinstance(content, str):
+                # Anchored to the last span, because a correction is only an
+                # instruction for what comes after it.
+                user_turns.append(
+                    UserTurn(text=content, after_span_id=spans[-1].span_id if spans else None)
+                )
+            else:
+                # Content blocks, an attachment, or nothing at all. Counted, not
+                # skipped: an export that drops one of these teaches the next
+                # action as an answer to a request the transcript never shows.
+                unrepresented += 1
+                issues.append(
+                    TraceIssue(
+                        kind="unrepresentable_user_turn",
+                        detail=f"message {index}: user content is "
+                        f"{type(content).__name__}, not text",
+                        location=location,
+                    )
+                )
+            continue
 
         if role == "assistant":
             calls = _tool_calls(message)
@@ -198,6 +227,24 @@ def _convert_conversation(
                 )
             ordinal += 1
 
+    # The instruction is the first turn that reached us as text. A conversation
+    # whose only user content is an image has no readable instruction, and is
+    # refused here rather than raising on a task that is not a string.
+    task = next((turn.text for turn in user_turns if turn.text), None)
+    if task is None:
+        issues.append(
+            TraceIssue(
+                kind="no_user_message",
+                detail=(
+                    "conversation has no readable user instruction"
+                    if unrepresented
+                    else "conversation has no user message"
+                ),
+                location=location,
+            )
+        )
+        return None
+
     if not spans:
         issues.append(
             TraceIssue(
@@ -214,6 +261,16 @@ def _convert_conversation(
         source_digest=source_digest,
         task=task,
         lineage_id=lineage_id,
+        # Keyed on presence, not truth: an explicitly empty `tools` is falsey,
+        # and reading it as absent turns "no tools were offered" back into
+        # "nobody said".
+        tools_available=parse_toolset(
+            wrapper["tools"] if "tools" in wrapper else wrapper.get("functions")
+        ),
+        system_prompt=system_prompt,
+        runtime_context=_settings_of(wrapper),
+        user_turns=tuple(user_turns),
+        unrepresented_user_turns=unrepresented,
         spans=tuple(spans),
     )
 
@@ -239,13 +296,14 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
 
     conversations = _conversations(payload)
     traces: list[Trace] = []
-    for index, (messages, lineage_id) in enumerate(conversations):
+    for index, (messages, lineage_id, wrapper) in enumerate(conversations):
         location = f"{path}[{index}]"
         trace = _convert_conversation(
             messages,
             trace_id=f"{path.stem}-{index}",
             source_digest=source_digest,
             lineage_id=lineage_id,
+            wrapper=wrapper,
             location=location,
             issues=issues,
         )

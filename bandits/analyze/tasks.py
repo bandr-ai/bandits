@@ -61,6 +61,52 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
     if not trace.spans:
         limitations.append("trace has no spans; no trajectory or outcome can be read")
 
+    if trace.tools_available is not None:
+        # The real fact a prompt may carry: what was on offer before anything
+        # happened. Schemas travel with it, because a call to a tool the harness
+        # cannot define is not reproducible.
+        prompt_evidence.append(
+            _observed(
+                trace_id=trace.trace_id,
+                claim="available_tools",
+                value=[tool.model_dump(mode="json") for tool in trace.tools_available],
+                visibility=Visibility.AT_START,
+                strength="strong",
+            )
+        )
+        undefined = [tool.name for tool in trace.tools_available if tool.parameters is None]
+        if undefined:
+            limitations.append(
+                f"{len(undefined)} offered tool(s) were named without a schema; "
+                "a call to them may not be reproducible"
+            )
+
+    if trace.system_prompt is not None:
+        prompt_evidence.append(
+            _observed(
+                trace_id=trace.trace_id,
+                claim="system_prompt",
+                value=trace.system_prompt,
+                visibility=Visibility.AT_START,
+                strength="strong",
+            )
+        )
+    else:
+        limitations.append(
+            "no system prompt is recorded; the instructions this episode ran under are unknown"
+        )
+
+    if trace.runtime_context:
+        context_evidence.append(
+            _observed(
+                trace_id=trace.trace_id,
+                claim="runtime_context",
+                value=dict(sorted(trace.runtime_context.items())),
+                visibility=Visibility.AT_START,
+                strength="strong",
+            )
+        )
+
     tools_called = tuple(dict.fromkeys(s.name for s in trace.spans if s.kind is SpanKind.TOOL))
     if tools_called:
         # Deliberately `during`, not `at_start`: the tools an agent happened to
@@ -75,9 +121,10 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
                 strength="strong",
             )
         )
-        limitations.append(
-            "available toolset is not recorded; only the tools this episode called are known"
-        )
+        if trace.tools_available is None:
+            limitations.append(
+                "available toolset is not recorded; only the tools this episode called are known"
+            )
 
     terminal = terminal_spans(trace.spans)
     terminal_ids = tuple(s.span_id for s in terminal)

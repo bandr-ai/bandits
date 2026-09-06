@@ -1,0 +1,8 @@
+[
+  {"role": "user", "content": "Update the dependency"},
+  {"role": "assistant", "content": "I can move it to version 2."},
+  {"role": "user", "content": "Use version 1.9 instead"},
+  {"role": "assistant", "tool_calls": [{"id": "call-1", "function": {"name": "edit_manifest", "arguments": "{\"version\": \"1.9\"}"}}]},
+  {"role": "tool", "tool_call_id": "call-1", "name": "edit_manifest", "content": "{\"status\": \"written\", \"version\": \"1.9\"}"},
+  {"role": "assistant", "content": "Pinned the dependency to 1.9."}
+]

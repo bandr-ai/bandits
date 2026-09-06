@@ -1,9 +1,9 @@
 """Calibration and adversarial tests.
 
-The address family is the useful case: drafting proposes two competing ideas of
-what success looks like — status 'overridden' and status 'paid' — and only
-labels can say which. addr-2 and addr-3 merely looked the order up and never
-changed anything, so a human calls them failures.
+The address family is the useful case: drafting proposes two ideas of what
+success looks like — the override tool reporting 'overridden', and the lookup
+tool reporting 'paid' — and only labels can say which. addr-2 and addr-3 merely
+looked the order up and never changed anything, so a human calls them failures.
 """
 
 from __future__ import annotations
@@ -91,14 +91,37 @@ def test_labels_separate_the_right_hypothesis_from_the_wrong_one(address) -> Non
     validation = _validated(address)
     by_expected = {spec.verifier_id: spec.checks[0].expected for spec in draft.verifiers}
 
-    held_out = {
+    fit = {
         by_expected[a.verifier_id]: a.agreement
         for a in validation.agreements
-        if a.split == "held_out" and a.labeled
+        if a.split == "fit" and a.labeled
     }
 
-    assert held_out["overridden"] == 1.0
-    assert held_out["paid"] == 0.0
+    assert fit["overridden"] == 1.0
+    assert fit["paid"] == 0.0
+
+
+def test_a_check_on_a_tool_that_never_reported_is_a_coverage_gap(address) -> None:
+    """Naming the reporting tool turns a silent pass into a visible gap.
+
+    While both checks read a field called ``status``, the override hypothesis
+    scored addr-2 by comparing against the *lookup* tool's status and reading
+    that as a failure. Each check now names the tool it needs, so a run where
+    that tool never reported leaves the check unscored — which is what a human
+    has to be shown, rather than a verdict assembled from another tool's field.
+    """
+    _, _, _, draft = address
+    validation = _validated(address)
+    by_expected = {spec.checks[0].expected: spec.verifier_id for spec in draft.verifiers}
+
+    held_out = {
+        a.verifier_id: a for a in validation.agreements if a.split == "held_out" and a.labeled
+    }
+
+    override = held_out[by_expected["overridden"]]
+    assert override.unscored == 1
+    assert override.agreement is None
+    assert held_out[by_expected["paid"]].agreement == 0.0
 
 
 def test_a_false_positive_is_named_and_ranked_first(address) -> None:

@@ -123,6 +123,11 @@ def _top_values_per_key(
     return kept
 
 
+def _field_name(item: Evidence) -> str:
+    """A state field's name, qualified by the tool that reported it."""
+    return str(item.value.get("field") or item.value.get("key"))
+
+
 def _invariants(
     family: TaskFamily, task_set_id: str, evidence: list[Evidence]
 ) -> list[VerifierSpec]:
@@ -133,11 +138,18 @@ def _invariants(
     saying so when the value differs run to run — which a fixed value cannot do,
     because it was only ever the one value this corpus happened to record.
     """
+    # A trace whose result was read only in part cannot retire an invariant: the
+    # field that would have disproved it may be one of the ones not read. Left
+    # in, it looks like supporting evidence for a rule nothing tested.
+    partial = {item.trace_id for item in evidence if item.claim == "truncated_outcome_fields"}
+
     by_trace: dict[str, dict[tuple[str, str], Any]] = {}
     for item in evidence:
+        if item.trace_id in partial:
+            continue
         if item.claim in ("final_state_field", "initial_state_field"):
             side = "final" if item.claim == "final_state_field" else "initial"
-            by_trace.setdefault(item.trace_id, {})[(side, str(item.value.get("key")))] = item
+            by_trace.setdefault(item.trace_id, {})[(side, _field_name(item))] = item
 
     candidates: dict[tuple[str, str], list[Evidence]] = {}
     disproved: set[tuple[str, str]] = set()
@@ -219,7 +231,7 @@ def draft_verifiers(
     states = [item for item in evidence if item.claim == "final_state_field"]
     grouped: dict[tuple[str, str], list[Evidence]] = {}
     for item in states:
-        key = str(item.value.get("key"))
+        key = _field_name(item)
         value = item.value.get("value")
         grouped.setdefault((key, _stable_value(value)), []).append(item)
     for key in _identifier_keys(grouped):
@@ -329,9 +341,15 @@ def draft_verifiers(
 
     unresolved: list[str] = []
     if not proposals:
-        unresolved.append(
-            "no deterministic terminal exit code or structured final-state field was recorded"
-        )
+        if any(item.claim == "unstructured_final_result" for item in evidence):
+            unresolved.append(
+                "terminal results were recorded but hold no comparable field; deciding what "
+                "they mean needs a judge or a domain extractor, not another replay check"
+            )
+        else:
+            unresolved.append(
+                "no deterministic terminal exit code or structured final-state field was recorded"
+            )
     elif len(proposals) == 1:
         unresolved.append("only one independent deterministic verifier pattern was supported")
     if proposals and all(spec.rests_only_on_self_report for spec in proposals[:limit]):

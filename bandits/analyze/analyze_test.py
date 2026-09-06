@@ -13,10 +13,10 @@ import pytest
 
 from bandits.analyze import analyze_corpus, extract_task, load_analysis, save_analysis
 from bandits.analyze.models import EvidenceKind, Visibility
-from bandits.analyze.outcomes import extract_outcome_evidence
+from bandits.analyze.outcomes import _state_fields, extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
-from bandits.traces import Span, SpanKind, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
@@ -161,6 +161,7 @@ def test_tool_result_before_final_model_is_terminal_state_evidence() -> None:
     assert task.terminal_span_ids == ("tool", "reply")
     assert final_state.span_id == "tool"
     assert final_state.visibility is Visibility.TERMINAL
+    assert final_state.value["field"] == "refund_order.status"
 
 
 def test_a_closing_claim_is_recorded_as_self_report_and_ranked_last() -> None:
@@ -246,3 +247,247 @@ def test_span_order_breaks_ties_on_source_order_not_span_id() -> None:
     trace = next(t for t in corpus.traces if t.trace_id == "addr-1")
 
     assert trace.spans[-1].name == "override_address_policy"
+
+
+def test_a_recorded_toolset_becomes_prompt_evidence_and_closes_the_gap() -> None:
+    """The tools on offer are prompt context; the tools called never are."""
+    trace = Trace(
+        trace_id="offered",
+        source="chat-json",
+        source_digest="a" * 64,
+        task="Refund it",
+        tools_available=(
+            ToolSchema(name="refund_order", parameters={"type": "object"}),
+            ToolSchema(name="lookup_order"),
+        ),
+        system_prompt="You are a support agent.",
+        runtime_context={"model": "gpt-5"},
+        spans=(
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ended_at=datetime(2026, 1, 1, tzinfo=UTC),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    offered = next(e for e in evidence if e.claim == "available_tools")
+    assert offered.visibility is Visibility.AT_START
+    assert [tool["name"] for tool in offered.value] == ["refund_order", "lookup_order"]
+    assert offered.evidence_id in task.prompt_evidence_ids
+    assert not any("available toolset is not recorded" in item for item in task.limitations)
+    assert any("without a schema" in item for item in task.limitations), (
+        "lookup_order was offered without a definition, so a call to it is not reproducible"
+    )
+    assert next(e for e in evidence if e.claim == "system_prompt").visibility is Visibility.AT_START
+    assert next(e for e in evidence if e.claim == "runtime_context").value == {"model": "gpt-5"}
+
+
+def test_an_undeclared_toolset_is_still_reported_as_missing() -> None:
+    trace = Trace(
+        trace_id="unknown-tools",
+        source="otlp",
+        source_digest="b" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ended_at=datetime(2026, 1, 1, tzinfo=UTC),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    assert not any(e.claim == "available_tools" for e in evidence)
+    assert any("available toolset is not recorded" in item for item in task.limitations)
+    assert any("no system prompt is recorded" in item for item in task.limitations)
+
+
+def _tool_trace(trace_id: str, output: object) -> Trace:
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    return Trace(
+        trace_id=trace_id,
+        source="otlp",
+        source_digest="c" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="lookup",
+                kind=SpanKind.TOOL,
+                name="lookup_order",
+                started_at=moment,
+                ended_at=moment,
+                output={"order": {"charge": {"amount": 48.0}}},
+            ),
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=moment + timedelta(seconds=1),
+                ended_at=moment + timedelta(seconds=1),
+                output=output,
+            ),
+        ),
+    )
+
+
+def test_a_nested_result_is_read_down_to_its_comparable_leaves() -> None:
+    """A source answering with an object produced no terminal evidence at all."""
+    trace = _tool_trace("nested", {"order": {"status": "refunded", "totals": {"refunded": 48.0}}})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {
+        "refund_order.order.status": "refunded",
+        "refund_order.order.totals.refunded": 48.0,
+    }
+
+
+def test_an_array_contributes_its_length_and_not_its_positions() -> None:
+    """Position in a list is not stable between runs of the same task."""
+    trace = _tool_trace("arrays", {"warnings": [], "items": [{"sku": "a"}, {"sku": "b"}]})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {"refund_order.warnings[].count": 0, "refund_order.items[].count": 2}
+
+
+def test_an_initial_state_field_is_read_from_a_nested_result_too() -> None:
+    trace = _tool_trace("nested-initial", {"refund": {"amount": 48.0}})
+
+    initial = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "initial_state_field"
+    }
+
+    assert initial == {"lookup_order.order.charge.amount": 48.0}
+
+
+def test_a_result_read_only_in_part_says_so() -> None:
+    """A field absent from a truncated read is unknown, not missing."""
+    trace = _tool_trace("wide", {f"field_{index}": index for index in range(100)})
+
+    evidence = extract_outcome_evidence(trace)
+
+    assert any(e.claim == "truncated_outcome_fields" for e in evidence)
+    assert len([e for e in evidence if e.claim == "final_state_field"]) == 64
+    analysis = analyze_corpus(TraceCorpus(source="otlp", traces=(trace,)))
+    assert any("truncated read is unknown" in item for item in analysis.limitations)
+
+
+def test_a_result_holding_nothing_comparable_is_named_rather_than_silent() -> None:
+    """Prose is a recorded outcome; it is just not one a replay check can read."""
+    trace = _tool_trace("prose", "I told the customer to try again later.")
+
+    evidence = extract_outcome_evidence(trace)
+
+    assert any(e.claim == "unstructured_final_result" for e in evidence)
+    assert not any(e.claim == "final_state_field" for e in evidence)
+    analysis = analyze_corpus(TraceCorpus(source="otlp", traces=(trace,)))
+    assert any("domain knowledge this extractor does not have" in i for i in analysis.limitations)
+
+
+def test_a_literal_dotted_key_stays_distinct_from_a_nested_path() -> None:
+    """Otherwise both write one evidence id and one of the two values wins."""
+    trace = _tool_trace("dotted", {"a.b": 1, "a": {"b": 2}})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {"refund_order.a\\.b": 1, "refund_order.a.b": 2}
+
+
+def test_a_truncated_initial_read_is_recorded_too() -> None:
+    """An invariant must not rest on a before-state nobody read in full."""
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="wide-initial",
+        source="otlp",
+        source_digest="d" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="lookup",
+                kind=SpanKind.TOOL,
+                name="lookup_order",
+                started_at=moment,
+                ended_at=moment,
+                output={f"field_{index}": index for index in range(100)},
+            ),
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=moment + timedelta(seconds=1),
+                ended_at=moment + timedelta(seconds=1),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    truncation = [
+        e for e in extract_outcome_evidence(trace) if e.claim == "truncated_outcome_fields"
+    ]
+
+    assert [e.span_id for e in truncation] == ["lookup"]
+
+
+def test_a_branch_heavy_result_is_bounded_across_the_whole_walk() -> None:
+    """Per-mapping bounds are not a bound: nothing emitted means nothing spent."""
+
+    def tree(depth: int) -> dict:
+        return {f"k{index}": tree(depth - 1) for index in range(8)} if depth else {}
+
+    fields, truncated = _state_fields(tree(4))
+
+    assert fields == []
+    assert truncated, "a tree holding no comparable value must still stop and say so"
+
+
+def test_a_declared_empty_toolset_is_evidence_not_a_gap() -> None:
+    """`()` is a toolset of none; only `None` is an unrecorded one."""
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="none-offered",
+        source="chat-json",
+        source_digest="e" * 64,
+        task="Refund it",
+        tools_available=(),
+        spans=(
+            Span(
+                span_id="reply",
+                kind=SpanKind.MODEL,
+                name="assistant",
+                started_at=moment,
+                ended_at=moment,
+                output="I have no tools for that.",
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    assert next(e for e in evidence if e.claim == "available_tools").value == []
+    assert not any("available toolset is not recorded" in item for item in task.limitations)

@@ -23,9 +23,11 @@ from bandits.export import (
     write_jsonl,
 )
 from bandits.export.sft import _quality_reasons
+from bandits.ingest.chat_json import load_chat_json
+from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, SpanStatus, ToolSchema, Trace, TraceCorpus, UserTurn
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
@@ -113,17 +115,13 @@ def _trace(
     )
 
 
-@pytest.fixture
-def export_case():
-    corpus = TraceCorpus(
-        source="otlp",
-        traces=(
-            _trace("good-1", 100, "changed"),
-            _trace("good-2", 200, "changed"),
-            _trace("failed", 300, "pending"),
-            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
-        ),
-    )
+def _export_case(traces: tuple[Trace, ...]):
+    """One reviewed verifier over one family, built from the traces given.
+
+    Taken as an argument rather than fixed so a test can vary one trace and keep
+    every id downstream of it consistent; the family names these trace ids.
+    """
+    corpus = TraceCorpus(source="otlp", traces=traces)
     analysis = analyze_corpus(corpus)
     analysis_id = compute_analysis_id(analysis)
     family = TaskFamily(
@@ -204,6 +202,18 @@ def export_case():
         draft, "draft-1", validation, "validation-1", spec.verifier_id, "owner-ticket-7"
     )
     return corpus, analysis, task_set, task_set_id, draft, validation, reviewed
+
+
+@pytest.fixture
+def export_case():
+    return _export_case(
+        (
+            _trace("good-1", 100, "changed"),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
 
 
 def test_eval_exports_every_prompt_safe_case_with_full_lineage(export_case) -> None:
@@ -333,6 +343,194 @@ def test_transcript_puts_the_action_on_the_assistant_turn(export_case) -> None:
     assert json.loads(call.function.arguments) == {"order_id": 100}
     assert messages[2].tool_call_id == call.id
     assert not messages[2].tool_calls
+
+
+def test_a_later_user_turn_is_replayed_where_it_arrived() -> None:
+    """The correction has to sit before the action it caused, not be dropped."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+
+    messages, defects, warnings = build_transcript(trace)
+
+    assert not defects and not warnings
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[2].content == "Use version 1.9 instead"
+    assert json.loads(messages[3].tool_calls[0].function.arguments) == {"version": "1.9"}
+
+
+def test_a_multi_turn_session_log_replays_its_correction_too() -> None:
+    messages, defects, _ = build_transcript(load_claude_code(MULTI_TURN_SESSION).traces[0])
+
+    assert not defects
+    assert [message.content for message in messages if message.role == "user"] == [
+        "Update the dependency",
+        "Use version 1.9 instead",
+    ]
+
+
+def test_a_trace_that_lost_a_user_turn_is_refused() -> None:
+    """Fail closed: the actions answered something this transcript cannot show."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+
+    _, defects, _ = build_transcript(trace.replace(unrepresented_user_turns=1))
+
+    assert any("does not represent" in defect for defect in defects)
+
+
+def test_a_user_turn_with_no_recorded_response_is_refused() -> None:
+    """A dangling instruction has no behavior to imitate after it."""
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+    dangling = trace.replace(
+        user_turns=(
+            *trace.user_turns,
+            UserTurn(text="also bump the lockfile", after_span_id=trace.spans[-1].span_id),
+        )
+    )
+
+    _, defects, _ = build_transcript(dangling)
+
+    assert any("no recorded response" in defect for defect in defects)
+
+
+def test_a_lost_user_turn_reaches_the_unresolved_output() -> None:
+    """The whole point of counting them: the row is refused, and the reason says why."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(unrepresented_user_turns=1),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("does not represent" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
+
+
+def test_start_context_reaches_the_exported_row() -> None:
+    """A row showing a call teaches the call; the choice needs what was on offer."""
+    tools = (ToolSchema(name="change_order", parameters={"type": "object"}),)
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(
+                system_prompt="You are a support agent.", tools_available=tools
+            ),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    assert row.messages[0].role == "system"
+    assert row.messages[0].content == "You are a support agent."
+    assert row.messages[1].role == "user"
+    assert row.tools == (
+        {"name": "change_order", "description": None, "parameters": {"type": "object"}},
+    )
+    assert row.jsonl_row()["messages"][0]["role"] == "system"
+
+
+def test_a_row_without_a_declared_toolset_says_unknown_rather_than_none_offered() -> None:
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed"),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    assert next(item for item in bundle.rows if item.trace_id == "good-1").tools is None
+
+
+def test_a_trace_with_no_instruction_is_refused_rather_than_given_a_blank_turn() -> None:
+    """A blank opening message is a turn the episode never had."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(task=None),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("no user instruction" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
+
+
+def test_user_turns_that_run_backwards_are_refused_not_reordered() -> None:
+    """Replay follows span order, so a backwards anchor would rewrite the conversation."""
+    trace = _trace("good-1", 100, "changed")
+    reversed_turns = trace.replace(
+        user_turns=(
+            UserTurn(text="second thought", after_span_id=trace.spans[-1].span_id),
+            UserTurn(text="do it", after_span_id=trace.spans[0].span_id),
+        )
+    )
+
+    _, defects, _ = build_transcript(reversed_turns)
+
+    assert any("do not run forwards" in defect for defect in defects)
+
+
+def test_an_export_refuses_a_session_whose_user_turn_was_not_text(tmp_path) -> None:
+    """End to end from a real session log, not a hand-built trace."""
+    path = tmp_path / "image.jsonl"
+    path.write_text(
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"change order 100"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"tool_use","id":"tu-1","name":"change_order",'
+        '"input":{"order_id":100}}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"tu-1","content":'
+        '"{\\"status\\": \\"changed\\", \\"order_id\\": 100}"}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user",'
+        '"content":[{"type":"image","source":{"data":"..."}}]}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+    trace = load_claude_code(path).traces[0].replace(trace_id="good-1", source="otlp")
+
+    _, defects, _ = build_transcript(trace)
+
+    assert any("does not represent" in defect for defect in defects)
+
+
+def test_a_user_turn_anchored_to_no_span_is_refused() -> None:
+    trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
+    orphaned = trace.replace(
+        user_turns=(*trace.user_turns, UserTurn(text="and pin it", after_span_id="not-a-span"))
+    )
+
+    _, defects, _ = build_transcript(orphaned)
+
+    assert any("does not sit anywhere" in defect for defect in defects)
+
+
+def test_a_single_turn_transcript_is_unchanged_by_recorded_turns() -> None:
+    """A source that records its one user turn must export what it always did."""
+    trace = _trace("good-1", 100, "changed")
+
+    recorded = trace.replace(user_turns=(UserTurn(text=trace.task),))
+
+    assert build_transcript(recorded) == build_transcript(trace)
 
 
 @pytest.mark.parametrize("carrier_args", [False, True])
@@ -473,12 +671,10 @@ def test_step_count_gate_quarantines_a_long_episode(export_case) -> None:
     assert any("family quality limit" in reason for reason in rejected["good-1"])
 
 
-SUPPORT_FIXTURE = (
-    Path(__file__).resolve().parent.parent.parent
-    / "tests"
-    / "fixtures"
-    / "traces.support.otlp.jsonl"
-)
+FIXTURES = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures"
+SUPPORT_FIXTURE = FIXTURES / "traces.support.otlp.jsonl"
+MULTI_TURN_FIXTURE = FIXTURES / "traces.multiturn.chat.json"
+MULTI_TURN_SESSION = FIXTURES / "session.multiturn.jsonl"
 
 
 def test_a_real_corpus_still_yields_trainable_rows() -> None:

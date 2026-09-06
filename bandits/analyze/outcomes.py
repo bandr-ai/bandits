@@ -9,6 +9,7 @@ verifier, drafted and then argued with — not for a reader of spans.
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Any
 
 from bandits.analyze.models import Evidence, EvidenceKind, Visibility, evidence_id
@@ -23,6 +24,20 @@ _SCORE_KEYS = ("score", "rating", "feedback", "user_feedback", "evaluation")
 
 _SCALAR = (str, int, float, bool)
 """Only scalars become state fields. A nested object is not a comparable value."""
+
+_MAX_DEPTH = 4
+"""How far into a nested result to walk. Deeper than this is a document, not state."""
+
+_MAX_FIELDS = 64
+"""Leaves read from one result. A large payload is read in part, and says so."""
+
+_MAX_NODES = 512
+"""Nodes visited while reading one result, counted across the whole walk.
+
+Bounding each mapping on its own is not a bound: a tree of mappings that hold no
+comparable value keeps the field count at zero, so every level grants itself a
+fresh budget and the visit count multiplies with depth.
+"""
 
 
 def _evidence(
@@ -59,10 +74,89 @@ def _first_key(payload: Any, keys: tuple[str, ...]) -> tuple[str, Any] | None:
     return None
 
 
-def _scalar_fields(payload: Any) -> list[tuple[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    return [(key, value) for key, value in sorted(payload.items()) if isinstance(value, _SCALAR)]
+def _qualified(span: Span, key: str) -> str:
+    """The field name a check refers to: the reporting tool, then the key.
+
+    Two tools both reporting ``status: "done"`` are two different facts. Named by
+    the key alone they group as one candidate and draft as one check, which then
+    passes on whichever tool happened to answer first.
+    """
+    return f"{_escape(span.name)}.{key}"
+
+
+def _escape(segment: str) -> str:
+    """Make one path segment unambiguous before joining it with dots.
+
+    Without this, the literal key ``{"a.b": 1}`` and the nested ``{"a": {"b": 2}}``
+    produce the same path, the same evidence id, and one of the two values
+    silently wins. Keys carrying dots are rare and the escaping is invisible
+    until one appears, which is the point.
+    """
+    return segment.replace("\\", "\\\\").replace(".", "\\.")
+
+
+def _path(prefix: str, key: str) -> str:
+    return f"{prefix}.{_escape(key)}" if prefix else _escape(key)
+
+
+def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
+    """Every comparable leaf a result holds, addressed by its path in the result.
+
+    A nested object is still not a comparable value — the leaves inside it are,
+    and reading only the top level meant a source that answers
+    ``{"order": {"status": "refunded"}}`` produced no terminal evidence at all
+    and drafted nothing. The object is walked; the scalars in it are the fields.
+
+    Arrays contribute their length and nothing else. Position in a list is not
+    stable between runs of the same task, so a check on the third element is a
+    check on whichever item happened to land third, which reads as a real rule
+    right up until the ordering changes.
+
+    The walk is bounded in depth and in count, and the second return value says
+    whether a bound was hit — a field missing from a truncated read is unknown,
+    not absent.
+    """
+    fields: list[tuple[str, Any]] = []
+    truncated = False
+    budget = _MAX_NODES
+
+    def walk(node: Any, prefix: str, depth: int) -> None:
+        nonlocal truncated, budget
+        if budget <= 0:
+            truncated = True
+            return
+        budget -= 1
+        if len(fields) >= _MAX_FIELDS:
+            truncated = True
+            return
+        if isinstance(node, _SCALAR):
+            if prefix:
+                fields.append((prefix, node))
+            return
+        if isinstance(node, (list, tuple)):
+            fields.append((f"{prefix}[].count", len(node)))
+            return
+        if not isinstance(node, dict):
+            # None, or something no exporter has shown us yet. Absent stays absent.
+            return
+        if depth >= _MAX_DEPTH:
+            truncated = truncated or bool(node)
+            return
+        # Bounded before it is sorted, not after. A result carrying a million
+        # keys would otherwise cost a full materialize-and-sort per span to
+        # produce sixty-four fields. The slice is taken in the order the source
+        # wrote them, which a parsed document preserves, so the same bytes
+        # always yield the same fields.
+        take = min(budget, _MAX_FIELDS - len(fields)) + 1
+        children = list(islice(node.items(), take))
+        if len(children) == take:
+            truncated = True
+            children = children[:-1]
+        for key, value in sorted(children, key=lambda pair: str(pair[0])):
+            walk(value, _path(prefix, str(key)), depth + 1)
+
+    walk(payload, "", 0)
+    return fields[:_MAX_FIELDS], truncated
 
 
 def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
@@ -131,18 +225,55 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
             )
 
         if span.kind is SpanKind.TOOL and is_terminal:
-            # Every scalar the terminal tool reported, not just its status. A
-            # check comparing an amount against what was charged needs the
-            # amount, and recording only one field per span made the whole
+            # Every comparable leaf the terminal tool reported, not just its
+            # status. A check comparing an amount against what was charged needs
+            # the amount, and recording only one field per span made the whole
             # class of before/after invariants impossible to express.
-            for key, value in _scalar_fields(span.output):
+            fields, truncated = _state_fields(span.output)
+            if span.output is not None and not fields:
+                # A result was recorded and nothing in it can be compared: prose,
+                # or a shape no rule here reads. Named, because "no terminal
+                # evidence" otherwise looks identical to a tool that answered
+                # nothing, and the two call for different work — one needs a
+                # judge or a domain extractor, the other needs the export fixed.
+                record(
+                    _evidence(
+                        span,
+                        trace_id=trace.trace_id,
+                        claim="unstructured_final_result",
+                        value={"tool": span.name, "type": type(span.output).__name__},
+                        visibility=Visibility.TERMINAL,
+                        strength="strong",
+                    )
+                )
+            if truncated:
+                record(
+                    _evidence(
+                        span,
+                        trace_id=trace.trace_id,
+                        claim="truncated_outcome_fields",
+                        value={
+                            "tool": span.name,
+                            "max_fields": _MAX_FIELDS,
+                            "max_depth": _MAX_DEPTH,
+                        },
+                        visibility=Visibility.TERMINAL,
+                        strength="strong",
+                    )
+                )
+            for key, value in fields:
                 record(
                     _evidence(
                         span,
                         trace_id=trace.trace_id,
                         claim="final_state_field",
-                        detail=key,
-                        value={"key": key, "value": value, "tool": span.name},
+                        detail=_qualified(span, key),
+                        value={
+                            "key": key,
+                            "field": _qualified(span, key),
+                            "value": value,
+                            "tool": span.name,
+                        },
                         visibility=Visibility.TERMINAL,
                         strength="moderate",
                         kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,
@@ -153,14 +284,35 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
             # The state the episode started from, as the first tool observed it.
             # Knowable only during the run, never at_start: the agent had to call
             # a tool to learn it, so a prompt may not contain it.
-            for key, value in _scalar_fields(span.output):
+            initial_fields, initial_truncated = _state_fields(span.output)
+            if initial_truncated:
+                record(
+                    _evidence(
+                        span,
+                        trace_id=trace.trace_id,
+                        claim="truncated_outcome_fields",
+                        value={
+                            "tool": span.name,
+                            "max_fields": _MAX_FIELDS,
+                            "max_depth": _MAX_DEPTH,
+                        },
+                        visibility=Visibility.DURING,
+                        strength="strong",
+                    )
+                )
+            for key, value in initial_fields:
                 record(
                     _evidence(
                         span,
                         trace_id=trace.trace_id,
                         claim="initial_state_field",
-                        detail=key,
-                        value={"key": key, "value": value, "tool": span.name},
+                        detail=_qualified(span, key),
+                        value={
+                            "key": key,
+                            "field": _qualified(span, key),
+                            "value": value,
+                            "tool": span.name,
+                        },
                         visibility=Visibility.DURING,
                         strength="moderate",
                         kind=EvidenceKind.STRUCTURED_EXTERNAL_RESULT,

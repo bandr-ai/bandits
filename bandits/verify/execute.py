@@ -33,13 +33,46 @@ def _unknown(reason: str) -> _Outcome:
     return _Outcome(None, reason=reason)
 
 
-def _field(evidence: tuple[Evidence, ...], claim: str, key: str) -> Evidence | None:
-    return next((e for e in evidence if e.claim == claim and e.value.get("key") == key), None)
+class _Ambiguous:
+    """A bare key that two tools both answered. Not a value: a question."""
+
+    __slots__ = ("key", "tools")
+
+    def __init__(self, key: str, tools: tuple[str, ...]) -> None:
+        self.key = key
+        self.tools = tools
+
+
+def _field(evidence: tuple[Evidence, ...], claim: str, key: str) -> Evidence | _Ambiguous | None:
+    """Find the state field a check names.
+
+    Matched on the tool-qualified name first. A spec accepted before fields
+    carried their tool names asks for the bare key, and must keep executing
+    exactly as it did when it was measured — but only while one tool answers to
+    that key. Where two do, the check cannot say which it meant, and picking the
+    first is how the collision this naming was meant to remove comes back.
+    """
+    qualified = next(
+        (e for e in evidence if e.claim == claim and e.value.get("field") == key), None
+    )
+    if qualified is not None:
+        return qualified
+
+    bare = [e for e in evidence if e.claim == claim and e.value.get("key") == key]
+    tools = tuple(dict.fromkeys(str(e.value.get("tool")) for e in bare))
+    if len(tools) > 1:
+        return _Ambiguous(key, tools)
+    return bare[0] if bare else None
 
 
 def _keyed_equality(check: CheckSpec, evidence: tuple[Evidence, ...], claim: str) -> _Outcome:
     key = check.claim.partition(":")[2]
     found = _field(evidence, claim, key)
+    if isinstance(found, _Ambiguous):
+        return _unknown(
+            f"{key!r} names no tool and {', '.join(found.tools)} each recorded it; "
+            "which one this check meant is not recorded"
+        )
     if found is None:
         return _unknown(f"no {claim} recorded for {key!r}")
     observed = found.value.get("value")
@@ -62,6 +95,9 @@ def _state_invariant(check: CheckSpec, evidence: tuple[Evidence, ...]) -> _Outco
     final_key, _, initial_key = check.claim.partition(":")[2].partition("==")
     final = _field(evidence, "final_state_field", final_key)
     initial = _field(evidence, "initial_state_field", initial_key)
+    for side, found in ((final_key, final), (initial_key, initial)):
+        if isinstance(found, _Ambiguous):
+            return _unknown(f"{side!r} names no tool and {', '.join(found.tools)} each recorded it")
     if final is None or initial is None:
         missing = final_key if final is None else initial_key
         return _unknown(f"no state recorded for {missing!r}")

@@ -116,6 +116,12 @@ def build_eval_export(
             EvalCase(
                 case_id=f"eval-{digest}",
                 instruction=trace.task,  # type: ignore[union-attr,arg-type]
+                system_prompt=trace.system_prompt,  # type: ignore[union-attr]
+                tools=(
+                    tuple(tool.model_dump(mode="json") for tool in trace.tools_available)  # type: ignore[union-attr]
+                    if trace.tools_available is not None  # type: ignore[union-attr]
+                    else None
+                ),
                 grader=spec.model_dump(mode="json"),
                 corpus_id=task_set.corpus_id,
                 task_set_id=task_set_id,

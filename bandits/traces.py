@@ -66,6 +66,24 @@ class Span(Contract):
     """Anything else the source declared that doesn't have a dedicated field."""
 
 
+class ToolSchema(Contract):
+    """One tool as it was offered to the agent, not as it was called."""
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    """The parameter schema the source declared. None means the tool was named
+    without a definition, so a call to it may not be reproducible anywhere."""
+
+
+class UserTurn(Contract):
+    """One user message, and the point in the trajectory it arrived at."""
+
+    text: str
+    after_span_id: str | None = None
+    """The span this turn followed. None means it opened the episode."""
+
+
 class TraceIssue(Contract):
     """One source record that could not be normalized. Never silently dropped."""
 
@@ -94,6 +112,40 @@ class Trace(Contract):
     same request on both sides of the boundary leaks the answer across it. None
     means the source declared no grouping, which is recorded rather than assumed
     to mean independence.
+    """
+
+    tools_available: tuple[ToolSchema, ...] | None = None
+    """The toolset offered at the start of the episode, when the source says.
+
+    Not the same fact as the tools this episode called: which tool to reach for,
+    out of what was on offer, is most of the decision a demonstration is meant to
+    teach, and a row showing a call carries neither the alternatives nor the
+    schema to reproduce it. None means the source declared no toolset, which is
+    recorded as unknown — never as an empty toolset.
+    """
+
+    system_prompt: str | None = None
+    """The system or developer instruction the episode ran under, when recorded."""
+
+    runtime_context: dict[str, Any] = Field(default_factory=dict)
+    """Configuration the episode ran under: model, sampling settings, working
+    directory, scaffold version. Empty means the source declared none."""
+
+    user_turns: tuple[UserTurn, ...] = ()
+    """Every user message the source recorded, in order, with its position.
+
+    A conversation is not one instruction followed by a monologue: a correction
+    or an approval halfway through is why the rest of the episode looks the way
+    it does. Empty means the source was not read for turns at all, not that the
+    episode had one — ``task`` still carries the opening instruction either way.
+    """
+
+    unrepresented_user_turns: int = 0
+    """User messages the source recorded and this trace could not represent.
+
+    Above zero, any transcript rebuilt from this trace omits something the agent
+    was actually told, so it must be refused rather than exported as if the
+    later actions answered only the first instruction.
     """
 
     spans: tuple[Span, ...]

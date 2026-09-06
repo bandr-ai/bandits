@@ -61,15 +61,54 @@ _SEMANTIC_RESERVE_LIMIT = (
     "depend on what the work meant need a domain extension to select for"
 )
 
+_ID_NOUNS = (
+    "order",
+    "invoice",
+    "ticket",
+    "issue",
+    "case",
+    "account",
+    "customer",
+    "user",
+    "session",
+    "payment",
+    "transaction",
+    "id",
+)
+"""Words that announce the thing after them is a reference, not a quantity.
+
+Deliberately short, and deliberately free of words that also read as verbs:
+``run 3 tests`` and ``build 2`` are counts, and a list that included them would
+mask the count as a reference."""
+
+_TYPED_ID = re.compile(
+    r"\b(" + "|".join(_ID_NOUNS) + r")s?\b(?:\s+(?:id|number|no\.?))?[\s:#-]*([a-z]*[-_]?\d[\w-]*)"
+)
+"""``order 7741`` and ``ticket #A-92`` — a named reference and its value."""
+
 _MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"), " <email> "),
     (re.compile(r"\bhttps?://\S+"), " <url> "),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), " <uuid> "),
     (re.compile(r"\b[0-9a-f]{16,}\b"), " <hash> "),
-    (re.compile(r"\b\w*\d[\w-]*\b"), " <id> "),
+    (re.compile(r"\b\d+(?:\.\d+)+\b"), lambda m: " " + m.group(0).replace(".", "_") + " "),
+    (_TYPED_ID, lambda m: f" {m.group(1)} <{m.group(1)}_id> "),
+    (re.compile(r"#\d+\b"), " <ref_id> "),
+    (re.compile(r"\b[\w-]*\d{4,}[\w-]*\b"), " <id> "),
 )
 """Value masks, applied in order. Identifiers are what vary between runs of the
-same task, so masking them is what makes two runs recognizable as one family."""
+same task, so masking them is what makes two runs recognizable as one family.
+
+Only values that read as references are masked, and each keeps the noun that
+named it. Masking every digit-bearing word instead collapsed distinctions the
+task depends on — ``http 404`` and ``http 500`` normalized identically, so
+"handle the 404" and "handle the 500" became one family under one drafted
+verifier — and split ``python 3.12`` into two tokens at the dot. A quantity
+(``retry 3 times``), a version (``python 3.12``) and a status code stay as
+written — a dotted version joined into one token, since the tokenizer would
+otherwise split it at the dot. What varies run to run is a reference, and the
+last rule catches the unnamed ones by the only shape that reliably tells them
+apart from a quantity: a run of four or more digits."""
 
 _NON_TOKEN = re.compile(r"[^a-z0-9<>_]+")
 
@@ -78,7 +117,7 @@ def normalize_instruction(instruction: str) -> str:
     """Reduce an instruction to the shape it shares with others like it."""
     text = instruction.lower()
     for pattern, replacement in _MASKS:
-        text = pattern.sub(replacement, text)
+        text = pattern.sub(replacement, text)  # type: ignore[arg-type]
     return " ".join(_NON_TOKEN.sub(" ", text).split())
 
 

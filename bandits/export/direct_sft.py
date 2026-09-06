@@ -173,6 +173,7 @@ def review_trace(
 
     counts = Counter(item.recommendation for item in parsed)
     recommendation, modal_count = counts.most_common(1)[0]
+
     def mean(field: str) -> float:
         return sum(getattr(item, field) for item in parsed) / len(parsed)
 

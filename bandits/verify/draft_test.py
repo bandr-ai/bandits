@@ -52,7 +52,7 @@ def test_support_family_proposes_structured_state_check() -> None:
     draft = draft_verifiers(task_set, "taskset-test", analysis, family.family_id)
 
     checks = [v.checks[0] for v in draft.verifiers]
-    assert any(check.claim == "final_state_field:status" for check in checks)
+    assert any(check.claim == "final_state_field:refund_order.status" for check in checks)
     assert all(check.supporting_evidence_ids for check in checks)
 
 
@@ -203,7 +203,7 @@ def test_an_invariant_is_drafted_from_the_before_and_after_pair(tmp_path) -> Non
         for check in spec.checks
     }
 
-    assert "invariant:refunded_amount==charged_amount" in claims
+    assert "invariant:refund_order.refunded_amount==lookup_order.charged_amount" in claims
 
 
 def test_a_field_that_differs_every_run_gets_no_equality_check(tmp_path) -> None:
@@ -214,12 +214,47 @@ def test_a_field_that_differs_every_run_gets_no_equality_check(tmp_path) -> None
         for check in spec.checks
     }
 
-    assert "final_state_field:refunded_amount" not in claims
-    assert "final_state_field:status" in claims, "a real status must survive"
+    assert "final_state_field:refund_order.refunded_amount" not in claims
+    assert "final_state_field:refund_order.status" in claims, "a real status must survive"
 
 
-def test_competing_values_for_one_field_are_both_drafted() -> None:
+def _competing_statuses(tmp_path) -> Path:
+    """One tool, one field, two values across runs — a real pair of hypotheses."""
+    rows = []
+    for i in range(1, 7):
+        base = f"2026-05-02T00:0{i}"
+        status = "resolved" if i % 2 else "escalated"
+        rows += [
+            f'{{"trace_id": "c-{i}", "span_id": "c-{i}-0", "parent_span_id": null,'
+            f' "name": "gpt-5", "start_time": "{base}:00Z", "end_time": "{base}:10Z",'
+            f' "attributes": {{"gen_ai.operation.name": "chat", "task": "Close ticket {7000 + i}"}}}}',
+            f'{{"trace_id": "c-{i}", "span_id": "c-{i}-1", "parent_span_id": "c-{i}-0",'
+            f' "name": "close_ticket", "start_time": "{base}:11Z", "end_time": "{base}:12Z",'
+            f' "attributes": {{"gen_ai.operation.name": "execute_tool",'
+            f' "gen_ai.tool.call.arguments": {{}},'
+            f' "gen_ai.tool.call.result": {{"status": "{status}"}}}}}}',
+        ]
+    path = tmp_path / "competing.jsonl"
+    path.write_text("\n".join(rows) + "\n")
+    return path
+
+
+def test_competing_values_for_one_field_are_both_drafted(tmp_path) -> None:
     """Two hypotheses for what success looks like is the question worth asking."""
+    draft = _drafted(_competing_statuses(tmp_path))
+
+    expected = {
+        check.expected
+        for spec in draft.verifiers
+        for check in spec.checks
+        if check.claim == "final_state_field:close_ticket.status"
+    }
+
+    assert expected == {"resolved", "escalated"}
+
+
+def test_two_tools_reporting_one_key_are_drafted_as_different_checks() -> None:
+    """`status` from a lookup and `status` from an override are not one field."""
     fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
     analysis = analyze_corpus(load_corpus(fixtures / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(
@@ -228,11 +263,75 @@ def test_competing_values_for_one_field_are_both_drafted() -> None:
     address = next(f for f in task_set.families if "address" in f.descriptor)
 
     draft = draft_verifiers(task_set, "ts-1", analysis, address.family_id, limit=6)
-    expected = {
-        check.expected
-        for spec in draft.verifiers
+    drafted = {(check.claim, check.expected) for spec in draft.verifiers for check in spec.checks}
+
+    assert ("final_state_field:lookup_order.status", "paid") in drafted
+    assert ("final_state_field:override_address_policy.status", "overridden") in drafted
+    assert not any(claim == "final_state_field:status" for claim, _ in drafted)
+
+
+def _nested_refunds(tmp_path) -> Path:
+    """Six refunds whose outcome is a structured object, not a flat scalar."""
+    rows = []
+    for i in range(1, 7):
+        base = f"2026-06-02T00:0{i}"
+        amount = 10.0 * i
+        rows += [
+            f'{{"trace_id": "n-{i}", "span_id": "n-{i}-0", "parent_span_id": null,'
+            f' "name": "gpt-5", "start_time": "{base}:00Z", "end_time": "{base}:10Z",'
+            f' "attributes": {{"gen_ai.operation.name": "chat", "task": "Refund order {7000 + i}"}}}}',
+            f'{{"trace_id": "n-{i}", "span_id": "n-{i}-1", "parent_span_id": "n-{i}-0",'
+            f' "name": "lookup_order", "start_time": "{base}:11Z", "end_time": "{base}:12Z",'
+            f' "attributes": {{"gen_ai.operation.name": "execute_tool",'
+            f' "gen_ai.tool.call.arguments": {{}},'
+            f' "gen_ai.tool.call.result": {{"order": {{"charge": {{"amount": {amount}}}}}}}}}}}',
+            f'{{"trace_id": "n-{i}", "span_id": "n-{i}-2", "parent_span_id": "n-{i}-0",'
+            f' "name": "refund_order", "start_time": "{base}:13Z", "end_time": "{base}:14Z",'
+            f' "attributes": {{"gen_ai.operation.name": "execute_tool",'
+            f' "gen_ai.tool.call.arguments": {{}},'
+            f' "gen_ai.tool.call.result": {{"refund": {{"amount": {amount},'
+            f' "status": "refunded"}}, "warnings": []}}}}}}',
+        ]
+    path = tmp_path / "nested.jsonl"
+    path.write_text("\n".join(rows) + "\n")
+    return path
+
+
+def test_a_structured_outcome_is_drafted_from_rather_than_reported_unresolved(tmp_path) -> None:
+    """A source answering with an object used to yield no terminal evidence at all."""
+    draft = _drafted(_nested_refunds(tmp_path))
+
+    claims = {check.claim for spec in draft.verifiers for check in spec.checks}
+    assert "final_state_field:refund_order.refund.status" in claims
+    assert "final_state_field:refund_order.warnings[].count" in claims
+    assert draft.unresolved == () or all("no deterministic" not in r for r in draft.unresolved)
+
+
+def test_an_invariant_spans_two_tools_nested_results(tmp_path) -> None:
+    """The refunded amount equalling the charge is the check worth having."""
+    claims = {
+        check.claim
+        for spec in _drafted(_nested_refunds(tmp_path)).verifiers
         for check in spec.checks
-        if check.claim == "final_state_field:status"
     }
 
-    assert expected == {"overridden", "paid"}
+    assert "invariant:refund_order.refund.amount==lookup_order.order.charge.amount" in claims
+
+
+def test_a_prose_outcome_says_what_kind_of_verifier_it_would_need(tmp_path) -> None:
+    path = tmp_path / "prose.jsonl"
+    path.write_text(
+        '{"trace_id": "p-1", "span_id": "p-1-0", "parent_span_id": null, "name": "gpt-5",'
+        ' "start_time": "2026-06-03T00:00:00Z", "end_time": "2026-06-03T00:00:01Z",'
+        ' "attributes": {"gen_ai.operation.name": "chat", "task": "Help the customer"}}\n'
+        '{"trace_id": "p-1", "span_id": "p-1-1", "parent_span_id": "p-1-0", "name": "reply",'
+        ' "start_time": "2026-06-03T00:00:02Z", "end_time": "2026-06-03T00:00:03Z",'
+        ' "attributes": {"gen_ai.operation.name": "execute_tool",'
+        ' "gen_ai.tool.call.arguments": {},'
+        ' "gen_ai.tool.call.result": "I told them to try again later."}}\n'
+    )
+
+    draft = _drafted(path)
+
+    assert draft.verifiers == ()
+    assert any("judge or a domain extractor" in reason for reason in draft.unresolved)

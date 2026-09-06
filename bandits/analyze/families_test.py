@@ -59,8 +59,9 @@ def _family(task_set: TaskSet, word: str) -> TaskFamily:
 @pytest.mark.parametrize(
     ("instruction", "expected"),
     [
-        ("Refund order 7741", "refund order <id>"),
-        ("Refund order 8820", "refund order <id>"),
+        ("Refund order 7741", "refund order <order_id>"),
+        ("Refund order 8820", "refund order <order_id>"),
+        ("Ticket #A-9928 is stuck", "ticket <ticket_id> is stuck"),
         ("Email alice@example.com", "email <email>"),
         ("Fetch https://example.com/x", "fetch <url>"),
         ("Check 3f2504e0-4f89-11d3-9a0c-0305e82c3301", "check <uuid>"),
@@ -70,19 +71,37 @@ def test_normalization_masks_the_values_that_vary(instruction: str, expected: st
     assert normalize_instruction(instruction) == expected
 
 
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    [
+        ("Handle the HTTP 404", "handle the http 404"),
+        ("Upgrade to Python 3.12", "upgrade to python 3_12"),
+        ("Retry 3 times", "retry 3 times"),
+        ("Upgrade to v2", "upgrade to v2"),
+    ],
+)
+def test_normalization_keeps_values_that_change_the_task(instruction: str, expected: str) -> None:
+    """A version, a status code and a count are the task, not identifiers in it."""
+    assert normalize_instruction(instruction) == expected
+
+
+def test_distinct_status_codes_do_not_share_a_descriptor() -> None:
+    assert normalize_instruction("Handle the 404") != normalize_instruction("Handle the 500")
+
+
 def test_repeated_tasks_collapse_into_one_family(task_set: TaskSet) -> None:
     refunds = _family(task_set, "refund")
 
     assert refunds.workload_mass == 12
-    assert refunds.descriptor == "refund order <id>"
+    assert refunds.descriptor == "refund order <order_id>"
 
 
 def test_distinct_tasks_are_not_merged(task_set: TaskSet) -> None:
     """Grouping is conservative: a refund and a cancellation are not one task."""
     descriptors = {f.descriptor for f in task_set.families}
 
-    assert "refund order <id>" in descriptors
-    assert "cancel order <id>" in descriptors
+    assert "refund order <order_id>" in descriptors
+    assert "cancel order <order_id>" in descriptors
 
 
 def test_medoid_is_a_real_trace_from_the_family(task_set: TaskSet) -> None:

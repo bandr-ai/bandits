@@ -42,3 +42,45 @@ def test_all_traces_share_the_file_digest() -> None:
     corpus = load_otlp(FIXTURE)
     digests = {t.source_digest for t in corpus.traces}
     assert len(digests) == 1
+
+
+def _root(tools: str, extra: str = "") -> str:
+    return (
+        '{"trace_id": "t-1", "span_id": "s-1", "parent_span_id": null, "name": "gpt-5",'
+        ' "start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:00:01Z",'
+        ' "attributes": {"gen_ai.operation.name": "chat", "task": "Refund order 7741",'
+        ' "gen_ai.request.model": "gpt-5", ' + tools + extra + "}}"
+    )
+
+
+def test_the_root_span_declares_the_offered_toolset(tmp_path) -> None:
+    path = tmp_path / "tools.jsonl"
+    path.write_text(
+        _root(
+            '"gen_ai.request.tools": [{"name": "refund_order", "parameters": {"type": "object"}}],',
+            ' "gen_ai.system_instructions": "You are a support agent."',
+        )
+        + "\n"
+    )
+
+    trace = load_otlp(path).traces[0]
+
+    assert trace.tools_available is not None
+    assert [tool.name for tool in trace.tools_available] == ["refund_order"]
+    assert trace.system_prompt == "You are a support agent."
+    assert trace.runtime_context == {"gen_ai.request.model": "gpt-5"}
+
+
+def test_a_toolset_declared_mid_episode_is_not_read_as_the_offered_one(tmp_path) -> None:
+    """By then the toolset has already been narrowed by what the agent learned."""
+    path = tmp_path / "late.jsonl"
+    path.write_text(
+        _root('"note": "no tools here",')
+        + "\n"
+        + '{"trace_id": "t-1", "span_id": "s-2", "parent_span_id": "s-1", "name": "refund_order",'
+        ' "start_time": "2026-01-01T00:00:02Z", "end_time": "2026-01-01T00:00:03Z",'
+        ' "attributes": {"gen_ai.operation.name": "execute_tool",'
+        ' "gen_ai.request.tools": [{"name": "refund_order"}]}}\n'
+    )
+
+    assert load_otlp(path).traces[0].tools_available is None

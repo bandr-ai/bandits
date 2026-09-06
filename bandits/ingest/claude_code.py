@@ -18,8 +18,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -46,6 +47,35 @@ _WRAPPER = re.compile(
 )
 
 
+_CONTEXT_KEYS = ("cwd", "model", "permissionMode", "version", "gitBranch")
+"""Session configuration, spread across the init record and the turn records."""
+
+
+def _session_context(records: list[dict]) -> tuple[object, str | None, dict]:
+    """The toolset and configuration the session declared, where it declared them.
+
+    A session log written by the CLI opens with an ``init`` record naming every
+    tool the run was started with; a log exported without one says nothing about
+    the toolset, and that stays unknown rather than being reconstructed from the
+    calls that happen to appear.
+    """
+    init = next(
+        (r for r in records if r.get("type") == "system" and r.get("subtype") == "init"),
+        None,
+    )
+    system_prompt = (init or {}).get("systemPrompt")
+    context: dict = {}
+    for record in (init, *records):
+        for key in _CONTEXT_KEYS:
+            if isinstance(record, dict) and record.get(key) is not None:
+                context.setdefault(key, record[key])
+    return (
+        parse_toolset((init or {}).get("tools")),
+        system_prompt if isinstance(system_prompt, str) else None,
+        context,
+    )
+
+
 def _timestamp(record: dict, ordinal: int) -> datetime:
     raw = record.get("timestamp")
     if isinstance(raw, str):
@@ -70,6 +100,18 @@ def _text(blocks: list[dict]) -> str:
     """The human-authored part of a turn, with harness scaffolding removed."""
     joined = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
     return _WRAPPER.sub(" ", joined).strip()
+
+
+def _unrepresentable(blocks: list[dict]) -> bool:
+    """Whether a user record carries content this trace cannot put in a transcript.
+
+    A ``tool_result`` is the harness answering the agent, and a text block that
+    is nothing but harness scaffolding strips to empty — neither is a user turn.
+    An image or a document is: the agent saw it, the transcript cannot show it,
+    and dropping it silently is what lets an export teach the next action as an
+    answer to a request nobody can read.
+    """
+    return any(block.get("type") not in ("tool_result", "text") for block in blocks)
 
 
 def _is_error(block: dict) -> bool:
@@ -122,6 +164,8 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
     issues: list[TraceIssue] = list(source.issues)
 
     spans: list[Span] = []
+    user_turns: list[UserTurn] = []
+    unrepresented = 0
     pending: dict[str, str] = {}
     results: dict[str, dict] = {}
     task: str | None = None
@@ -157,10 +201,35 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
         blocks = _blocks(record)
         started = _timestamp(record, ordinal)
 
-        if record.get("type") == "user" and task is None and not record.get("isSidechain"):
+        if record.get("type") == "user" and not record.get("isSidechain"):
+            # Only turns a human actually wrote: a user record carrying nothing
+            # but tool results is the harness answering the agent.
             text = _text(blocks)
             if text:
-                task = text
+                task = task if task is not None else text
+                user_turns.append(
+                    UserTurn(text=text, after_span_id=spans[-1].span_id if spans else None)
+                )
+            if _unrepresentable(blocks):
+                # Counted even when the record also carried text: the turn that
+                # reaches a transcript is then only part of what the user sent.
+                unrepresented += 1
+                issues.append(
+                    TraceIssue(
+                        kind="unrepresentable_user_turn",
+                        detail="user turn carries content that is not text: "
+                        + ", ".join(
+                            sorted(
+                                {
+                                    str(b.get("type"))
+                                    for b in blocks
+                                    if b.get("type") not in ("tool_result", "text")
+                                }
+                            )
+                        ),
+                        location=str(path),
+                    )
+                )
 
         for block in blocks:
             if block.get("type") == "text" and record.get("type") == "assistant":
@@ -238,12 +307,18 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
             redaction_ruleset=source.ruleset,
         )
 
+    tools_available, system_prompt, context = _session_context(records)
     trace = Trace(
         trace_id=path.stem,
         source="claude-code",
         source_digest=source.source_digest,
         task=task,
         lineage_id=session_id,
+        tools_available=tools_available,  # type: ignore[arg-type]
+        system_prompt=system_prompt,
+        runtime_context=context,
+        user_turns=tuple(user_turns),
+        unrepresented_user_turns=unrepresented,
         spans=tuple(spans),
     )
     return TraceCorpus(

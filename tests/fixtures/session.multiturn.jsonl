@@ -1,0 +1,6 @@
+{"type":"user","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:00Z","message":{"role":"user","content":"Update the dependency"}}
+{"type":"assistant","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:01Z","message":{"role":"assistant","model":"claude","content":[{"type":"text","text":"I can move it to version 2."}]}}
+{"type":"user","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:02Z","message":{"role":"user","content":"Use version 1.9 instead"}}
+{"type":"assistant","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:03Z","message":{"role":"assistant","model":"claude","content":[{"type":"tool_use","id":"tu-1","name":"Edit","input":{"version":"1.9"}}]}}
+{"type":"user","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-1","content":"{\"status\": \"written\", \"version\": \"1.9\"}"}]}}
+{"type":"assistant","sessionId":"sess-mt","timestamp":"2026-05-01T00:00:05Z","message":{"role":"assistant","model":"claude","content":[{"type":"text","text":"Pinned the dependency to 1.9."}]}}
