@@ -172,3 +172,17 @@ def test_every_system_and_developer_instruction_is_kept(tmp_path) -> None:
     trace = load_chat_json(path).traces[0]
 
     assert trace.system_prompt == "be terse\n\nnever refund over 100"
+
+
+def test_an_explicitly_empty_toolset_survives_the_adapter(tmp_path) -> None:
+    """`"tools": []` is falsey, and reading it as absent would say nobody declared one."""
+    path = tmp_path / "empty_tools.json"
+    path.write_text(
+        '[{"tools": [], "messages": ['
+        '{"role": "user", "content": "refund 7741"},'
+        '{"role": "assistant", "content": "I cannot, I have no tools."}]}]'
+    )
+
+    trace = load_chat_json(path).traces[0]
+
+    assert trace.tools_available == ()

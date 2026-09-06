@@ -31,6 +31,14 @@ _MAX_DEPTH = 4
 _MAX_FIELDS = 64
 """Leaves read from one result. A large payload is read in part, and says so."""
 
+_MAX_NODES = 512
+"""Nodes visited while reading one result, counted across the whole walk.
+
+Bounding each mapping on its own is not a bound: a tree of mappings that hold no
+comparable value keeps the field count at zero, so every level grants itself a
+fresh budget and the visit count multiplies with depth.
+"""
+
 
 def _evidence(
     span: Span | None,
@@ -110,9 +118,14 @@ def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
     """
     fields: list[tuple[str, Any]] = []
     truncated = False
+    budget = _MAX_NODES
 
     def walk(node: Any, prefix: str, depth: int) -> None:
-        nonlocal truncated
+        nonlocal truncated, budget
+        if budget <= 0:
+            truncated = True
+            return
+        budget -= 1
         if len(fields) >= _MAX_FIELDS:
             truncated = True
             return
@@ -134,9 +147,9 @@ def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
         # produce sixty-four fields. The slice is taken in the order the source
         # wrote them, which a parsed document preserves, so the same bytes
         # always yield the same fields.
-        budget = _MAX_FIELDS - len(fields) + 1
-        children = list(islice(node.items(), budget))
-        if len(children) == budget:
+        take = min(budget, _MAX_FIELDS - len(fields)) + 1
+        children = list(islice(node.items(), take))
+        if len(children) == take:
             truncated = True
             children = children[:-1]
         for key, value in sorted(children, key=lambda pair: str(pair[0])):

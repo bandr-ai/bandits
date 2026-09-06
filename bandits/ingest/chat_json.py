@@ -261,7 +261,12 @@ def _convert_conversation(
         source_digest=source_digest,
         task=task,
         lineage_id=lineage_id,
-        tools_available=parse_toolset(wrapper.get("tools") or wrapper.get("functions")),
+        # Keyed on presence, not truth: an explicitly empty `tools` is falsey,
+        # and reading it as absent turns "no tools were offered" back into
+        # "nobody said".
+        tools_available=parse_toolset(
+            wrapper["tools"] if "tools" in wrapper else wrapper.get("functions")
+        ),
         system_prompt=system_prompt,
         runtime_context=_settings_of(wrapper),
         user_turns=tuple(user_turns),

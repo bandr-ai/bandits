@@ -13,7 +13,7 @@ import pytest
 
 from bandits.analyze import analyze_corpus, extract_task, load_analysis, save_analysis
 from bandits.analyze.models import EvidenceKind, Visibility
-from bandits.analyze.outcomes import extract_outcome_evidence
+from bandits.analyze.outcomes import _state_fields, extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus
@@ -452,3 +452,42 @@ def test_a_truncated_initial_read_is_recorded_too() -> None:
     ]
 
     assert [e.span_id for e in truncation] == ["lookup"]
+
+
+def test_a_branch_heavy_result_is_bounded_across_the_whole_walk() -> None:
+    """Per-mapping bounds are not a bound: nothing emitted means nothing spent."""
+
+    def tree(depth: int) -> dict:
+        return {f"k{index}": tree(depth - 1) for index in range(8)} if depth else {}
+
+    fields, truncated = _state_fields(tree(4))
+
+    assert fields == []
+    assert truncated, "a tree holding no comparable value must still stop and say so"
+
+
+def test_a_declared_empty_toolset_is_evidence_not_a_gap() -> None:
+    """`()` is a toolset of none; only `None` is an unrecorded one."""
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="none-offered",
+        source="chat-json",
+        source_digest="e" * 64,
+        task="Refund it",
+        tools_available=(),
+        spans=(
+            Span(
+                span_id="reply",
+                kind=SpanKind.MODEL,
+                name="assistant",
+                started_at=moment,
+                ended_at=moment,
+                output="I have no tools for that.",
+            ),
+        ),
+    )
+
+    task, evidence = extract_task(trace)
+
+    assert next(e for e in evidence if e.claim == "available_tools").value == []
+    assert not any("available toolset is not recorded" in item for item in task.limitations)
