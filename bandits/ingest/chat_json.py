@@ -110,9 +110,8 @@ def _convert_conversation(
     spans: list[Span] = []
     user_turns: list[UserTurn] = []
     unrepresented = 0
-    pending_calls: dict[
-        str, str
-    ] = {}  # tool_call_id -> span_id of the MODEL span that requested it
+    pending_calls: dict[str, tuple[str, str]] = {}
+    """tool_call_id -> (span_id, tool name) for a call awaiting one result."""
     ordinal = 0
 
     for index, message in enumerate(messages):
@@ -180,7 +179,7 @@ def _convert_conversation(
                         )
                     )
                     if isinstance(call_id, str) and call_id:
-                        pending_calls[call_id] = span_id
+                        pending_calls[call_id] = (span_id, name)
                     ordinal += 1
             else:
                 content = message.get("content")
@@ -201,8 +200,16 @@ def _convert_conversation(
 
         elif role == "tool":
             call_id = message.get("tool_call_id")
-            parent_span_id = pending_calls.get(call_id) if isinstance(call_id, str) else None
-            name = message.get("name") or "tool"
+            pending = pending_calls.pop(call_id, None) if isinstance(call_id, str) else None
+            declared_name = message.get("name")
+            name_mismatch = (
+                pending is not None
+                and isinstance(declared_name, str)
+                and bool(declared_name)
+                and declared_name != pending[1]
+            )
+            parent_span_id = pending[0] if pending is not None and not name_mismatch else None
+            name = pending[1] if pending is not None else declared_name or "tool"
             span_id = f"{trace_id}:span-{ordinal}"
             spans.append(
                 Span(
@@ -223,10 +230,17 @@ def _convert_conversation(
                 )
             )
             if parent_span_id is None:
+                detail = (
+                    f"message {index}: tool result names {declared_name!r}, but matching "
+                    f"assistant tool_call names {pending[1]!r}"
+                    if name_mismatch
+                    else f"message {index}: no matching assistant tool_call for "
+                    f"tool_call_id {call_id!r}"
+                )
                 issues.append(
                     TraceIssue(
-                        kind="unpaired_tool_result",
-                        detail=f"message {index}: no matching assistant tool_call for tool_call_id {call_id!r}",
+                        kind="mismatched_tool_result" if name_mismatch else "unpaired_tool_result",
+                        detail=detail,
                         location=location,
                     )
                 )
