@@ -31,10 +31,16 @@ SUCCEEDED = "addr-1"
 """The only address run that actually changed anything."""
 
 
+def _test_distance(left: str, right: str) -> float:
+    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
+
+
 @pytest.fixture
 def address():
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
     family = next(f for f in task_set.families if "address" in f.descriptor)
     draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
     return analysis, task_set, family, draft
@@ -110,7 +116,9 @@ def test_agreement_is_reported_per_split(address) -> None:
 
 def test_a_run_the_verifier_cannot_score_is_not_a_disagreement() -> None:
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
     draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
     label_set = _labels(
@@ -162,7 +170,9 @@ def test_an_unlabeled_held_out_side_is_called_out(address) -> None:
 def test_forging_a_before_and_after_pair_costs_more_than_writing_one_field() -> None:
     """A bare gameable flag would hide why the invariant is the better check."""
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
     draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=6)
     label_set = _labels(family, lambda t: Verdict.SUCCESS)

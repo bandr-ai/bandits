@@ -12,7 +12,6 @@ from bandits.analyze import (
     DEFAULT_BUDGET,
     DEFAULT_HELD_OUT,
     DEFAULT_NEIGHBORS,
-    DEFAULT_SIMILARITY,
     analyze_corpus,
     load_analysis,
     load_task_set,
@@ -21,6 +20,21 @@ from bandits.analyze import (
     save_analysis,
     save_task_set,
     split_family,
+)
+from bandits.analyze.embed import (
+    DEFAULT_MODEL as EMBEDDING_MODEL,
+)
+from bandits.analyze.embed import (
+    DEFAULT_SIMILARITY as EMBEDDING_SIMILARITY,
+)
+from bandits.analyze.embed import (
+    EmbeddingCache,
+    EmbeddingError,
+    build_cache,
+    descriptors,
+    embedding_distance,
+    load_cache,
+    save_cache,
 )
 from bandits.export import (
     Partition,
@@ -74,6 +88,8 @@ console = Console()
 
 _MAX_INLINE_ISSUES = 3
 _DEFAULT_PROJECT = Path(".")
+_SINGLETON_WARNING = 0.8
+"""Fraction of one-trace families above which grouping is reported as inert."""
 
 
 @app.command()
@@ -213,6 +229,31 @@ def analyze(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
+def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[EmbeddingCache, str]:
+    """Vectors for every descriptor this analysis will be grouped on.
+
+    Reuses a saved cache when one covers the corpus, and embeds only what it is
+    missing, so re-mining the same analysis at a different threshold costs
+    nothing. Vectors from two models are never mixed — a cache pinned to another
+    model is passed over rather than extended.
+    """
+    wanted = descriptors(analysis)
+    existing: EmbeddingCache | None = None
+    reused_id = ""
+    for envelope in store.list(kind="embeddings"):
+        if envelope.parent_artifact_id != analysis.corpus_id:
+            continue
+        candidate = load_cache(envelope.artifact_id, store)
+        if candidate.model == model:
+            existing, reused_id = candidate, envelope.artifact_id
+            break
+
+    cache = build_cache(wanted, model=model, existing=existing)
+    if existing is not None and cache.vectors == existing.vectors:
+        return cache, reused_id
+    return cache, save_cache(cache, store, analysis.corpus_id).artifact_id
+
+
 def _derived(project: Path) -> DerivedStore:
     return DerivedStore(project / ".bandits")
 
@@ -236,6 +277,17 @@ def _report(task_set, envelope_id: str) -> None:
     )
     if task_set.underfilled:
         console.print("[yellow]underfilled:[/yellow] eligibility ran out before the budget did")
+
+    # A grouping stage that grouped nothing is not obviously broken from the
+    # summary above: coverage still reads high when every trace is its own
+    # family. Saying so is what makes an inert backend visible.
+    singletons = sum(1 for f in task_set.families if f.workload_mass == 1)
+    if task_set.families and singletons > _SINGLETON_WARNING * len(task_set.families):
+        console.print(
+            f"[yellow]warning:[/yellow] {singletons} of {len(task_set.families)} families "
+            "contain one trace; grouping found almost no structure — the corpus may be "
+            "genuinely diverse, or --similarity may be too high for this backend"
+        )
 
     table = Table("family_id", "descriptor", "mass", "medoid", "fit", "held out", "status")
     for family in sorted(task_set.families, key=lambda f: -f.workload_mass):
@@ -281,10 +333,15 @@ def mine(
     budget: int = typer.Option(DEFAULT_BUDGET, "--budget", help="How many tasks to select."),
     held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
     similarity: float = typer.Option(
-        DEFAULT_SIMILARITY, "--similarity", help="Higher groups more conservatively."
+        EMBEDDING_SIMILARITY,
+        "--similarity",
+        help="Higher groups more conservatively. Tuned for cosine similarity.",
     ),
     neighbors: int = typer.Option(
         DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
+    ),
+    embedding_model: str = typer.Option(
+        EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -296,6 +353,14 @@ def mine(
         console.print(f"[red]error:[/red] no analysis {analysis_id!r}")
         raise typer.Exit(code=1) from exc
 
+    try:
+        cache, cache_id = _embedding_cache(analysis, store, embedding_model)
+    except EmbeddingError as exc:
+        # Embedding failures must stop the run rather than produce a task set
+        # whose requested clustering operation never completed.
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
     task_set = mine_task_set(
         analysis,
         analysis_id,
@@ -303,9 +368,12 @@ def mine(
         held_out=held_out,
         similarity=similarity,
         neighbors=neighbors,
+        distance=embedding_distance(cache),
+        proposed_by="model",
     )
     envelope = save_task_set(task_set, store)
     _report(task_set, envelope.artifact_id)
+    console.print(f"embeddings:  {cache_id} ({len(cache.vectors)} vectors, {embedding_model})")
 
 
 @app.command()

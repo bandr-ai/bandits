@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+from unittest import mock
 
+import pytest
 from typer.testing import CliRunner
 
 from bandits.analyze import load_analysis, load_task_set
+from bandits.analyze.embed import EmbeddingError
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -100,6 +105,49 @@ SUPPORT_FIXTURE = (
 )
 
 
+@pytest.fixture(autouse=True)
+def offline_embedder(monkeypatch):
+    """Keep `mine` off the network.
+
+    Grouping now embeds every descriptor, so without this the whole suite would
+    need an API key. Vectors are derived from the descriptor's own tokens, which
+    gives the support fixture stable, expected families — these
+    tests are about the command's plumbing, not about grouping quality.
+    """
+
+    def deterministic(model: str, texts):
+        # Hashed into a fixed width rather than a per-call vocabulary: build_cache
+        # embeds in batches, so a vocabulary derived from the batch would give
+        # later batches a different dimensionality and make cosine_distance raise.
+        # Wide enough that the fixtures' tokens do not collide, which would merge
+        # descriptors that share no words.
+        width = 4096
+        vectors = []
+        for text in texts:
+            vector = [0.0] * width
+            for token in text.split():
+                vector[hash_token(token) % width] = 1.0
+            vectors.append(vector)
+        return vectors
+
+    monkeypatch.setattr("bandits.cli.build_cache", _partial_embed(deterministic))
+
+
+def hash_token(token: str) -> int:
+    """Stable across processes, unlike hash(), so vectors do not shift per run."""
+    return int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
+
+
+def _partial_embed(embedder):
+    """Bind a stub embedder into `build_cache` without changing its signature."""
+    from bandits.analyze.embed import build_cache
+
+    def patched(texts, *, model, embed=None, existing=None):
+        return build_cache(texts, model=model, embed=embedder, existing=existing)
+
+    return patched
+
+
 def _mined(tmp_path: Path) -> str:
     """Ingest, analyze and mine the support fixture; return the task set id."""
     runner.invoke(
@@ -128,6 +176,114 @@ def test_mine_reports_coverage_and_unfilled_slots(tmp_path) -> None:
     assert "taskset_id:  taskset-" in result.stdout
     assert "coverage:" in result.stdout
     assert "missing slot" in result.stdout
+
+
+def test_mine_embeds_and_records_the_cache_it_grouped_with(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+
+    embeddings = DerivedStore(tmp_path / ".bandits").list(kind="embeddings")
+    assert len(embeddings) == 1, "grouping should have saved exactly one cache"
+    assert embeddings[0].parent_artifact_id == task_set.corpus_id
+    assert {f.proposed_by for f in task_set.families} == {"model"}
+
+
+def test_mining_twice_reuses_the_saved_cache(tmp_path) -> None:
+    """A second run must not pay for the same vectors again."""
+    _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    before = store.list(kind="embeddings")[0].artifact_id
+
+    def refuse(model, texts):
+        raise AssertionError(f"re-embedded {len(texts)} descriptor(s) already cached")
+
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    with mock.patch("bandits.cli.build_cache", _partial_embed(refuse)):
+        again = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
+        )
+
+    assert again.exit_code == 0, again.stdout
+    assert store.list(kind="embeddings")[0].artifact_id == before
+
+
+def test_mine_fails_loudly_when_embedding_fails(tmp_path) -> None:
+    """No silent fallback: a task set nobody knows to distrust is the bug itself."""
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    def unreachable(model, texts):
+        raise EmbeddingError("FIREWORKS_API_KEY is not set")
+
+    with mock.patch("bandits.cli.build_cache", _partial_embed(unreachable)):
+        result = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
+        )
+
+    assert result.exit_code == 1
+    assert "FIREWORKS_API_KEY" in result.stdout
+    assert not DerivedStore(tmp_path / ".bandits").list(kind="taskset")
+
+
+def test_mine_warns_when_grouping_found_no_structure(tmp_path) -> None:
+    """An inert grouping stage still reports high coverage; the warning is the tell."""
+    # The support fixture repeats four instructions across its traces, and exact
+    # duplicates collapse before clustering. Singletons need distinct text.
+    corpus = tmp_path / "varied.otlp.jsonl"
+    corpus.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "trace_id": f"t-{i}",
+                    "span_id": f"t-{i}-s0",
+                    "parent_span_id": None,
+                    "name": "gpt-5",
+                    "start_time": "2026-03-01T00:00:00Z",
+                    "end_time": "2026-03-01T00:00:30Z",
+                    "attributes": {
+                        "gen_ai.operation.name": "chat",
+                        "task": "unrelated request "
+                        + "alpha bravo charlie delta echo foxtrot".split()[i],
+                        "gen_ai.completion": "done",
+                    },
+                }
+            )
+            for i in range(6)
+        )
+    )
+    runner.invoke(app, ["ingest", str(corpus), "--source", "otlp", "--project", str(tmp_path)])
+    corpus_id = compute_artifact_id(load_otlp(corpus))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    # Every descriptor mutually distant, so each lands in its own family.
+    def orthogonal(model, texts):
+        return [[1.0 if i == j else 0.0 for j in range(len(texts))] for i in range(len(texts))]
+
+    with mock.patch("bandits.cli.build_cache", _partial_embed(orthogonal)):
+        result = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
+        )
+
+    assert result.exit_code == 0
+    assert "contain one trace" in result.stdout
+
+
+def test_mine_stays_quiet_when_grouping_worked(tmp_path) -> None:
+    assert (
+        "contain one trace"
+        not in runner.invoke(app, ["families", _mined(tmp_path), "--project", str(tmp_path)]).stdout
+    )
 
 
 def test_families_shows_one_family_in_full(tmp_path) -> None:
@@ -524,9 +680,7 @@ def test_export_rejects_unknown_format_before_writing(tmp_path) -> None:
 
 
 def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monkeypatch) -> None:
-    runner.invoke(
-        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
+    runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
     artifact_id = compute_artifact_id(load_otlp(FIXTURE))
     reply = (
         '{"outcome":"success","task_clarity":5,"demonstrated_success":5,'
