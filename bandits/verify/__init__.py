@@ -29,8 +29,11 @@ from bandits.verify.judge import (
 )
 from bandits.verify.models import (
     CheckOperator,
+    CheckReview,
     CheckSpec,
+    Interpretation,
     InterviewAnswer,
+    InterviewDecision,
     InterviewQuestion,
     Result,
     SubScore,
@@ -72,6 +75,9 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "Interpretation",
+    "InterviewDecision",
+    "CheckReview",
     "PromotionBlocker",
     "assess_promotion",
     "Agreement",

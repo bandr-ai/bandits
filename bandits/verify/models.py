@@ -210,14 +210,116 @@ class InterviewAnswer(Contract):
     value: str
 
 
+class InterviewDecision(str, Enum):
+    """What a reviewer concluded about one candidate check."""
+
+    ACCEPT = "accept"
+    REJECT = "reject"
+    REVISE = "revise"
+    COMBINE = "combine"
+
+
+class Interpretation(Contract):
+    """A model's structured read of one free-text reply.
+
+    Never applied on its own: a human confirms it first. Recorded whole so a
+    later reader can see what the model proposed, including where it was
+    overruled.
+    """
+
+    decision: InterviewDecision
+    rationale: str
+    revised_expected: Any = None
+    revised_operator: CheckOperator | None = None
+    combine_with: str | None = None
+    blind_spots: tuple[str, ...] = ()
+    gaming_hypotheses: tuple[str, ...] = ()
+
+    dropped_combine_target: str | None = None
+    """A combine target the model named that is not a real check.
+
+    Kept rather than raising. Following ``analyze/audit.py::_clean_ids``: a
+    model that fumbles one reference should not cost the whole interpretation
+    the parts it got right. The human is told the target did not resolve.
+    """
+
+    @model_validator(mode="after")
+    def fields_match_decision(self) -> Interpretation:
+        if self.decision is not InterviewDecision.REVISE and (
+            self.revised_expected is not None or self.revised_operator is not None
+        ):
+            raise ValueError("only a revise decision may carry a revised value or operator")
+        if self.decision is InterviewDecision.COMBINE:
+            # A dropped target still leaves a combine the human has to retarget,
+            # so the decision stands with neither field set.
+            if self.combine_with and self.dropped_combine_target:
+                raise ValueError("a combine cannot both resolve and drop its target")
+        elif self.combine_with:
+            raise ValueError("only a combine decision may name another check")
+        return self
+
+
+class CheckReview(Contract):
+    """One completed review of one candidate check.
+
+    ``decision`` is the human's confirmed decision, which may differ from the
+    model's. The prompt, model and raw response are recorded alongside it so a
+    later reader can audit the change without re-running anything.
+    """
+
+    review_id: str
+    verifier_id: str
+    check_id: str
+    reply: str
+    decision: InterviewDecision
+    authoritative: bool | None = None
+    authoritative_why: str = ""
+    interpretation: Interpretation | None = None
+    model: str = ""
+    prompt: str = ""
+    response: str = ""
+    failure: str | None = None
+    superseded_by: str | None = None
+    """Set when a later combine reopened this decision."""
+
+    @model_validator(mode="after")
+    def failure_means_no_interpretation(self) -> CheckReview:
+        if self.failure and self.interpretation is not None:
+            raise ValueError("a failed interpretation cannot also carry a result")
+        return self
+
+
 class VerifierInterview(Contract):
     schema_version: int = 1
     source_draft_id: str
     draft: VerifierDraft
-    questions: tuple[InterviewQuestion, ...]
+    questions: tuple[InterviewQuestion, ...] = ()
     answers: tuple[InterviewAnswer, ...] = ()
     next_question_index: int = 0
     complete: bool = False
+
+    reviews: tuple[CheckReview, ...] = ()
+    """Completed free-text reviews, in the order they were confirmed."""
+
+    pending: tuple[tuple[str, str], ...] = ()
+    """(verifier_id, check_id) still to review, in order."""
+
+    validation_id: str | None = None
+    """The validation whose results this round was reviewed against, if any."""
+
+    @model_validator(mode="after")
+    def validate_review_ids(self) -> VerifierInterview:
+        ids = [review.review_id for review in self.reviews]
+        if len(ids) != len(set(ids)):
+            raise ValueError("interview contains duplicate review ids")
+        known = set(ids)
+        for review in self.reviews:
+            if review.superseded_by and review.superseded_by not in known:
+                raise ValueError(
+                    f"review {review.review_id} is superseded by unknown review "
+                    f"{review.superseded_by!r}"
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_progress(self) -> VerifierInterview:
@@ -225,8 +327,12 @@ class VerifierInterview(Contract):
             raise ValueError("interview progress must match its recorded answers")
         if self.next_question_index > len(self.questions):
             raise ValueError("interview progressed past its final question")
-        if self.complete != (self.next_question_index == len(self.questions)):
+        if self.questions and self.complete != (self.next_question_index == len(self.questions)):
             raise ValueError("interview completion flag disagrees with its progress")
+        if not self.questions and self.complete and self.pending:
+            # The free-text flow tracks work in ``pending`` rather than by
+            # question index, so completion is what is left to review.
+            raise ValueError("interview cannot be complete with checks still pending")
         expected_ids = [q.question_id for q in self.questions[: self.next_question_index]]
         if [a.question_id for a in self.answers] != expected_ids:
             raise ValueError("answers must correspond to questions in order")
