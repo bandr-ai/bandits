@@ -746,6 +746,7 @@ def test_a_composite_never_appears_without_the_checks_it_was_built_from(limit: i
         analysis,
         compute_analysis_id(analysis),
         distance=lambda left, right: 0.0,
+        backend="first-word",
         similarity=0.5,
         budget=10,
     )
@@ -769,6 +770,7 @@ def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() ->
         analysis,
         compute_analysis_id(analysis),
         distance=lambda left, right: 0.0,
+        backend="first-word",
         similarity=0.5,
         budget=10,
     )
@@ -781,3 +783,38 @@ def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() ->
 
     assert len([spec for spec in draft.verifiers if len(spec.checks) == 1]) == 2
     assert any(len(spec.checks) > 1 for spec in draft.verifiers)
+
+
+def test_labels_covering_only_the_held_out_side_do_not_claim_calibration() -> None:
+    """Drafting reads the fit side, so a label elsewhere measures nothing here."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.held_out_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(not item.calibrated for item in draft.candidates)
+    assert any("outside the side these checks were drafted from" in u for u in draft.unresolved)
+
+
+def test_an_empty_label_set_reads_as_no_labels_rather_than_as_contrast() -> None:
+    analysis, task_set, family = _skewed()
+    empty = LabelSet(task_set_id="taskset-test", family_id=family.family_id, labels=())
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=empty
+    )
+
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert any("no adjudicated label" in u for u in draft.unresolved)

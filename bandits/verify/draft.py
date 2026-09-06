@@ -111,6 +111,12 @@ Bounded because the pairs grow quadratically and every one of them costs a pass
 over the family. The four best-ranked standalone checks are where a useful
 conjunction comes from; a pair drawn from further down is two weak checks."""
 
+_UNCALIBRATED_OFF_PARTITION = (
+    "every adjudicated label names a trace outside the side these checks were drafted "
+    "from, so nothing below was measured against an outcome; the candidates are "
+    "frequency-based hypotheses"
+)
+
 _UNCALIBRATED = (
     "no adjudicated label was available for this family; every candidate below is a "
     "frequency-based hypothesis, and its support says how often a value was recorded, "
@@ -588,9 +594,17 @@ def draft_verifiers(
         trace_id: tuple(item for item in analysis.evidence if item.trace_id == trace_id)
         for trace_id in fit_ids
     }
-    derivation = "contrast" if verdicts else "frequency"
+    # Only a label on a trace being measured can calibrate anything. A label set
+    # covering the held-out side alone is not stale — it names traces of this
+    # family — but drafting never reads those traces, so calling the result
+    # contrast-derived would mark every candidate as measured against outcomes
+    # while each one reports itself uncalibrated.
+    applicable = {
+        trace_id: verdict for trace_id, verdict in verdicts.items() if trace_id in evidence_by_trace
+    }
+    derivation = "contrast" if applicable else "frequency"
     measured = [
-        (spec, *_measure(spec, evidence_by_trace, verdicts, derivation=derivation))
+        (spec, *_measure(spec, evidence_by_trace, applicable, derivation=derivation))
         for spec in proposals
     ]
     measured.sort(key=lambda item: _rank(item[0], item[1]))
@@ -601,7 +615,7 @@ def draft_verifiers(
     composites: list[tuple[VerifierSpec, CandidateStats, dict[str, bool | None]]] = []
     composite_sources: dict[str, set[str]] = {}
     """Which standalone candidates each conjunction was built from."""
-    if verdicts:
+    if applicable:
         sources = measured[:_MAX_COMPOSITE_SOURCES]
         seen_ids = {spec.verifier_id for spec, _, _ in measured}
         for index, (left, _, left_outcomes) in enumerate(sources):
@@ -611,9 +625,9 @@ def draft_verifiers(
                 # what makes the pair defensible, and only one of the two
                 # orderings may be the one that shows it.
                 composed = _compose(
-                    family, task_set_id, left, right, left_outcomes, right_outcomes, verdicts
+                    family, task_set_id, left, right, left_outcomes, right_outcomes, applicable
                 ) or _compose(
-                    family, task_set_id, right, left, right_outcomes, left_outcomes, verdicts
+                    family, task_set_id, right, left, right_outcomes, left_outcomes, applicable
                 )
                 if composed is None:
                     continue
@@ -628,7 +642,7 @@ def draft_verifiers(
                         *_measure(
                             spec,
                             evidence_by_trace,
-                            verdicts,
+                            applicable,
                             derivation="contrast",
                             rationale=rationale,
                         ),
@@ -651,8 +665,8 @@ def draft_verifiers(
     candidates = [stats for _, stats, _ in ranked]
 
     unresolved: list[str] = []
-    if not verdicts and proposals:
-        unresolved.append(_UNCALIBRATED)
+    if proposals and not applicable:
+        unresolved.append(_UNCALIBRATED_OFF_PARTITION if verdicts else _UNCALIBRATED)
     if not proposals:
         if any(item.claim == "unstructured_final_result" for item in evidence):
             unresolved.append(
