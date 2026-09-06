@@ -368,6 +368,43 @@ def test_audit_families_can_reprint_a_saved_audit(tmp_path) -> None:
     assert "Refund an eligible order" in result.stdout
 
 
+def test_audit_families_refuses_an_audit_of_another_task_set(tmp_path) -> None:
+    """The audit and the task set are loaded independently, so nothing else
+    notices they disagree.
+
+    Geometric coherence is looked up by family id, so families the supplied task
+    set never had read as "not measured" rather than as wrong, and the printed
+    `split-family` line would name the audit's task set beside a family judged
+    against another one.
+    """
+    task_set_id = _mined(tmp_path)
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+    other = runner.invoke(app, ["mine", analysis_id, "--budget", "4", "--project", str(tmp_path)])
+    other_task_set_id = other.stdout.split()[1]
+    assert other_task_set_id != task_set_id
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="One task."
+        ),
+    ):
+        first = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+    audit_id = first.stdout.split("audit_id:")[1].split()[0]
+
+    result = runner.invoke(
+        app,
+        ["audit-families", other_task_set_id, "--show", audit_id, "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert task_set_id in result.stdout
+    assert other_task_set_id in result.stdout
+
+
 def test_mine_reports_coverage_and_unfilled_slots(tmp_path) -> None:
     runner.invoke(
         app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]

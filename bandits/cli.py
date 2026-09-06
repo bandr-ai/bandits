@@ -552,10 +552,22 @@ def audit_families_command(
 
     if show is not None:
         try:
-            _report_audit(load_audit_run(show, store), show, task_set)
+            run = load_audit_run(show, store)
         except FileNotFoundError as exc:
             console.print(f"[red]error:[/red] no audit {show!r}")
             raise typer.Exit(code=1) from exc
+        if run.task_set_id != task_set_id:
+            # The two are read independently, and nothing downstream notices the
+            # mismatch: geometric coherence is looked up by family id, so a
+            # family this task set never had reads as "not measured" rather than
+            # as wrong, and the `split-family` line would name the audit's task
+            # set beside a family judged against another one.
+            console.print(
+                f"[red]error:[/red] audit {show} is for task set {run.task_set_id}, "
+                f"not {task_set_id}"
+            )
+            raise typer.Exit(code=1)
+        _report_audit(run, show, task_set)
         return
 
     try:
