@@ -405,3 +405,62 @@ def test_a_family_cannot_be_both_audited_and_skipped():
 
 def test_the_prompt_digest_changes_with_the_model():
     assert prompt_digest("model-a") != prompt_digest("model-b")
+
+
+def test_the_member_view_shows_the_tools_an_episode_actually_called():
+    """The row the model reads must match the corpus it describes.
+
+    Read over a real corpus rather than a hand-built analysis: the shape of a
+    span id is exactly what this once got wrong, and a fixture that invents its
+    own ids cannot catch that. `addr-1` calls three tools across eleven spans.
+    """
+    from pathlib import Path
+
+    from bandits.analyze import analyze_corpus
+    from bandits.analyze.audit import _member_view
+    from bandits.ingest import load_corpus
+    from bandits.traces import SpanKind
+
+    corpus = load_corpus(Path("tests/fixtures/traces.support.otlp.jsonl"), "otlp")
+    analysis = analyze_corpus(corpus)
+    task_set = mine_task_set(
+        analysis,
+        "analysis-test",
+        distance=lambda left, right: 0.0 if left == right else 0.9,
+        similarity=0.6,
+        held_out=0.0,
+    )
+
+    rows = {
+        row["trace_id"]: row
+        for family in task_set.families
+        for row in _member_view(family, analysis)
+    }
+
+    for trace in corpus.traces:
+        row = rows[trace.trace_id]
+        assert row["tool_names"] == sorted({s.name for s in trace.spans if s.kind is SpanKind.TOOL})
+        assert row["span_count"] == len(trace.spans)
+
+    assert rows["addr-1"]["tool_names"] == [
+        "lookup_order",
+        "override_address_policy",
+        "validate_address",
+    ]
+    assert rows["addr-1"]["span_count"] == 11
+
+
+def test_every_key_the_prompt_promises_is_on_the_row(two_family_set):
+    """A key the prompt names but the row omits is a KeyError in model-written
+    REPL code, spent silently against the iteration budget."""
+    import re
+
+    from bandits.analyze.audit import _INSTRUCTION, _member_view
+
+    analysis, task_set = two_family_set
+    promised = re.search(r"each with keys: ([^.]+)\.", _INSTRUCTION).group(1)
+    names = {re.match(r"\s*(\w+)", part).group(1) for part in promised.split(",")}
+
+    row = _member_view(_family_of(task_set), analysis)[0]
+
+    assert names <= set(row)

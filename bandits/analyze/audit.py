@@ -38,8 +38,10 @@ import json
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
+from bandits.analyze.families import normalize_instruction
 from bandits.analyze.models import (
     CorpusAnalysis,
+    Evidence,
     FamilyAudit,
     FamilyAuditRun,
     SkippedAudit,
@@ -97,28 +99,39 @@ class _Predictor(Protocol):
 def _member_view(family: TaskFamily, analysis: CorpusAnalysis) -> list[dict[str, Any]]:
     """What the model reads: one row per member, ordered like the family.
 
-    Only ``at_start`` content plus structural shape. An outcome or a label would
-    let the audit call a family incoherent because its episodes *ended*
-    differently, which is a fact about the runs and not about the grouping.
+    The instruction, the masked form clustering compared, and structural shape.
+    No outcome and no label: either would let the audit call a family incoherent
+    because its episodes *ended* differently, which is a fact about the runs and
+    not about the grouping. The tools called and the span count are shape rather
+    than outcome, and are what ``families.py`` groups on.
     """
     by_trace = {task.trace_id: task for task in analysis.tasks}
+    evidence_by_trace: dict[str, list[Evidence]] = {}
+    for item in analysis.evidence:
+        evidence_by_trace.setdefault(item.trace_id, []).append(item)
+
     rows: list[dict[str, Any]] = []
     for trace_id in family.trace_ids:
         task = by_trace.get(trace_id)
         if task is None:
             continue
+        evidence = evidence_by_trace.get(trace_id, [])
         rows.append(
             {
                 "trace_id": trace_id,
                 "instruction": task.instruction,
-                "tool_names": sorted(
-                    {
-                        span_id.split(":", 1)[0]
-                        for span_id in task.trajectory_span_ids
-                        if ":" in span_id
-                    }
+                "normalized": normalize_instruction(task.instruction),
+                # Both read from evidence, the way `families.py` reads them to
+                # group in the first place. Span ids are `span-{n}` or
+                # `{trace_id}:span-{n}` and never name a tool, so deriving these
+                # from them reported no tools at all on one ingest path and the
+                # trace's own id as a tool name on the other.
+                "tool_names": next(
+                    (sorted(e.value) for e in evidence if e.claim == "tools_called"), []
                 ),
-                "span_count": len(task.trajectory_span_ids),
+                "span_count": next(
+                    (int(e.value) for e in evidence if e.claim == "episode_span_count"), 0
+                ),
             }
         )
     return rows
@@ -149,9 +162,7 @@ def build_predictor(
     try:
         import dspy
     except ImportError as exc:  # pragma: no cover - depends on the extra
-        raise AuditError(
-            "the family audit needs the 'audit' extra: uv sync --extra audit"
-        ) from exc
+        raise AuditError("the family audit needs the 'audit' extra: uv sync --extra audit") from exc
 
     from bandits.verify.judge import resolve_api_key
 
