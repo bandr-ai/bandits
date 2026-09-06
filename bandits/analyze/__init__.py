@@ -25,6 +25,7 @@ from bandits.analyze.embed import (
 )
 from bandits.analyze.families import (
     DEFAULT_BUDGET,
+    DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
     DEFAULT_NEIGHBORS,
     compute_task_set_id,
@@ -33,11 +34,14 @@ from bandits.analyze.families import (
     merge_families,
     mine_task_set,
     normalize_instruction,
+    normalize_request,
     save_task_set,
     split_family,
 )
 from bandits.analyze.models import (
+    ClusteringProvenance,
     CorpusAnalysis,
+    DuplicateEdge,
     Evidence,
     EvidenceKind,
     LeakageError,
@@ -54,7 +58,10 @@ from bandits.analyze.outcomes import extract_outcome_evidence
 from bandits.analyze.tasks import extract_task
 
 __all__ = [
+    "DuplicateEdge",
+    "ClusteringProvenance",
     "DEFAULT_BUDGET",
+    "DEFAULT_DUPLICATE_SIMILARITY",
     "DEFAULT_HELD_OUT",
     "DEFAULT_NEIGHBORS",
     "CorpusAnalysis",
@@ -86,6 +93,7 @@ __all__ = [
     "merge_families",
     "mine_task_set",
     "normalize_instruction",
+    "normalize_request",
     "save_analysis",
     "save_cache",
     "save_task_set",

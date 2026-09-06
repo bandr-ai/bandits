@@ -114,6 +114,14 @@ uv run bandits export <task-set-id> --format sft \
 > [!NOTE]
 > SFT defaults to the `fit` partition; eval defaults to `held_out`. Passing `--split all` is allowed but recorded as an overlap warning in the export manifest.
 
+### Duplicates and the held-out split
+
+The fit/held-out split moves whole lineage groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so two runs of the same request from different sessions arrive as independent groups — and a source that declares no lineage at all leaves every trace its own.
+
+Before splitting, lineage groups are unioned by duplicate evidence: identical requests, and — where a backend can measure it — requests above a much stricter similarity than the one used for grouping. Sameness is measured on requests with their identifiers intact, never on the masked descriptors grouping compares, because under those `refund order 7741` and `refund order 8802` are one string.
+
+The joins are recorded on the family as auditable edges rather than applied silently, and survive a reviewer's correction: `merge-families` reads the analysis so it can find lineages the two families disagreed about, moves any that end up on both sides whole to one side, and says it did. Without them, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
+
 ### What produced a grouping
 
 A task set records the clustering that formed its families: the distance backend, the resolved similarity threshold and neighbor count, and — where vectors were compared — the embedding model and the cache artifact holding them. Resolved values, not the flags that were passed, so an omitted flag records the default that actually applied.
@@ -189,7 +197,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `ingest` | Normalize, redact, and store a trace export |
 | `list` / `show` | Browse corpora, traces, spans, and ingest issues |
 | `analyze` | Extract task candidates and outcome evidence |
-| `mine` / `families` | Group tasks, split lineages, and select representative runs, recording the clustering that produced them |
+| `mine` / `families` | Group tasks, split lineages without separating duplicates, and select representative runs, recording the clustering that produced them |
 | `merge-families` / `split-family` | Record human corrections to proposed groupings |
 | `draft-verifier` | Propose deterministic checks and replay them on history |
 | `interview-verifier` | Refine a draft through a bounded owner interview |

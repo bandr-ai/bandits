@@ -25,10 +25,17 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
-from bandits.analyze.families import DEFAULT_NEIGHBORS, _cluster, _medoid, _TraceFeatures
+from bandits.analyze.families import (
+    DEFAULT_NEIGHBORS,
+    _cluster,
+    _features,
+    _medoid,
+    _TraceFeatures,
+)
 from bandits.analyze.models import (
     ClusteringProvenance,
     CorpusAnalysis,
+    DuplicateEdge,
     FamilyCoherence,
     TaskCandidate,
     TaskFamily,
@@ -315,10 +322,10 @@ def test_traces_without_an_instruction_count_against_coverage() -> None:
     assert task_set.total_workload_mass == len(analysis.tasks)
 
 
-def test_merging_records_a_human_correction(task_set: TaskSet) -> None:
+def test_merging_records_a_human_correction(task_set: TaskSet, analysis) -> None:
     refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
 
-    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
     survivor = merged.family_by_id()[refunds.family_id]
 
     assert len(merged.families) == len(task_set.families) - 1
@@ -327,10 +334,12 @@ def test_merging_records_a_human_correction(task_set: TaskSet) -> None:
     assert survivor.proposed_by == "human"
 
 
-def test_a_correction_does_not_change_which_traces_were_selected(task_set: TaskSet) -> None:
+def test_a_correction_does_not_change_which_traces_were_selected(
+    task_set: TaskSet, analysis
+) -> None:
     refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
 
-    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
 
     assert [s.trace_id for s in merged.selected] == [s.trace_id for s in task_set.selected]
     assert set(merged.family_by_id()) >= {s.family_id for s in merged.selected}
@@ -339,7 +348,7 @@ def test_a_correction_does_not_change_which_traces_were_selected(task_set: TaskS
 def test_merge_then_split_restores_the_original_grouping(task_set, analysis) -> None:
     refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
 
-    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
     restored = split_family(merged, refunds.family_id, analysis)
 
     by_id = restored.family_by_id()
@@ -351,7 +360,7 @@ def test_merge_then_split_restores_the_original_grouping(task_set, analysis) -> 
 def test_splitting_preserves_which_side_each_trace_was_on(task_set, analysis) -> None:
     """A reviewer's correction must not move a trace across the split."""
     refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
-    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
 
     restored = split_family(merged, refunds.family_id, analysis)
 
@@ -369,7 +378,7 @@ def test_splitting_preserves_which_side_each_trace_was_on(task_set, analysis) ->
 )
 def test_merge_rejects_an_unusable_request(task_set, family_ids, message) -> None:
     with pytest.raises(ValueError, match=message):
-        merge_families(task_set, family_ids)
+        merge_families(task_set, family_ids, analysis)
 
 
 def test_splitting_a_single_instruction_family_is_refused(task_set, analysis) -> None:
@@ -525,11 +534,11 @@ def test_invalid_clustering_parameters_are_refused(analysis) -> None:
         )
 
 
-def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet) -> None:
+def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet, analysis) -> None:
     """A merged family is wider than either input; a stale figure would understate it."""
     ids = tuple(f.family_id for f in task_set.families[:2])
 
-    merged = merge_families(task_set, ids)
+    merged = merge_families(task_set, ids, analysis)
 
     survivor = next(f for f in merged.families if f.family_id in ids)
     assert survivor.coherence is None
@@ -537,7 +546,7 @@ def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet) -> Non
     assert any("not recomputed" in limit for limit in survivor.limitations)
 
 
-def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet) -> None:
+def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet, analysis) -> None:
     """A widest pair measured before a merge says nothing about the merged family."""
     first, second, *rest = task_set.families
     stale = "widest pair inside this family is 0.75 apart, over the old threshold"
@@ -553,7 +562,7 @@ def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet) -> None:
     assert flagged.over_merged
     source = task_set.replace(families=(flagged, second, *rest))
 
-    merged = merge_families(source, (first.family_id, second.family_id))
+    merged = merge_families(source, (first.family_id, second.family_id), analysis)
     survivor = merged.family_by_id()[first.family_id]
 
     assert stale not in survivor.limitations
@@ -629,7 +638,7 @@ def test_a_correction_keeps_the_provenance_of_the_grouping_it_corrects(task_set,
     """A reviewer's correction does not change what grouped the set in the first place."""
     refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
 
-    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
     restored = split_family(merged, refunds.family_id, analysis)
 
     assert merged.clustering == task_set.clustering
@@ -672,3 +681,380 @@ def test_a_task_set_mined_before_provenance_was_recorded_reads_back_as_unknown(t
     )
 
     assert older.clustering is None
+
+
+def _requests(*pairs: tuple[str, str, str | None]) -> CorpusAnalysis:
+    """An analysis of nothing but instructions, which is all grouping reads."""
+    return CorpusAnalysis(
+        corpus_id="corpus-duplicates",
+        source="otlp",
+        tasks=tuple(
+            TaskCandidate(
+                task_id=f"task-{trace_id}",
+                trace_id=trace_id,
+                lineage_id=lineage_id,
+                instruction=instruction,
+            )
+            for trace_id, instruction, lineage_id in pairs
+        ),
+        evidence=(),
+    )
+
+
+def _identical(left: str, right: str) -> float:
+    return 0.0 if left == right else 1.0
+
+
+def _mined(analysis: CorpusAnalysis, **overrides) -> TaskSet:
+    arguments = {"distance": _identical, "backend": "exact", "similarity": 0.9}
+    return mine_task_set(analysis, "analysis-duplicates", **{**arguments, **overrides})
+
+
+def test_the_same_request_from_two_sessions_never_straddles_the_split() -> None:
+    """The defect: a verifier drafted on one, then measured against the other."""
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", "refund order 7741", "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"monday", "tuesday"} <= side for side in sides)
+
+
+def test_a_source_declaring_no_lineage_at_all_still_holds_duplicates_together() -> None:
+    """The degenerate case: every trace its own group, so nothing was ever merged."""
+    analysis = _requests(*[(f"t{index}", "refund order 7741", None) for index in range(6)])
+
+    family = _mined(analysis).families[0]
+
+    assert not family.held_out_trace_ids
+    assert len(family.fit_trace_ids) == 6
+    assert any("repeats another request" in limit for limit in family.limitations)
+
+
+def test_different_requests_in_one_family_still_split() -> None:
+    """Grouping masks identifiers; sameness must not, or nothing is ever held out."""
+    analysis = _requests(
+        *[(f"t{index}", f"refund order {7741 + index}", None) for index in range(6)]
+    )
+
+    family = _mined(analysis, distance=lambda left, right: 0.0).families[0]
+
+    assert family.fit_trace_ids and family.held_out_trace_ids
+    assert family.duplicate_lineages == ()
+
+
+def test_an_exact_duplicate_is_recorded_as_evidence_rather_than_merged_silently() -> None:
+    analysis = _requests(
+        ("monday", "Refund order 7741.", "sess-a"),
+        ("tuesday", "refund  order 7741", "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    edge = next(item for item in family.duplicate_lineages)
+    assert (edge.left, edge.right) == ("sess-a", "sess-b")
+    assert edge.trace_ids == ("monday", "tuesday")
+    assert edge.basis == "identical_descriptor"
+    assert edge.similarity == 1.0
+
+
+def test_a_paraphrase_is_held_together_when_a_backend_can_measure_sameness() -> None:
+    """The half that needs embeddings: same request, different words."""
+    paraphrase = "please issue a refund for order 7741"
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", paraphrase, "sess-b"),
+        ("other-1", "refund order 9002", "sess-c"),
+        ("other-2", "refund order 9100", "sess-d"),
+    )
+
+    def near(left: str, right: str) -> float:
+        pair = {left, right}
+        return 0.02 if pair == {"refund order 7741", paraphrase} else 1.0
+
+    # Grouping puts all four in one family; only sameness separates them.
+    family = _mined(
+        analysis,
+        distance=lambda left, right: 0.0,
+        duplicate_distance=near,
+        duplicate_similarity=0.95,
+    ).families[0]
+
+    edge = next(item for item in family.duplicate_lineages)
+    assert edge.basis == "near_identical_descriptor"
+    assert edge.similarity == pytest.approx(0.98)
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"monday", "tuesday"} <= side for side in sides)
+
+
+def test_duplicate_evidence_is_transitive() -> None:
+    """A joined to B and B to C is one group, not two overlapping pairs."""
+    analysis = _requests(
+        ("a", "refund order 7741", "sess-a"),
+        ("b", "refund order 7741", "sess-b"),
+        ("c", "refund order 7741", "sess-c"),
+        ("d", "refund order 9002", "sess-d"),
+        ("e", "refund order 9100", "sess-e"),
+        ("f", "refund order 9200", "sess-f"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"a", "b", "c"} <= side for side in sides)
+
+
+def test_without_a_sameness_backend_only_identical_requests_are_held_together() -> None:
+    """The recorded threshold is what ran, not what was asked for."""
+    analysis = _requests(
+        ("monday", "refund order 7741", "sess-a"),
+        ("tuesday", "refund order 7741", "sess-b"),
+    )
+
+    task_set = _mined(analysis, duplicate_similarity=0.95)
+
+    assert task_set.clustering.duplicate_similarity == 1.0
+    assert task_set.families[0].duplicate_lineages
+
+
+def test_a_duplicate_threshold_looser_than_the_grouping_one_is_refused() -> None:
+    """Under it every member of a family is a retry of every other."""
+    with pytest.raises(ValidationError, match="at least as strict"):
+        ClusteringProvenance(
+            backend="embedding", similarity=0.6, neighbors=3, duplicate_similarity=0.5
+        )
+
+
+def test_a_duplicate_edge_records_its_groups_in_one_order() -> None:
+    with pytest.raises(ValidationError, match="sorted order"):
+        DuplicateEdge(
+            left="sess-b",
+            right="sess-a",
+            trace_ids=("t1", "t2"),
+            basis="identical_descriptor",
+            similarity=1.0,
+        )
+
+
+def test_a_declared_retry_chain_is_still_moved_whole() -> None:
+    """The behavior that already worked, and must survive the merge step."""
+    analysis = _requests(
+        ("retry-1", "refund order 7741", "sess-a"),
+        ("retry-2", "refund order 7742", "sess-a"),
+        ("other-1", "refund order 9002", "sess-b"),
+        ("other-2", "refund order 9100", "sess-c"),
+    )
+
+    family = _mined(analysis).families[0]
+
+    sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
+    assert any({"retry-1", "retry-2"} <= side for side in sides)
+
+
+def _corrected_case():
+    """Two families that each hold half of one lineage, on opposite sides.
+
+    The shape a reviewer produces by merging: family A put ``sess-a`` in fit,
+    family B put the same lineage in held-out, and neither was wrong on its own.
+    """
+    analysis = _requests(
+        ("a-fit", "refund order 7741", "sess-a"),
+        ("a-held", "refund order 9002", "sess-b"),
+        ("b-held", "refund order 7741", "sess-a"),
+        ("b-fit", "refund order 9100", "sess-c"),
+    )
+    left = TaskFamily(
+        family_id="fam-a",
+        descriptor="refund order <order_id>",
+        trace_ids=("a-fit", "a-held"),
+        medoid_trace_id="a-fit",
+        workload_mass=2,
+        fit_trace_ids=("a-fit",),
+        held_out_trace_ids=("a-held",),
+    )
+    right = TaskFamily(
+        family_id="fam-b",
+        descriptor="refund the order <order_id>",
+        trace_ids=("b-held", "b-fit"),
+        medoid_trace_id="b-fit",
+        workload_mass=2,
+        fit_trace_ids=("b-fit",),
+        held_out_trace_ids=("b-held",),
+    )
+    task_set = TaskSet(
+        corpus_id="corpus-duplicates",
+        analysis_id="analysis-duplicates",
+        families=(left, right),
+        selected=(),
+        total_workload_mass=4,
+        workload_coverage=1.0,
+        clustering=ClusteringProvenance(backend="exact", similarity=0.9, neighbors=3),
+    )
+    return task_set, analysis
+
+
+def test_merging_never_leaves_one_lineage_on_both_sides() -> None:
+    """The correction that reopened the leak this grouping closes."""
+    task_set, analysis = _corrected_case()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert not ({"a-fit", "b-held"} & fit and {"a-fit", "b-held"} & held)
+    assert any("both sides" in limit for limit in family.limitations)
+
+
+def test_a_duplicate_only_visible_once_merged_is_held_together() -> None:
+    """Two traces of one request in two families were never compared before."""
+    analysis = _requests(
+        ("a-fit", "refund order 7741", "sess-a"),
+        ("a-other", "refund order 9002", "sess-b"),
+        ("b-held", "refund order 7741", "sess-c"),
+        ("b-other", "refund order 9100", "sess-d"),
+    )
+    task_set, _ = _corrected_case()
+    task_set = task_set.replace(
+        families=(
+            task_set.families[0].replace(
+                trace_ids=("a-fit", "a-other"),
+                medoid_trace_id="a-fit",
+                fit_trace_ids=("a-fit",),
+                held_out_trace_ids=("a-other",),
+            ),
+            task_set.families[1].replace(
+                trace_ids=("b-held", "b-other"),
+                medoid_trace_id="b-other",
+                fit_trace_ids=("b-other",),
+                held_out_trace_ids=("b-held",),
+            ),
+        )
+    )
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    joined = {frozenset(edge.trace_ids) for edge in family.duplicate_lineages}
+    assert frozenset({"a-fit", "b-held"}) in joined
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert {"a-fit", "b-held"} <= fit or {"a-fit", "b-held"} <= held
+
+
+def test_merging_moves_only_the_lineages_that_were_in_conflict() -> None:
+    """A correction is not a re-mine; an untouched trace must not change sides."""
+    task_set, analysis = _corrected_case()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    # sess-b and sess-c never straddled, so they stay exactly where they were.
+    assert "a-held" in family.held_out_trace_ids
+    assert "b-fit" in family.fit_trace_ids
+
+
+def test_merging_keeps_the_duplicate_evidence_of_the_families_it_merged() -> None:
+    """Without it, nothing explains why two lineages are on one side."""
+    task_set, analysis = _corrected_case()
+    edge = DuplicateEdge(
+        left="sess-a",
+        right="sess-b",
+        trace_ids=("a-fit", "a-held"),
+        basis="near_identical_descriptor",
+        similarity=0.97,
+    )
+    task_set = task_set.replace(
+        families=(task_set.families[0].replace(duplicate_lineages=(edge,)), task_set.families[1])
+    )
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    assert edge in family.duplicate_lineages
+
+
+def test_merging_is_deterministic() -> None:
+    task_set, analysis = _corrected_case()
+
+    first = merge_families(task_set, ("fam-a", "fam-b"), analysis)
+    second = merge_families(task_set, ("fam-b", "fam-a"), analysis)
+
+    assert first.families[0].fit_trace_ids == second.families[0].fit_trace_ids
+    assert first.families[0].held_out_trace_ids == second.families[0].held_out_trace_ids
+
+
+def test_splitting_keeps_the_duplicate_evidence_that_still_applies(task_set, analysis) -> None:
+    """An edge belongs to a replacement only when both its groups are still in it."""
+    refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id), analysis)
+
+    restored = split_family(merged, refunds.family_id, analysis)
+
+    by_id = restored.family_by_id()
+    for family in by_id.values():
+        members = {
+            feature.lineage_group
+            for feature in _features(analysis)[0]
+            if feature.trace_id in set(family.trace_ids)
+        }
+        for edge in family.duplicate_lineages:
+            assert {edge.left, edge.right} <= members
+
+
+def _all_one_request() -> tuple[TaskSet, CorpusAnalysis]:
+    """Two families whose every trace is the same request under a different session."""
+    analysis = _requests(
+        ("a1", "refund order 7741", "sess-a"),
+        ("a2", "refund order 7741", "sess-b"),
+        ("b1", "refund order 7741", "sess-c"),
+        ("b2", "refund order 7741", "sess-d"),
+    )
+    left = TaskFamily(
+        family_id="fam-a",
+        descriptor="refund order <order_id>",
+        trace_ids=("a1", "a2"),
+        medoid_trace_id="a1",
+        workload_mass=2,
+        fit_trace_ids=("a1",),
+        held_out_trace_ids=("a2",),
+    )
+    right = TaskFamily(
+        family_id="fam-b",
+        descriptor="refund the order <order_id>",
+        trace_ids=("b1", "b2"),
+        medoid_trace_id="b1",
+        workload_mass=2,
+        fit_trace_ids=("b1",),
+        held_out_trace_ids=("b2",),
+    )
+    task_set = TaskSet(
+        corpus_id="corpus-duplicates",
+        analysis_id="analysis-duplicates",
+        families=(left, right),
+        selected=(),
+        total_workload_mass=4,
+        workload_coverage=1.0,
+        clustering=ClusteringProvenance(backend="exact", similarity=0.9, neighbors=3),
+    )
+    return task_set, analysis
+
+
+def test_a_merge_that_empties_a_side_says_so_rather_than_stopping_the_family_quietly() -> None:
+    """Every trace is one request, so there is genuinely nothing to hold out."""
+    task_set, analysis = _all_one_request()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    assert not family.held_out_trace_ids
+    assert any("no held-out side remains" in limit for limit in family.limitations)
+
+
+def test_a_repair_never_takes_the_fit_side_away_on_a_tie() -> None:
+    """A family with no fit side can draft nothing at all; one with no held-out can still draft."""
+    task_set, analysis = _all_one_request()
+
+    family = merge_families(task_set, ("fam-a", "fam-b"), analysis).families[0]
+
+    assert set(family.fit_trace_ids) == {"a1", "a2", "b1", "b2"}

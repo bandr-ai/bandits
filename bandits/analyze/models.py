@@ -270,6 +270,34 @@ class FamilyCoherence(Contract):
         return self.diameter > self.diameter_factor * self.link_threshold
 
 
+class DuplicateEdge(Contract):
+    """Two lineage groups held together because they answer the same request.
+
+    Kept as evidence rather than merged silently. A reviewer looking at a family
+    whose held-out side is smaller than they expected needs to see which pairs
+    were joined and on what basis, because a wrong merge costs measurement and a
+    missing one costs the meaning of the number that measurement produces.
+    """
+
+    left: str
+    right: str
+    """The two lineage groups, ordered so one edge has one representation."""
+
+    trace_ids: tuple[str, str]
+    """The pair of traces that evidenced it, one from each group."""
+
+    basis: Literal["identical_descriptor", "near_identical_descriptor"]
+    similarity: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def edge_joins_two_groups(self) -> DuplicateEdge:
+        if self.left == self.right:
+            raise ValueError("a duplicate edge joins two different lineage groups")
+        if self.left > self.right:
+            raise ValueError("a duplicate edge records its groups in sorted order")
+        return self
+
+
 class TaskFamily(Contract):
     """A group of episodes proposed as the same repeatable task."""
 
@@ -292,6 +320,14 @@ class TaskFamily(Contract):
     coherence: FamilyCoherence | None = None
     """How wide this family is, and against what it was judged. None before mining
     recorded it, or after a correction that could not recompute it."""
+    duplicate_lineages: tuple[DuplicateEdge, ...] = ()
+    """Lineage groups this family held together before splitting, and why.
+
+    Lineage ids are read from the source and never inferred, so two runs of one
+    request from different sessions arrive as independent groups. Splitting them
+    across the boundary would let a verifier drafted on one be measured against
+    the other, and held-out agreement would then be reporting memorisation.
+    """
 
     limitations: tuple[str, ...] = ()
 
@@ -335,12 +371,26 @@ class ClusteringProvenance(Contract):
 
     embedding_cache_id: str | None = None
 
+    duplicate_similarity: float = Field(default=1.0, ge=0, le=1)
+    """Above this, two descriptors were treated as the same request and their
+    lineage groups held to one side of the split. Deliberately far stricter than
+    ``similarity``: grouping asks whether two runs are the same kind of task,
+    this asks whether they are the same task. 1.0 records that only identical
+    descriptors were joined."""
+
     @model_validator(mode="after")
     def cached_vectors_name_their_model(self) -> ClusteringProvenance:
         if self.embedding_cache_id and not self.embedding_model:
             raise ValueError("an embedding cache id is meaningless without the model it pins")
         if not self.backend.strip():
             raise ValueError("clustering provenance must name the backend that grouped")
+        if self.duplicate_similarity < self.similarity:
+            # A duplicate bar looser than the grouping bar says every member of
+            # a family is a retry of every other, which collapses the family to
+            # one lineage group and leaves nothing to hold out.
+            raise ValueError(
+                "the duplicate threshold must be at least as strict as the grouping threshold"
+            )
         return self
 
 

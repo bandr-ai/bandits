@@ -11,6 +11,7 @@ from rich.table import Table
 
 from bandits.analyze import (
     DEFAULT_BUDGET,
+    DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
     DEFAULT_NEIGHBORS,
     analyze_corpus,
@@ -35,6 +36,7 @@ from bandits.analyze.embed import (
     descriptors,
     embedding_distance,
     load_cache,
+    requests,
     save_cache,
 )
 from bandits.export import (
@@ -240,7 +242,10 @@ def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[Embeddi
     nothing. Vectors from two models are never mixed — a cache pinned to another
     model is passed over rather than extended.
     """
-    wanted = descriptors(analysis)
+    # Both halves of what mining compares: masked descriptors for grouping, and
+    # requests with their identifiers intact for duplicate detection. Building
+    # only the first leaves every duplicate comparison reading maximally far.
+    wanted = descriptors(analysis) + requests(analysis)
     existing: EmbeddingCache | None = None
     reused_id = ""
     for envelope in store.list(kind="embeddings"):
@@ -370,6 +375,11 @@ def mine(
     neighbors: int = typer.Option(
         DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
     ),
+    duplicate_similarity: float = typer.Option(
+        DEFAULT_DUPLICATE_SIMILARITY,
+        "--duplicate-similarity",
+        help="Above this two requests are the same one, and never straddle the split.",
+    ),
     embedding_model: str = typer.Option(
         EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
     ),
@@ -399,6 +409,8 @@ def mine(
         similarity=similarity,
         neighbors=neighbors,
         distance=embedding_distance(cache),
+        duplicate_distance=embedding_distance(cache),
+        duplicate_similarity=duplicate_similarity,
         backend="embedding",
         embedding_model=embedding_model,
         embedding_cache_id=cache_id,
@@ -451,14 +463,17 @@ def merge_families_command(
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Record a reviewer's decision that several families are the same task."""
+    store = _derived(project)
     task_set = _load_task_set(task_set_id, project)
     try:
-        corrected = merge_families(task_set, tuple(family_ids))
-    except ValueError as exc:
+        corrected = merge_families(
+            task_set, tuple(family_ids), load_analysis(task_set.analysis_id, store)
+        )
+    except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    envelope = save_task_set(corrected, _derived(project))
+    envelope = save_task_set(corrected, store)
     _report(corrected, envelope.artifact_id)
 
 

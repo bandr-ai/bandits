@@ -8,8 +8,13 @@ from unittest import mock
 import pytest
 from typer.testing import CliRunner
 
-from bandits.analyze import load_analysis, load_task_set, save_task_set
-from bandits.analyze.embed import EmbeddingError
+from bandits.analyze import (
+    DEFAULT_DUPLICATE_SIMILARITY,
+    load_analysis,
+    load_task_set,
+    save_task_set,
+)
+from bandits.analyze.embed import EmbeddingError, descriptors, load_cache, requests
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -829,3 +834,16 @@ def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(
 
     assert result.exit_code == 0, result.stdout
     assert "records nothing about how it" in result.stdout
+
+
+def test_mine_embeds_the_requests_duplicate_detection_compares(tmp_path) -> None:
+    """Descriptors alone leave every sameness comparison reading maximally far."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(task_set_id, store)
+    cache = load_cache(task_set.clustering.embedding_cache_id, store)
+
+    analysis = load_analysis(task_set.analysis_id, store)
+    assert set(requests(analysis)) <= set(cache.vectors)
+    assert set(descriptors(analysis)) <= set(cache.vectors)
+    assert task_set.clustering.duplicate_similarity == DEFAULT_DUPLICATE_SIMILARITY

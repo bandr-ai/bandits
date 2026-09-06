@@ -21,6 +21,7 @@ from typing import Literal
 from bandits.analyze.models import (
     ClusteringProvenance,
     CorpusAnalysis,
+    DuplicateEdge,
     Evidence,
     EvidenceKind,
     FamilyCoherence,
@@ -70,6 +71,17 @@ _COHERENCE_INVALIDATED = (
     "coherence was not recomputed after this merge; the family is at least "
     "as wide as the widest it was built from"
 )
+DEFAULT_DUPLICATE_SIMILARITY = 0.95
+"""Above this, two descriptors are treated as the same request rather than as
+two runs of the same kind of task, and their lineage groups are held to one side
+of the split.
+
+Deliberately far stricter than the grouping threshold, and answering a different
+question. Grouping asks whether two runs belong to one family, which is a claim
+about what a verifier should cover. This asks whether one run is evidence about
+the other, which is a claim about whether measuring against it means anything.
+A value near the grouping threshold would collapse each family to a single
+lineage group and leave nothing to hold out."""
 
 _TAIL_SLOTS: tuple[SlotKind, ...] = (
     SlotKind.KNOWN_FAILURE,
@@ -149,6 +161,20 @@ def normalize_instruction(instruction: str) -> str:
     return " ".join(_NON_TOKEN.sub(" ", text).split())
 
 
+def normalize_request(instruction: str) -> str:
+    """Reduce an instruction to the shape it shares only with the same request.
+
+    The opposite end of :func:`normalize_instruction`, and deliberately so.
+    Grouping masks identifiers because that is what makes two runs recognizable
+    as one family; sameness cannot use the same reduction, because under it
+    "refund order 7741" and "refund order 8802" are one string, and treating
+    those as the same request would collapse a whole family into one lineage
+    group and leave nothing to hold out. Case and punctuation go; every
+    identifier stays exactly where it was.
+    """
+    return " ".join(_NON_TOKEN.sub(" ", instruction.lower()).split())
+
+
 def fingerprint(instruction: str) -> str:
     normalized = normalize_instruction(instruction)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
@@ -189,6 +215,7 @@ class _TraceFeatures:
         "lineage_id",
         "instruction",
         "normalized",
+        "request",
         "tools",
         "span_count",
         "has_failure",
@@ -210,6 +237,7 @@ class _TraceFeatures:
         self.lineage_id = lineage_id
         self.instruction = instruction
         self.normalized = normalize_instruction(instruction)
+        self.request = normalize_request(instruction)
         self.tools = tools
         self.span_count = span_count
         self.has_failure = has_failure
@@ -360,13 +388,112 @@ def _medoid(members: list[_TraceFeatures], distance: Distance) -> str:
     return representatives[winning_descriptor].trace_id
 
 
+def _duplicate_edges(
+    members: list[_TraceFeatures],
+    duplicate_distance: Distance | None,
+    duplicate_similarity: float,
+) -> list[DuplicateEdge]:
+    """Lineage groups that answer the same request and must not be separated.
+
+    Lineage ids are read from the source and never inferred, so a source that
+    declares none leaves every trace its own group. Two runs of one request from
+    different sessions then look independent, and the split may put one on each
+    side — after which a verifier drafted on the first is measured against the
+    second, and held-out agreement reports memorisation as generalisation.
+
+    Compared over requests, not over the masked descriptors grouping uses. Under
+    those, every refund in a family is one string, and every family would become
+    a single lineage group with nothing left to hold out.
+    """
+    by_request: dict[str, list[_TraceFeatures]] = {}
+    for feature in members:
+        by_request.setdefault(feature.request, []).append(feature)
+
+    edges: list[DuplicateEdge] = []
+
+    def join(left: _TraceFeatures, right: _TraceFeatures, basis: str, similarity: float) -> None:
+        if left.lineage_group == right.lineage_group:
+            return
+        first, second = sorted((left, right), key=lambda item: item.lineage_group)
+        edges.append(
+            DuplicateEdge(
+                left=first.lineage_group,
+                right=second.lineage_group,
+                trace_ids=(first.trace_id, second.trace_id),
+                basis=basis,  # type: ignore[arg-type]
+                similarity=similarity,
+            )
+        )
+
+    # Identical text, which needs no backend and catches the case the whole
+    # defect is about: the same request typed twice on different days.
+    for request in sorted(by_request):
+        group = sorted(by_request[request], key=lambda item: item.trace_id)
+        # A star rather than every pair: union-find needs one edge per member to
+        # reach the same component, and n(n-1)/2 identical edges only bury the
+        # evidence a reviewer is meant to read.
+        for other in group[1:]:
+            join(group[0], other, "identical_descriptor", 1.0)
+
+    if duplicate_distance is None or duplicate_similarity >= 1:
+        return edges
+
+    requests = sorted(by_request)
+    representative = {
+        request: min(group, key=lambda item: item.trace_id) for request, group in by_request.items()
+    }
+    for index, left in enumerate(requests):
+        for right in requests[index + 1 :]:
+            similarity = 1.0 - duplicate_distance(left, right)
+            if similarity >= duplicate_similarity:
+                join(
+                    representative[left],
+                    representative[right],
+                    "near_identical_descriptor",
+                    similarity,
+                )
+    return edges
+
+
+def _merge_lineages(edges: list[DuplicateEdge]) -> dict[str, str]:
+    """Union-find over duplicate edges: every joined group maps to one name.
+
+    The smallest key in a component wins, so the merged name is a real lineage
+    group and the same components come out under the same names on every run.
+    """
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    for edge in edges:
+        left, right = find(edge.left), find(edge.right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+    return {key: find(key) for key in parent}
+
+
 def _split_by_lineage(
-    members: list[_TraceFeatures], family_id: str, held_out: float
+    members: list[_TraceFeatures],
+    family_id: str,
+    held_out: float,
+    merged: dict[str, str] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Partition whole lineage groups, never individual traces."""
+    """Partition whole lineage groups, never individual traces.
+
+    ``merged`` renames groups duplicate evidence held together, so a component
+    of them moves as one thing exactly as a declared retry chain does.
+    """
+    merged = merged or {}
     groups: dict[str, list[str]] = {}
     for feature in members:
-        groups.setdefault(feature.lineage_group, []).append(feature.trace_id)
+        groups.setdefault(merged.get(feature.lineage_group, feature.lineage_group), []).append(
+            feature.trace_id
+        )
 
     target = int(round(held_out * len(members)))
     ordered = sorted(groups, key=lambda key: (_stable_fraction(family_id, key), key))
@@ -452,6 +579,8 @@ def mine_task_set(
     budget: int = DEFAULT_BUDGET,
     held_out: float = DEFAULT_HELD_OUT,
     neighbors: int = DEFAULT_NEIGHBORS,
+    duplicate_distance: Distance | None = None,
+    duplicate_similarity: float = DEFAULT_DUPLICATE_SIMILARITY,
     tail_reserve: float = DEFAULT_TAIL_RESERVE,
     diameter_factor: float = DEFAULT_DIAMETER_FACTOR,
     proposed_by: Literal["rule", "model", "human"] = "rule",
@@ -463,6 +592,13 @@ def mine_task_set(
     guessing at what grouped the corpus and recording the guess as provenance.
     The thresholds are read back off the arguments actually applied, so an
     omitted flag records the default that ran and not ``None``.
+
+    ``duplicate_distance`` measures sameness between whole requests, and is a
+    separate callable from ``distance`` because the two compare different text:
+    grouping compares descriptors with their identifiers masked out, and under
+    those every refund in a family reads as the same request. Without it only
+    identical requests are held together, which is what the resolved
+    ``duplicate_similarity`` on the artifact then records.
     """
     features, ungroupable = _features(analysis)
     total_mass = len(analysis.tasks)
@@ -475,6 +611,10 @@ def mine_task_set(
         raise ValueError(f"similarity must be between 0 and 1, got {similarity}")
     if diameter_factor <= 0:
         raise ValueError(f"diameter_factor must be positive, got {diameter_factor}")
+    # What was actually applied, not what was asked for: with no backend to
+    # measure sameness, only identical requests were held together, and a
+    # recorded 0.95 would describe a comparison that never ran.
+    resolved_duplicate_similarity = duplicate_similarity if duplicate_distance is not None else 1.0
     clusters = _cluster(features, similarity, neighbors, distance)
     families: list[TaskFamily] = []
     family_of: dict[str, str] = {}
@@ -482,7 +622,11 @@ def mine_task_set(
     for members in sorted(clusters, key=lambda c: (-len(c), c[0].trace_id)):
         descriptor = Counter(f.normalized for f in members).most_common(1)[0][0]
         family_id = f"family-{fingerprint(descriptor)}"
-        fit, held = _split_by_lineage(members, family_id, held_out)
+        # Duplicates are unioned before the split, never after: the split is the
+        # step that would separate them, and afterwards there is nothing left to
+        # fix without moving a trace across the boundary.
+        edges = _duplicate_edges(members, duplicate_distance, resolved_duplicate_similarity)
+        fit, held = _split_by_lineage(members, family_id, held_out, _merge_lineages(edges))
 
         limitations: list[str] = []
         span, left, right = _diameter(members, distance)
@@ -504,15 +648,26 @@ def mine_task_set(
                 f"single link: {left!r} vs {right!r}; mutual-kNN bounds each edge "
                 "but not the span of the component, so check these are one task"
             )
-        if not held and len(members) > 1:
+        if not held and len(members) > 1 and edges:
+            limitations.append(
+                "every trace in this family repeats another request; no held-out split "
+                "is possible without measuring a verifier against a run it was drafted from"
+            )
+        elif not held and len(members) > 1:
             limitations.append(
                 "every trace shares one lineage group; no held-out split is possible "
                 "without splitting a retry chain"
             )
-        if all(f.lineage_id is None for f in members):
+        if all(f.lineage_id is None for f in members) and not edges:
             limitations.append(
                 "no trace declares a lineage id; each is treated as independent, "
                 "which the source does not actually prove"
+            )
+        elif all(f.lineage_id is None for f in members):
+            limitations.append(
+                f"no trace declares a lineage id; {len(edges)} pair(s) were held together "
+                "on descriptor evidence alone, and any remaining duplicate the descriptors "
+                "do not show is still treated as independent"
             )
 
         families.append(
@@ -526,6 +681,7 @@ def mine_task_set(
                 held_out_trace_ids=held,
                 proposed_by=proposed_by,
                 coherence=coherence,
+                duplicate_lineages=tuple(edges),
                 limitations=tuple(limitations),
             )
         )
@@ -625,6 +781,7 @@ def mine_task_set(
             neighbors=neighbors,
             embedding_model=embedding_model,
             embedding_cache_id=embedding_cache_id,
+            duplicate_similarity=resolved_duplicate_similarity,
         ),
         families=tuple(families),
         selected=tuple(selected),
@@ -636,8 +793,56 @@ def mine_task_set(
     )
 
 
-def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
-    """Combine families a reviewer says are one task. Recorded as a human correction."""
+def _repair_straddles(
+    members: list[_TraceFeatures],
+    fit: set[str],
+    held: set[str],
+    merged: dict[str, str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Move whole components off the boundary, leaving everything else where it is.
+
+    A correction is not a re-mine. Redrawing the split from scratch would move
+    traces that were never in conflict, and a verifier already drafted against
+    the old fit side would silently be measuring against runs it had seen. So
+    only a component actually sitting on both sides is moved, and it is moved
+    whole — which is the same rule :func:`_split_by_lineage` follows.
+
+    The larger side wins, so the fewest traces move. An even split goes to fit,
+    which is what :func:`_split_by_lineage` does with a group too big for the
+    held-out target, and which fails in the less damaging direction: a family
+    with no fit side can draft no verifier at all, while one with no held-out
+    side can still draft and simply cannot validate.
+    """
+    grouped: dict[str, set[str]] = {}
+    for feature in members:
+        key = merged.get(feature.lineage_group, feature.lineage_group)
+        grouped.setdefault(key, set()).add(feature.trace_id)
+
+    moved: list[str] = []
+    for key in sorted(grouped):
+        traces = grouped[key]
+        in_fit, in_held = traces & fit, traces & held
+        if not in_fit or not in_held:
+            continue
+        to_fit = len(in_fit) >= len(in_held)
+        target, other = (fit, held) if to_fit else (held, fit)
+        target |= traces
+        other -= traces
+        moved.append(key)
+    return tuple(sorted(fit)), tuple(sorted(held)), tuple(moved)
+
+
+def merge_families(
+    task_set: TaskSet, family_ids: tuple[str, ...], analysis: CorpusAnalysis
+) -> TaskSet:
+    """Combine families a reviewer says are one task. Recorded as a human correction.
+
+    ``analysis`` is required because a family records which traces it holds and
+    which side each is on, but never which lineage they belong to. Unioning two
+    families' splits without it puts one lineage on both sides whenever the two
+    disagreed about which side it belonged on — reopening exactly the leak
+    grouping closes, through an ordinary reviewer action.
+    """
     known = task_set.family_by_id()
     unknown = [fid for fid in family_ids if fid not in known]
     if unknown:
@@ -649,30 +854,64 @@ def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
     trace_ids = tuple(sorted({tid for f in merged_from for tid in f.trace_ids}))
     survivor = max(merged_from, key=lambda f: (f.workload_mass, f.family_id))
 
+    features, _ = _features(analysis)
+    members = [f for f in features if f.trace_id in set(trace_ids)]
+    # The edges each family already carried, plus any that only become visible
+    # now these members sit together: two traces of one request in two families
+    # were never compared before. Exact evidence only — the sameness backend is
+    # a mining argument and is not available to a correction.
+    inherited = {edge for f in merged_from for edge in f.duplicate_lineages}
+    edges = sorted(
+        inherited | set(_duplicate_edges(members, None, 1.0)),
+        key=lambda edge: (edge.left, edge.right, edge.trace_ids),
+    )
+    fit, held, moved = _repair_straddles(
+        members,
+        {t for f in merged_from for t in f.fit_trace_ids},
+        {t for f in merged_from for t in f.held_out_trace_ids},
+        _merge_lineages(edges),
+    )
+
+    limitations = {limit for f in merged_from for limit in f.limitations}
+    if moved:
+        limitations.add(
+            f"{len(moved)} lineage group(s) sat on both sides of the merged split and were "
+            "moved whole to one side; a verifier measured against the old partition should "
+            "be revalidated"
+        )
+    # A side emptied by the repair is the honest answer for a family whose
+    # traces are all one request — there is genuinely nothing independent to
+    # measure against — but it stops the family dead, so it is said outright
+    # rather than left to be discovered as an export drawing no rows.
+    if not held and len(trace_ids) > 1:
+        limitations.add(
+            "no held-out side remains after the merge; every lineage in this family "
+            "repeats another, so a verifier drafted here cannot be validated against it"
+        )
+    if not fit and len(trace_ids) > 1:
+        limitations.add(
+            "no fit side remains after the merge; there is nothing left in this family "
+            "to draft a verifier from"
+        )
+
     merged = TaskFamily(
         family_id=survivor.family_id,
         descriptor=survivor.descriptor,
         trace_ids=trace_ids,
         medoid_trace_id=survivor.medoid_trace_id,
         workload_mass=len(trace_ids),
-        # The split is rebuilt from the union rather than concatenated, so a
-        # lineage group present in two merged families cannot end up on both sides.
-        fit_trace_ids=tuple(sorted({t for f in merged_from for t in f.fit_trace_ids})),
-        held_out_trace_ids=tuple(sorted({t for f in merged_from for t in f.held_out_trace_ids})),
+        fit_trace_ids=fit,
+        held_out_trace_ids=held,
         proposed_by="human",
         review_status="merged",
         # Deliberately dropped: the merged family is wider than either input, and
         # recomputing needs the distance function that grouped them, which a
         # correction does not have. A stale narrower figure would understate it.
         coherence=None,
+        duplicate_lineages=tuple(edges),
         limitations=(
             *sorted(
-                {
-                    limit
-                    for family in merged_from
-                    for limit in family.limitations
-                    if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
-                }
+                limit for limit in limitations if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
             ),
             _COHERENCE_INVALIDATED,
         ),
@@ -707,6 +946,14 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
         raise ValueError(f"family {family_id} holds one distinct instruction; nothing to split")
 
     held_out_ids = set(target.held_out_trace_ids)
+    # An edge belongs to a replacement only when both lineage groups it joins
+    # are still in it. Dropping them all instead left a reviewer unable to see
+    # why two lineages had been held together, which is the record the merge
+    # was supposed to leave behind.
+    groups_of = {
+        descriptor: {feature.lineage_group for feature in group}
+        for descriptor, group in groups.items()
+    }
     replacements = [
         TaskFamily(
             family_id=f"family-{fingerprint(descriptor)}",
@@ -732,6 +979,11 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
             # parent's measurement would overstate it; there is no distance
             # function here to recompute one with.
             coherence=None,
+            duplicate_lineages=tuple(
+                edge
+                for edge in target.duplicate_lineages
+                if {edge.left, edge.right} <= groups_of[descriptor]
+            ),
             limitations=tuple(
                 limit for limit in target.limitations if not limit.startswith("widest pair")
             ),
