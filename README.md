@@ -171,6 +171,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `analyze` | Extract task candidates and outcome evidence |
 | `mine` / `families` | Group tasks, split lineages, and select representative runs |
 | `merge-families` / `split-family` | Record human corrections to proposed groupings |
+| `audit-families` | Advisory model read of family coherence; proposes splits only |
 | `draft-verifier` | Propose deterministic checks and replay them on history |
 | `interview-verifier` | Refine a draft through a bounded owner interview |
 | `label` | Label disagreements and the remaining family runs |
@@ -201,6 +202,16 @@ uv sync --extra dev
 uv run ruff check .
 uv run pytest --cov=bandits --cov-report=term-missing
 ```
+
+The family coherence audit is an optional extra, since it pulls a REPL sandbox
+and reaches a model:
+
+```bash
+uv sync --extra audit
+```
+
+The test suite injects a predictor instead of calling one, so neither the extra
+nor a credential is needed to run it.
 
 The test suite exercises ingestion fidelity, redaction, content-addressed storage, task mining, verifier execution and validation, model-judge behavior, and both verifier-gated export formats.
 

@@ -21,6 +21,16 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
+from bandits.analyze.audit import (
+    DEFAULT_MODEL as AUDIT_MODEL,
+)
+from bandits.analyze.audit import (
+    AuditError,
+    audit_task_set,
+    build_predictor,
+    load_audit_run,
+    save_audit_run,
+)
 from bandits.analyze.embed import (
     DEFAULT_MODEL as EMBEDDING_MODEL,
 )
@@ -334,6 +344,90 @@ def _report(task_set, envelope_id: str) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
+def _report_audit(run, run_id: str, task_set) -> None:
+    """Advisory findings, kept visibly separate from what mining decided.
+
+    The audit never changed the grouping printed above it, so it reads as a
+    second opinion pointing at `split-family`, not as a result.
+    """
+    console.print(f"\naudit_id:    {run_id} ({run.model})")
+    if not run.audits and not run.skipped:
+        console.print("[dim]no families were eligible for audit[/dim]")
+        return
+
+    coherence_of = {f.family_id: f.coherence for f in task_set.families}
+    table = Table("family_id", "semantic", "geometric", "outliers", "proposed split")
+    for audit in sorted(run.audits, key=lambda a: (a.coherent, a.family_id)):
+        measured = coherence_of.get(audit.family_id)
+        # Printed beside each other and never reconciled: one read the
+        # instructions, the other measured embedding distance. Where they
+        # disagree is the finding, not a conflict to resolve here.
+        geometric = (
+            "[dim]not measured[/dim]"
+            if measured is None
+            else ("[yellow]over-merged[/yellow]" if measured.over_merged else "within threshold")
+        )
+        table.add_row(
+            audit.family_id,
+            "coherent" if audit.coherent else "[yellow]incoherent[/yellow]",
+            geometric,
+            str(len(audit.outlier_trace_ids)),
+            " | ".join(str(len(g)) for g in audit.proposed_subgroups) or "-",
+        )
+    if run.audits:
+        console.print(table)
+
+    # Names go under the table rather than in it: a generated name is prose and
+    # a column narrow enough to fit beside five others would truncate the one
+    # thing that made it worth generating.
+    for audit in sorted(run.audits, key=lambda a: a.family_id):
+        if audit.generated_name:
+            console.print(
+                f"[dim]name[/dim] {audit.family_id}: {audit.generated_name}",
+                overflow="ignore",
+                crop=False,
+                soft_wrap=True,
+            )
+
+    for audit in run.incoherent():
+        console.print(f"\n[yellow]incoherent[/yellow] {audit.family_id}: {audit.rationale}")
+        if audit.outlier_trace_ids:
+            console.print(f"  outliers: {', '.join(audit.outlier_trace_ids)}")
+        if audit.proposed_subgroups:
+            # The audit proposes; `split-family` is what actually splits, and it
+            # splits deterministically by exact instruction rather than by this.
+            console.print(
+                f"  to act on this: bandits split-family {run.task_set_id} {audit.family_id}",
+                # A wrapped command cannot be copied and run; ids are long
+                # enough that a narrow terminal would break every one of them.
+                overflow="ignore",
+                crop=False,
+                soft_wrap=True,
+            )
+
+    for skip in run.skipped:
+        console.print(f"[dim]skipped[/dim] {skip.family_id}: {skip.reason}")
+    for limitation in run.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+def _run_audit(task_set, task_set_id: str, analysis, store, *, model: str, family_ids=None):
+    """Audit a task set and persist the result beside it. Never rewrites it."""
+    predict = build_predictor(model=model)
+    run = audit_task_set(
+        task_set,
+        task_set_id,
+        analysis,
+        predict=predict,
+        model=model,
+        family_ids=family_ids,
+        on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
+    )
+    envelope = save_audit_run(run, store)
+    _report_audit(run, envelope.artifact_id, task_set)
+    return run
+
+
 @app.command()
 def mine(
     analysis_id: str,
@@ -350,6 +444,12 @@ def mine(
     embedding_model: str = typer.Option(
         EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
     ),
+    audit: bool = typer.Option(
+        True,
+        "--audit/--no-audit",
+        help="Run the advisory family coherence audit. Never changes grouping.",
+    ),
+    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Group an analysis into task families and select a representative set."""
@@ -381,6 +481,18 @@ def mine(
     envelope = save_task_set(task_set, store)
     _report(task_set, envelope.artifact_id)
     console.print(f"embeddings:  {cache_id} ({len(cache.vectors)} vectors, {embedding_model})")
+
+    if not audit:
+        return
+    try:
+        # Written as its own artifact parented to the task set just saved. The
+        # task set is already persisted and is not touched again, so mining is
+        # byte-identical whether or not this pass runs.
+        _run_audit(task_set, envelope.artifact_id, analysis, store, model=audit_model)
+    except AuditError as exc:
+        # The grouping above is complete and saved. An audit that could not run
+        # is a missing second opinion, not a failed mine.
+        console.print(f"[yellow]audit skipped:[/yellow] {exc}")
 
 
 @app.command()
@@ -416,6 +528,54 @@ def families(
     console.print(table)
     for limitation in found.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="audit-families")
+def audit_families_command(
+    task_set_id: str,
+    family: list[str] = typer.Option(
+        None, "--family", help="Audit only these families. Repeatable."
+    ),
+    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
+    show: str = typer.Option(
+        None, "--show", help="Print a saved audit by id instead of running a new one."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Read each family with a model and report whether it holds together.
+
+    Advisory only: proposes splits for a reviewer to apply and never changes
+    grouping, merges families, or touches clustering parameters.
+    """
+    store = _derived(project)
+    task_set = _load_task_set(task_set_id, project)
+
+    if show is not None:
+        try:
+            _report_audit(load_audit_run(show, store), show, task_set)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no audit {show!r}")
+            raise typer.Exit(code=1) from exc
+        return
+
+    try:
+        analysis = load_analysis(task_set.analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no analysis {task_set.analysis_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        _run_audit(
+            task_set,
+            task_set_id,
+            analysis,
+            store,
+            model=audit_model,
+            family_ids=tuple(family) if family else None,
+        )
+    except (AuditError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command(name="merge-families")
