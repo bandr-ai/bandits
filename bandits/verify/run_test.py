@@ -23,11 +23,17 @@ from bandits.verify.models import (
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
+def _test_distance(left: str, right: str) -> float:
+    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
+
+
 @pytest.fixture
 def context():
     corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
     analysis = analyze_corpus(corpus)
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
     family = max(task_set.families, key=lambda f: f.workload_mass)
     return analysis, task_set, family
 

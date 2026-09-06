@@ -19,10 +19,16 @@ from bandits.verify import (
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
+def _test_distance(left: str, right: str) -> float:
+    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
+
+
 def _task_set(path: Path):
     analysis = analyze_corpus(load_corpus(path, "otlp"))
     analysis_id = compute_analysis_id(analysis)
-    return analysis, mine_task_set(analysis, analysis_id, budget=10)
+    return analysis, mine_task_set(
+        analysis, analysis_id, distance=_test_distance, similarity=0.7, budget=10
+    )
 
 
 def test_coding_family_proposes_exit_code_check() -> None:
@@ -97,7 +103,9 @@ def test_exact_output_is_proposed_only_when_the_instruction_requires_exact_text(
         ),
     )
     analysis = analyze_corpus(corpus)
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=1)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=1
+    )
 
     draft = draft_verifiers(task_set, "taskset-test", analysis, task_set.families[0].family_id)
 
@@ -120,7 +128,9 @@ def test_a_recorded_evaluator_score_becomes_a_check(tmp_path) -> None:
         + "\n"
     )
     analysis = analyze_corpus(load_corpus(source, "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=5)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=5
+    )
     family = task_set.families[0]
 
     draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id)
@@ -143,7 +153,9 @@ def test_stronger_evidence_survives_the_draft_limit(tmp_path) -> None:
         ' "gen_ai.tool.call.arguments": {}, "gen_ai.tool.call.result": {"exit_code": 0}}}\n'
     )
     analysis = analyze_corpus(load_corpus(source, "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=5)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=5
+    )
 
     draft = draft_verifiers(task_set, "ts-1", analysis, task_set.families[0].family_id, limit=1)
 
@@ -178,7 +190,9 @@ def _varying_amounts(tmp_path) -> Path:
 
 def _drafted(path, limit: int = 8):
     analysis = analyze_corpus(load_corpus(path, "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=5)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=5
+    )
     return draft_verifiers(task_set, "ts-1", analysis, task_set.families[0].family_id, limit=limit)
 
 
@@ -208,7 +222,9 @@ def test_competing_values_for_one_field_are_both_drafted() -> None:
     """Two hypotheses for what success looks like is the question worth asking."""
     fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
     analysis = analyze_corpus(load_corpus(fixtures / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
     address = next(f for f in task_set.families if "address" in f.descriptor)
 
     draft = draft_verifiers(task_set, "ts-1", analysis, address.family_id, limit=6)
