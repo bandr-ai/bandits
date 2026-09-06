@@ -9,6 +9,7 @@ verifier, drafted and then argued with — not for a reader of spans.
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Any
 
 from bandits.analyze.models import Evidence, EvidenceKind, Visibility, evidence_id
@@ -128,12 +129,17 @@ def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
         if depth >= _MAX_DEPTH:
             truncated = truncated or bool(node)
             return
-        for key, value in sorted(node.items(), key=lambda pair: str(pair[0])):
-            if len(fields) >= _MAX_FIELDS:
-                # Stop walking, not just stop emitting: a result with a very
-                # large map should not cost a full traversal per span.
-                truncated = True
-                return
+        # Bounded before it is sorted, not after. A result carrying a million
+        # keys would otherwise cost a full materialize-and-sort per span to
+        # produce sixty-four fields. The slice is taken in the order the source
+        # wrote them, which a parsed document preserves, so the same bytes
+        # always yield the same fields.
+        budget = _MAX_FIELDS - len(fields) + 1
+        children = list(islice(node.items(), budget))
+        if len(children) == budget:
+            truncated = True
+            children = children[:-1]
+        for key, value in sorted(children, key=lambda pair: str(pair[0])):
             walk(value, _path(prefix, str(key)), depth + 1)
 
     walk(payload, "", 0)

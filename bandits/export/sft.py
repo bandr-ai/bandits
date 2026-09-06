@@ -101,7 +101,17 @@ def build_transcript(
 
     defects: list[str] = []
     warnings: list[str] = []
-    turns = trace.user_turns or (UserTurn(text=trace.task if trace.task is not None else ""),)
+    if trace.user_turns:
+        turns: tuple[UserTurn, ...] = trace.user_turns
+    elif trace.task is not None:
+        turns = (UserTurn(text=trace.task),)
+    else:
+        # No recorded instruction and no turns to fall back on. An empty user
+        # message here would be a turn this episode never had, and a fabricated
+        # prompt is worse than a refused row.
+        turns = ()
+        defects.append("trace records no user instruction")
+
     anchored: dict[str | None, list[UserTurn]] = {}
     for turn in turns:
         anchored.setdefault(turn.after_span_id, []).append(turn)
@@ -110,15 +120,34 @@ def build_transcript(
     )
     if unplaceable:
         defects.append("a recorded user turn does not sit anywhere in the trajectory")
+
+    # Turns are replayed in span order, so anchors that run backwards would come
+    # out reordered — the transcript would show the user saying things in an
+    # order they never said them in. Refused rather than silently rearranged.
+    order = {span.span_id: index for index, span in enumerate(trace.spans)}
+    positions = [
+        order.get(turn.after_span_id, -1)
+        for turn in turns
+        if turn.after_span_id in by_id or turn.after_span_id is None
+    ]
+    if any(later < earlier for earlier, later in zip(positions, positions[1:], strict=False)):
+        defects.append("recorded user turns do not run forwards through the trajectory")
     if trace.unrepresented_user_turns:
         defects.append(
             f"the source recorded {trace.unrepresented_user_turns} user turn(s) this "
             "trace does not represent"
         )
 
-    messages: list[TrainingMessage] = [
+    messages: list[TrainingMessage] = []
+    if trace.system_prompt:
+        # The instructions the episode ran under, where the source recorded
+        # them. A row that omits them teaches behavior as if it were
+        # unconditional, when it was a response to a policy the next run may
+        # not be given.
+        messages.append(TrainingMessage(role="system", content=trace.system_prompt))
+    messages.extend(
         TrainingMessage(role="user", content=turn.text) for turn in anchored.get(None, ())
-    ]
+    )
     open_text_span: str | None = None
     """The span behind the last message, when that message is assistant text."""
 
@@ -357,6 +386,11 @@ def build_sft_export(
             SFTExample(
                 example_id=f"sft-{digest}",
                 messages=messages,
+                tools=(
+                    tuple(tool.model_dump(mode="json") for tool in trace.tools_available)
+                    if trace.tools_available is not None
+                    else None
+                ),
                 generating_policy=generating_policy(trace),  # type: ignore[arg-type]
                 warnings=warnings,
                 corpus_id=task_set.corpus_id,

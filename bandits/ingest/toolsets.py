@@ -39,10 +39,14 @@ def _one(declared: Any) -> ToolSchema | None:
 def parse_toolset(declared: Any) -> tuple[ToolSchema, ...] | None:
     """Normalize a declared toolset, or return None when there is nothing to read.
 
-    A declaration that is present but holds no readable tool still returns None:
-    'the source said the agent had no tools' is a claim no export actually makes,
-    and reading it as one would turn an unreadable field into a fact.
+    An explicitly empty list is a declaration and comes back as ``()``: a source
+    that says the agent was offered nothing has said something, and the canonical
+    type can carry it. A declaration holding only entries this cannot read comes
+    back as None, because reading an unreadable field as an empty toolset would
+    turn a parsing gap into a fact.
     """
+    if isinstance(declared, (list, tuple)) and not declared:
+        return ()
     if isinstance(declared, str):
         # OTLP attributes are typed, so an exporter with a list to record often
         # serializes it. The JSON is the declaration; refusing to parse it would

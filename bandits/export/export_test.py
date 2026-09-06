@@ -27,7 +27,7 @@ from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, UserTurn
+from bandits.traces import Span, SpanKind, SpanStatus, ToolSchema, Trace, TraceCorpus, UserTurn
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
@@ -414,6 +414,103 @@ def test_a_lost_user_turn_reaches_the_unresolved_output() -> None:
     rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
     assert any("does not represent" in reason for reason in rejected.reasons)
     assert not any(row.trace_id == "good-1" for row in bundle.rows)
+
+
+def test_start_context_reaches_the_exported_row() -> None:
+    """A row showing a call teaches the call; the choice needs what was on offer."""
+    tools = (ToolSchema(name="change_order", parameters={"type": "object"}),)
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(
+                system_prompt="You are a support agent.", tools_available=tools
+            ),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    assert row.messages[0].role == "system"
+    assert row.messages[0].content == "You are a support agent."
+    assert row.messages[1].role == "user"
+    assert row.tools == (
+        {"name": "change_order", "description": None, "parameters": {"type": "object"}},
+    )
+    assert row.jsonl_row()["messages"][0]["role"] == "system"
+
+
+def test_a_row_without_a_declared_toolset_says_unknown_rather_than_none_offered() -> None:
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed"),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    assert next(item for item in bundle.rows if item.trace_id == "good-1").tools is None
+
+
+def test_a_trace_with_no_instruction_is_refused_rather_than_given_a_blank_turn() -> None:
+    """A blank opening message is a turn the episode never had."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(task=None),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("no user instruction" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
+
+
+def test_user_turns_that_run_backwards_are_refused_not_reordered() -> None:
+    """Replay follows span order, so a backwards anchor would rewrite the conversation."""
+    trace = _trace("good-1", 100, "changed")
+    reversed_turns = trace.replace(
+        user_turns=(
+            UserTurn(text="second thought", after_span_id=trace.spans[-1].span_id),
+            UserTurn(text="do it", after_span_id=trace.spans[0].span_id),
+        )
+    )
+
+    _, defects, _ = build_transcript(reversed_turns)
+
+    assert any("do not run forwards" in defect for defect in defects)
+
+
+def test_an_export_refuses_a_session_whose_user_turn_was_not_text(tmp_path) -> None:
+    """End to end from a real session log, not a hand-built trace."""
+    path = tmp_path / "image.jsonl"
+    path.write_text(
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"change order 100"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"tool_use","id":"tu-1","name":"change_order",'
+        '"input":{"order_id":100}}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"tu-1","content":'
+        '"{\\"status\\": \\"changed\\", \\"order_id\\": 100}"}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user",'
+        '"content":[{"type":"image","source":{"data":"..."}}]}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+    trace = load_claude_code(path).traces[0].replace(trace_id="good-1", source="otlp")
+
+    _, defects, _ = build_transcript(trace)
+
+    assert any("does not represent" in defect for defect in defects)
 
 
 def test_a_user_turn_anchored_to_no_span_is_refused() -> None:

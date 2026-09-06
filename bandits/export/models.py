@@ -62,7 +62,7 @@ class TrainingMessage(Contract):
     recorded there is on the wrong side of the loss and teaches nothing.
     """
 
-    role: Literal["user", "assistant", "tool"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
     name: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
@@ -70,6 +70,8 @@ class TrainingMessage(Contract):
 
     @model_validator(mode="after")
     def shape_matches_role(self) -> TrainingMessage:
+        if self.role == "system" and not self.content:
+            raise ValueError("a system message requires the instruction it carries")
         if self.tool_calls and self.role != "assistant":
             raise ValueError("only an assistant message may announce tool calls")
         if self.role == "tool" and not self.tool_call_id:
@@ -107,6 +109,13 @@ class TrainingMessage(Contract):
 class EvalCase(Contract):
     case_id: str
     instruction: str
+    system_prompt: str | None = None
+    """The system instruction the recorded episode ran under, when recorded."""
+
+    tools: tuple[dict[str, Any], ...] | None = None
+    """The toolset the recorded episode was offered. None means the source did
+    not declare one, so a harness replaying this case cannot reproduce it."""
+
     grader: dict[str, Any]
     corpus_id: str
     task_set_id: str
@@ -122,6 +131,15 @@ class EvalCase(Contract):
 class SFTExample(Contract):
     example_id: str
     messages: tuple[TrainingMessage, ...]
+    tools: tuple[dict[str, Any], ...] | None = None
+    """The toolset the episode was offered, when its source declared one.
+
+    A row showing a call teaches the call's shape; which tool to reach for, out
+    of what was on offer, is the decision behind it, and without the schemas the
+    row may not be reproducible against a harness at all. None means the source
+    declared no toolset — never that the agent had none.
+    """
+
     generating_policy: dict[str, Any]
     warnings: tuple[str, ...] = ()
     """What is imperfect about this demonstration, carried rather than hidden.
@@ -139,9 +157,19 @@ class SFTExample(Contract):
 
     @model_validator(mode="after")
     def has_prompt_and_target(self) -> SFTExample:
-        if not self.messages or self.messages[0].role != "user":
+        # A system instruction may come first, and only first: a row whose
+        # instructions arrive after the agent has already acted describes a run
+        # nobody had.
+        body = (
+            self.messages[1:]
+            if self.messages[:1] and self.messages[0].role == "system"
+            else self.messages
+        )
+        if any(message.role == "system" for message in body):
+            raise ValueError("a system message may only open an SFT example")
+        if not body or body[0].role != "user":
             raise ValueError("an SFT example must begin with a user message")
-        if not any(message.role == "assistant" for message in self.messages[1:]):
+        if not any(message.role == "assistant" for message in body[1:]):
             raise ValueError("an SFT example requires an assistant target")
         if not self.generating_policy.get("models"):
             raise ValueError("an SFT example must record its generating model(s)")
