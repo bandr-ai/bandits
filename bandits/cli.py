@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -37,7 +38,9 @@ from bandits.analyze.embed import (
     save_cache,
 )
 from bandits.export import (
+    CompositionReport,
     Partition,
+    SamplingCaps,
     build_direct_sft,
     build_eval_export,
     build_sft_export,
@@ -746,6 +749,45 @@ def review_verifier_command(
         console.print(f"[yellow]accepted risk:[/yellow] {risk.code} — {risk.detail}")
 
 
+_SKEW_WARNING = 0.5
+"""Share of a dataset one family, source, model or tool may hold before it is
+worth saying out loud. Not a limit — nothing is refused for crossing it — but a
+dataset half made of one thing is rarely the dataset someone believes they
+asked for, and the summary above it reads the same either way."""
+
+
+def _report_composition(report: CompositionReport | None) -> None:
+    """Say what the selected dataset is mostly made of, when it is mostly one thing."""
+    if report is None or not report.selected.rows:
+        return
+    rows = report.selected.rows
+    console.print(
+        f"composed of: {report.selected.lineages} lineage(s) over "
+        f"{rows} row(s), median {report.selected.messages_per_row.median:g} message(s) "
+        f"and {report.selected.characters_per_row.median:g} character(s) per row"
+    )
+    for dimension, counts in (
+        ("family", report.selected.rows_by_family),
+        ("source", report.selected.rows_by_source),
+        ("model", report.selected.rows_by_model),
+        ("tool", report.selected.rows_by_tool),
+    ):
+        if len(counts) < 2:
+            continue
+        name, count = next(iter(counts.items()))
+        if count > _SKEW_WARNING * rows:
+            console.print(
+                f"[yellow]skew:[/yellow] {count} of {rows} row(s) share one {dimension} "
+                f"({name}); see the composition report"
+            )
+    repeated = report.selected.repeated_lineages
+    if repeated:
+        console.print(
+            f"[yellow]repeated lineage:[/yellow] {len(repeated)} lineage(s) contribute "
+            f"more than one row, the largest {max(repeated.values())}"
+        )
+
+
 @app.command(name="export")
 def export_command(
     task_set_id: str,
@@ -757,11 +799,35 @@ def export_command(
         "--split",
         help="fit, held_out or all. Defaults to fit for sft and held_out for eval.",
     ),
+    max_rows_per_family: int = typer.Option(
+        None, "--max-rows-per-family", help="SFT only. Unset means no limit."
+    ),
+    max_rows_per_lineage: int = typer.Option(
+        None, "--max-rows-per-lineage", help="SFT only. Caps one retry chain or session."
+    ),
+    max_messages_per_row: int = typer.Option(None, "--max-messages-per-row", help="SFT only."),
+    max_characters_per_row: int = typer.Option(
+        None, "--max-characters-per-row", help="SFT only. Characters, never tokens."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Write reviewed eval or SFT rows plus an unresolved quarantine file."""
     if format_ not in {"eval", "sft"}:
         console.print("[red]error:[/red] --format must be one of: eval, sft")
+        raise typer.Exit(code=1)
+    try:
+        caps = SamplingCaps(
+            max_rows_per_family=max_rows_per_family,
+            max_rows_per_lineage=max_rows_per_lineage,
+            max_messages_per_row=max_messages_per_row,
+            max_characters_per_row=max_characters_per_row,
+        )
+    except ValidationError as exc:
+        console.print(f"[red]error:[/red] {exc.errors()[0]['msg']}")
+        raise typer.Exit(code=1) from exc
+    if format_ == "eval" and caps.configured:
+        # Silently ignoring them would produce an eval set that looks capped.
+        console.print("[red]error:[/red] sampling caps apply to --format sft only")
         raise typer.Exit(code=1)
     default_split = Partition.FIT if format_ == "sft" else Partition.HELD_OUT
     try:
@@ -775,6 +841,9 @@ def export_command(
         analysis = load_analysis(task_set.analysis_id, store)
         corpus = ArtifactStore(project / ".bandits").read(task_set.corpus_id)
         reviewed = load_reviewed_verifier(reviewed_verifier_id, store)
+        arguments = {"partition": partition}
+        if format_ == "sft":
+            arguments["caps"] = caps
         builder = build_eval_export if format_ == "eval" else build_sft_export
         bundle = builder(
             corpus,
@@ -783,14 +852,14 @@ def export_command(
             analysis,
             reviewed,
             reviewed_verifier_id,
-            partition=partition,
+            **arguments,
         )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     envelope = save_export(bundle, store)
-    accepted_path, unresolved_path = write_jsonl(bundle, output)
+    accepted_path, unresolved_path, composition_path = write_jsonl(bundle, output)
     console.print(f"export_id:   {envelope.artifact_id}")
     console.print(f"format:      {format_}")
     console.print(
@@ -802,6 +871,9 @@ def export_command(
     console.print(f"unresolved:  {len(bundle.unresolved)}")
     console.print(f"output:      {accepted_path}")
     console.print(f"quarantine:  {unresolved_path}")
+    if composition_path is not None:
+        console.print(f"composition: {composition_path}")
+    _report_composition(bundle.composition)
     for code in bundle.manifest.accepted_risks:
         console.print(f"[yellow]accepted risk:[/yellow] {code}")
     for warning in bundle.manifest.warnings:

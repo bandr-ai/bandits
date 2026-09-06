@@ -717,3 +717,87 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
     assert (output / "selection-report.json").exists()
+
+
+def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    report = output.with_name("sft.composition.json")
+    assert report.exists()
+    payload = json.loads(report.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["offered_traces"] >= payload["selected"]["rows"]
+    assert "composition:" in result.stdout
+
+
+def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path) -> None:
+    """An ignored cap would produce an eval set that looks curated and is not."""
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "eval.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "eval",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-family",
+            "1",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "sft only" in result.stdout
+    assert not output.exists()
+
+
+def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-lineage",
+            "0",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "at least 1" in result.stdout
+    assert not output.exists()

@@ -11,6 +11,7 @@ from bandits.analyze import analyze_corpus, compute_analysis_id, compute_task_se
 from bandits.analyze.models import TaskFamily, TaskSet
 from bandits.export import (
     Partition,
+    SamplingCaps,
     SFTExample,
     ToolCall,
     ToolFunction,
@@ -22,7 +23,7 @@ from bandits.export import (
     save_export,
     write_jsonl,
 )
-from bandits.export.sft import _quality_reasons
+from bandits.export.sft import _quality_reasons, generating_policy
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
@@ -115,7 +116,12 @@ def _trace(
     )
 
 
-def _export_case(traces: tuple[Trace, ...]):
+def _export_case(
+    traces: tuple[Trace, ...],
+    *,
+    fit: tuple[str, ...] = ("good-1", "failed"),
+    held_out: tuple[str, ...] = ("good-2", "recovered"),
+):
     """One reviewed verifier over one family, built from the traces given.
 
     Taken as an argument rather than fixed so a test can vary one trace and keep
@@ -128,17 +134,17 @@ def _export_case(traces: tuple[Trace, ...]):
         family_id="family-change",
         descriptor="change order <id>",
         trace_ids=tuple(trace.trace_id for trace in corpus.traces),
-        medoid_trace_id="good-1",
-        workload_mass=4,
-        fit_trace_ids=("good-1", "failed"),
-        held_out_trace_ids=("good-2", "recovered"),
+        medoid_trace_id=fit[0],
+        workload_mass=len(traces),
+        fit_trace_ids=fit,
+        held_out_trace_ids=held_out,
     )
     task_set = TaskSet(
         corpus_id=compute_artifact_id(corpus),
         analysis_id=analysis_id,
         families=(family,),
         selected=(),
-        total_workload_mass=4,
+        total_workload_mass=len(traces),
         workload_coverage=1,
     )
     task_set_id = compute_task_set_id(task_set)
@@ -269,7 +275,7 @@ def test_jsonl_writer_is_deterministic_and_always_writes_quarantine(export_case,
     )
     output = tmp_path / "sft.jsonl"
 
-    accepted, unresolved = write_jsonl(bundle, output)
+    accepted, unresolved, composition = write_jsonl(bundle, output)
     first = accepted.read_bytes(), unresolved.read_bytes()
     write_jsonl(bundle, output)
 
@@ -277,6 +283,8 @@ def test_jsonl_writer_is_deterministic_and_always_writes_quarantine(export_case,
     assert len(accepted.read_text().splitlines()) == len(bundle.rows)
     assert len(unresolved.read_text().splitlines()) == len(bundle.unresolved)
     assert json.loads(accepted.read_text().splitlines()[0])["trace_id"] == "good-1"
+    assert composition is not None
+    assert json.loads(composition.read_text())["selected"]["rows"] == len(bundle.rows)
 
 
 def test_export_artifact_round_trips_and_records_review_parent(export_case, tmp_path) -> None:
@@ -624,7 +632,7 @@ def test_emitted_jsonl_is_clean_chat_completions(export_case, tmp_path) -> None:
     bundle = build_sft_export(
         corpus, task_set, task_set_id, analysis, reviewed, compute_reviewed_verifier_id(reviewed)
     )
-    accepted, _ = write_jsonl(bundle, tmp_path / "sft.jsonl")
+    accepted, _, _ = write_jsonl(bundle, tmp_path / "sft.jsonl")
 
     messages = json.loads(accepted.read_text().splitlines()[0])["messages"]
     assert messages[0] == {"role": "user", "content": "Change order 100"}
@@ -970,3 +978,365 @@ def test_an_otlp_tool_span_carrying_its_own_arguments_still_exports() -> None:
     assert tool_span.call_recorded is True and tool_span.arguments == {"order_id": 100}
     call = next(call for message in row.messages for call in message.tool_calls)
     assert json.loads(call.function.arguments) == {"order_id": 100}
+
+
+def _distinct(trace_id: str, order: int, note: str, **fields) -> Trace:
+    """A successful trace that is not a near-duplicate of its siblings.
+
+    Every ``_trace`` in one family normalizes to the same transcript, so the
+    deduplication gate would leave one row and there would be nothing for a cap
+    to cap. The note varies the instruction and nothing else.
+    """
+    return _trace(trace_id, order, "changed").replace(
+        task=f"Change order {order} for {note}", **fields
+    )
+
+
+def _composition_case(traces: tuple[Trace, ...], **caps):
+    """Every trace on the fit side, so the whole family is offered to one export."""
+    ids = tuple(trace.trace_id for trace in traces)
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        traces, fit=ids, held_out=()
+    )
+    return build_sft_export(
+        corpus,
+        task_set,
+        task_set_id,
+        analysis,
+        reviewed,
+        "reviewed-1",
+        caps=SamplingCaps(**caps) if caps else None,
+    )
+
+
+def test_the_report_describes_the_offered_partition_and_the_selection_apart() -> None:
+    """The gap between the two is the whole point: what was on offer, and what survived."""
+    bundle = _composition_case(
+        (
+            _distinct("keep-1", 100, "acme"),
+            _distinct("keep-2", 200, "globex").replace(source="chat-json"),
+            _trace("drop-1", 300, "pending"),
+        )
+    )
+
+    report = bundle.composition
+    assert report is not None and report.schema_version == 1
+    assert report.offered_traces == 3
+    assert report.offered.rows == 3
+    assert report.selected.rows == 2
+    assert report.selected.rows_by_family == {"family-change": 2}
+    assert report.offered.rows_by_source == {"otlp": 2, "chat-json": 1}
+    assert report.selected.rows_by_source == {"otlp": 1, "chat-json": 1}
+    assert report.selected.rows_by_tool == {"change_order": 2}
+    assert report.selected.tool_calls_by_tool == {"change_order": 2}
+    assert report.selected.rows_by_model == {"model-v1": 2}
+    assert report.selected.messages_per_row.rows == 2
+    assert report.selected.characters_per_row.total > 0
+    assert "reviewed verifier did not establish success" in report.unresolved_reasons
+
+
+def test_length_summaries_never_claim_to_be_token_counts() -> None:
+    """No tokenizer is configured, so nothing here may read as a token count."""
+    bundle = _composition_case((_distinct("keep-1", 100, "acme"),))
+
+    summary = bundle.composition.selected.characters_per_row
+    assert summary.rows == 1
+    assert summary.minimum == summary.maximum == summary.total
+    assert set(summary.model_dump()) == {"rows", "minimum", "median", "p90", "maximum", "total"}
+
+
+def test_a_repeated_lineage_is_counted_rather_than_left_to_look_independent() -> None:
+    bundle = _composition_case(
+        (
+            _distinct("keep-1", 100, "acme", lineage_id="sess-a"),
+            _distinct("keep-2", 200, "globex", lineage_id="sess-a"),
+            _distinct("keep-3", 300, "initech", lineage_id="sess-b"),
+        )
+    )
+
+    assert bundle.composition.selected.lineages == 2
+    assert bundle.composition.selected.repeated_lineages == {"sess-a": 2}
+
+
+def test_a_trace_with_no_declared_lineage_is_its_own_rather_than_pooled() -> None:
+    """Pooling them would read as one enormous retry chain and one cap would gut the set."""
+    bundle = _composition_case(
+        (_distinct("keep-1", 100, "acme"), _distinct("keep-2", 200, "globex"))
+    )
+
+    assert bundle.composition.selected.lineages == 2
+    assert bundle.composition.selected.repeated_lineages == {}
+
+
+def test_duplicate_groups_are_reported_and_not_only_dropped() -> None:
+    """Deduplication already removes them; how many there were is what it hides."""
+    bundle = _composition_case((_trace("dup-1", 100, "changed"), _trace("dup-2", 200, "changed")))
+
+    assert bundle.composition.selected.rows == 1
+    assert [group.trace_ids for group in bundle.composition.duplicate_groups] == [
+        ("dup-1", "dup-2")
+    ]
+
+
+def test_the_report_and_the_selection_are_identical_across_runs() -> None:
+    traces = (
+        _distinct("keep-1", 100, "acme"),
+        _distinct("keep-2", 200, "globex"),
+        _distinct("keep-3", 300, "initech"),
+    )
+
+    first = _composition_case(traces, max_rows_per_family=2)
+    second = _composition_case(traces, max_rows_per_family=2)
+
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_no_caps_leaves_the_selection_exactly_as_it_was() -> None:
+    """An unset cap is the caller declining to limit, not a default chosen here."""
+    traces = (_distinct("keep-1", 100, "acme"), _distinct("keep-2", 200, "globex"))
+
+    uncapped = _composition_case(traces)
+
+    assert [row.trace_id for row in uncapped.rows] == ["keep-1", "keep-2"]
+    assert uncapped.manifest.caps is None
+
+
+def test_a_family_cap_limits_the_selection_and_names_itself_in_the_quarantine() -> None:
+    traces = (
+        _distinct("keep-1", 100, "acme"),
+        _distinct("keep-2", 200, "globex"),
+        _distinct("keep-3", 300, "initech"),
+    )
+
+    bundle = _composition_case(traces, max_rows_per_family=2)
+
+    assert [row.trace_id for row in bundle.rows] == ["keep-1", "keep-2"]
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "keep-3")
+    assert any("max_rows_per_family" in reason for reason in rejected.reasons)
+    assert bundle.manifest.caps.max_rows_per_family == 2
+
+
+def test_a_lineage_cap_stops_one_retry_chain_from_dominating() -> None:
+    traces = (
+        _distinct("keep-1", 100, "acme", lineage_id="sess-a"),
+        _distinct("keep-2", 200, "globex", lineage_id="sess-a"),
+        _distinct("keep-3", 300, "initech", lineage_id="sess-b"),
+    )
+
+    bundle = _composition_case(traces, max_rows_per_lineage=1)
+
+    assert [row.trace_id for row in bundle.rows] == ["keep-1", "keep-3"]
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "keep-2")
+    assert any("max_rows_per_lineage" in reason for reason in rejected.reasons)
+
+
+def test_a_cap_keeps_the_rows_it_reaches_first_in_trace_id_order() -> None:
+    """Selection order is a property of the traces, not of how the family listed them."""
+    traces = (
+        _distinct("b-second", 200, "globex"),
+        _distinct("a-first", 100, "acme"),
+        _distinct("c-third", 300, "initech"),
+    )
+    ids = tuple(trace.trace_id for trace in traces)
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        traces, fit=ids, held_out=()
+    )
+
+    bundle = build_sft_export(
+        corpus,
+        task_set,
+        task_set_id,
+        analysis,
+        reviewed,
+        "reviewed-1",
+        caps=SamplingCaps(max_rows_per_family=1),
+    )
+
+    assert [row.trace_id for row in bundle.rows] == ["a-first"]
+    assert "trace_id ascending" in bundle.manifest.selection_policy
+
+
+def test_a_row_rejected_by_another_gate_does_not_spend_cap_budget() -> None:
+    """A cap counts what it kept, so a defect must not quietly cost a good row its place."""
+    traces = (
+        _trace("a-failed", 100, "pending"),
+        _distinct("b-good", 200, "globex"),
+    )
+
+    bundle = _composition_case(traces, max_rows_per_family=1)
+
+    assert [row.trace_id for row in bundle.rows] == ["b-good"]
+
+
+@pytest.mark.parametrize(
+    ("cap", "fragment"),
+    [
+        ({"max_messages_per_row": 2}, "max_messages_per_row"),
+        ({"max_characters_per_row": 5}, "max_characters_per_row"),
+    ],
+)
+def test_a_row_over_a_size_cap_is_quarantined_with_the_cap_that_removed_it(
+    cap: dict, fragment: str
+) -> None:
+    bundle = _composition_case((_distinct("keep-1", 100, "acme"),), **cap)
+
+    assert not bundle.rows
+    assert any(fragment in reason for item in bundle.unresolved for reason in item.reasons)
+
+
+def test_the_manifest_records_the_report_version_the_caps_and_the_order() -> None:
+    bundle = _composition_case((_distinct("keep-1", 100, "acme"),), max_rows_per_lineage=3)
+
+    assert bundle.manifest.composition_schema_version == bundle.composition.schema_version
+    assert bundle.manifest.caps == SamplingCaps(max_rows_per_lineage=3)
+    assert bundle.manifest.selection_policy
+
+
+def test_a_cap_below_one_is_refused_rather_than_read_as_no_limit() -> None:
+    with pytest.raises(ValidationError, match="at least 1"):
+        SamplingCaps(max_rows_per_family=0)
+
+
+def test_an_eval_export_carries_no_composition_report(export_case) -> None:
+    """The report describes a training set; an eval set is not one."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = export_case
+
+    bundle = build_eval_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    assert bundle.composition is None
+
+
+def test_a_declared_model_beats_a_span_name_that_is_really_a_tool(tmp_path) -> None:
+    """A chat tool call is a MODEL span named after the tool, not after the model."""
+    trace = _chat_trace(
+        tmp_path,
+        "declared",
+        json.dumps(
+            [
+                {
+                    "session_id": "s-1",
+                    "model": "gpt-5",
+                    "scaffold": "agent-v2",
+                    "messages": json.loads(_PAIRED_CONVERSATION),
+                }
+            ]
+        ),
+        "good-1",
+    )
+
+    policy = generating_policy(trace)
+
+    assert trace.runtime_context["model"] == "gpt-5"
+    assert policy["models"] == ("gpt-5",)
+    assert policy["scaffolds"] == ("agent-v2",)
+    assert "change_order" not in policy["models"]
+
+
+def test_with_nothing_declared_a_call_carrier_is_not_read_as_the_model(tmp_path) -> None:
+    """A bare message array has nowhere to declare a policy, and must not invent one."""
+    trace = _chat_trace(tmp_path, "bare", _PAIRED_CONVERSATION, "good-1")
+
+    policy = generating_policy(trace)
+
+    assert trace.runtime_context == {}
+    assert "change_order" not in policy["models"]
+    assert policy["models"] == ("assistant",)
+
+
+def test_an_otlp_trace_still_reports_the_model_its_spans_name() -> None:
+    """The fallback is unchanged where span names really are model names."""
+    assert generating_policy(_trace("good-1", 100, "changed"))["models"] == ("model-v1",)
+
+
+def test_the_composition_report_counts_the_declared_model_not_the_tool(tmp_path) -> None:
+    trace = _chat_trace(
+        tmp_path,
+        "composed",
+        json.dumps(
+            [
+                {
+                    "session_id": "s-1",
+                    "model": "gpt-5",
+                    "scaffold": "agent-v2",
+                    "messages": json.loads(_PAIRED_CONVERSATION),
+                }
+            ]
+        ),
+        "good-1",
+    )
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(trace)
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    assert bundle.composition.selected.rows_by_model == {"gpt-5": 1}
+    assert bundle.composition.selected.rows_by_scaffold == {"agent-v2": 1}
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    assert tuple(row.generating_policy["models"]) == ("gpt-5",)
+
+
+def _chat_policy(tmp_path, name: str, wrapper: dict, arguments: str = "{}") -> dict:
+    path = tmp_path / f"{name}.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    **wrapper,
+                    "messages": [
+                        {"role": "user", "content": "Refund order 7741"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {"name": "refund", "arguments": arguments},
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "c1", "name": "refund", "content": "{}"},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+            ]
+        )
+    )
+    return generating_policy(load_chat_json(path).traces[0])
+
+
+def test_a_call_taking_no_arguments_is_still_not_read_as_the_model(tmp_path) -> None:
+    """The argument-based carrier rule has nothing to find when a call took none."""
+    policy = _chat_policy(tmp_path, "zero_arg", {"session_id": "s"}, arguments="{}")
+
+    assert "refund" not in policy["models"]
+
+
+@pytest.mark.parametrize(
+    ("name", "declared"),
+    [("empty", ""), ("structured", {"name": "gpt-5"}), ("numeric", 0)],
+)
+def test_a_declaration_that_does_not_read_as_a_name_is_not_one(
+    tmp_path, name: str, declared: object
+) -> None:
+    """str()-ing a structure would put {'name': 'gpt-5'} where a reader expects a model."""
+    policy = _chat_policy(tmp_path, f"declared_{name}", {"session_id": "s", "model": declared})
+
+    assert policy["models"] == ("assistant",)
+    assert "refund" not in policy["models"]
+
+
+def test_a_claude_code_tool_call_span_is_not_read_as_the_model(tmp_path) -> None:
+    """That adapter marks its carriers outright; the marking is honoured."""
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"change order 100"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant","model":"claude-opus-5",'
+        '"content":[{"type":"tool_use","id":"tu-1","name":"change_order","input":{}}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":'
+        '[{"type":"tool_result","tool_use_id":"tu-1","content":"{}"}]}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+
+    policy = generating_policy(load_claude_code(path).traces[0])
+
+    assert "change_order" not in policy["models"]

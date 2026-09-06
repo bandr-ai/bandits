@@ -98,6 +98,19 @@ uv run bandits export <task-set-id> --format sft \
 
 Every export also writes a sibling `<name>.unresolved.jsonl`. Ineligible or unscorable traces are quarantined with reasons instead of vanishing from the dataset.
 
+An SFT export additionally writes `<name>.composition.json`: a versioned report describing the partition offered and the rows selected, broken down by task family, source, generating model, tool, and lineage, with message and character distributions and the duplicate groups it collapsed. Every gate in the exporter judges one trace at a time, so none of them can see that most of what passed came from a single lineage or a single tool.
+
+Sampling caps act on what that report shows. They are unset by default, and a row a cap removes is quarantined naming the cap that removed it:
+
+```bash
+uv run bandits export <task-set-id> --format sft \
+  --verifier <reviewed-verifier-id> --output sft.jsonl \
+  --max-rows-per-lineage 3 --max-rows-per-family 200
+```
+
+> [!NOTE]
+> Message and character counts are tokenizer-independent approximations of what a row costs. No tokenizer is configured anywhere in this pipeline, and nothing in the report may be read as a token count.
+
 > [!NOTE]
 > SFT defaults to the `fit` partition; eval defaults to `held_out`. Passing `--split all` is allowed but recorded as an overlap warning in the export manifest.
 
@@ -158,7 +171,8 @@ Demonstration selection additionally rejects or quarantines trajectories with pr
 - repeated identical tool actions;
 - unusually long trajectories relative to their task family;
 - verifier inputs that are unavailable;
-- near-duplicates of already selected examples.
+- near-duplicates of already selected examples;
+- rows beyond a configured family, lineage, or per-row size cap.
 
 These are demonstration-quality gates, not claims that a successful outcome alone makes behavior worth imitating.
 
@@ -177,7 +191,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
 | `review-verifier` | Record explicit acceptance of a calibrated verifier |
 | `judge` | Sample a rubric judge for unstructured outcomes |
-| `export` | Write verifier-gated eval or SFT JSONL plus quarantine |
+| `export` | Write verifier-gated eval or SFT JSONL plus quarantine and composition report |
 
 Run `uv run bandits <command> --help` for every option.
 
