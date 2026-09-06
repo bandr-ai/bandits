@@ -627,7 +627,7 @@ def validate_verifier_command(
 
     try:
         validation = validate_draft(
-            draft, verifier_draft_id, task_set, analysis.evidence, label_set, label_set_id
+            draft, verifier_draft_id, task_set, analysis, label_set, label_set_id
         )
     except ValueError as exc:
         console.print(f"[red]error:[/red] {exc}")

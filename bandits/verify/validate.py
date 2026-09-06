@@ -18,10 +18,19 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from bandits.analyze.models import Evidence, EvidenceKind, TaskSet, Visibility
-from bandits.labels import LabelSet, Verdict
+from bandits.analyze.analysis import compute_analysis_id
+from bandits.analyze.families import compute_task_set_id
+from bandits.analyze.models import (
+    CorpusAnalysis,
+    Evidence,
+    EvidenceKind,
+    TaskSet,
+    Visibility,
+)
+from bandits.labels import LabelSet, Verdict, compute_label_set_id
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
+from bandits.verify.draft import compute_verifier_draft_id
 from bandits.verify.execute import execute_verifier
 from bandits.verify.models import (
     CheckOperator,
@@ -396,21 +405,83 @@ def validate_draft(
     draft: VerifierDraft,
     draft_id: str,
     task_set: TaskSet,
-    evidence: tuple[Evidence, ...],
+    analysis: CorpusAnalysis,
     label_set: LabelSet,
     label_set_id: str,
     *,
     success_threshold: float = DEFAULT_SUCCESS_THRESHOLD,
 ) -> Validation:
-    """Measure each verifier against labels on both splits, then try to game it."""
+    """Measure each verifier against labels on both splits, then try to game it.
+
+    Every artifact here is independently valid, so a mismatched set of them
+    produces a measurement about the wrong examples rather than an error. The
+    checks below are what make a measurement's subject provable, and they run
+    before anything is measured.
+    """
+    # Identity before anything derived from it: an id that does not match its
+    # own content cannot be trusted to name the artifact in later messages.
+    if compute_verifier_draft_id(draft) != draft_id:
+        raise ValueError(f"verifier draft content does not hash to {draft_id}")
+    if compute_label_set_id(label_set) != label_set_id:
+        raise ValueError(f"label set content does not hash to {label_set_id}")
+    if compute_task_set_id(task_set) != draft.task_set_id:
+        raise ValueError(
+            f"draft was built against task set {draft.task_set_id} but the supplied "
+            f"one hashes to {compute_task_set_id(task_set)}"
+        )
+    if compute_analysis_id(analysis) != draft.analysis_id:
+        raise ValueError(
+            f"draft was built from analysis {draft.analysis_id} but the supplied "
+            f"one hashes to {compute_analysis_id(analysis)}"
+        )
+    if analysis.corpus_id != task_set.corpus_id:
+        raise ValueError(
+            f"analysis describes corpus {analysis.corpus_id} and the task set "
+            f"{task_set.corpus_id}; they are not the same evidence"
+        )
+    if draft.analysis_id != task_set.analysis_id:
+        raise ValueError(
+            f"draft was built from analysis {draft.analysis_id} but the task set "
+            f"comes from {task_set.analysis_id}; the evidence and the split do not "
+            "describe the same corpus"
+        )
+
     family = task_set.family_by_id().get(draft.family_id)
     if family is None:
         raise ValueError(f"unknown family id: {draft.family_id!r}")
 
+    if label_set.task_set_id != draft.task_set_id:
+        raise ValueError(
+            f"label set {label_set_id} labels task set {label_set.task_set_id}, "
+            f"not the draft's {draft.task_set_id}"
+        )
+    if label_set.family_id != draft.family_id:
+        raise ValueError(
+            f"label set {label_set_id} labels family {label_set.family_id}, "
+            f"not the draft's {draft.family_id}"
+        )
+
     by_trace: dict[str, list[Evidence]] = {}
-    for item in evidence:
+    for item in analysis.evidence:
         by_trace.setdefault(item.trace_id, []).append(item)
     evidence_by_trace = {key: tuple(value) for key, value in by_trace.items()}
+
+    # A label set is family-scoped by construction, so every label has to name a
+    # member. Requiring only one to overlap would let a set that is mostly about
+    # other traces through, and labels_used would then count labels that no
+    # agreement was measured on — a summary at odds with itself.
+    family_traces = set(family.fit_trace_ids) | set(family.held_out_trace_ids)
+    stray = sorted({label.trace_id for label in label_set.labels} - family_traces)
+    if stray:
+        # Without this the agreement tally is a silent zero on both splits, which
+        # reads downstream as a corpus too thin to measure rather than as the
+        # wrong label set — and invites an --accept-risks override.
+        raise ValueError(
+            f"label set {label_set_id} labels {len(stray)} trace(s) outside family "
+            f"{draft.family_id}, starting with {stray[0]!r}; a validation must be "
+            "measured on the family it claims to be about"
+        )
+
     verdicts = label_set.adjudicated()
 
     agreements: list[Agreement] = []
@@ -445,9 +516,6 @@ def validate_draft(
             "every rate above rather than counted as either outcome"
         )
 
-    # Counted over this family only: a corpus-wide verdict tally would let
-    # labels from another task stand in for the ones this check was measured on.
-    family_traces = set(family.fit_trace_ids) | set(family.held_out_trace_ids)
     in_family = [verdicts[trace_id] for trace_id in family_traces if trace_id in verdicts]
     successes = sum(1 for verdict in in_family if verdict is Verdict.SUCCESS)
 
@@ -458,7 +526,7 @@ def validate_draft(
         success_threshold=success_threshold,
         agreements=tuple(agreements),
         gameability=tuple(gameability),
-        labels_used=len(verdicts),
+        labels_used=len(in_family),
         unclear_labels=unclear,
         success_labels=successes,
         failure_labels=len(in_family) - successes,
