@@ -12,7 +12,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from bandits.traces import Contract
 
@@ -245,6 +245,31 @@ class MissingSlot(Contract):
     reason: str
 
 
+class FamilyCoherence(Contract):
+    """How far apart a family's most distant members are, and what that was judged against.
+
+    The threshold is stored beside the measurement rather than only applied to it:
+    grouping links edges and never bounds the span of the component they build, so
+    a reader has to be able to recompute the verdict — and re-choose the factor —
+    from the artifact alone, without re-mining or knowing the flags that were passed.
+    """
+
+    diameter: float = Field(ge=0.0, le=1.0)
+    """Widest distance between any two descriptors in this family."""
+
+    link_threshold: float = Field(ge=0.0, le=1.0)
+    """``1 - similarity``: the furthest apart any single admitted link could be."""
+
+    diameter_factor: float = Field(gt=0.0)
+    widest_pair: tuple[str, str]
+    """The two descriptors that span the family, so a reviewer knows what to split."""
+
+    @property
+    def over_merged(self) -> bool:
+        """Wider than any single legal link explains, so held together only transitively."""
+        return self.diameter > self.diameter_factor * self.link_threshold
+
+
 class TaskFamily(Contract):
     """A group of episodes proposed as the same repeatable task."""
 
@@ -263,7 +288,16 @@ class TaskFamily(Contract):
     held_out_trace_ids: tuple[str, ...] = ()
     proposed_by: Literal["rule", "model", "human"] = "rule"
     review_status: Literal["proposed", "accepted", "split", "merged"] = "proposed"
+
+    coherence: FamilyCoherence | None = None
+    """How wide this family is, and against what it was judged. None before mining
+    recorded it, or after a correction that could not recompute it."""
+
     limitations: tuple[str, ...] = ()
+
+    @property
+    def over_merged(self) -> bool:
+        return self.coherence is not None and self.coherence.over_merged
 
 
 class TaskSet(Contract):

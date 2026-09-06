@@ -304,6 +304,32 @@ def _report(task_set, envelope_id: str) -> None:
 
     for slot in task_set.missing_slots:
         console.print(f"[yellow]missing slot[/yellow] {slot.slot}: {slot.reason}")
+
+    # An over-merged family is invisible in the table above: it reads as one
+    # large healthy group. Verifiers are drafted per family, so it has to be
+    # said here rather than only under `families --family`.
+    for family in task_set.families:
+        # Read off the measurement, not off the limitation prose: a family also
+        # carries limitations about lineage and splits, and printing those under
+        # an over-merged heading would attribute them to the wrong finding.
+        coherence = family.coherence
+        if coherence is None:
+            for limitation in family.limitations:
+                if limitation.startswith("coherence was not recomputed"):
+                    console.print(
+                        f"[yellow]coherence unknown[/yellow] {family.family_id}: {limitation}"
+                    )
+            continue
+        if not coherence.over_merged:
+            continue
+        left, right = coherence.widest_pair
+        console.print(
+            f"[yellow]over-merged[/yellow] {family.family_id}: widest pair is "
+            f"{coherence.diameter:.2f} apart, over {coherence.diameter_factor:g}x the "
+            f"{coherence.link_threshold:.2f} that admitted any single link — "
+            f"{left!r} vs {right!r}"
+        )
+
     for limitation in task_set.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 

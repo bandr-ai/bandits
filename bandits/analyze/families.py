@@ -22,6 +22,7 @@ from bandits.analyze.models import (
     CorpusAnalysis,
     Evidence,
     EvidenceKind,
+    FamilyCoherence,
     MissingSlot,
     SelectedTask,
     SlotKind,
@@ -41,7 +42,33 @@ reduces fragmentation but widens the transitive components that :func:`_cluster`
 builds, so it cannot be tuned on its own — the two effects need choosing together
 against a labelled corpus."""
 
+DEFAULT_DIAMETER_FACTOR = 1.25
+"""Multiple of the link threshold above which a family is reported as over-merged.
+
+Mutual-kNN bounds each *edge* but not the *span* of the component it builds, so a
+family can end up wider than the threshold that admitted any of its links without
+a single edge having broken the rule. A span at or under the threshold is always
+explicable as one legal edge; past it, the family is only held together
+transitively, and the further past, the less any single pair accounts for it.
+
+Measured on thirteen support instructions embedded with qwen3-embedding-8b: the
+families that collapsed eleven-of-thirteen at ``neighbors=5`` span 1.44x the
+threshold, while every family that survived as a coherent task spans 1.00x or
+less. This sits between them.
+
+Advisory and provisional. What counts as implausibly wide depends on the same
+``(similarity, neighbors)`` pair that has never been measured against a labelled
+corpus (#2, #16), and thirteen hand-written instructions are not that corpus.
+It attaches a limitation and changes no grouping, so a wrong value costs a
+reviewer one glance rather than a corrupted family."""
+
 DEFAULT_TAIL_RESERVE = 0.3
+
+_COHERENCE_LIMITATION_PREFIX = "widest pair inside this family"
+_COHERENCE_INVALIDATED = (
+    "coherence was not recomputed after this merge; the family is at least "
+    "as wide as the widest it was built from"
+)
 
 _TAIL_SLOTS: tuple[SlotKind, ...] = (
     SlotKind.KNOWN_FAILURE,
@@ -292,6 +319,22 @@ def _cluster(
     ]
 
 
+def _diameter(members: list[_TraceFeatures], distance: Distance) -> tuple[float, str, str]:
+    """The widest distance inside one family, and the two descriptors that span it.
+
+    Reported rather than acted on: naming the pair is what lets a reviewer decide
+    whether the family is one task, and reach for ``split-family`` if it is not.
+    """
+    descriptors = sorted({member.normalized for member in members})
+    widest = (0.0, descriptors[0], descriptors[0])
+    for index, left in enumerate(descriptors):
+        for right in descriptors[index + 1 :]:
+            span = distance(left, right)
+            if span > widest[0]:
+                widest = (span, left, right)
+    return widest
+
+
 def _medoid(members: list[_TraceFeatures], distance: Distance) -> str:
     """Find the exact weighted medoid over distinct descriptors, not every trace."""
     by_descriptor: dict[str, list[_TraceFeatures]] = {}
@@ -406,6 +449,7 @@ def mine_task_set(
     held_out: float = DEFAULT_HELD_OUT,
     neighbors: int = DEFAULT_NEIGHBORS,
     tail_reserve: float = DEFAULT_TAIL_RESERVE,
+    diameter_factor: float = DEFAULT_DIAMETER_FACTOR,
     proposed_by: Literal["rule", "model", "human"] = "rule",
 ) -> TaskSet:
     """Group an analysis into families and select a set that stands for the workload."""
@@ -414,6 +458,12 @@ def mine_task_set(
 
     if neighbors < 1:
         raise ValueError("neighbors must be at least 1")
+    if not 0.0 <= similarity <= 1.0:
+        # A similarity outside [0, 1] inverts the link threshold, which silently
+        # admits every pair and reports every family as over-merged.
+        raise ValueError(f"similarity must be between 0 and 1, got {similarity}")
+    if diameter_factor <= 0:
+        raise ValueError(f"diameter_factor must be positive, got {diameter_factor}")
     clusters = _cluster(features, similarity, neighbors, distance)
     families: list[TaskFamily] = []
     family_of: dict[str, str] = {}
@@ -424,6 +474,25 @@ def mine_task_set(
         fit, held = _split_by_lineage(members, family_id, held_out)
 
         limitations: list[str] = []
+        span, left, right = _diameter(members, distance)
+        coherence = FamilyCoherence(
+            diameter=span,
+            link_threshold=1.0 - similarity,
+            diameter_factor=diameter_factor,
+            widest_pair=(left, right),
+        )
+        if coherence.over_merged:
+            # Every edge cleared the threshold; the component did not. Verifiers
+            # are drafted per family, so an over-merged one is read for terminal
+            # evidence across unrelated tasks and keyed to whichever value was
+            # most common. Fragmentation is recoverable with merge-families;
+            # this is not visible at all unless it is said out loud.
+            limitations.append(
+                f"{_COHERENCE_LIMITATION_PREFIX} is {span:.2f} apart, over "
+                f"{diameter_factor:g}x the {1.0 - similarity:.2f} that admitted any "
+                f"single link: {left!r} vs {right!r}; mutual-kNN bounds each edge "
+                "but not the span of the component, so check these are one task"
+            )
         if not held and len(members) > 1:
             limitations.append(
                 "every trace shares one lineage group; no held-out split is possible "
@@ -445,6 +514,7 @@ def mine_task_set(
                 fit_trace_ids=fit,
                 held_out_trace_ids=held,
                 proposed_by=proposed_by,
+                coherence=coherence,
                 limitations=tuple(limitations),
             )
         )
@@ -573,7 +643,21 @@ def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
         held_out_trace_ids=tuple(sorted({t for f in merged_from for t in f.held_out_trace_ids})),
         proposed_by="human",
         review_status="merged",
-        limitations=tuple(sorted({limit for f in merged_from for limit in f.limitations})),
+        # Deliberately dropped: the merged family is wider than either input, and
+        # recomputing needs the distance function that grouped them, which a
+        # correction does not have. A stale narrower figure would understate it.
+        coherence=None,
+        limitations=(
+            *sorted(
+                {
+                    limit
+                    for family in merged_from
+                    for limit in family.limitations
+                    if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
+                }
+            ),
+            _COHERENCE_INVALIDATED,
+        ),
     )
     remap = {fid: survivor.family_id for fid in family_ids}
     families = tuple(
@@ -626,7 +710,13 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
             ),
             proposed_by="human",
             review_status="split",
-            limitations=target.limitations,
+            # A subfamily is narrower than the family it came from, so the
+            # parent's measurement would overstate it; there is no distance
+            # function here to recompute one with.
+            coherence=None,
+            limitations=tuple(
+                limit for limit in target.limitations if not limit.startswith("widest pair")
+            ),
         )
         for descriptor, group in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     ]

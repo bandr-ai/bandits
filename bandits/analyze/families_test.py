@@ -26,7 +26,13 @@ from bandits.analyze import (
     split_family,
 )
 from bandits.analyze.families import _cluster, _medoid, _TraceFeatures
-from bandits.analyze.models import TaskFamily, TaskSet
+from bandits.analyze.models import (
+    CorpusAnalysis,
+    FamilyCoherence,
+    TaskCandidate,
+    TaskFamily,
+    TaskSet,
+)
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 
@@ -394,3 +400,144 @@ def test_task_set_round_trips_through_the_derived_store(tmp_path, task_set: Task
     assert envelope.kind == "taskset"
     assert envelope.parent_artifact_id == task_set.analysis_id
     assert load_task_set(envelope.artifact_id, store) == task_set
+
+
+_CHAIN = ("descriptor alpha", "descriptor bravo", "descriptor charlie", "descriptor delta")
+"""Four descriptors placed on a line by _chain_distance, 0.25 apart in order."""
+
+
+def _chain_analysis(count: int) -> CorpusAnalysis:
+    return CorpusAnalysis(
+        corpus_id="corpus-chain",
+        source="otlp",
+        evidence=(),
+        tasks=tuple(
+            TaskCandidate(task_id=f"task-{i}", trace_id=f"c{i}", instruction=text)
+            for i, text in enumerate(_CHAIN[:count])
+        ),
+    )
+
+
+def _chain_distance(left: str, right: str) -> float:
+    """Distance along a line: adjacent descriptors 0.25 apart, the ends 0.75."""
+    position = {normalize_instruction(text): i * 0.25 for i, text in enumerate(_CHAIN)}
+    return abs(position[left] - position[right])
+
+
+def test_a_transitively_chained_family_is_reported_as_over_merged() -> None:
+    """Every edge legal at 0.25, the component 0.75 wide: the span no link explains."""
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    family = next(f for f in task_set.families if f.workload_mass == 4)
+    assert family.over_merged
+    assert family.coherence.diameter == pytest.approx(0.75)
+    assert family.coherence.widest_pair == (
+        normalize_instruction(_CHAIN[0]),
+        normalize_instruction(_CHAIN[3]),
+    )
+
+
+def test_the_flag_names_the_pair_that_spans_the_family() -> None:
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    limitation = next(
+        limit for f in task_set.families for limit in f.limitations if "widest pair" in limit
+    )
+    assert "descriptor alpha" in limitation
+    assert "descriptor delta" in limitation
+
+
+def test_a_family_no_wider_than_one_legal_link_is_not_flagged() -> None:
+    task_set = mine_task_set(
+        _chain_analysis(2), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+
+    family = next(f for f in task_set.families if f.workload_mass == 2)
+    assert not family.over_merged
+    assert family.coherence.diameter == pytest.approx(0.25)
+
+
+def test_flagging_changes_no_grouping(task_set: TaskSet, analysis) -> None:
+    """Advisory only: a different factor must move no trace between families."""
+    loose = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        similarity=0.7,
+        budget=10,
+        diameter_factor=99.0,
+    )
+
+    assert [f.trace_ids for f in loose.families] == [f.trace_ids for f in task_set.families]
+    assert not any(f.over_merged for f in loose.families)
+
+
+def test_invalid_clustering_parameters_are_refused(analysis) -> None:
+    """An out-of-range similarity inverts the threshold and flags every family."""
+    analysis_id = compute_analysis_id(analysis)
+
+    with pytest.raises(ValueError, match="similarity must be between 0 and 1"):
+        mine_task_set(analysis, analysis_id, distance=_test_distance, similarity=1.5)
+    with pytest.raises(ValueError, match="diameter_factor must be positive"):
+        mine_task_set(
+            analysis,
+            analysis_id,
+            distance=_test_distance,
+            similarity=0.7,
+            diameter_factor=0.0,
+        )
+
+
+def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet) -> None:
+    """A merged family is wider than either input; a stale figure would understate it."""
+    ids = tuple(f.family_id for f in task_set.families[:2])
+
+    merged = merge_families(task_set, ids)
+
+    survivor = next(f for f in merged.families if f.family_id in ids)
+    assert survivor.coherence is None
+    assert not survivor.over_merged
+    assert any("not recomputed" in limit for limit in survivor.limitations)
+
+
+def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet) -> None:
+    """A widest pair measured before a merge says nothing about the merged family."""
+    first, second, *rest = task_set.families
+    stale = "widest pair inside this family is 0.75 apart, over the old threshold"
+    flagged = first.replace(
+        coherence=FamilyCoherence(
+            diameter=0.75,
+            link_threshold=0.4,
+            diameter_factor=1.25,
+            widest_pair=("old-left", "old-right"),
+        ),
+        limitations=(*first.limitations, stale),
+    )
+    assert flagged.over_merged
+    source = task_set.replace(families=(flagged, second, *rest))
+
+    merged = merge_families(source, (first.family_id, second.family_id))
+    survivor = merged.family_by_id()[first.family_id]
+
+    assert stale not in survivor.limitations
+    assert not any(limit.startswith("widest pair") for limit in survivor.limitations)
+    assert any("coherence was not recomputed" in limit for limit in survivor.limitations)
+
+
+def test_a_split_drops_the_parents_over_merge_finding(analysis) -> None:
+    """The finding was about the parent's span, which no subfamily still has."""
+    task_set = mine_task_set(
+        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+    )
+    flagged = next(f for f in task_set.families if f.over_merged)
+
+    split = split_family(task_set, flagged.family_id, _chain_analysis(4))
+
+    replacements = [f for f in split.families if f.review_status == "split"]
+    assert replacements
+    assert all(f.coherence is None for f in replacements)
+    assert not any(limit.startswith("widest pair") for f in replacements for limit in f.limitations)
