@@ -32,7 +32,12 @@ def context():
     corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
     analysis = analyze_corpus(corpus)
     task_set = mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
     family = max(task_set.families, key=lambda f: f.workload_mass)
     return analysis, task_set, family

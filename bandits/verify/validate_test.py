@@ -44,7 +44,12 @@ def _test_distance(left: str, right: str) -> float:
 def address():
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
     family = next(f for f in task_set.families if "address" in f.descriptor)
     # The real id, not a placeholder: validate_draft now proves the artifacts it
@@ -150,7 +155,12 @@ def test_agreement_is_reported_per_split(address) -> None:
 def test_a_run_the_verifier_cannot_score_is_not_a_disagreement() -> None:
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
     draft = draft_verifiers(
@@ -217,7 +227,12 @@ def test_forging_a_before_and_after_pair_costs_more_than_writing_one_field() -> 
     """A bare gameable flag would hide why the invariant is the better check."""
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
     task_set = mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
     draft = draft_verifiers(
@@ -339,6 +354,7 @@ def test_a_task_set_that_is_not_the_one_the_draft_was_built_against_is_refused(a
         analysis,
         compute_analysis_id(analysis),
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
         budget=3,
     )

@@ -114,6 +114,12 @@ uv run bandits export <task-set-id> --format sft \
 > [!NOTE]
 > SFT defaults to the `fit` partition; eval defaults to `held_out`. Passing `--split all` is allowed but recorded as an overlap warning in the export manifest.
 
+### What produced a grouping
+
+A task set records the clustering that formed its families: the distance backend, the resolved similarity threshold and neighbor count, and — where vectors were compared — the embedding model and the cache artifact holding them. Resolved values, not the flags that were passed, so an omitted flag records the default that actually applied.
+
+Mining the same analysis twice under different settings produces two task sets that differ in content, and therefore in id. This is what explains why. It is also what an embedding grouping needs in order to be reproducible at all: `EmbeddingCache` refuses to mix vectors from two models because they are not comparable, and a task set grouped by those vectors inherits the constraint.
+
 ### Tasks without deterministic outcome state
 
 For conversational or otherwise unstructured work, a sampled model judge can add rubric evidence:
@@ -183,7 +189,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `ingest` | Normalize, redact, and store a trace export |
 | `list` / `show` | Browse corpora, traces, spans, and ingest issues |
 | `analyze` | Extract task candidates and outcome evidence |
-| `mine` / `families` | Group tasks, split lineages, and select representative runs |
+| `mine` / `families` | Group tasks, split lineages, and select representative runs, recording the clustering that produced them |
 | `merge-families` / `split-family` | Record human corrections to proposed groupings |
 | `draft-verifier` | Propose deterministic checks and replay them on history |
 | `interview-verifier` | Refine a draft through a bounded owner interview |

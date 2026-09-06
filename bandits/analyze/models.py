@@ -300,6 +300,50 @@ class TaskFamily(Contract):
         return self.coherence is not None and self.coherence.over_merged
 
 
+class ClusteringProvenance(Contract):
+    """How one task set's families were grouped, as the run actually resolved it.
+
+    Grouping is the one model-influenced step whose configuration used to
+    disappear into the result. Two task sets mined from the same analysis at
+    different thresholds differ in content, so their ids differ and nothing is
+    corrupted — but nothing explained the difference either, and neither could
+    be reproduced without knowing which flags were passed.
+
+    Recorded for the same reason as ``TraceCorpus.redaction_ruleset``: the same
+    inputs under a changed setting produce a different artifact, and without the
+    setting there is nothing to explain why two artifacts sharing a parent do
+    not match. Resolved values, never the raw flags — an omitted flag records
+    the default that was actually applied rather than ``None``.
+    """
+
+    backend: str
+    """What measured the distance between two descriptors.
+
+    Declared by the caller, because a task set is grouped by an opaque callable
+    and no default here could be anything but a guess about what was behind it.
+    """
+
+    similarity: float = Field(ge=0, le=1)
+    neighbors: int = Field(ge=1)
+    embedding_model: str | None = None
+    """The model whose vectors were compared, when the backend used any.
+
+    ``EmbeddingCache`` refuses to mix vectors from two models because they are
+    not comparable. A task set grouped by those vectors inherits that constraint
+    and would otherwise record none of it.
+    """
+
+    embedding_cache_id: str | None = None
+
+    @model_validator(mode="after")
+    def cached_vectors_name_their_model(self) -> ClusteringProvenance:
+        if self.embedding_cache_id and not self.embedding_model:
+            raise ValueError("an embedding cache id is meaningless without the model it pins")
+        if not self.backend.strip():
+            raise ValueError("clustering provenance must name the backend that grouped")
+        return self
+
+
 class TaskSet(Contract):
     """Mined families plus the selection drawn from them."""
 
@@ -308,6 +352,10 @@ class TaskSet(Contract):
     analysis_id: str
     families: tuple[TaskFamily, ...]
     selected: tuple[SelectedTask, ...]
+
+    clustering: ClusteringProvenance | None = None
+    """What produced this grouping. None only for an artifact mined before this
+    was recorded, which is exactly the case it cannot be reconstructed for."""
 
     total_workload_mass: int
     workload_coverage: float

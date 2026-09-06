@@ -25,8 +25,9 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
-from bandits.analyze.families import _cluster, _medoid, _TraceFeatures
+from bandits.analyze.families import DEFAULT_NEIGHBORS, _cluster, _medoid, _TraceFeatures
 from bandits.analyze.models import (
+    ClusteringProvenance,
     CorpusAnalysis,
     FamilyCoherence,
     TaskCandidate,
@@ -54,7 +55,12 @@ def analysis():
 @pytest.fixture
 def task_set(analysis):
     return mine_task_set(
-        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        budget=10,
     )
 
 
@@ -176,6 +182,7 @@ def test_the_split_is_reproducible(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     second = mine_task_set(
@@ -183,6 +190,7 @@ def test_the_split_is_reproducible(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -197,6 +205,7 @@ def test_grouping_ignores_everything_a_live_request_would_not_know(analysis) -> 
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     refunds = set(_family(task_set, "refund").trace_ids)
@@ -246,6 +255,7 @@ def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
         compute_analysis_id(analysis),
         budget=1,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
     full = mine_task_set(
@@ -253,6 +263,7 @@ def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
         compute_analysis_id(analysis),
         budget=10,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -267,6 +278,7 @@ def test_a_budget_larger_than_the_corpus_is_reported_as_underfilled(analysis) ->
         compute_analysis_id(analysis),
         budget=40,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -280,6 +292,7 @@ def test_the_last_slot_is_never_taken_by_the_tail_reserve(analysis) -> None:
         compute_analysis_id(analysis),
         budget=1,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -295,6 +308,7 @@ def test_traces_without_an_instruction_count_against_coverage() -> None:
         compute_analysis_id(analysis),
         budget=5,
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
     )
 
@@ -427,7 +441,12 @@ def _chain_distance(left: str, right: str) -> float:
 def test_a_transitively_chained_family_is_reported_as_over_merged() -> None:
     """Every edge legal at 0.25, the component 0.75 wide: the span no link explains."""
     task_set = mine_task_set(
-        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+        _chain_analysis(4),
+        "analysis-x",
+        budget=10,
+        similarity=0.7,
+        backend="first-word",
+        distance=_chain_distance,
     )
 
     family = next(f for f in task_set.families if f.workload_mass == 4)
@@ -441,7 +460,12 @@ def test_a_transitively_chained_family_is_reported_as_over_merged() -> None:
 
 def test_the_flag_names_the_pair_that_spans_the_family() -> None:
     task_set = mine_task_set(
-        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+        _chain_analysis(4),
+        "analysis-x",
+        budget=10,
+        similarity=0.7,
+        backend="first-word",
+        distance=_chain_distance,
     )
 
     limitation = next(
@@ -453,7 +477,12 @@ def test_the_flag_names_the_pair_that_spans_the_family() -> None:
 
 def test_a_family_no_wider_than_one_legal_link_is_not_flagged() -> None:
     task_set = mine_task_set(
-        _chain_analysis(2), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+        _chain_analysis(2),
+        "analysis-x",
+        budget=10,
+        similarity=0.7,
+        backend="first-word",
+        distance=_chain_distance,
     )
 
     family = next(f for f in task_set.families if f.workload_mass == 2)
@@ -467,6 +496,7 @@ def test_flagging_changes_no_grouping(task_set: TaskSet, analysis) -> None:
         analysis,
         compute_analysis_id(analysis),
         distance=_test_distance,
+        backend="first-word",
         similarity=0.7,
         budget=10,
         diameter_factor=99.0,
@@ -481,12 +511,15 @@ def test_invalid_clustering_parameters_are_refused(analysis) -> None:
     analysis_id = compute_analysis_id(analysis)
 
     with pytest.raises(ValueError, match="similarity must be between 0 and 1"):
-        mine_task_set(analysis, analysis_id, distance=_test_distance, similarity=1.5)
+        mine_task_set(
+            analysis, analysis_id, distance=_test_distance, backend="first-word", similarity=1.5
+        )
     with pytest.raises(ValueError, match="diameter_factor must be positive"):
         mine_task_set(
             analysis,
             analysis_id,
             distance=_test_distance,
+            backend="first-word",
             similarity=0.7,
             diameter_factor=0.0,
         )
@@ -531,7 +564,12 @@ def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet) -> None:
 def test_a_split_drops_the_parents_over_merge_finding(analysis) -> None:
     """The finding was about the parent's span, which no subfamily still has."""
     task_set = mine_task_set(
-        _chain_analysis(4), "analysis-x", budget=10, similarity=0.7, distance=_chain_distance
+        _chain_analysis(4),
+        "analysis-x",
+        budget=10,
+        similarity=0.7,
+        backend="first-word",
+        distance=_chain_distance,
     )
     flagged = next(f for f in task_set.families if f.over_merged)
 
@@ -541,3 +579,96 @@ def test_a_split_drops_the_parents_over_merge_finding(analysis) -> None:
     assert replacements
     assert all(f.coherence is None for f in replacements)
     assert not any(limit.startswith("widest pair") for f in replacements for limit in f.limitations)
+
+
+def test_a_mined_task_set_records_what_grouped_it(analysis) -> None:
+    """Two task sets from one analysis differ only by this, and could not say so."""
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="first-word",
+        similarity=0.7,
+        neighbors=2,
+        budget=10,
+    )
+
+    assert task_set.clustering == ClusteringProvenance(
+        backend="first-word", similarity=0.7, neighbors=2
+    )
+
+
+def test_an_omitted_threshold_records_the_default_that_actually_applied(analysis) -> None:
+    """Recording None would say 'unset' about a value that certainly ran."""
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="x",
+        similarity=0.7,
+    )
+
+    assert task_set.clustering.neighbors == DEFAULT_NEIGHBORS
+
+
+def test_two_thresholds_produce_task_sets_that_explain_their_difference(analysis) -> None:
+    analysis_id = compute_analysis_id(analysis)
+
+    loose = mine_task_set(
+        analysis, analysis_id, distance=_test_distance, backend="first-word", similarity=0.1
+    )
+    tight = mine_task_set(
+        analysis, analysis_id, distance=_test_distance, backend="first-word", similarity=0.99
+    )
+
+    assert compute_task_set_id(loose) != compute_task_set_id(tight)
+    assert loose.clustering.similarity != tight.clustering.similarity
+
+
+def test_a_correction_keeps_the_provenance_of_the_grouping_it_corrects(task_set, analysis) -> None:
+    """A reviewer's correction does not change what grouped the set in the first place."""
+    refunds, cancels = _family(task_set, "refund"), _family(task_set, "cancel")
+
+    merged = merge_families(task_set, (refunds.family_id, cancels.family_id))
+    restored = split_family(merged, refunds.family_id, analysis)
+
+    assert merged.clustering == task_set.clustering
+    assert restored.clustering == task_set.clustering
+
+
+def test_an_embedding_grouping_pins_the_vectors_it_compared(analysis) -> None:
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        backend="embedding",
+        embedding_model="qwen3-embedding-8b",
+        embedding_cache_id="embeddings-abc123",
+        similarity=0.6,
+        proposed_by="model",
+    )
+
+    assert task_set.clustering.embedding_model == "qwen3-embedding-8b"
+    assert task_set.clustering.embedding_cache_id == "embeddings-abc123"
+
+
+def test_a_cache_id_without_its_model_is_refused() -> None:
+    """Vectors from two models are not comparable; the id alone does not say which."""
+    with pytest.raises(ValidationError, match="meaningless without the model"):
+        ClusteringProvenance(
+            backend="embedding", similarity=0.6, neighbors=3, embedding_cache_id="embeddings-abc"
+        )
+
+
+def test_a_grouping_must_name_its_backend() -> None:
+    with pytest.raises(ValidationError, match="name the backend"):
+        ClusteringProvenance(backend="  ", similarity=0.6, neighbors=3)
+
+
+def test_a_task_set_mined_before_provenance_was_recorded_reads_back_as_unknown(task_set) -> None:
+    """An older artifact says nothing rather than claiming a backend it never had."""
+    older = TaskSet.model_validate(
+        {k: v for k, v in task_set.model_dump().items() if k != "clustering"}
+    )
+
+    assert older.clustering is None

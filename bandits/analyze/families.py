@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Literal
 
 from bandits.analyze.models import (
+    ClusteringProvenance,
     CorpusAnalysis,
     Evidence,
     EvidenceKind,
@@ -445,6 +446,9 @@ def mine_task_set(
     *,
     distance: Distance,
     similarity: float,
+    backend: str,
+    embedding_model: str | None = None,
+    embedding_cache_id: str | None = None,
     budget: int = DEFAULT_BUDGET,
     held_out: float = DEFAULT_HELD_OUT,
     neighbors: int = DEFAULT_NEIGHBORS,
@@ -452,7 +456,14 @@ def mine_task_set(
     diameter_factor: float = DEFAULT_DIAMETER_FACTOR,
     proposed_by: Literal["rule", "model", "human"] = "rule",
 ) -> TaskSet:
-    """Group an analysis into families and select a set that stands for the workload."""
+    """Group an analysis into families and select a set that stands for the workload.
+
+    ``backend`` names what is behind ``distance``, and is required rather than
+    defaulted: the callable is opaque here, so any default would be this module
+    guessing at what grouped the corpus and recording the guess as provenance.
+    The thresholds are read back off the arguments actually applied, so an
+    omitted flag records the default that ran and not ``None``.
+    """
     features, ungroupable = _features(analysis)
     total_mass = len(analysis.tasks)
 
@@ -608,6 +619,13 @@ def mine_task_set(
     return TaskSet(
         corpus_id=analysis.corpus_id,
         analysis_id=analysis_id,
+        clustering=ClusteringProvenance(
+            backend=backend,
+            similarity=similarity,
+            neighbors=neighbors,
+            embedding_model=embedding_model,
+            embedding_cache_id=embedding_cache_id,
+        ),
         families=tuple(families),
         selected=tuple(selected),
         total_workload_mass=total_mass,

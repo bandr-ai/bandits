@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 from typer.testing import CliRunner
 
-from bandits.analyze import load_analysis, load_task_set
+from bandits.analyze import load_analysis, load_task_set, save_task_set
 from bandits.analyze.embed import EmbeddingError
 from bandits.cli import app
 from bandits.export import direct_sft
@@ -801,3 +801,31 @@ def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None
     assert result.exit_code == 1
     assert "at least 1" in result.stdout
     assert not output.exists()
+
+
+def test_mine_reports_the_backend_threshold_and_vectors_it_grouped_with(tmp_path) -> None:
+    """The one difference between two task sets from one analysis, said out loud."""
+    task_set_id = _mined(tmp_path)
+
+    result = runner.invoke(app, ["families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "clustering:" in result.stdout
+    assert "embedding at similarity" in result.stdout
+
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+    assert task_set.clustering.backend == "embedding"
+    assert task_set.clustering.embedding_cache_id
+    assert task_set.clustering.embedding_model
+
+
+def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(tmp_path) -> None:
+    """An artifact from before this was recorded is the one case it cannot be recovered for."""
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(_mined(tmp_path), store)
+    older = save_task_set(task_set.replace(clustering=None), store).artifact_id
+
+    result = runner.invoke(app, ["families", older, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "records nothing about how it" in result.stdout

@@ -281,6 +281,26 @@ def _report(task_set, envelope_id: str) -> None:
     if task_set.underfilled:
         console.print("[yellow]underfilled:[/yellow] eligibility ran out before the budget did")
 
+    # Printed with the families rather than buried in the artifact: two task sets
+    # from one analysis differ only by this, and the summary above them reads the
+    # same either way.
+    clustering = task_set.clustering
+    if clustering is None:
+        console.print(
+            "[yellow]clustering:[/yellow] this task set records nothing about how it "
+            "was grouped and cannot be reproduced from the artifact alone"
+        )
+    else:
+        pinned = (
+            f", {clustering.embedding_model} ({clustering.embedding_cache_id})"
+            if clustering.embedding_model
+            else ""
+        )
+        console.print(
+            f"clustering:  {clustering.backend} at similarity {clustering.similarity:g}, "
+            f"{clustering.neighbors} neighbor(s){pinned}"
+        )
+
     # A grouping stage that grouped nothing is not obviously broken from the
     # summary above: coverage still reads high when every trace is its own
     # family. Saying so is what makes an inert backend visible.
@@ -379,6 +399,9 @@ def mine(
         similarity=similarity,
         neighbors=neighbors,
         distance=embedding_distance(cache),
+        backend="embedding",
+        embedding_model=embedding_model,
+        embedding_cache_id=cache_id,
         proposed_by="model",
     )
     envelope = save_task_set(task_set, store)
