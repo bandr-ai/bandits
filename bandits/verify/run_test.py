@@ -10,7 +10,16 @@ from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
 from bandits.analyze.models import EvidenceKind
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
-from bandits.verify import draft_verifiers, load_draft_run, run_draft, save_draft_run
+from bandits.verify import (
+    Agreement,
+    GameabilityResult,
+    Validation,
+    build_check_summary,
+    draft_verifiers,
+    load_draft_run,
+    run_draft,
+    save_draft_run,
+)
 from bandits.verify.models import (
     CheckOperator,
     CheckSpec,
@@ -180,3 +189,91 @@ def test_a_run_round_trips_through_the_derived_store(tmp_path, context) -> None:
 
     assert envelope.kind == "verifier_run"
     assert load_draft_run(envelope.artifact_id, store) == run
+
+
+def _summary_for(context, **kwargs):
+    analysis, task_set, family = context
+    draft = draft_verifiers(task_set, "ts-1", analysis, family.family_id, limit=3)
+    run = run_draft(draft, analysis, task_set)
+    spec = draft.verifiers[0]
+    return build_check_summary(spec, spec.checks[0], run, **kwargs), spec, run
+
+
+def test_a_summary_counts_what_the_check_did(context) -> None:
+    summary, spec, run = _summary_for(context)
+    scored = summary.passed + summary.failed + summary.unscorable
+    assert scored == sum(1 for o in run.outcomes if o.verifier_id == spec.verifier_id)
+    assert summary.check_id == spec.checks[0].check_id
+
+
+def test_a_summary_bounds_its_examples(context) -> None:
+    summary, _, _ = _summary_for(context, examples=2)
+    assert len(summary.example_trace_ids) <= 2
+
+
+def test_prompt_lines_never_carry_trace_ids(context) -> None:
+    """Trace ids are for the reviewer to open, not for a model to read."""
+    summary, _, _ = _summary_for(context)
+    rendered = "\n".join(summary.prompt_lines())
+    for trace_id in summary.example_trace_ids:
+        assert trace_id not in rendered
+
+
+def test_a_check_that_never_fails_says_so(context) -> None:
+    summary, _, _ = _summary_for(context)
+    if summary.passed and not summary.failed:
+        assert any("discriminating" in line for line in summary.prompt_lines())
+
+
+def test_validation_results_reach_the_summary_and_the_prompt(context) -> None:
+    """The round-two half: the reviewer answers these numbers, so the model sees them."""
+    summary, spec, run = _summary_for(context)
+    validation = Validation(
+        source_draft_id="draft-one",
+        family_id=spec.family_id,
+        label_set_id="labels-one",
+        success_threshold=1.0,
+        agreements=(
+            Agreement(
+                verifier_id=spec.verifier_id,
+                split="held_out",
+                labeled=10,
+                agreed=5,
+                disagreed=5,
+                unscored=0,
+                agreement=0.5,
+            ),
+            Agreement(
+                verifier_id="verifier-someone-else",
+                split="held_out",
+                labeled=4,
+                agreed=4,
+                disagreed=0,
+                unscored=0,
+                agreement=1.0,
+            ),
+        ),
+        gameability=(
+            GameabilityResult(
+                verifier_id=spec.verifier_id,
+                hypothesis="Write the field directly.",
+                constructed={},
+                passed=True,
+                forged_facts=1,
+            ),
+        ),
+    )
+    with_validation = build_check_summary(spec, spec.checks[0], run, validation=validation)
+
+    assert len(with_validation.agreements) == 1
+    assert with_validation.agreements[0].verifier_id == spec.verifier_id
+    rendered = "\n".join(with_validation.prompt_lines())
+    assert "agreement held_out: 0.50" in rendered
+    assert "Write the field directly." in rendered
+
+
+def test_without_a_validation_the_summary_carries_none(context) -> None:
+    summary, _, _ = _summary_for(context)
+    assert summary.agreements == ()
+    assert summary.gameability == ()
+    assert "agreement" not in "\n".join(summary.prompt_lines())

@@ -64,9 +64,11 @@ from bandits.verify.review import (
     save_reviewed_verifier,
 )
 from bandits.verify.run import (
+    CheckSummary,
     Disagreement,
     DraftRun,
     TraceOutcome,
+    build_check_summary,
     compute_run_id,
     load_draft_run,
     run_draft,
@@ -86,6 +88,8 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "build_check_summary",
+    "CheckSummary",
     "start_review",
     "prior_decisions",
     "next_check",

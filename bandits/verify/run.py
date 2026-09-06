@@ -18,7 +18,8 @@ from bandits.analyze.models import CorpusAnalysis, TaskSet
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
 from bandits.verify.execute import execute_verifier
-from bandits.verify.models import Result, VerifierDraft
+from bandits.verify.models import CheckSpec, Result, VerifierDraft, VerifierSpec
+from bandits.verify.validate import Agreement, GameabilityResult, Validation
 
 
 class TraceOutcome(Contract):
@@ -126,3 +127,116 @@ def save_draft_run(run: DraftRun, store: DerivedStore) -> DerivedEnvelope:
 
 def load_draft_run(run_id: str, store: DerivedStore) -> DraftRun:
     return DraftRun.model_validate_json(store.read_payload(run_id))
+
+
+class CheckSummary(Contract):
+    """What a reviewer is shown before deciding about one check.
+
+    Bounded on purpose. A reviewer asked to judge a check against every trace
+    it ever ran on reads nothing; the counts, the runs the verifiers split on,
+    and — in a later round — what validation measured are what a decision
+    actually turns on.
+    """
+
+    verifier_id: str
+    check_id: str
+    claim: str
+    passed: int = 0
+    failed: int = 0
+    unscorable: int = 0
+    example_trace_ids: tuple[str, ...] = ()
+    """For the reviewer to open. Never sent to a model: an opaque id carries no
+    signal it can use."""
+
+    disagreement_trace_ids: tuple[str, ...] = ()
+    evidence_kind: str = ""
+    blind_spots: tuple[str, ...] = ()
+    gaming_hypotheses: tuple[str, ...] = ()
+
+    agreements: tuple[Agreement, ...] = ()
+    """Per-split label agreement, when an earlier round measured it."""
+
+    gameability: tuple[GameabilityResult, ...] = ()
+    """Attacks that beat this verifier, when an earlier round probed it."""
+
+    def prompt_lines(self) -> tuple[str, ...]:
+        """The summary as the interpreter sees it — everything but trace ids.
+
+        A second-round reply is usually answering the validation numbers. A
+        model that cannot see them cannot tell a considered "still fine" about
+        a check known to be weak from a first, uninformed look.
+        """
+        lines = [
+            f"scored: {self.passed} passed, {self.failed} failed, {self.unscorable} unscorable",
+            f"evidence_kind: {self.evidence_kind}",
+        ]
+        if self.passed and not self.failed:
+            lines.append(
+                "note: this check passed every run it could score, so nothing here shows it discriminating"
+            )
+        if self.disagreement_trace_ids:
+            lines.append(f"verifiers disagreed on {len(self.disagreement_trace_ids)} run(s)")
+        for agreement in self.agreements:
+            rate = "unmeasured" if agreement.agreement is None else f"{agreement.agreement:.2f}"
+            lines.append(
+                f"agreement {agreement.split}: {rate} over {agreement.labeled} labeled run(s)"
+            )
+        for attack in self.gameability:
+            if attack.passed:
+                lines.append(
+                    f"gameability: {attack.hypothesis} (passed, {attack.forged_facts} forged fact(s))"
+                )
+        for blind in self.blind_spots:
+            lines.append(f"blind spot: {blind}")
+        for gaming in self.gaming_hypotheses:
+            lines.append(f"gaming hypothesis: {gaming}")
+        return tuple(lines)
+
+
+def build_check_summary(
+    spec: VerifierSpec,
+    check: CheckSpec,
+    run: DraftRun,
+    *,
+    validation: Validation | None = None,
+    examples: int = 3,
+) -> CheckSummary:
+    """Gather what one check did, for one reviewer, in one screen."""
+    passed = failed = unscorable = 0
+    example_ids: list[str] = []
+    for outcome in run.outcomes:
+        if outcome.verifier_id != spec.verifier_id:
+            continue
+        part = next((s for s in outcome.result.subscores if s.check_id == check.check_id), None)
+        if part is None or part.score is None:
+            unscorable += 1
+        elif part.score >= 1.0:
+            passed += 1
+        else:
+            failed += 1
+        if len(example_ids) < examples:
+            example_ids.append(outcome.trace_id)
+
+    agreements: tuple[Agreement, ...] = ()
+    gameability: tuple[GameabilityResult, ...] = ()
+    if validation is not None:
+        agreements = tuple(a for a in validation.agreements if a.verifier_id == spec.verifier_id)
+        gameability = tuple(g for g in validation.gameability if g.verifier_id == spec.verifier_id)
+
+    return CheckSummary(
+        verifier_id=spec.verifier_id,
+        check_id=check.check_id,
+        claim=check.claim,
+        passed=passed,
+        failed=failed,
+        unscorable=unscorable,
+        example_trace_ids=tuple(example_ids),
+        disagreement_trace_ids=tuple(
+            d.trace_id for d in run.disagreements if spec.verifier_id in d.scores
+        ),
+        evidence_kind=check.evidence_kind.value,
+        blind_spots=spec.blind_spots,
+        gaming_hypotheses=spec.gaming_hypotheses,
+        agreements=agreements,
+        gameability=gameability,
+    )
