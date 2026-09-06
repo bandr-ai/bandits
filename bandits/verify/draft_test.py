@@ -716,3 +716,68 @@ def test_an_invariant_is_not_retired_by_the_failures_it_exists_to_catch() -> Non
     assert "invariant:refund_order.refunded_amount==lookup_order.charged_amount" in invariants(
         informed
     )
+
+
+def test_a_label_set_from_another_task_set_is_refused() -> None:
+    """Family ids are descriptor-derived, so the same id recurs across task sets."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    with pytest.raises(ValueError, match="adjudicated against task set"):
+        draft_verifiers(
+            task_set, "taskset-from-another-mine", analysis, family.family_id, labels=labels
+        )
+
+
+def test_a_stale_label_set_is_refused_rather_than_read_as_uncalibrated() -> None:
+    """Silently dropping unknown trace ids makes a wrong label set look merely thin."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, [*family.fit_trace_ids, "trace-from-elsewhere"])
+
+    with pytest.raises(ValueError, match="outside family"):
+        draft_verifiers(task_set, "taskset-test", analysis, family.family_id, labels=labels)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 8])
+def test_a_composite_never_appears_without_the_checks_it_was_built_from(limit: int) -> None:
+    """Validation exists to compare the conjunction against its sources."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=limit, labels=labels
+    )
+
+    standalone = {spec.checks[0].claim for spec in draft.verifiers if len(spec.checks) == 1}
+    for spec in draft.verifiers:
+        if len(spec.checks) > 1:
+            assert all(check.claim in standalone for check in spec.checks)
+
+
+def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() -> None:
+    """A derived candidate does not consume a slot a caller was choosing between."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=2, labels=labels
+    )
+
+    assert len([spec for spec in draft.verifiers if len(spec.checks) == 1]) == 2
+    assert any(len(spec.checks) > 1 for spec in draft.verifiers)

@@ -423,8 +423,23 @@ def draft_verifiers(
     if limit < 1:
         raise ValueError("limit must be at least 1")
 
-    if labels is not None and labels.family_id != family_id:
-        raise ValueError("labels belong to another family")
+    if labels is not None:
+        if labels.task_set_id != task_set_id:
+            # Family ids are derived from the descriptor, so the same id recurs
+            # across task sets whose traces, splits and evidence all differ. A
+            # label set from another one would rank these candidates against
+            # verdicts about other runs, and _measure would then quietly drop
+            # every trace it could not find — leaving a stale label set looking
+            # uncalibrated rather than wrong.
+            raise ValueError(
+                f"labels were adjudicated against task set {labels.task_set_id!r}, "
+                f"not {task_set_id!r}"
+            )
+        if labels.family_id != family_id:
+            raise ValueError("labels belong to another family")
+        stray = sorted(set(labels.verdicts()) - set(family.trace_ids))
+        if stray:
+            raise ValueError(f"labels name trace(s) outside family {family_id}: {', '.join(stray)}")
 
     evidence = _eligible(family, analysis)
     verdicts = labels.adjudicated() if labels is not None else {}
@@ -584,6 +599,8 @@ def draft_verifiers(
     # alongside them, never instead of them: validation has to be able to
     # compare a composite against the checks it was built from.
     composites: list[tuple[VerifierSpec, CandidateStats, dict[str, bool | None]]] = []
+    composite_sources: dict[str, set[str]] = {}
+    """Which standalone candidates each conjunction was built from."""
     if verdicts:
         sources = measured[:_MAX_COMPOSITE_SOURCES]
         seen_ids = {spec.verifier_id for spec, _, _ in measured}
@@ -604,6 +621,7 @@ def draft_verifiers(
                 if spec.verifier_id in seen_ids:
                     continue
                 seen_ids.add(spec.verifier_id)
+                composite_sources[spec.verifier_id] = {left.verifier_id, right.verifier_id}
                 composites.append(
                     (
                         spec,
@@ -617,7 +635,18 @@ def draft_verifiers(
                     )
                 )
 
-    ranked = sorted([*measured, *composites], key=lambda item: _rank(item[0], item[1]))
+    # ``limit`` bounds the independent checks, which is what it says and what a
+    # caller is choosing between. A composite is not one of those: it is derived
+    # from checks in this draft, and returning it without them would leave
+    # validation unable to do the one comparison it exists for — whether the
+    # conjunction earns its narrowness against the checks it was built from.
+    kept = measured[:limit]
+    retained = {spec.verifier_id for spec, _, _ in kept}
+    admitted = [
+        item for item in composites if composite_sources.get(item[0].verifier_id, set()) <= retained
+    ][:limit]
+
+    ranked = sorted([*kept, *admitted], key=lambda item: _rank(item[0], item[1]))
     proposals = [spec for spec, _, _ in ranked]
     candidates = [stats for _, stats, _ in ranked]
 
@@ -645,8 +674,8 @@ def draft_verifiers(
         task_set_id=task_set_id,
         analysis_id=task_set.analysis_id,
         family_id=family_id,
-        verifiers=tuple(proposals[:limit]),
-        candidates=tuple(candidates[:limit]),
+        verifiers=tuple(proposals),
+        candidates=tuple(candidates),
         unresolved=tuple(unresolved),
     )
 
