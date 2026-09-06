@@ -30,6 +30,7 @@ from bandits.analyze.models import (
 from bandits.labels import LabelSet, Verdict, compute_label_set_id
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
+from bandits.verify.draft import compute_verifier_draft_id
 from bandits.verify.execute import execute_verifier
 from bandits.verify.models import (
     CheckOperator,
@@ -419,6 +420,8 @@ def validate_draft(
     """
     # Identity before anything derived from it: an id that does not match its
     # own content cannot be trusted to name the artifact in later messages.
+    if compute_verifier_draft_id(draft) != draft_id:
+        raise ValueError(f"verifier draft content does not hash to {draft_id}")
     if compute_label_set_id(label_set) != label_set_id:
         raise ValueError(f"label set content does not hash to {label_set_id}")
     if compute_task_set_id(task_set) != draft.task_set_id:

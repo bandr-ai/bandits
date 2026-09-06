@@ -21,7 +21,7 @@ from bandits.analyze import (
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, compute_label_set_id, make_label
 from bandits.store import DerivedStore
-from bandits.verify import draft_verifiers
+from bandits.verify import compute_verifier_draft_id, draft_verifiers
 from bandits.verify.models import VerifierStatus
 from bandits.verify.validate import (
     accept,
@@ -78,7 +78,7 @@ def _validated(address, verdict_for=None):
     label_set = _labels(family, verdict_for, task_set=task_set)
     return validate_draft(
         draft,
-        "draft-1",
+        compute_verifier_draft_id(draft),
         task_set,
         analysis,
         label_set,
@@ -140,7 +140,12 @@ def test_a_run_the_verifier_cannot_score_is_not_a_disagreement() -> None:
     )
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
+        draft,
+        compute_verifier_draft_id(draft),
+        task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
     )
 
     unscored = [a for a in validation.agreements if a.unscored]
@@ -174,7 +179,12 @@ def test_an_unlabeled_held_out_side_is_called_out(address) -> None:
     )
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
+        draft,
+        compute_verifier_draft_id(draft),
+        task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
     )
 
     assert any("not an honest estimate" in limit for limit in validation.limitations)
@@ -193,7 +203,12 @@ def test_forging_a_before_and_after_pair_costs_more_than_writing_one_field() -> 
     label_set = _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set)
 
     validation = validate_draft(
-        draft, "draft-1", task_set, analysis, label_set, compute_label_set_id(label_set)
+        draft,
+        compute_verifier_draft_id(draft),
+        task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
     )
     cost = {result.hypothesis.split()[0]: result.forged_facts for result in validation.gameability}
 
@@ -232,14 +247,30 @@ def test_a_validation_round_trips_through_the_derived_store(tmp_path, address) -
 
 def _validate(address, label_set, label_set_id=None, draft=None, task_set=None, analysis=None):
     built_analysis, built_task_set, _family, drafted = address
+    supplied_draft = draft or drafted
     return validate_draft(
-        draft or drafted,
-        "draft-1",
+        supplied_draft,
+        compute_verifier_draft_id(supplied_draft),
         task_set or built_task_set,
         analysis or built_analysis,
         label_set,
         label_set_id or compute_label_set_id(label_set),
     )
+
+
+def test_a_draft_id_that_does_not_match_its_content_is_refused(address) -> None:
+    analysis, task_set, family, draft = address
+    label_set = _labels(family, lambda t: Verdict.SUCCESS, task_set=task_set)
+
+    with pytest.raises(ValueError, match="verifier draft content does not hash to"):
+        validate_draft(
+            draft,
+            "verifier-draft-0000000000000000",
+            task_set,
+            analysis,
+            label_set,
+            compute_label_set_id(label_set),
+        )
 
 
 def test_labels_for_another_family_are_refused_rather_than_measured(address) -> None:
@@ -281,7 +312,13 @@ def test_a_draft_from_another_analysis_is_refused(address) -> None:
 def test_a_task_set_that_is_not_the_one_the_draft_was_built_against_is_refused(address) -> None:
     """Ids can agree while the objects do not; only the content settles it."""
     analysis, task_set, family, _draft = address
-    other = mine_task_set(analysis, compute_analysis_id(analysis), budget=3)
+    other = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=_test_distance,
+        similarity=0.7,
+        budget=3,
+    )
 
     with pytest.raises(ValueError, match="but the supplied one hashes to"):
         _validate(
