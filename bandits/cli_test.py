@@ -14,7 +14,16 @@ from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
-from bandits.verify import draft_verifiers, load_interview, load_verifier_draft, save_verifier_draft
+from bandits.verify import (
+    apply_decision,
+    draft_verifiers,
+    load_interview,
+    load_verifier_draft,
+    save_interview,
+    save_verifier_draft,
+    start_review,
+)
+from bandits.verify.models import CheckReview, InterviewDecision
 from bandits.verify.validate import Agreement, Validation, save_validation
 
 runner = CliRunner()
@@ -589,6 +598,24 @@ def _reviewed_refund_verifier(tmp_path: Path) -> tuple[str, str]:
         failure_labels=1,
     )
     validation_id = save_validation(validation, store).artifact_id
+
+    # Promotion needs a round in which a person saw these measurements and
+    # accepted every check, so the export chain starts from one.
+    interview = start_review(draft, draft_id, validation_id=validation_id, round_number=2)
+    for index, (verifier_id, check_id) in enumerate(interview.pending, start=1):
+        interview = apply_decision(
+            interview,
+            CheckReview(
+                review_id=f"review-{index:03d}-{check_id}",
+                verifier_id=verifier_id,
+                check_id=check_id,
+                reply="reads the refund status; keep it",
+                decision=InterviewDecision.ACCEPT,
+                authoritative=True,
+            ),
+        )
+    interview_id = save_interview(interview, store).artifact_id
+
     result = runner.invoke(
         app,
         [
@@ -598,8 +625,8 @@ def _reviewed_refund_verifier(tmp_path: Path) -> tuple[str, str]:
             validation_id,
             "--verifier",
             spec.verifier_id,
-            "--acceptance-id",
-            "owner-ticket-cli",
+            "--interview",
+            interview_id,
             "--project",
             str(tmp_path),
         ],

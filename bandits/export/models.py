@@ -233,10 +233,24 @@ class ExportManifest(Contract):
     human_acceptance_id: str
 
     verifier_status: str
-    """``reviewed`` or ``risk_accepted``. What authorized this export, exactly."""
+    """What authorized this export, exactly."""
+
+    interview_id: str = ""
+    """The review round that accepted the verifier behind this data.
+
+    Carried to where the data lands so a reader can reach the reasoning — the
+    reviewer's words, the measurements they saw, what they held authoritative —
+    rather than only the fact that someone signed. Empty on manifests written
+    before promotion required a review.
+    """
 
     accepted_risks: tuple[str, ...] = ()
-    """Codes the owner promoted the verifier over, carried to where the data lands."""
+    """Codes an owner promoted the verifier over.
+
+    Always empty now: promotion rests on a review in which the evidence was
+    shown and accepted, so there is no blocker left to override. Kept so
+    manifests written under the old override path still read back.
+    """
 
     partition: Partition
     partition_trace_count: int

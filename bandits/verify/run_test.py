@@ -12,6 +12,7 @@ from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 from bandits.verify import (
     Agreement,
+    GameabilityAssessment,
     GameabilityResult,
     Validation,
     build_check_summary,
@@ -242,6 +243,9 @@ def test_validation_results_reach_the_summary_and_the_prompt(context) -> None:
                 disagreed=5,
                 unscored=0,
                 agreement=0.5,
+                false_positives=3,
+                false_negatives=2,
+                successes_agreed=4,
             ),
             Agreement(
                 verifier_id="verifier-someone-else",
@@ -270,10 +274,94 @@ def test_validation_results_reach_the_summary_and_the_prompt(context) -> None:
     rendered = "\n".join(with_validation.prompt_lines())
     assert "agreement held_out: 0.50" in rendered
     assert "Write the field directly." in rendered
+    # The rate alone cannot say which way the errors went. A reviewer answering
+    # "0.50" needs to know three of those five passed a run a human failed.
+    assert "errors held_out: 3 false positive(s), 2 false negative(s)" in rendered
+    assert "failures caught held_out: 0.25 (1 of 4)" in rendered
 
 
-def test_without_a_validation_the_summary_carries_none(context) -> None:
+def test_without_a_validation_the_summary_says_so_rather_than_going_quiet(context) -> None:
+    """Unmeasured and measured-as-good must not both render as silence."""
     summary, _, _ = _summary_for(context)
     assert summary.agreements == ()
     assert summary.gameability == ()
-    assert "agreement" not in "\n".join(summary.prompt_lines())
+
+    rendered = "\n".join(summary.prompt_lines())
+
+    assert "agreement: unavailable" in rendered
+    assert "0." not in rendered.partition("agreement:")[2].partition("\n")[0]
+
+
+def test_gameability_coverage_reaches_the_reviewer(context) -> None:
+    """A verifier nothing could attack must not read like one that resisted."""
+    summary, spec, run = _summary_for(context)
+    validation = Validation(
+        source_draft_id="draft-one",
+        family_id=spec.family_id,
+        label_set_id="labels-one",
+        agreements=(
+            Agreement(
+                verifier_id=spec.verifier_id,
+                split="held_out",
+                labeled=2,
+                agreed=2,
+                disagreed=0,
+                unscored=0,
+                agreement=1.0,
+                successes_agreed=2,
+            ),
+        ),
+        gameability_assessments=(
+            GameabilityAssessment(
+                verifier_id=spec.verifier_id,
+                coverage="none",
+                attack_succeeded=False,
+                checks_attacked=0,
+                checks_total=len(spec.checks),
+            ),
+        ),
+    )
+
+    rendered = "\n".join(
+        build_check_summary(spec, spec.checks[0], run, validation=validation).prompt_lines()
+    )
+
+    assert "gameability coverage: none" in rendered
+    assert "never tried" in rendered
+
+
+def test_a_resisted_attack_is_shown_not_only_a_successful_one(context) -> None:
+    """A resisted attack is evidence; silence about it is not."""
+    summary, spec, run = _summary_for(context)
+    validation = Validation(
+        source_draft_id="draft-one",
+        family_id=spec.family_id,
+        label_set_id="labels-one",
+        agreements=(
+            Agreement(
+                verifier_id=spec.verifier_id,
+                split="held_out",
+                labeled=1,
+                agreed=1,
+                disagreed=0,
+                unscored=0,
+                agreement=1.0,
+                successes_agreed=1,
+            ),
+        ),
+        gameability=(
+            GameabilityResult(
+                verifier_id=spec.verifier_id,
+                hypothesis="Write the field directly.",
+                constructed={},
+                passed=False,
+                forged_facts=1,
+            ),
+        ),
+    )
+
+    rendered = "\n".join(
+        build_check_summary(spec, spec.checks[0], run, validation=validation).prompt_lines()
+    )
+
+    assert "resisted" in rendered

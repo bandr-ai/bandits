@@ -22,11 +22,23 @@ from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, compute_label_set_id, make_label
 from bandits.store import DerivedStore
 from bandits.verify import compute_verifier_draft_id, draft_verifiers
-from bandits.verify.models import VerifierStatus
+from bandits.verify.models import (
+    CheckOperator,
+    CheckSpec,
+    VerifierMode,
+    VerifierSpec,
+    VerifierStatus,
+)
 from bandits.verify.validate import (
+    Agreement,
+    GameabilityAssessment,
+    Validation,
+    _attack,
     accept,
+    assess_gameability,
     calibrate,
     load_validation,
+    probe_gameability,
     save_validation,
     validate_draft,
 )
@@ -422,3 +434,242 @@ def test_a_correctly_scoped_all_unclear_label_set_still_validates(address) -> No
 
     assert validation.labels_used == 0
     assert validation.unclear_labels == len(family.trace_ids)
+
+
+def test_disagreements_are_counted_by_direction(address) -> None:
+    """The rate alone cannot say which way an error went, and only one reaches training."""
+    validation = _validated(address)
+
+    for agreement in validation.agreements:
+        assert agreement.false_positives + agreement.false_negatives == agreement.disagreed
+        assert agreement.successes_agreed <= agreement.agreed
+
+
+def test_the_error_split_survives_past_the_counterexample_cap() -> None:
+    """Counterexamples are truncated at ten; the counts must not be read from them."""
+    agreement = Agreement(
+        verifier_id="v1",
+        split="held_out",
+        labeled=40,
+        agreed=0,
+        disagreed=40,
+        unscored=0,
+        agreement=0.0,
+        false_positives=31,
+        false_negatives=9,
+    )
+
+    assert agreement.false_positives == 31
+    assert len(agreement.counterexamples) == 0
+
+
+def test_an_error_split_that_does_not_account_for_its_disagreements_is_refused() -> None:
+    with pytest.raises(ValueError, match="splits into"):
+        Agreement(
+            verifier_id="v1",
+            split="held_out",
+            labeled=4,
+            agreed=2,
+            disagreed=2,
+            unscored=0,
+            agreement=0.5,
+            false_positives=1,
+            false_negatives=0,
+        )
+
+
+def test_coverage_reads_apart_from_agreement() -> None:
+    """One agreed run beside ninety-nine unscorable ones is not a verifier that works."""
+    thin = Agreement(
+        verifier_id="v1",
+        split="held_out",
+        labeled=100,
+        agreed=1,
+        disagreed=0,
+        unscored=99,
+        agreement=1.0,
+        successes_agreed=1,
+    )
+
+    assert thin.agreement == 1.0
+    assert thin.coverage == 0.01
+
+
+def test_failure_catch_rate_exposes_a_verifier_that_only_says_success() -> None:
+    """Nine of ten runs succeeded, so plain agreement flatters a check that never fails."""
+    flattered = Agreement(
+        verifier_id="v1",
+        split="held_out",
+        labeled=10,
+        agreed=9,
+        disagreed=1,
+        unscored=0,
+        agreement=0.9,
+        false_positives=1,
+        false_negatives=0,
+        successes_agreed=9,
+    )
+
+    assert flattered.agreement == 0.9
+    assert flattered.caught_failures == 0
+    assert flattered.failure_catch_rate == 0.0
+
+
+def _rubric_only_spec() -> VerifierSpec:
+    """A verifier ``_attack`` has no template for: the softest checks there are."""
+    return VerifierSpec(
+        verifier_id="v-rubric",
+        family_id="f1",
+        task_set_id="ts1",
+        mode=VerifierMode.REPLAY,
+        status=VerifierStatus.EXECUTABLE,
+        inputs=("terminal_evidence:rubric",),
+        checks=(
+            CheckSpec(
+                check_id="c-rubric",
+                claim="rubric:helpful",
+                operator=CheckOperator.RUBRIC_AT_LEAST,
+                expected=4,
+                supporting_evidence_ids=("e1",),
+                description="a judge scored this at least 4",
+            ),
+        ),
+        unknown_when=("no judge verdict",),
+        blind_spots=("a judge that always scores high",),
+        gaming_hypotheses=("persuade the judge without doing the task",),
+    )
+
+
+def test_a_verifier_no_template_can_attack_records_that_it_was_never_tried() -> None:
+    """An empty result set used to read exactly like resisting every attack."""
+    spec = _rubric_only_spec()
+    assert all(_attack(check) is None for check in spec.checks)
+    assert probe_gameability(spec) == []
+
+    assessment = assess_gameability(spec, ())
+
+    assert assessment.coverage == "none"
+    assert assessment.attack_succeeded is False
+
+
+def test_coverage_and_outcome_are_independent_facts() -> None:
+    """A half-covered verifier can still have been beaten by the half that was tried."""
+    beaten = GameabilityAssessment(
+        verifier_id="v1",
+        coverage="partial",
+        attack_succeeded=True,
+        checks_attacked=1,
+        checks_total=2,
+    )
+
+    assert beaten.coverage == "partial"
+    assert beaten.attack_succeeded
+
+    with pytest.raises(ValueError, match="does not match"):
+        GameabilityAssessment(
+            verifier_id="v1",
+            coverage="complete",
+            attack_succeeded=False,
+            checks_attacked=1,
+            checks_total=2,
+        )
+
+
+def test_an_attack_cannot_have_landed_when_none_was_attempted() -> None:
+    with pytest.raises(ValueError, match="cannot have succeeded"):
+        GameabilityAssessment(
+            verifier_id="v1",
+            coverage="none",
+            attack_succeeded=True,
+            checks_attacked=0,
+            checks_total=2,
+        )
+
+
+def test_a_catch_rate_is_unavailable_rather_than_flattering_when_unrecorded() -> None:
+    """A record that never said how its agreements split cannot state this rate.
+
+    Defaulting the split to zero would report every agreed run as a caught
+    failure — a perfect score for exactly the always-says-success verifier this
+    number exists to expose.
+    """
+    unrecorded = Agreement(
+        verifier_id="v1",
+        split="held_out",
+        labeled=10,
+        agreed=9,
+        disagreed=1,
+        unscored=0,
+        agreement=0.9,
+        false_positives=1,
+        false_negatives=0,
+    )
+
+    assert unrecorded.successes_agreed is None
+    assert unrecorded.caught_failures is None
+    assert unrecorded.failure_catch_rate is None
+    assert unrecorded.replace(successes_agreed=9).failure_catch_rate == 0.0
+
+
+def test_the_error_split_survives_a_store_round_trip(tmp_path, address) -> None:
+    """Every promotion decision downstream reads these back from disk."""
+    store = DerivedStore(tmp_path / ".bandits")
+    validation = _validated(address).replace(
+        agreements=(
+            Agreement(
+                verifier_id="v1",
+                split="held_out",
+                labeled=6,
+                agreed=3,
+                disagreed=3,
+                unscored=0,
+                agreement=0.5,
+                false_positives=2,
+                false_negatives=1,
+                successes_agreed=1,
+            ),
+        ),
+        gameability=(),
+        gameability_assessments=(),
+    )
+
+    envelope = save_validation(validation, store)
+    restored = load_validation(envelope.artifact_id, store).agreements[0]
+
+    assert (restored.false_positives, restored.false_negatives) == (2, 1)
+    assert restored.successes_agreed == 1
+    assert restored.caught_failures == 2
+
+
+def test_assessing_only_some_measured_verifiers_is_refused() -> None:
+    """Assessing three of four leaves the fourth indistinguishable from clean."""
+    agreements = tuple(
+        Agreement(
+            verifier_id=verifier_id,
+            split="held_out",
+            labeled=1,
+            agreed=1,
+            disagreed=0,
+            unscored=0,
+            agreement=1.0,
+            successes_agreed=1,
+        )
+        for verifier_id in ("v1", "v2")
+    )
+
+    with pytest.raises(ValueError, match="assessed for some verifiers but not"):
+        Validation(
+            source_draft_id="d1",
+            family_id="f1",
+            label_set_id="l1",
+            agreements=agreements,
+            gameability_assessments=(
+                GameabilityAssessment(
+                    verifier_id="v1",
+                    coverage="complete",
+                    attack_succeeded=False,
+                    checks_attacked=1,
+                    checks_total=1,
+                ),
+            ),
+        )

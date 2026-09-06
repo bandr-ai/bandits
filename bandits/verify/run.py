@@ -19,7 +19,12 @@ from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
 from bandits.verify.execute import execute_verifier
 from bandits.verify.models import CheckSpec, Result, VerifierDraft, VerifierSpec
-from bandits.verify.validate import Agreement, GameabilityResult, Validation
+from bandits.verify.validate import (
+    Agreement,
+    GameabilityAssessment,
+    GameabilityResult,
+    Validation,
+)
 
 
 class TraceOutcome(Contract):
@@ -157,7 +162,14 @@ class CheckSummary(Contract):
     """Per-split label agreement, when an earlier round measured it."""
 
     gameability: tuple[GameabilityResult, ...] = ()
-    """Attacks that beat this verifier, when an earlier round probed it."""
+    """Every attack an earlier round ran against this verifier, resisted or not.
+
+    Resisted attacks are shown too: "three attacks, none landed" and "no attack
+    could be built" are different findings, and only the first is evidence.
+    """
+
+    assessment: GameabilityAssessment | None = None
+    """What the probe covered. None when no round has probed this verifier yet."""
 
     def prompt_lines(self) -> tuple[str, ...]:
         """The summary as the interpreter sees it — everything but trace ids.
@@ -176,16 +188,55 @@ class CheckSummary(Contract):
             )
         if self.disagreement_trace_ids:
             lines.append(f"verifiers disagreed on {len(self.disagreement_trace_ids)} run(s)")
+        if not self.agreements:
+            # Said rather than left blank. A check nobody has measured and a
+            # check measured as good both render as silence otherwise, and
+            # silence is the more flattering of the two readings.
+            lines.append("agreement: unavailable — no labeled measurement covers this verifier yet")
         for agreement in self.agreements:
             rate = "unmeasured" if agreement.agreement is None else f"{agreement.agreement:.2f}"
             lines.append(
                 f"agreement {agreement.split}: {rate} over {agreement.labeled} labeled run(s)"
             )
-        for attack in self.gameability:
-            if attack.passed:
+            if agreement.scored:
+                # The rate alone cannot say which way the errors went, and the
+                # two are not equally costly: a false positive passes a run a
+                # human failed, and that is the one that reaches training data.
                 lines.append(
-                    f"gameability: {attack.hypothesis} (passed, {attack.forged_facts} forged fact(s))"
+                    f"errors {agreement.split}: {agreement.false_positives} false positive(s), "
+                    f"{agreement.false_negatives} false negative(s)"
                 )
+                caught = agreement.failure_catch_rate
+                if caught is not None:
+                    lines.append(
+                        f"failures caught {agreement.split}: {caught:.2f} "
+                        f"({agreement.caught_failures} of "
+                        f"{agreement.caught_failures + agreement.false_positives})"
+                    )
+            if agreement.coverage is not None and agreement.unscored:
+                lines.append(
+                    f"coverage {agreement.split}: {agreement.coverage:.2f} "
+                    f"({agreement.unscored} of {agreement.labeled} unscorable)"
+                )
+        if self.assessment is not None:
+            state = (
+                "an attack succeeded" if self.assessment.attack_succeeded else "no attack succeeded"
+            )
+            lines.append(
+                f"gameability coverage: {self.assessment.coverage} "
+                f"({self.assessment.checks_attacked} of {self.assessment.checks_total} "
+                f"check(s) attackable); {state}"
+            )
+            if self.assessment.coverage != "complete":
+                lines.append(
+                    "note: checks no template could attack were never tried, so a failed "
+                    "attack here is not evidence they resist one"
+                )
+        for attack in self.gameability:
+            outcome = "passed" if attack.passed else "resisted"
+            lines.append(
+                f"gameability: {attack.hypothesis} ({outcome}, {attack.forged_facts} forged fact(s))"
+            )
         for blind in self.blind_spots:
             lines.append(f"blind spot: {blind}")
         for gaming in self.gaming_hypotheses:
@@ -219,9 +270,14 @@ def build_check_summary(
 
     agreements: tuple[Agreement, ...] = ()
     gameability: tuple[GameabilityResult, ...] = ()
+    assessment: GameabilityAssessment | None = None
     if validation is not None:
         agreements = tuple(a for a in validation.agreements if a.verifier_id == spec.verifier_id)
         gameability = tuple(g for g in validation.gameability if g.verifier_id == spec.verifier_id)
+        assessment = next(
+            (a for a in validation.gameability_assessments if a.verifier_id == spec.verifier_id),
+            None,
+        )
 
     return CheckSummary(
         verifier_id=spec.verifier_id,
@@ -239,4 +295,5 @@ def build_check_summary(
         gaming_hypotheses=spec.gaming_hypotheses,
         agreements=agreements,
         gameability=gameability,
+        assessment=assessment,
     )

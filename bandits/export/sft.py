@@ -412,7 +412,7 @@ def build_sft_export(
             validation_id=reviewed.validation_id,
             human_acceptance_id=reviewed.human_acceptance_id,
             verifier_status=spec.status.value,
-            accepted_risks=tuple(item.code for item in reviewed.accepted_risks),
+            interview_id=reviewed.interview_id,
             partition=partition,
             partition_trace_count=len(eligible),
             success_threshold=success_threshold,

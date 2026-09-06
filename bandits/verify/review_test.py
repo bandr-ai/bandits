@@ -3,22 +3,24 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from bandits.verify.interview import apply_decision, start_review
 from bandits.verify.models import (
     CheckOperator,
+    CheckReview,
     CheckSpec,
+    InterviewDecision,
     VerifierDraft,
     VerifierMode,
     VerifierSpec,
     VerifierStatus,
 )
 from bandits.verify.review import (
-    PromotionBlocker,
     assess_promotion,
     load_reviewed_verifier,
     review_verifier,
     save_reviewed_verifier,
 )
-from bandits.verify.validate import Agreement, GameabilityResult, Validation
+from bandits.verify.validate import Agreement, Validation
 
 
 def _inputs():
@@ -66,23 +68,137 @@ def _inputs():
     return draft, validation
 
 
-def test_review_requires_matching_validation_and_explicit_acceptance() -> None:
-    draft, validation = _inputs()
-    with pytest.raises(ValueError, match="must not be empty"):
-        review_verifier(draft, "d1", validation, "val1", "v1", " ")
-    with pytest.raises(ValueError, match="another verifier draft"):
-        review_verifier(draft, "wrong", validation, "val1", "v1", "owner-1")
+def _review(draft, draft_id="d1", validation_id="val1", *, decision=None, verifier_id=None):
+    """A completed round, accepting every check unless told otherwise."""
+    interview = start_review(draft, draft_id, validation_id=validation_id, round_number=2)
+    for index, (spec_id, check_id) in enumerate(interview.pending, start=1):
+        chosen = decision if decision and (verifier_id in (None, spec_id)) else None
+        interview = apply_decision(
+            interview,
+            CheckReview(
+                review_id=f"review-{index:03d}-{check_id}",
+                verifier_id=spec_id,
+                check_id=check_id,
+                reply="reads the right field",
+                decision=chosen or InterviewDecision.ACCEPT,
+                authoritative=True,
+            ),
+        )
+    return interview
 
-    unmeasured = validation.replace(agreements=())
-    with pytest.raises(ValueError, match="no validation measurements"):
-        review_verifier(draft, "d1", unmeasured, "val1", "v1", "owner-1")
+
+def test_review_requires_artifacts_that_belong_to_one_chain() -> None:
+    draft, validation = _inputs()
+    interview = _review(draft)
+
+    with pytest.raises(ValueError, match="another verifier draft"):
+        review_verifier(draft, "wrong", validation, "val1", "v1", interview, "i1")
+
+    elsewhere = _review(draft, draft_id="other")
+    with pytest.raises(ValueError, match="conducted against another verifier draft"):
+        review_verifier(draft, "d1", validation, "val1", "v1", elsewhere, "i1")
+
+    stale = _review(draft, validation_id="val-earlier")
+    with pytest.raises(ValueError, match="read validation val-earlier"):
+        review_verifier(draft, "d1", validation, "val1", "v1", stale, "i1")
+
+
+def test_a_verifier_the_validation_never_scored_cannot_promote() -> None:
+    """The reviewer accepted a check no measurement in this validation covers."""
+    draft, validation = _inputs()
+
+    blockers = assess_promotion(validation.replace(agreements=()), "v1", _review(draft), "i1")
+
+    assert {item.code for item in blockers} == {"verifier_not_measured"}
+
+
+def test_a_review_that_saw_no_validation_cannot_promote() -> None:
+    """Round one decides before anything is measured; that is not an informed accept."""
+    draft, validation = _inputs()
+    blind = start_review(draft, "d1", round_number=1)
+    blind = apply_decision(
+        blind,
+        CheckReview(
+            review_id="review-001-c1",
+            verifier_id="v1",
+            check_id="c1",
+            reply="looks fine",
+            decision=InterviewDecision.ACCEPT,
+        ),
+    )
+
+    blockers = assess_promotion(validation, "v1", blind, "i1")
+
+    assert {item.code for item in blockers} == {"review_saw_no_validation"}
+
+
+def test_a_check_the_reviewer_did_not_accept_blocks_promotion() -> None:
+    draft, validation = _inputs()
+    rejected = _review(draft, decision=InterviewDecision.REJECT)
+
+    blockers = assess_promotion(validation, "v1", rejected, "i1")
+
+    assert {item.code for item in blockers} == {"checks_not_accepted"}
+
+
+def test_a_superseded_accept_no_longer_stands() -> None:
+    """A combination reopens an earlier decision; the accept it replaced is spent."""
+    draft, validation = _inputs()
+    interview = _review(draft)
+    spent = interview.replace(
+        reviews=tuple(
+            review.replace(superseded_by=review.review_id) for review in interview.reviews
+        )
+    )
+
+    blockers = assess_promotion(validation, "v1", spent, "i1")
+
+    assert {item.code for item in blockers} == {"checks_not_accepted"}
+
+
+def test_a_revised_verifier_cannot_promote_on_the_old_validation() -> None:
+    """Revision mints a new id, so the accepted verifier is not the promoted one."""
+    draft, validation = _inputs()
+    interview = _review(draft)
+    departed = interview.replace(
+        draft=interview.draft.replace(
+            verifiers=tuple(
+                spec.replace(verifier_id="v1-revised") for spec in interview.draft.verifiers
+            )
+        )
+    )
+
+    blockers = assess_promotion(validation, "v1", departed, "i1")
+
+    assert {item.code for item in blockers} == {"verifier_not_in_reviewed_draft"}
+
+
+def test_promotion_refuses_without_a_confirmed_review() -> None:
+    """A bare acceptance string used to be enough. It no longer reaches the call."""
+    draft, validation = _inputs()
+    rejected = _review(draft, decision=InterviewDecision.REJECT)
+
+    with pytest.raises(ValueError, match="no confirmed review supports promoting"):
+        review_verifier(draft, "d1", validation, "val1", "v1", rejected, "i1")
+
+
+def test_a_confirmed_review_promotes_and_is_referenced() -> None:
+    draft, validation = _inputs()
+
+    reviewed = review_verifier(draft, "d1", validation, "val1", "v1", _review(draft), "i1")
+
+    assert reviewed.spec.status is VerifierStatus.REVIEWED
+    # The reasoning lives in the round, so the artifact points at it rather than
+    # copying a sentence out of it.
+    assert reviewed.interview_id == "i1"
+    assert reviewed.human_acceptance_id == "i1"
 
 
 def test_review_round_trips_as_immutable_derived_artifact(tmp_path) -> None:
     from bandits.store import DerivedStore
 
     draft, validation = _inputs()
-    reviewed = review_verifier(draft, "d1", validation, "val1", "v1", "owner-1")
+    reviewed = review_verifier(draft, "d1", validation, "val1", "v1", _review(draft), "i1")
     store = DerivedStore(tmp_path / ".bandits")
 
     envelope = save_reviewed_verifier(reviewed, store)
@@ -91,84 +207,22 @@ def test_review_round_trips_as_immutable_derived_artifact(tmp_path) -> None:
     assert reviewed.spec.status is VerifierStatus.REVIEWED
 
 
-def _validation(**overrides) -> Validation:
-    _, validation = _inputs()
-    return validation.replace(**overrides)
-
-
-def test_a_measurement_that_measured_nothing_blocks_promotion() -> None:
-    """An Agreement existing is not the same as that Agreement saying anything."""
-    empty = Agreement(verifier_id="v1", split="fit", labeled=0, agreed=0, disagreed=0, unscored=0)
-
-    blockers = assess_promotion(_validation(agreements=(empty,)), "v1")
-
-    assert {item.code for item in blockers} == {"no_held_out_measurement"}
-
-
-def test_all_held_out_runs_unscorable_blocks_promotion() -> None:
-    blind = Agreement(
-        verifier_id="v1", split="held_out", labeled=3, agreed=0, disagreed=0, unscored=3
-    )
-
-    blockers = assess_promotion(_validation(agreements=(blind,)), "v1")
-
-    assert {item.code for item in blockers} == {"no_scorable_held_out"}
-
-
-def test_labels_of_one_verdict_block_promotion() -> None:
-    blockers = assess_promotion(
-        _validation(labels_used=4, success_labels=4, failure_labels=0), "v1"
-    )
-
-    assert {item.code for item in blockers} == {"single_verdict_labels"}
-
-
-def test_a_working_attack_blocks_promotion() -> None:
-    gamed = GameabilityResult(
-        verifier_id="v1",
-        hypothesis="Write the status field directly.",
-        constructed={"status": "refunded"},
-        passed=True,
-        forged_facts=1,
-    )
-
-    blockers = assess_promotion(_validation(gameability=(gamed,)), "v1")
-
-    assert {item.code for item in blockers} == {"gameable"}
-
-
-def test_sufficient_evidence_promotes_cleanly() -> None:
+def test_a_promotion_cannot_name_a_review_it_was_not_accepted_by() -> None:
     draft, validation = _inputs()
+    reviewed = review_verifier(draft, "d1", validation, "val1", "v1", _review(draft), "i1")
 
-    reviewed = review_verifier(draft, "d1", validation, "val-1", "v1", "ticket-7")
-
-    assert reviewed.spec.status is VerifierStatus.REVIEWED
-    assert not reviewed.accepted_risks
-    assert reviewed.success_threshold == validation.success_threshold
+    with pytest.raises(ValidationError, match="accepted by the review it names"):
+        reviewed.replace(interview_id="some-other-round")
 
 
-def test_review_refuses_insufficient_evidence_by_default() -> None:
-    draft, _ = _inputs()
-    weak = _validation(success_labels=1, failure_labels=0)
-
-    with pytest.raises(ValueError, match="single_verdict_labels"):
-        review_verifier(draft, "d1", weak, "val-1", "v1", "ticket-7")
-
-
-def test_an_override_is_a_different_artifact_not_the_same_one() -> None:
-    """An owner going against the evidence must not look like one who did not."""
-    draft, _ = _inputs()
-    weak = _validation(success_labels=1, failure_labels=0)
-
-    reviewed = review_verifier(draft, "d1", weak, "val-1", "v1", "ticket-7", accept_risks=True)
-
-    assert reviewed.spec.status is VerifierStatus.RISK_ACCEPTED
-    assert [item.code for item in reviewed.accepted_risks] == ["single_verdict_labels"]
-
-
-def test_a_risk_accepted_spec_cannot_pose_as_an_ordinary_review() -> None:
+def test_an_unfinished_review_cannot_promote_what_it_reached() -> None:
+    """A reviewer can stop at any check, and where they stopped is not where they finished."""
     draft, validation = _inputs()
-    reviewed = review_verifier(draft, "d1", validation, "val-1", "v1", "ticket-7")
+    interview = _review(draft)
+    abandoned = interview.replace(complete=False, pending=(("v1", "c-unreviewed"),))
 
-    with pytest.raises(ValidationError, match="cannot carry accepted risks"):
-        reviewed.replace(accepted_risks=(PromotionBlocker(code="gameable", detail="x"),))
+    blockers = assess_promotion(validation, "v1", abandoned, "i1")
+
+    assert {item.code for item in blockers} == {"review_unfinished"}
+    with pytest.raises(ValueError, match="review_unfinished"):
+        review_verifier(draft, "d1", validation, "val1", "v1", abandoned, "i1")

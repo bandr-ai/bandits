@@ -82,11 +82,14 @@ uv run bandits label <verifier-draft-id> --labeler "your-name"
 # 5. Measure agreement and actively probe the checks for gameability.
 uv run bandits validate-verifier <verifier-draft-id> --labels <label-set-id>
 
-# 6. Record explicit owner acceptance of one measured verifier.
+# 6. Review the measured checks in your own words, then promote what you accepted.
+uv run bandits interview-review <verifier-draft-id> \
+  --validation <validation-id> --round 2
+
 uv run bandits review-verifier <verifier-draft-id> \
   --validation <validation-id> \
   --verifier <verifier-id> \
-  --acceptance-id <ticket-or-review-id>
+  --interview <interview-id>
 
 # 7. Export held-out evals or successful fit demonstrations.
 uv run bandits export <task-set-id> --format eval \
@@ -142,10 +145,9 @@ Verifier status also carries a concrete meaning:
 | `executable` | The check can run against recorded evidence |
 | `calibrated` | It has been measured against historical labels |
 | `reviewed` | It cleared promotion checks and has explicit human acceptance |
-| `risk_accepted` | An owner promoted it despite recorded blockers |
 | `rejected` | Evidence contradicted the verifier or exposed unacceptable gaming |
 
-A verifier cannot be promoted as `reviewed` unless held-out evidence is labeled and scorable, labels cover both success and failure, and constructed attacks do not pass. `--accept-risks` preserves an override as the distinct `risk_accepted` status and carries the blocker codes into downstream manifests.
+A verifier is promoted on the strength of a review, not a threshold. `interview-review` shows one reviewer what the checks did — per-split agreement, how the disagreements split into false positives and false negatives, how much was scorable, which attacks were attempted and whether any were even possible — and records what they decided and why. `review-verifier` then promotes only what that review accepted, proving it named this verifier and this validation, that every check carries a standing accept, and that no revision has changed the verifier since. A revised or combined verifier returns through validation and review rather than inheriting the old decision.
 
 ## Dataset contracts
 
@@ -176,7 +178,8 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
 | `label` | Label disagreements and the remaining family runs |
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
-| `review-verifier` | Record explicit acceptance of a calibrated verifier |
+| `interview-review` | Review a draft's checks in free text, read by a model, confirmed by you |
+| `review-verifier` | Promote a calibrated verifier a review round accepted |
 | `judge` | Sample a rubric judge for unstructured outcomes |
 | `export` | Write verifier-gated eval or SFT JSONL plus quarantine |
 

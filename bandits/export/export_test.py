@@ -28,9 +28,12 @@ from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
 from bandits.store import DerivedStore, compute_artifact_id
 from bandits.traces import Span, SpanKind, SpanStatus, ToolSchema, Trace, TraceCorpus, UserTurn
+from bandits.verify.interview import apply_decision, start_review
 from bandits.verify.models import (
     CheckOperator,
+    CheckReview,
     CheckSpec,
+    InterviewDecision,
     VerifierDraft,
     VerifierMode,
     VerifierSpec,
@@ -113,6 +116,24 @@ def _trace(
         task=f"Change order {order}",
         spans=tuple(spans),
     )
+
+
+def _accepting_review(draft, draft_id: str, validation_id: str):
+    """A completed round in which a reviewer accepted every check."""
+    interview = start_review(draft, draft_id, validation_id=validation_id, round_number=2)
+    for index, (verifier_id, check_id) in enumerate(interview.pending, start=1):
+        interview = apply_decision(
+            interview,
+            CheckReview(
+                review_id=f"review-{index:03d}-{check_id}",
+                verifier_id=verifier_id,
+                check_id=check_id,
+                reply="reads the right field; keep it",
+                decision=InterviewDecision.ACCEPT,
+                authoritative=True,
+            ),
+        )
+    return interview
 
 
 def _export_case(traces: tuple[Trace, ...]):
@@ -198,8 +219,9 @@ def _export_case(traces: tuple[Trace, ...]):
         success_labels=3,
         failure_labels=1,
     )
+    interview = _accepting_review(draft, "draft-1", "validation-1")
     reviewed = review_verifier(
-        draft, "draft-1", validation, "validation-1", spec.verifier_id, "owner-ticket-7"
+        draft, "draft-1", validation, "validation-1", spec.verifier_id, interview, "interview-1"
     )
     return corpus, analysis, task_set, task_set_id, draft, validation, reviewed
 

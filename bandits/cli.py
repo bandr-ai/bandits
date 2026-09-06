@@ -62,6 +62,7 @@ from bandits.verify import (
     build_check_summary,
     draft_verifiers,
     find_check,
+    load_interview,
     load_reviewed_verifier,
     load_verifier_draft,
     next_check,
@@ -726,29 +727,32 @@ def review_verifier_command(
     verifier_draft_id: str,
     validation_id: str = typer.Option(..., "--validation"),
     verifier_id: str = typer.Option(..., "--verifier"),
-    acceptance_id: str = typer.Option(
-        ..., "--acceptance-id", help="Ticket, review record, or owner decision id."
-    ),
-    accept_risks: bool = typer.Option(
-        False,
-        "--accept-risks",
-        help="Promote despite blockers, recording them on the artifact.",
+    interview_id: str = typer.Option(
+        ...,
+        "--interview",
+        help="The confirmed review round that accepted this verifier.",
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Record explicit human acceptance of one calibrated verifier."""
+    """Promote one calibrated verifier a review round accepted.
+
+    Takes the review rather than a sign-off string: what authorises a promotion
+    is a person having seen the measurements and said yes, and only the review
+    artifact records that happening.
+    """
     store = _derived(project)
     try:
         draft = load_verifier_draft(verifier_draft_id, store)
         validation = load_validation(validation_id, store)
+        interview = load_interview(interview_id, store)
         reviewed = review_verifier(
             draft,
             verifier_draft_id,
             validation,
             validation_id,
             verifier_id,
-            acceptance_id,
-            accept_risks=accept_risks,
+            interview,
+            interview_id,
         )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
@@ -758,10 +762,8 @@ def review_verifier_command(
     console.print(f"verifier:             {reviewed.spec.verifier_id}")
     console.print(f"status:               {reviewed.spec.status.value}")
     console.print(f"validation:           {reviewed.validation_id}")
-    console.print(f"acceptance:           {reviewed.human_acceptance_id}")
+    console.print(f"review:               {reviewed.interview_id}")
     console.print(f"threshold:            {reviewed.success_threshold}")
-    for risk in reviewed.accepted_risks:
-        console.print(f"[yellow]accepted risk:[/yellow] {risk.code} — {risk.detail}")
 
 
 @app.command(name="export")
@@ -949,16 +951,53 @@ def _show_check_summary(summary, check, spec) -> None:
     if summary.example_trace_ids:
         console.print(f"  examples: {', '.join(summary.example_trace_ids)}")
     console.print(f"  evidence: {summary.evidence_kind}")
+    if not summary.agreements:
+        console.print(
+            "  [yellow]agreement: unavailable[/yellow] — no labeled measurement covers "
+            "this verifier yet"
+        )
     for agreement in summary.agreements:
         rate = "unmeasured" if agreement.agreement is None else f"{agreement.agreement:.0%}"
         console.print(
             f"  [cyan]agreement ({agreement.split})[/cyan]: {rate} of "
             f"{agreement.labeled} labeled run(s)"
         )
+        if agreement.scored:
+            console.print(
+                f"    errors: [red]{agreement.false_positives} false positive(s)[/red], "
+                f"{agreement.false_negatives} false negative(s)"
+            )
+            caught = agreement.failure_catch_rate
+            if caught is not None:
+                console.print(
+                    f"    failures caught: {caught:.0%} ({agreement.caught_failures} of "
+                    f"{agreement.caught_failures + agreement.false_positives})"
+                )
+        if agreement.coverage is not None and agreement.unscored:
+            console.print(
+                f"    coverage: {agreement.coverage:.0%} "
+                f"({agreement.unscored} of {agreement.labeled} unscorable)"
+            )
+    if summary.assessment is not None:
+        assessment = summary.assessment
+        colour = "red" if assessment.coverage == "none" else "cyan"
+        console.print(
+            f"  [{colour}]gameability coverage[/{colour}]: {assessment.coverage} "
+            f"({assessment.checks_attacked} of {assessment.checks_total} check(s) attackable)"
+        )
+        if assessment.coverage != "complete":
+            console.print(
+                "    [yellow]checks no template could attack were never tried[/yellow]: "
+                "a failed attack here is not evidence they resist one"
+            )
     for attack in summary.gameability:
         if attack.passed:
             console.print(
                 f"  [red]gameable[/red]: {attack.hypothesis} ({attack.forged_facts} forged fact(s))"
+            )
+        else:
+            console.print(
+                f"  [dim]resisted[/dim]: {attack.hypothesis} ({attack.forged_facts} forged fact(s))"
             )
     for blind in summary.blind_spots:
         console.print(f"  [dim]blind spot:[/dim] {blind}")

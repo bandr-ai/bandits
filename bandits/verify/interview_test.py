@@ -306,3 +306,19 @@ def test_a_later_round_chains_to_the_one_before() -> None:
     assert second.prior_interview_id == "interview-aaa"
     assert second.validation_id == "validation-xyz"
     assert second.round_number == 2
+
+
+def test_an_operator_only_revision_changes_identity() -> None:
+    """Identity follows content, and the operator is content.
+
+    A revision that kept its id could satisfy a promotion bound to the review of
+    the shape the reviewer actually accepted.
+    """
+    from bandits.verify.interview import _revised_identity, find_check
+
+    spec, check = find_check(_draft(), "verifier-one", "check-one")
+
+    before, _ = _revised_identity(spec, check)
+    after, _ = _revised_identity(spec, check.replace(operator=CheckOperator.EXACT_OUTPUT))
+
+    assert before != after
