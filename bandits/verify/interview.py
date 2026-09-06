@@ -221,8 +221,15 @@ def _revised_identity(spec: VerifierSpec, check: CheckSpec) -> tuple[str, str]:
     Reuses the drafting hash so a revision is addressed the same way a fresh
     proposal would be: identity follows content, never the history that
     produced it.
+
+    The operator is part of that content. ``exit_code_zero`` and ``equals`` over
+    one claim and value are different checks, and an operator-only revision that
+    kept its id would let a promotion match the review of the shape the reviewer
+    actually accepted.
     """
-    verifier_id = _spec_id(spec.family_id, check.claim, check.expected)
+    verifier_id = _spec_id(
+        spec.family_id, f"{check.claim}\x00{check.operator.value}", check.expected
+    )
     return verifier_id, f"check-{verifier_id.removeprefix('verifier-')}"
 
 
@@ -346,6 +353,15 @@ def apply_decision(interview: VerifierInterview, review: CheckReview) -> Verifie
     elif review.decision is InterviewDecision.REVISE:
         if interpretation is None:
             raise ValueError("a revise decision needs an interpretation to revise from")
+        if interpretation.revised_expected is None and interpretation.revised_operator is None:
+            # A revision that changes neither value nor operator would keep the
+            # check's content-addressed id — identity follows content — while
+            # clearing the evidence selected for it and marking it human-authored.
+            # The same id would then denote a check with less behind it than
+            # before. Refused here as well as in the interpreter, because a human
+            # overruling some other reading into a revise arrives with an
+            # interpretation that names nothing to revise.
+            raise ValueError("a revise decision needs a revised value or operator")
         verifiers[index] = _apply_revision(
             _with_extractions(spec, interpretation), check, interpretation
         )

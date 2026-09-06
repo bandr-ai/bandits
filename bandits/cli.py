@@ -1110,6 +1110,16 @@ def interview_review_command(
             console.print("  [yellow]no resolved target to combine with[/yellow]; skipped")
             continue
 
+        if decision is InterviewDecision.REVISE and (
+            interpretation is None
+            or (interpretation.revised_expected is None and interpretation.revised_operator is None)
+        ):
+            # Reachable by overruling some other reading into a revise: the
+            # interpretation on hand names nothing to revise, and applying it
+            # would strip the check's evidence without changing the check.
+            console.print("  [yellow]nothing named to revise[/yellow]; skipped")
+            continue
+
         review = CheckReview(
             review_id=f"review-{len(interview.reviews) + 1:03d}-{check_id}",
             verifier_id=verifier_id,

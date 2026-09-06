@@ -286,6 +286,41 @@ def test_a_revise_without_an_interpretation_is_refused() -> None:
         apply_decision(interview, _review("check-one", InterviewDecision.REVISE))
 
 
+def test_a_revise_that_names_nothing_is_refused() -> None:
+    """A revision that changes nothing must not strip the check's evidence.
+
+    Identity follows content, so a revise with neither field set keeps the
+    verifier id while clearing supporting evidence and marking the spec
+    human-authored — the same id then standing for a check with less behind it.
+    Reachable by overruling another reading into a revise, so it is refused
+    where it would be applied and not only where it is read.
+    """
+    interview = start_review(_two_check_draft(), "draft-one")
+    empty = Interpretation(decision=InterviewDecision.ACCEPT, rationale="looks fine")
+
+    with pytest.raises(ValueError, match="needs a revised value or operator"):
+        apply_decision(
+            interview,
+            _review("check-one", InterviewDecision.REVISE, interpretation=empty),
+        )
+
+
+def test_an_operator_only_revision_changes_identity() -> None:
+    """Identity follows content, and the operator is content.
+
+    A revision that kept its id could satisfy a promotion bound to the review of
+    the shape the reviewer actually accepted.
+    """
+    from bandits.verify.interview import _revised_identity, find_check
+
+    spec, check = find_check(_two_check_draft(), "verifier-one", "check-one")
+
+    before, _ = _revised_identity(spec, check)
+    after, _ = _revised_identity(spec, check.replace(operator=CheckOperator.EXACT_OUTPUT))
+
+    assert before != after
+
+
 def test_prior_decisions_reads_back_what_a_round_decided() -> None:
     interview = start_review(_two_check_draft(), "draft-one")
     interview = apply_decision(
