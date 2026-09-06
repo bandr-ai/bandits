@@ -33,11 +33,13 @@ from bandits.store import DerivedEnvelope, DerivedStore
 
 DEFAULT_BUDGET = 20
 DEFAULT_HELD_OUT = 0.3
-DEFAULT_SIMILARITY = 0.7
-"""Grouping stays conservative: two instructions must share most of their shape."""
-
 DEFAULT_NEIGHBORS = 3
-"""Maximum neighbors per descriptor in the mutual-kNN grouping graph."""
+"""Maximum neighbors per descriptor in the mutual-kNN grouping graph.
+
+This value has not yet been calibrated for the embedding backend. Raising it
+reduces fragmentation but widens the transitive components that :func:`_cluster`
+builds, so it cannot be tuned on its own — the two effects need choosing together
+against a labelled corpus."""
 
 DEFAULT_TAIL_RESERVE = 0.3
 
@@ -85,30 +87,11 @@ def fingerprint(instruction: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
 
 
-def _tokens(normalized: str) -> frozenset[str]:
-    return frozenset(normalized.split())
-
-
 Distance = Callable[[str, str], float]
 """How far apart two normalized instructions are, in [0, 1].
 
-Takes the descriptors rather than their tokens so that a backend measuring
-meaning rather than overlap can implement it.
+The callable receives the normalized descriptors used as embedding-cache keys.
 """
-
-
-def jaccard_distance(left: str, right: str) -> float:
-    """Token overlap. Two empty instructions are identical, not infinitely far.
-
-    Cheap, offline and reproducible, and blind to paraphrase: "bro login in aws"
-    and "can you login to the aws thing" share two tokens of fifteen, which reads
-    as unrelated. Real corpora need an embedding backend to group at all.
-    """
-    left_tokens, right_tokens = _tokens(left), _tokens(right)
-    if not left_tokens and not right_tokens:
-        return 0.0
-    union = left_tokens | right_tokens
-    return 1.0 - (len(left_tokens & right_tokens) / len(union)) if union else 0.0
 
 
 def _stable_fraction(*parts: str) -> float:
@@ -270,7 +253,7 @@ def _cluster(
     ]
 
 
-def _medoid(members: list[_TraceFeatures], distance: Distance = jaccard_distance) -> str:
+def _medoid(members: list[_TraceFeatures], distance: Distance) -> str:
     """Find the exact weighted medoid over distinct descriptors, not every trace."""
     by_descriptor: dict[str, list[_TraceFeatures]] = {}
     for member in members:
@@ -378,12 +361,12 @@ def mine_task_set(
     analysis: CorpusAnalysis,
     analysis_id: str,
     *,
+    distance: Distance,
+    similarity: float,
     budget: int = DEFAULT_BUDGET,
     held_out: float = DEFAULT_HELD_OUT,
-    similarity: float = DEFAULT_SIMILARITY,
     neighbors: int = DEFAULT_NEIGHBORS,
     tail_reserve: float = DEFAULT_TAIL_RESERVE,
-    distance: Distance = jaccard_distance,
     proposed_by: Literal["rule", "model", "human"] = "rule",
 ) -> TaskSet:
     """Group an analysis into families and select a set that stands for the workload."""
@@ -588,7 +571,11 @@ def split_family(task_set: TaskSet, family_id: str, analysis: CorpusAnalysis) ->
             family_id=f"family-{fingerprint(descriptor)}",
             descriptor=descriptor,
             trace_ids=tuple(sorted(f.trace_id for f in group)),
-            medoid_trace_id=_medoid(group),
+            # Every member in this correction group has the same normalized
+            # descriptor, so every candidate has identical medoid cost. The
+            # stable trace-id tie-break is the complete answer and needs no
+            # clustering backend that the old task-set artifact did not record.
+            medoid_trace_id=min(group, key=lambda feature: feature.trace_id).trace_id,
             workload_mass=len(group),
             # The parent's split is carried through rather than redrawn, so a
             # trace cannot change sides as a side effect of the correction.

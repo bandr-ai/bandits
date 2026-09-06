@@ -25,7 +25,7 @@ from bandits.analyze import (
     save_task_set,
     split_family,
 )
-from bandits.analyze.families import _cluster, _medoid, _TraceFeatures, jaccard_distance
+from bandits.analyze.families import _cluster, _medoid, _TraceFeatures
 from bandits.analyze.models import TaskFamily, TaskSet
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
@@ -35,6 +35,11 @@ RETRY_CHAIN = {"refund-1", "refund-2", "refund-3"}
 """All three share session sess-r1 and must never straddle a split."""
 
 
+def _test_distance(left: str, right: str) -> float:
+    """Fixture-specific distance for mining mechanics; production uses embeddings."""
+    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
+
+
 @pytest.fixture
 def analysis():
     return analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
@@ -42,7 +47,9 @@ def analysis():
 
 @pytest.fixture
 def task_set(analysis):
-    return mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    return mine_task_set(
+        analysis, compute_analysis_id(analysis), distance=_test_distance, similarity=0.7, budget=10
+    )
 
 
 def _family(task_set: TaskSet, word: str) -> TaskFamily:
@@ -102,7 +109,7 @@ def test_mutual_knn_avoids_a_plain_single_link_chain() -> None:
         _feature("c", "beta gamma"),
     ]
 
-    clusters = _cluster(features, similarity=0.6, neighbors=1, distance=jaccard_distance)
+    clusters = _cluster(features, similarity=0.6, neighbors=1, distance=_test_distance)
 
     assert sorted(sorted(f.trace_id for f in cluster) for cluster in clusters) == [
         ["a", "b"],
@@ -115,10 +122,10 @@ def test_medoid_work_scales_with_distinct_descriptors() -> None:
     members.extend(_feature(f"b-{i:03}", "alpha gamma") for i in range(50))
     calls = 0
 
-    def counted(left: frozenset[str], right: frozenset[str]) -> float:
+    def counted(left: str, right: str) -> float:
         nonlocal calls
         calls += 1
-        return jaccard_distance(left, right)
+        return _test_distance(left, right)
 
     assert _medoid(members, counted) == "a-000"
     assert calls == 4
@@ -139,8 +146,20 @@ def test_a_retry_chain_never_straddles_the_split(task_set: TaskSet) -> None:
 
 
 def test_the_split_is_reproducible(analysis) -> None:
-    first = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
-    second = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    first = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=10,
+        distance=_test_distance,
+        similarity=0.7,
+    )
+    second = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=10,
+        distance=_test_distance,
+        similarity=0.7,
+    )
 
     assert first == second
     assert compute_task_set_id(first) == compute_task_set_id(second)
@@ -148,7 +167,13 @@ def test_the_split_is_reproducible(analysis) -> None:
 
 def test_grouping_ignores_everything_a_live_request_would_not_know(analysis) -> None:
     """Two refunds group together despite one failing and one succeeding."""
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=10,
+        distance=_test_distance,
+        similarity=0.7,
+    )
     refunds = set(_family(task_set, "refund").trace_ids)
 
     assert {"refund-4", "refund-9"} <= refunds, "failed runs belong to the family too"
@@ -191,8 +216,20 @@ def test_semantic_categories_are_declared_a_limitation_not_a_missing_slot(
 
 
 def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
-    small = mine_task_set(analysis, compute_analysis_id(analysis), budget=1)
-    full = mine_task_set(analysis, compute_analysis_id(analysis), budget=10)
+    small = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=1,
+        distance=_test_distance,
+        similarity=0.7,
+    )
+    full = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=10,
+        distance=_test_distance,
+        similarity=0.7,
+    )
 
     assert small.workload_coverage < full.workload_coverage
     assert full.workload_coverage == 1.0
@@ -200,14 +237,26 @@ def test_coverage_reports_what_a_small_budget_leaves_out(analysis) -> None:
 
 
 def test_a_budget_larger_than_the_corpus_is_reported_as_underfilled(analysis) -> None:
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=40)
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=40,
+        distance=_test_distance,
+        similarity=0.7,
+    )
 
     assert task_set.underfilled
     assert len(task_set.selected) == task_set.total_workload_mass
 
 
 def test_the_last_slot_is_never_taken_by_the_tail_reserve(analysis) -> None:
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=1)
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=1,
+        distance=_test_distance,
+        similarity=0.7,
+    )
 
     assert [s.slot for s in task_set.selected] == [SlotKind.MEDOID]
 
@@ -216,7 +265,13 @@ def test_traces_without_an_instruction_count_against_coverage() -> None:
     corpus = load_corpus(FIXTURES / "traces.otlp.jsonl", "otlp")
     analysis = analyze_corpus(corpus)
 
-    task_set = mine_task_set(analysis, compute_analysis_id(analysis), budget=5)
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        budget=5,
+        distance=_test_distance,
+        similarity=0.7,
+    )
 
     assert task_set.total_workload_mass == len(analysis.tasks)
 
