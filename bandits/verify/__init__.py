@@ -15,11 +15,16 @@ from bandits.verify.interpret import (
 )
 from bandits.verify.interview import (
     answer_question,
+    apply_decision,
     compute_interview_id,
+    find_check,
     load_interview,
+    next_check,
     next_question,
+    prior_decisions,
     save_interview,
     start_interview,
+    start_review,
 )
 from bandits.verify.judge import (
     JudgeError,
@@ -81,6 +86,11 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "start_review",
+    "prior_decisions",
+    "next_check",
+    "find_check",
+    "apply_decision",
     "render_interview_prompt",
     "interpret_reply",
     "Interpreter",

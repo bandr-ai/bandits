@@ -105,6 +105,9 @@ class VerifierSpec(Contract):
     validation_artifact_id: str | None = None
     human_acceptance_id: str | None = None
 
+    source_verifier_ids: tuple[str, ...] = ()
+    """The verifiers this one was combined from, if any."""
+
     @property
     def rests_only_on_self_report(self) -> bool:
         """True when nothing but the agent's own claim supports this verifier."""
@@ -306,6 +309,17 @@ class VerifierInterview(Contract):
 
     validation_id: str | None = None
     """The validation whose results this round was reviewed against, if any."""
+
+    prior_interview_id: str | None = None
+    """The round before this one.
+
+    Each round is its own artifact — the store is content-addressed, so a
+    growing record would mint a new id on every save anyway and merely hide the
+    chain. Making it explicit keeps each round honest about being one round,
+    and lets a later round read what earlier ones decided.
+    """
+
+    round_number: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def validate_review_ids(self) -> VerifierInterview:
