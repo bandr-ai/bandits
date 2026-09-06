@@ -83,6 +83,11 @@ def build_transcript(
     user said "use 1.9 instead" halfway through is a demonstration of following
     that correction, and a transcript holding only the opening instruction would
     teach the final action as the answer to a question nobody asked.
+
+    A tool result the source never paired with a call is a defect, not a call to
+    reconstruct. The name and arguments of the action are only inferable from
+    what came back from it, and a row built that way would teach the model to
+    commit to an action it can only justify by its outcome.
     """
     by_id = {span.span_id: span for span in trace.spans}
     children = {span.parent_span_id for span in trace.spans if span.parent_span_id}
@@ -162,6 +167,16 @@ def build_transcript(
 
     for span in trace.spans:
         if span.kind is SpanKind.TOOL:
+            if not span.call_recorded:
+                # A result the source never paired with a call. The only way to
+                # put it in a transcript is to write the assistant turn that
+                # would have produced it, which is a decision no one recorded
+                # making — so nothing is emitted for it and the row is refused.
+                defects.append(f"tool result {span.name!r} has no recorded assistant call")
+                open_text_span = None
+                close_turn(span.span_id)
+                continue
+
             carrier = carriers.get(span.span_id)
             call = ToolCall(
                 id=_tool_call_id(span),

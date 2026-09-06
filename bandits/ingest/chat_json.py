@@ -214,6 +214,11 @@ def _convert_conversation(
                     ended_at=timestamp,
                     output=_tool_result(message.get("content")),
                     status=SpanStatus.OK,
+                    # A result whose call this file never recorded. Kept, so the
+                    # observation stays available to analysis, and marked, so an
+                    # export cannot reach backwards from it to a call the
+                    # assistant was never shown to have made.
+                    call_recorded=parent_span_id is not None,
                     attributes={"synthetic_time": True},
                 )
             )

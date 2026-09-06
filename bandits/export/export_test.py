@@ -836,3 +836,114 @@ def test_a_split_verdict_is_scored_against_the_frozen_threshold(export_case) -> 
         if item.trace_id == "good-1"
         for reason in item.reasons
     )
+
+
+def _chat_trace(tmp_path, name: str, messages: str, trace_id: str) -> Trace:
+    """One chat-JSON conversation, ingested rather than hand-built.
+
+    The pairing state these tests are about is decided by the adapter, so a
+    hand-assembled trace would only ever prove that the flag it was given is the
+    flag the exporter read.
+    """
+    path = tmp_path / f"{name}.json"
+    path.write_text(messages)
+    return load_chat_json(path).traces[0].replace(trace_id=trace_id)
+
+
+_PAIRED_CONVERSATION = (
+    '[{"role": "user", "content": "Change order 100"},'
+    ' {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function":'
+    '  {"name": "change_order", "arguments": "{\\"order_id\\": 100}"}}]},'
+    ' {"role": "tool", "tool_call_id": "c1", "name": "change_order",'
+    '  "content": "{\\"status\\": \\"changed\\", \\"order_id\\": 100}"},'
+    ' {"role": "assistant", "content": "completed"}]'
+)
+
+_ORPHANED_CONVERSATION = (
+    '[{"role": "user", "content": "Change order 100"},'
+    ' {"role": "tool", %s"name": "change_order",'
+    '  "content": "{\\"status\\": \\"changed\\", \\"order_id\\": 100}"},'
+    ' {"role": "assistant", "content": "completed"}]'
+)
+
+
+def _export_with(trace: Trace):
+    """The standard four-trace family, with ``good-1`` swapped for one under test."""
+    return _export_case(
+        (
+            trace,
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "id_field"),
+    [("missing_id", ""), ("unknown_id", '"tool_call_id": "c-elsewhere", ')],
+)
+def test_a_tool_result_answering_no_recorded_call_is_never_given_one(
+    tmp_path, name: str, id_field: str
+) -> None:
+    """The exporter may not reach backwards from a result to the call for it."""
+    trace = _chat_trace(tmp_path, name, _ORPHANED_CONVERSATION % id_field, "good-1")
+
+    messages, defects, _ = build_transcript(trace)
+
+    assert any("has no recorded assistant call" in defect for defect in defects)
+    assert not any(message.tool_calls for message in messages)
+    assert not any(message.role == "tool" for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("name", "id_field"),
+    [("missing_id", ""), ("unknown_id", '"tool_call_id": "c-elsewhere", ')],
+)
+def test_an_orphaned_result_is_excluded_from_verifier_gated_sft(
+    tmp_path, name: str, id_field: str
+) -> None:
+    """End to end from the file: ingestion decides, and the export refuses."""
+    trace = _chat_trace(tmp_path, name, _ORPHANED_CONVERSATION % id_field, "good-1")
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(trace)
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("has no recorded assistant call" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
+    assert not any(
+        call.function.name == "change_order"
+        for row in bundle.rows
+        for message in row.messages
+        for call in message.tool_calls
+        if row.trace_id == "good-1"
+    )
+
+
+def test_a_paired_chat_call_and_result_still_exports(tmp_path) -> None:
+    """The refusal is about missing pairing evidence, not about chat JSON."""
+    trace = _chat_trace(tmp_path, "paired", _PAIRED_CONVERSATION, "good-1")
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(trace)
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    call = next(call for message in row.messages for call in message.tool_calls)
+    assert call.function.name == "change_order"
+    assert json.loads(call.function.arguments) == {"order_id": 100}
+
+
+def test_an_otlp_tool_span_carrying_its_own_arguments_still_exports() -> None:
+    """OTLP declares the tool span itself as the executed call; that is pairing evidence."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_with(
+        _trace("good-1", 100, "changed")
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    row = next(item for item in bundle.rows if item.trace_id == "good-1")
+    tool_span = next(span for span in corpus.traces[0].spans if span.kind is SpanKind.TOOL)
+    assert tool_span.call_recorded is True and tool_span.arguments == {"order_id": 100}
+    call = next(call for message in row.messages for call in message.tool_calls)
+    assert json.loads(call.function.arguments) == {"order_id": 100}
