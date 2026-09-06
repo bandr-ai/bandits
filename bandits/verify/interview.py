@@ -1,4 +1,16 @@
-"""Bounded, one-question-at-a-time review of deterministic verifier drafts."""
+"""Owner review of deterministic verifier drafts.
+
+Two flows live here. The older one asks a fixed sequence of narrow questions
+per check — ``start_interview`` / ``next_question`` / ``answer_question`` — and
+is kept because recorded interviews still load and replay through it.
+
+The newer one asks a single open question per check and reads the answer:
+``start_review`` queues the checks, ``bandits.verify.interpret`` maps a
+free-text reply to a proposed decision, and ``apply_decision`` records what the
+owner confirmed. A fixed form cannot carry the objection that fits none of its
+slots — "you are checking the wrong signal entirely" — and prose typed into one
+was never read by anything downstream.
+"""
 
 from __future__ import annotations
 

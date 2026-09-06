@@ -173,6 +173,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `merge-families` / `split-family` | Record human corrections to proposed groupings |
 | `draft-verifier` | Propose deterministic checks and replay them on history |
 | `interview-verifier` | Refine a draft through a bounded owner interview |
+| `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
 | `label` | Label disagreements and the remaining family runs |
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
 | `review-verifier` | Record explicit acceptance of a calibrated verifier |
