@@ -18,7 +18,7 @@ import hashlib
 import json
 
 from bandits.store import DerivedEnvelope, DerivedStore
-from bandits.verify.draft import _spec_id
+from bandits.verify.draft import _spec_id, _stable_value
 from bandits.verify.models import (
     CheckOperator,
     CheckReview,
@@ -171,11 +171,19 @@ def start_review(
     validation_id: str | None = None,
     prior_interview_id: str | None = None,
     round_number: int = 1,
+    prior: VerifierInterview | None = None,
 ) -> VerifierInterview:
     """Open a free-text review round over every check in the draft.
 
     Each round is its own artifact. ``prior_interview_id`` chains it to the
     round before so a later round can read what earlier ones decided.
+
+    Pass ``prior`` to make that chain real rather than nominal. The round then
+    opens over the draft the previous round *left* — accepts, revisions and
+    combinations included — and carries its reviews forward, which is what
+    ``prior_decisions`` reads to tell the interpreter that a check has been seen
+    before. Without it a second round re-asks the first round's questions
+    against the first round's draft, and every earlier decision is invisible.
 
     No stop condition is enforced across rounds: the loop ends when the owner
     ends it. Candidate rules exist — a round proposing nothing already decided,
@@ -183,6 +191,14 @@ def start_review(
     is unknown until one has been run, and a rule guessed now would be enforced
     before anyone had watched the loop behave. Out of scope for #14.
     """
+    if prior is not None:
+        # A rejected check is decided, not pending: reopening it every round
+        # would ask the reviewer to re-refuse it indefinitely.
+        draft = prior.draft.replace(
+            verifiers=tuple(
+                spec for spec in prior.draft.verifiers if spec.status is not VerifierStatus.REJECTED
+            )
+        )
     pending = tuple(
         (spec.verifier_id, check.check_id) for spec in draft.verifiers for check in spec.checks
     )
@@ -190,6 +206,7 @@ def start_review(
         source_draft_id=source_draft_id,
         draft=draft,
         questions=(),
+        reviews=prior.reviews if prior is not None else (),
         pending=pending,
         validation_id=validation_id,
         prior_interview_id=prior_interview_id,
@@ -290,10 +307,19 @@ def _combined_spec(left: VerifierSpec, right: VerifierSpec) -> VerifierSpec:
     checks = tuple(
         check.replace(supporting_evidence_ids=()) for check in left.checks + right.checks
     )
+    # Each check hashes as one whole tuple, and the tuples are sorted together.
+    # Sorting claims and expected values in separate lists loses which value
+    # belonged to which claim, so `A==1` with `B==2` and `A==2` with `B==1` hash
+    # alike; dropping the operator collides `equals` with `exact_output`; and
+    # `str()` collapses `1` into `"1"`. All three are different verifiers that
+    # would have shared one content-addressed identity.
     verifier_id = _spec_id(
         left.family_id,
-        "+".join(sorted(check.claim for check in checks)),
-        tuple(sorted(str(check.expected) for check in checks)),
+        "combination",
+        sorted(
+            [check.claim, check.operator.value, _stable_value(check.expected), check.weight]
+            for check in checks
+        ),
     )
     seen: dict[str, None] = {}
     for value in left.unknown_when + right.unknown_when:
@@ -386,7 +412,9 @@ def apply_decision(interview: VerifierInterview, review: CheckReview) -> Verifie
             for item in reviews
         ]
 
-    reviews.append(review)
+    # Stamped here rather than trusted from the caller, so a decision is always
+    # attributed to the round that actually made it.
+    reviews.append(review.replace(round_number=interview.round_number))
     return interview.replace(
         draft=interview.draft.replace(verifiers=tuple(verifiers)),
         reviews=tuple(reviews),
@@ -414,8 +442,11 @@ def prior_decisions(interview: VerifierInterview, check_id: str) -> tuple[str, .
     for review in interview.reviews:
         if review.check_id != check_id:
             continue
+        # Only rounds before this one. A decision made in this round is not a
+        # prior decision, and showing it back would tell the interpreter the
+        # reviewer had already settled the check it is being asked about.
+        if review.round_number >= interview.round_number:
+            continue
         note = " (superseded)" if review.superseded_by else ""
-        lines.append(
-            f"round {interview.round_number}: {review.decision.value}{note} — {review.reply}"
-        )
+        lines.append(f"round {review.round_number}: {review.decision.value}{note} — {review.reply}")
     return tuple(lines)
