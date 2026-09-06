@@ -26,7 +26,13 @@ from bandits.analyze import (
     split_family,
 )
 from bandits.analyze.families import _cluster, _medoid, _TraceFeatures
-from bandits.analyze.models import CorpusAnalysis, TaskCandidate, TaskFamily, TaskSet
+from bandits.analyze.models import (
+    CorpusAnalysis,
+    FamilyCoherence,
+    TaskCandidate,
+    TaskFamily,
+    TaskSet,
+)
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 
@@ -477,6 +483,30 @@ def test_a_merge_says_its_coherence_was_not_recomputed(task_set: TaskSet) -> Non
     assert survivor.coherence is None
     assert not survivor.over_merged
     assert any("not recomputed" in limit for limit in survivor.limitations)
+
+
+def test_a_merge_drops_stale_coherence_limitations(task_set: TaskSet) -> None:
+    """A widest pair measured before a merge says nothing about the merged family."""
+    first, second, *rest = task_set.families
+    stale = "widest pair inside this family is 0.75 apart, over the old threshold"
+    flagged = first.replace(
+        coherence=FamilyCoherence(
+            diameter=0.75,
+            link_threshold=0.4,
+            diameter_factor=1.25,
+            widest_pair=("old-left", "old-right"),
+        ),
+        limitations=(*first.limitations, stale),
+    )
+    assert flagged.over_merged
+    source = task_set.replace(families=(flagged, second, *rest))
+
+    merged = merge_families(source, (first.family_id, second.family_id))
+    survivor = merged.family_by_id()[first.family_id]
+
+    assert stale not in survivor.limitations
+    assert not any(limit.startswith("widest pair") for limit in survivor.limitations)
+    assert any("coherence was not recomputed" in limit for limit in survivor.limitations)
 
 
 def test_a_split_drops_the_parents_over_merge_finding(analysis) -> None:

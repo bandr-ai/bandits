@@ -333,6 +333,7 @@ def test_merge_families_writes_a_new_task_set(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
+    assert "coherence unknown" in result.stdout
     merged_id = result.stdout.split()[1]
     assert merged_id != task_set_id
     assert load_task_set(task_set_id, store).families == families, "the original is untouched"

@@ -64,6 +64,12 @@ reviewer one glance rather than a corrupted family."""
 
 DEFAULT_TAIL_RESERVE = 0.3
 
+_COHERENCE_LIMITATION_PREFIX = "widest pair inside this family"
+_COHERENCE_INVALIDATED = (
+    "coherence was not recomputed after this merge; the family is at least "
+    "as wide as the widest it was built from"
+)
+
 _TAIL_SLOTS: tuple[SlotKind, ...] = (
     SlotKind.KNOWN_FAILURE,
     SlotKind.RARE_TOOL,
@@ -443,7 +449,7 @@ def mine_task_set(
             # most common. Fragmentation is recoverable with merge-families;
             # this is not visible at all unless it is said out loud.
             limitations.append(
-                f"widest pair inside this family is {span:.2f} apart, over "
+                f"{_COHERENCE_LIMITATION_PREFIX} is {span:.2f} apart, over "
                 f"{diameter_factor:g}x the {1.0 - similarity:.2f} that admitted any "
                 f"single link: {left!r} vs {right!r}; mutual-kNN bounds each edge "
                 "but not the span of the component, so check these are one task"
@@ -603,9 +609,15 @@ def merge_families(task_set: TaskSet, family_ids: tuple[str, ...]) -> TaskSet:
         # correction does not have. A stale narrower figure would understate it.
         coherence=None,
         limitations=(
-            *sorted({limit for f in merged_from for limit in f.limitations}),
-            "coherence was not recomputed after this merge; the family is at least "
-            "as wide as the widest it was built from",
+            *sorted(
+                {
+                    limit
+                    for family in merged_from
+                    for limit in family.limitations
+                    if not limit.startswith(_COHERENCE_LIMITATION_PREFIX)
+                }
+            ),
+            _COHERENCE_INVALIDATED,
         ),
     )
     remap = {fid: survivor.family_id for fid in family_ids}

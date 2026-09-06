@@ -313,7 +313,14 @@ def _report(task_set, envelope_id: str) -> None:
         # carries limitations about lineage and splits, and printing those under
         # an over-merged heading would attribute them to the wrong finding.
         coherence = family.coherence
-        if coherence is None or not coherence.over_merged:
+        if coherence is None:
+            for limitation in family.limitations:
+                if limitation.startswith("coherence was not recomputed"):
+                    console.print(
+                        f"[yellow]coherence unknown[/yellow] {family.family_id}: {limitation}"
+                    )
+            continue
+        if not coherence.over_merged:
             continue
         left, right = coherence.widest_pair
         console.print(
