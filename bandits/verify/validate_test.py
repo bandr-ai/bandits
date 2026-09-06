@@ -673,3 +673,45 @@ def test_assessing_only_some_measured_verifiers_is_refused() -> None:
                 ),
             ),
         )
+
+
+def test_an_agreement_without_a_recorded_split_still_loads() -> None:
+    """An artifact written before the split fields must stay readable.
+
+    Defaulting the two counts to zero would make the validator reject every
+    stored record that had a disagreement, since zero errors cannot account for
+    one. Reading as split unknown is true; reading as no errors would be both
+    false and flattering to the verifier.
+    """
+    stored = {
+        "verifier_id": "v1",
+        "split": "held_out",
+        "labeled": 10,
+        "agreed": 7,
+        "disagreed": 3,
+        "unscored": 0,
+        "agreement": 0.7,
+        "counterexamples": [],
+    }
+
+    agreement = Agreement.model_validate(stored)
+
+    assert agreement.false_positives is None
+    assert agreement.false_negatives is None
+    assert agreement.failure_catch_rate is None
+
+
+def test_a_half_recorded_split_is_still_checked() -> None:
+    """Nullability is for whole records, not a way past the sum check."""
+    with pytest.raises(ValueError, match="splits into"):
+        Agreement(
+            verifier_id="v1",
+            split="held_out",
+            labeled=10,
+            agreed=7,
+            disagreed=3,
+            unscored=0,
+            agreement=0.7,
+            false_positives=1,
+            false_negatives=1,
+        )

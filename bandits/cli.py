@@ -962,7 +962,7 @@ def _show_check_summary(summary, check, spec) -> None:
             f"  [cyan]agreement ({agreement.split})[/cyan]: {rate} of "
             f"{agreement.labeled} labeled run(s)"
         )
-        if agreement.scored:
+        if agreement.scored and agreement.false_positives is not None:
             console.print(
                 f"    errors: [red]{agreement.false_positives} false positive(s)[/red], "
                 f"{agreement.false_negatives} false negative(s)"

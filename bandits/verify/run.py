@@ -198,10 +198,11 @@ class CheckSummary(Contract):
             lines.append(
                 f"agreement {agreement.split}: {rate} over {agreement.labeled} labeled run(s)"
             )
-            if agreement.scored:
+            if agreement.scored and agreement.false_positives is not None:
                 # The rate alone cannot say which way the errors went, and the
                 # two are not equally costly: a false positive passes a run a
                 # human failed, and that is the one that reaches training data.
+                # Omitted, not printed as zero, when an older record never said.
                 lines.append(
                     f"errors {agreement.split}: {agreement.false_positives} false positive(s), "
                     f"{agreement.false_negatives} false negative(s)"

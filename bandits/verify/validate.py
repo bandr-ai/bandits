@@ -78,8 +78,8 @@ class Agreement(Contract):
     agreement: float | None = None
     """None when nothing was both labeled and scorable — not zero."""
 
-    false_positives: int = Field(default=0, ge=0)
-    false_negatives: int = Field(default=0, ge=0)
+    false_positives: int | None = Field(default=None, ge=0)
+    false_negatives: int | None = Field(default=None, ge=0)
     """How the disagreements split, and the reason a rate alone is not enough.
 
     A false positive passes a run a human failed, and admits a failed trajectory
@@ -90,8 +90,11 @@ class Agreement(Contract):
     ``_MAX_COUNTEREXAMPLES`` truncates: past ten disagreements the examples are
     a sample and the split is unrecoverable from them.
 
-    Ordinary integers. Zero means measured and none occurred — an unmeasured
-    split has no ``Agreement`` record at all.
+    ``None``, never ``0``, when a record does not carry the split — which is how
+    an artifact written before this field reads. Zero would claim the run was
+    measured and found errorless, and a stored disagreement would then contradict
+    its own split. Every record this code writes populates both, so ``None``
+    means only that an older artifact is being read back.
     """
 
     counterexamples: tuple[Counterexample, ...] = ()
@@ -120,7 +123,7 @@ class Agreement(Contract):
         missing field would flatter exactly the verifier this exists to catch.
         """
         caught = self.caught_failures
-        if caught is None:
+        if caught is None or self.false_positives is None:
             return None
         failures = self.false_positives + caught
         return (caught / failures) if failures else None
@@ -174,11 +177,15 @@ class Agreement(Contract):
             self.agreement is None or abs(self.agreement - expected) > 1e-9
         ):
             raise ValueError(f"stated agreement {self.agreement} does not match {expected}")
-        if self.false_positives + self.false_negatives != self.disagreed:
-            raise ValueError(
-                f"agreement states {self.disagreed} disagreement(s) but splits into "
-                f"{self.false_positives + self.false_negatives}"
-            )
+        if self.false_positives is not None and self.false_negatives is not None:
+            # Only checkable when the record carries the split. An older artifact
+            # that predates these fields reads as split unknown, which is true,
+            # rather than as no errors, which is both false and flattering.
+            if self.false_positives + self.false_negatives != self.disagreed:
+                raise ValueError(
+                    f"agreement states {self.disagreed} disagreement(s) but splits into "
+                    f"{self.false_positives + self.false_negatives}"
+                )
         if self.successes_agreed is not None and self.successes_agreed > self.agreed:
             raise ValueError(
                 f"agreement states {self.agreed} agreed run(s) but {self.successes_agreed} "
