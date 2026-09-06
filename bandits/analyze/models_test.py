@@ -35,7 +35,7 @@ def test_prompt_built_from_at_start_evidence_is_accepted() -> None:
         terminal_span_ids=("span-2",),
         outcome_evidence=(),
     )
-    assert task.prompt_evidence_ids == ("ev-trace-1-trace-instruction",)
+    assert task.prompt_evidence_ids[0].startswith("ev-trace-1-trace-instruction-")
 
 
 @pytest.mark.parametrize(
@@ -55,9 +55,18 @@ def test_prompt_built_from_later_evidence_raises(visibility: Visibility) -> None
 
 
 def test_evidence_ids_are_stable_for_the_same_fact() -> None:
-    assert evidence_id(trace_id="trace-1", claim="command_exit_code", span_id="span-2") == (
-        "ev-trace-1-span-2-command-exit-code"
-    )
+    once = evidence_id(trace_id="trace-1", claim="command_exit_code", span_id="span-2")
+
+    assert once.startswith("ev-trace-1-span-2-command-exit-code-")
+    assert once == evidence_id(trace_id="trace-1", claim="command_exit_code", span_id="span-2")
+
+
+def test_two_details_differing_only_in_punctuation_are_two_ids() -> None:
+    """The readable half flattens them; the fact behind them is not the same."""
+    literal = evidence_id(trace_id="t", claim="final_state_field", span_id="s", detail="tool.a\\.b")
+    nested = evidence_id(trace_id="t", claim="final_state_field", span_id="s", detail="tool.a.b")
+
+    assert literal != nested
 
 
 def test_strength_ranks_order_conflicting_evidence() -> None:

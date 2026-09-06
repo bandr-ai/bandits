@@ -138,8 +138,15 @@ def _invariants(
     saying so when the value differs run to run — which a fixed value cannot do,
     because it was only ever the one value this corpus happened to record.
     """
+    # A trace whose result was read only in part cannot retire an invariant: the
+    # field that would have disproved it may be one of the ones not read. Left
+    # in, it looks like supporting evidence for a rule nothing tested.
+    partial = {item.trace_id for item in evidence if item.claim == "truncated_outcome_fields"}
+
     by_trace: dict[str, dict[tuple[str, str], Any]] = {}
     for item in evidence:
+        if item.trace_id in partial:
+            continue
         if item.claim in ("final_state_field", "initial_state_field"):
             side = "final" if item.claim == "final_state_field" else "initial"
             by_trace.setdefault(item.trace_id, {})[(side, _field_name(item))] = item

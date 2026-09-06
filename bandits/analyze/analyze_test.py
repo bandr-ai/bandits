@@ -404,3 +404,51 @@ def test_a_result_holding_nothing_comparable_is_named_rather_than_silent() -> No
     assert not any(e.claim == "final_state_field" for e in evidence)
     analysis = analyze_corpus(TraceCorpus(source="otlp", traces=(trace,)))
     assert any("domain knowledge this extractor does not have" in i for i in analysis.limitations)
+
+
+def test_a_literal_dotted_key_stays_distinct_from_a_nested_path() -> None:
+    """Otherwise both write one evidence id and one of the two values wins."""
+    trace = _tool_trace("dotted", {"a.b": 1, "a": {"b": 2}})
+
+    fields = {
+        e.value["field"]: e.value["value"]
+        for e in extract_outcome_evidence(trace)
+        if e.claim == "final_state_field"
+    }
+
+    assert fields == {"refund_order.a\\.b": 1, "refund_order.a.b": 2}
+
+
+def test_a_truncated_initial_read_is_recorded_too() -> None:
+    """An invariant must not rest on a before-state nobody read in full."""
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="wide-initial",
+        source="otlp",
+        source_digest="d" * 64,
+        task="Refund it",
+        spans=(
+            Span(
+                span_id="lookup",
+                kind=SpanKind.TOOL,
+                name="lookup_order",
+                started_at=moment,
+                ended_at=moment,
+                output={f"field_{index}": index for index in range(100)},
+            ),
+            Span(
+                span_id="tool",
+                kind=SpanKind.TOOL,
+                name="refund_order",
+                started_at=moment + timedelta(seconds=1),
+                ended_at=moment + timedelta(seconds=1),
+                output={"status": "refunded"},
+            ),
+        ),
+    )
+
+    truncation = [
+        e for e in extract_outcome_evidence(trace) if e.claim == "truncated_outcome_fields"
+    ]
+
+    assert [e.span_id for e in truncation] == ["lookup"]

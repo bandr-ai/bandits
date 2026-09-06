@@ -10,6 +10,7 @@ acquiring an empty one.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from bandits.traces import ToolSchema
@@ -42,6 +43,14 @@ def parse_toolset(declared: Any) -> tuple[ToolSchema, ...] | None:
     'the source said the agent had no tools' is a claim no export actually makes,
     and reading it as one would turn an unreadable field into a fact.
     """
+    if isinstance(declared, str):
+        # OTLP attributes are typed, so an exporter with a list to record often
+        # serializes it. The JSON is the declaration; refusing to parse it would
+        # report a toolset that was recorded as one that was not.
+        try:
+            declared = json.loads(declared)
+        except json.JSONDecodeError:
+            return None
     if not isinstance(declared, (list, tuple)) or not declared:
         return None
     tools = tuple(tool for tool in (_one(item) for item in declared) if tool is not None)

@@ -7,6 +7,7 @@ artifact rather than rewrite the evidence it was derived from.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from enum import Enum
 from typing import Any, Literal
@@ -197,12 +198,18 @@ def evidence_id(
     ``detail`` separates several facts of the same claim on one span — one span
     reporting both an amount and a status is two pieces of evidence, not one
     overwriting the other.
+
+    The readable half flattens punctuation, so two details differing only in it —
+    a literal ``a.b`` key and a nested ``a`` inside ``b`` — would share one id
+    and the second fact would be dropped as a duplicate of the first. The digest
+    is over the exact parts, so the id stays readable and still separates them.
     """
     parts = [trace_id, span_id or "trace", claim]
     if detail is not None:
         parts.append(detail)
     slug = _SLUG_UNSAFE.sub("-", "-".join(parts).lower()).strip("-")
-    return f"ev-{slug}"
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:8]
+    return f"ev-{slug}-{digest}"
 
 
 class SlotKind(str, Enum):

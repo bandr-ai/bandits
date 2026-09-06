@@ -45,8 +45,17 @@ def test_a_bare_name_keeps_no_schema_rather_than_an_empty_one() -> None:
     assert all(tool.parameters is None for tool in tools)
 
 
+def test_a_serialized_declaration_is_read_as_one() -> None:
+    """OTLP attributes are typed, so exporters serialize the tool array."""
+    tools = parse_toolset('[{"type": "function", "function": {"name": "refund_order"}}]')
+
+    assert tools is not None
+    assert [tool.name for tool in tools] == ["refund_order"]
+
+
 def test_nothing_readable_stays_unknown() -> None:
     """'The source declared no toolset' is not 'the agent had no tools'."""
     assert parse_toolset(None) is None
     assert parse_toolset([]) is None
     assert parse_toolset([{"no": "name"}]) is None
+    assert parse_toolset("not json") is None

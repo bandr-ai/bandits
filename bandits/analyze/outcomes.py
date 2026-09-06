@@ -72,11 +72,22 @@ def _qualified(span: Span, key: str) -> str:
     the key alone they group as one candidate and draft as one check, which then
     passes on whichever tool happened to answer first.
     """
-    return f"{span.name}.{key}"
+    return f"{_escape(span.name)}.{key}"
+
+
+def _escape(segment: str) -> str:
+    """Make one path segment unambiguous before joining it with dots.
+
+    Without this, the literal key ``{"a.b": 1}`` and the nested ``{"a": {"b": 2}}``
+    produce the same path, the same evidence id, and one of the two values
+    silently wins. Keys carrying dots are rare and the escaping is invisible
+    until one appears, which is the point.
+    """
+    return segment.replace("\\", "\\\\").replace(".", "\\.")
 
 
 def _path(prefix: str, key: str) -> str:
-    return f"{prefix}.{key}" if prefix else key
+    return f"{prefix}.{_escape(key)}" if prefix else _escape(key)
 
 
 def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
@@ -118,6 +129,11 @@ def _state_fields(payload: Any) -> tuple[list[tuple[str, Any]], bool]:
             truncated = truncated or bool(node)
             return
         for key, value in sorted(node.items(), key=lambda pair: str(pair[0])):
+            if len(fields) >= _MAX_FIELDS:
+                # Stop walking, not just stop emitting: a result with a very
+                # large map should not cost a full traversal per span.
+                truncated = True
+                return
             walk(value, _path(prefix, str(key)), depth + 1)
 
     walk(payload, "", 0)
@@ -249,7 +265,23 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
             # The state the episode started from, as the first tool observed it.
             # Knowable only during the run, never at_start: the agent had to call
             # a tool to learn it, so a prompt may not contain it.
-            for key, value in _state_fields(span.output)[0]:
+            initial_fields, initial_truncated = _state_fields(span.output)
+            if initial_truncated:
+                record(
+                    _evidence(
+                        span,
+                        trace_id=trace.trace_id,
+                        claim="truncated_outcome_fields",
+                        value={
+                            "tool": span.name,
+                            "max_fields": _MAX_FIELDS,
+                            "max_depth": _MAX_DEPTH,
+                        },
+                        visibility=Visibility.DURING,
+                        strength="strong",
+                    )
+                )
+            for key, value in initial_fields:
                 record(
                     _evidence(
                         span,
