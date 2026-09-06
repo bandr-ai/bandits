@@ -115,17 +115,13 @@ def _trace(
     )
 
 
-@pytest.fixture
-def export_case():
-    corpus = TraceCorpus(
-        source="otlp",
-        traces=(
-            _trace("good-1", 100, "changed"),
-            _trace("good-2", 200, "changed"),
-            _trace("failed", 300, "pending"),
-            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
-        ),
-    )
+def _export_case(traces: tuple[Trace, ...]):
+    """One reviewed verifier over one family, built from the traces given.
+
+    Taken as an argument rather than fixed so a test can vary one trace and keep
+    every id downstream of it consistent; the family names these trace ids.
+    """
+    corpus = TraceCorpus(source="otlp", traces=traces)
     analysis = analyze_corpus(corpus)
     analysis_id = compute_analysis_id(analysis)
     family = TaskFamily(
@@ -206,6 +202,18 @@ def export_case():
         draft, "draft-1", validation, "validation-1", spec.verifier_id, "owner-ticket-7"
     )
     return corpus, analysis, task_set, task_set_id, draft, validation, reviewed
+
+
+@pytest.fixture
+def export_case():
+    return _export_case(
+        (
+            _trace("good-1", 100, "changed"),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
 
 
 def test_eval_exports_every_prompt_safe_case_with_full_lineage(export_case) -> None:
@@ -388,6 +396,24 @@ def test_a_user_turn_with_no_recorded_response_is_refused() -> None:
     _, defects, _ = build_transcript(dangling)
 
     assert any("no recorded response" in defect for defect in defects)
+
+
+def test_a_lost_user_turn_reaches_the_unresolved_output() -> None:
+    """The whole point of counting them: the row is refused, and the reason says why."""
+    corpus, analysis, task_set, task_set_id, _, _, reviewed = _export_case(
+        (
+            _trace("good-1", 100, "changed").replace(unrepresented_user_turns=1),
+            _trace("good-2", 200, "changed"),
+            _trace("failed", 300, "pending"),
+            _trace("recovered", 400, "changed", tool_status=SpanStatus.ERROR),
+        )
+    )
+
+    bundle = build_sft_export(corpus, task_set, task_set_id, analysis, reviewed, "reviewed-1")
+
+    rejected = next(item for item in bundle.unresolved if item.trace_id == "good-1")
+    assert any("does not represent" in reason for reason in rejected.reasons)
+    assert not any(row.trace_id == "good-1" for row in bundle.rows)
 
 
 def test_a_user_turn_anchored_to_no_span_is_refused() -> None:
