@@ -124,3 +124,51 @@ def test_an_undeclared_toolset_stays_unknown() -> None:
     assert trace.tools_available is None
     assert trace.system_prompt is None
     assert trace.runtime_context == {}
+
+
+def test_a_multimodal_instruction_is_refused_rather_than_crashing(tmp_path) -> None:
+    """The first user turn is not always text, and ingest must survive that."""
+    path = tmp_path / "multimodal.json"
+    path.write_text(
+        '[{"role": "user", "content": [{"type": "image", "source": "x"}]},'
+        '{"role": "assistant", "content": "sure"}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    assert corpus.traces == ()
+    assert {issue.kind for issue in corpus.issues} == {
+        "unrepresentable_user_turn",
+        "no_user_message",
+    }
+
+
+def test_a_later_multimodal_turn_is_counted_not_skipped(tmp_path) -> None:
+    path = tmp_path / "later.json"
+    path.write_text(
+        '[{"role": "user", "content": "do the thing"},'
+        '{"role": "assistant", "content": "working"},'
+        '{"role": "user", "content": [{"type": "image", "source": "x"}]},'
+        '{"role": "assistant", "content": "done"}]'
+    )
+
+    trace = load_chat_json(path).traces[0]
+
+    assert trace.task == "do the thing"
+    assert trace.unrepresented_user_turns == 1
+
+
+def test_every_system_and_developer_instruction_is_kept(tmp_path) -> None:
+    """The developer message is usually the one carrying the constraint."""
+    path = tmp_path / "system.json"
+    path.write_text(
+        '[{"messages": ['
+        '{"role": "system", "content": "be terse"},'
+        '{"role": "developer", "content": "never refund over 100"},'
+        '{"role": "user", "content": "refund 7741"},'
+        '{"role": "assistant", "content": "done"}]}]'
+    )
+
+    trace = load_chat_json(path).traces[0]
+
+    assert trace.system_prompt == "be terse\n\nnever refund over 100"

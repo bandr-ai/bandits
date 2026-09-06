@@ -51,3 +51,29 @@ def test_a_log_without_an_init_record_says_nothing_about_the_toolset() -> None:
     trace = load_claude_code(MULTI_TURN).traces[0]
 
     assert trace.tools_available is None
+
+
+def test_a_non_text_user_turn_is_counted_and_reported(tmp_path) -> None:
+    """An image the agent acted on cannot reach a transcript, so the row must fail closed."""
+    path = tmp_path / "image.jsonl"
+    path.write_text(
+        '{"type":"user","sessionId":"s","message":{"role":"user","content":"do the thing"}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"working"}]}}\n'
+        '{"type":"user","sessionId":"s","message":{"role":"user",'
+        '"content":[{"type":"image","source":{"data":"..."}}]}}\n'
+        '{"type":"assistant","sessionId":"s","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"done"}]}}\n'
+    )
+
+    corpus = load_claude_code(path)
+
+    assert corpus.traces[0].unrepresented_user_turns == 1
+    assert any(issue.kind == "unrepresentable_user_turn" for issue in corpus.issues)
+
+
+def test_a_tool_result_record_is_still_not_counted_against_the_trace() -> None:
+    """The harness answering the agent is neither a turn nor a loss."""
+    trace = load_claude_code(MULTI_TURN).traces[0]
+
+    assert trace.unrepresented_user_turns == 0

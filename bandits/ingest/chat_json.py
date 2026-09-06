@@ -97,30 +97,15 @@ def _convert_conversation(
     location: str,
     issues: list[TraceIssue],
 ) -> Trace | None:
-    task = next(
-        (
-            m.get("content")
-            for m in messages
-            if m.get("role") in ("user", "human") and m.get("content")
-        ),
-        None,
-    )
-    if task is None:
-        issues.append(
-            TraceIssue(
-                kind="no_user_message", detail="conversation has no user message", location=location
-            )
-        )
-        return None
-
-    system_prompt = next(
-        (
-            m.get("content")
-            for m in messages
-            if m.get("role") in ("system", "developer") and isinstance(m.get("content"), str)
-        ),
-        None,
-    )
+    # Every system and developer message, in order. Keeping only the first
+    # dropped the developer instruction that narrowed it, which is the half that
+    # usually carries the constraint the run was actually held to.
+    declared = [
+        m["content"]
+        for m in messages
+        if m.get("role") in ("system", "developer") and isinstance(m.get("content"), str)
+    ]
+    system_prompt = "\n\n".join(declared) if declared else None
 
     spans: list[Span] = []
     user_turns: list[UserTurn] = []
@@ -136,18 +121,22 @@ def _convert_conversation(
 
         if role in ("user", "human"):
             content = message.get("content")
-            if isinstance(content, str) and content:
+            if isinstance(content, str):
                 # Anchored to the last span, because a correction is only an
                 # instruction for what comes after it.
                 user_turns.append(
                     UserTurn(text=content, after_span_id=spans[-1].span_id if spans else None)
                 )
-            elif content:
+            else:
+                # Content blocks, an attachment, or nothing at all. Counted, not
+                # skipped: an export that drops one of these teaches the next
+                # action as an answer to a request the transcript never shows.
                 unrepresented += 1
                 issues.append(
                     TraceIssue(
                         kind="unrepresentable_user_turn",
-                        detail=f"message {index}: user content is {type(content).__name__}, not text",
+                        detail=f"message {index}: user content is "
+                        f"{type(content).__name__}, not text",
                         location=location,
                     )
                 )
@@ -237,6 +226,24 @@ def _convert_conversation(
                     )
                 )
             ordinal += 1
+
+    # The instruction is the first turn that reached us as text. A conversation
+    # whose only user content is an image has no readable instruction, and is
+    # refused here rather than raising on a task that is not a string.
+    task = next((turn.text for turn in user_turns if turn.text), None)
+    if task is None:
+        issues.append(
+            TraceIssue(
+                kind="no_user_message",
+                detail=(
+                    "conversation has no readable user instruction"
+                    if unrepresented
+                    else "conversation has no user message"
+                ),
+                location=location,
+            )
+        )
+        return None
 
     if not spans:
         issues.append(

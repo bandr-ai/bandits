@@ -102,6 +102,18 @@ def _text(blocks: list[dict]) -> str:
     return _WRAPPER.sub(" ", joined).strip()
 
 
+def _unrepresentable(blocks: list[dict]) -> bool:
+    """Whether a user record carries content this trace cannot put in a transcript.
+
+    A ``tool_result`` is the harness answering the agent, and a text block that
+    is nothing but harness scaffolding strips to empty — neither is a user turn.
+    An image or a document is: the agent saw it, the transcript cannot show it,
+    and dropping it silently is what lets an export teach the next action as an
+    answer to a request nobody can read.
+    """
+    return any(block.get("type") not in ("tool_result", "text") for block in blocks)
+
+
 def _is_error(block: dict) -> bool:
     """``is_error`` arrives as a real bool from some writers and as text from others."""
     raw = block.get("is_error")
@@ -153,6 +165,7 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
 
     spans: list[Span] = []
     user_turns: list[UserTurn] = []
+    unrepresented = 0
     pending: dict[str, str] = {}
     results: dict[str, dict] = {}
     task: str | None = None
@@ -196,6 +209,26 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
                 task = task if task is not None else text
                 user_turns.append(
                     UserTurn(text=text, after_span_id=spans[-1].span_id if spans else None)
+                )
+            if _unrepresentable(blocks):
+                # Counted even when the record also carried text: the turn that
+                # reaches a transcript is then only part of what the user sent.
+                unrepresented += 1
+                issues.append(
+                    TraceIssue(
+                        kind="unrepresentable_user_turn",
+                        detail="user turn carries content that is not text: "
+                        + ", ".join(
+                            sorted(
+                                {
+                                    str(b.get("type"))
+                                    for b in blocks
+                                    if b.get("type") not in ("tool_result", "text")
+                                }
+                            )
+                        ),
+                        location=str(path),
+                    )
                 )
 
         for block in blocks:
@@ -285,6 +318,7 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
         system_prompt=system_prompt,
         runtime_context=context,
         user_turns=tuple(user_turns),
+        unrepresented_user_turns=unrepresented,
         spans=tuple(spans),
     )
     return TraceCorpus(
