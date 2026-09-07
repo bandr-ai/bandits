@@ -1,4 +1,16 @@
-"""Bounded, one-question-at-a-time review of deterministic verifier drafts."""
+"""Owner review of deterministic verifier drafts.
+
+Two flows live here. The older one asks a fixed sequence of narrow questions
+per check — ``start_interview`` / ``next_question`` / ``answer_question`` — and
+is kept because recorded interviews still load and replay through it.
+
+The newer one asks a single open question per check and reads the answer:
+``start_review`` queues the checks, ``bandits.verify.interpret`` maps a
+free-text reply to a proposed decision, and ``apply_decision`` records what the
+owner confirmed. A fixed form cannot carry the objection that fits none of its
+slots — "you are checking the wrong signal entirely" — and prose typed into one
+was never read by anything downstream.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +18,19 @@ import hashlib
 import json
 
 from bandits.store import DerivedEnvelope, DerivedStore
+from bandits.verify.draft import _spec_id, _stable_value
 from bandits.verify.models import (
     CheckOperator,
+    CheckReview,
+    CheckSpec,
+    Interpretation,
     InterviewAnswer,
+    InterviewDecision,
     InterviewQuestion,
     VerifierDraft,
     VerifierInterview,
+    VerifierSpec,
+    VerifierStatus,
 )
 
 _HAS_EXPECTED_VALUE = frozenset({CheckOperator.EQUALS, CheckOperator.EXACT_OUTPUT})
@@ -114,7 +133,7 @@ def answer_question(interview: VerifierInterview, value: str) -> VerifierIntervi
 
     index = interview.next_question_index + 1
     return interview.replace(
-        draft=interview.draft.replace(verifiers=tuple(revised)),
+        draft=_redrafted(interview.draft, tuple(revised)),
         answers=interview.answers
         + (InterviewAnswer(question_id=question.question_id, value=value),),
         next_question_index=index,
@@ -139,3 +158,318 @@ def save_interview(interview: VerifierInterview, store: DerivedStore) -> Derived
 
 def load_interview(interview_id: str, store: DerivedStore) -> VerifierInterview:
     return VerifierInterview.model_validate_json(store.read_payload(interview_id))
+
+
+def _review_id(interview: VerifierInterview, check_id: str) -> str:
+    return f"review-{len(interview.reviews) + 1:03d}-{check_id}"
+
+
+def start_review(
+    draft: VerifierDraft,
+    source_draft_id: str,
+    *,
+    validation_id: str | None = None,
+    prior_interview_id: str | None = None,
+    round_number: int = 1,
+    prior: VerifierInterview | None = None,
+) -> VerifierInterview:
+    """Open a free-text review round over every check in the draft.
+
+    Each round is its own artifact. ``prior_interview_id`` chains it to the
+    round before so a later round can read what earlier ones decided.
+
+    Pass ``prior`` to make that chain real rather than nominal. The round then
+    opens over the draft the previous round *left* — accepts, revisions and
+    combinations included — and carries its reviews forward, which is what
+    ``prior_decisions`` reads to tell the interpreter that a check has been seen
+    before. Without it a second round re-asks the first round's questions
+    against the first round's draft, and every earlier decision is invisible.
+
+    No stop condition is enforced across rounds: the loop ends when the owner
+    ends it. Candidate rules exist — a round proposing nothing already decided,
+    or every survivor reaching calibration — but which one matches a real review
+    is unknown until one has been run, and a rule guessed now would be enforced
+    before anyone had watched the loop behave. Out of scope for #14.
+    """
+    if prior is not None:
+        # A rejected check is decided, not pending: reopening it every round
+        # would ask the reviewer to re-refuse it indefinitely.
+        draft = _redrafted(
+            prior.draft,
+            tuple(
+                spec for spec in prior.draft.verifiers if spec.status is not VerifierStatus.REJECTED
+            ),
+        )
+    pending = tuple(
+        (spec.verifier_id, check.check_id) for spec in draft.verifiers for check in spec.checks
+    )
+    return VerifierInterview(
+        source_draft_id=source_draft_id,
+        draft=draft,
+        questions=(),
+        reviews=prior.reviews if prior is not None else (),
+        pending=pending,
+        validation_id=validation_id,
+        prior_interview_id=prior_interview_id,
+        round_number=round_number,
+        complete=not pending,
+    )
+
+
+def next_check(interview: VerifierInterview) -> tuple[str, str] | None:
+    """The next (verifier_id, check_id) awaiting a decision."""
+    return interview.pending[0] if interview.pending else None
+
+
+def find_check(
+    draft: VerifierDraft, verifier_id: str, check_id: str
+) -> tuple[VerifierSpec, CheckSpec]:
+    for spec in draft.verifiers:
+        if spec.verifier_id != verifier_id:
+            continue
+        for check in spec.checks:
+            if check.check_id == check_id:
+                return spec, check
+    raise ValueError(f"no check {check_id!r} on verifier {verifier_id!r}")
+
+
+def _redrafted(draft: VerifierDraft, verifiers: tuple[VerifierSpec, ...]) -> VerifierDraft:
+    """Replace a draft's verifiers, keeping the candidate rows that still apply.
+
+    ``candidates`` describes every drafted verifier or none of them: the draft
+    refuses to validate on any other split. A revision or combination mints an
+    id that drafting never ranked, so the rows can no longer describe the set
+    and a round that changed anything would leave a draft that cannot be
+    written back.
+
+    Dropped rather than filtered down. A subset would still fail the same
+    check, and carrying the surviving rows alone would offer a ranking of the
+    candidates that happened to survive a review — which is not what drafting
+    measured, and not a comparison anything should read.
+    """
+    ids = {spec.verifier_id for spec in verifiers}
+    described = {item.verifier_id for item in draft.candidates}
+    return draft.replace(
+        verifiers=verifiers,
+        candidates=draft.candidates if described == ids else (),
+    )
+
+
+def _revised_identity(spec: VerifierSpec, check: CheckSpec) -> tuple[str, str]:
+    """A new verifier and check id for a materially changed check.
+
+    Reuses the drafting hash so a revision is addressed the same way a fresh
+    proposal would be: identity follows content, never the history that
+    produced it.
+
+    The operator is part of that content. ``exit_code_zero`` and ``equals`` over
+    one claim and value are different checks, and an operator-only revision that
+    kept its id would let a promotion match the review of the shape the reviewer
+    actually accepted.
+    """
+    verifier_id = _spec_id(
+        spec.family_id, f"{check.claim}\x00{check.operator.value}", check.expected
+    )
+    return verifier_id, f"check-{verifier_id.removeprefix('verifier-')}"
+
+
+def _with_extractions(spec: VerifierSpec, interpretation: Interpretation | None) -> VerifierSpec:
+    if interpretation is None:
+        return spec
+    blind = tuple(b for b in interpretation.blind_spots if b not in spec.blind_spots)
+    gaming = tuple(g for g in interpretation.gaming_hypotheses if g not in spec.gaming_hypotheses)
+    if not blind and not gaming:
+        return spec
+    return spec.replace(
+        blind_spots=spec.blind_spots + blind,
+        gaming_hypotheses=spec.gaming_hypotheses + gaming,
+    )
+
+
+def _apply_revision(
+    spec: VerifierSpec, check: CheckSpec, interpretation: Interpretation
+) -> VerifierSpec:
+    """Revise a check, and give the result an identity that admits the change.
+
+    Evidence selected for the old value is cleared rather than carried: it was
+    chosen to support a claim this check no longer makes, and leaving it in
+    would make a human revision look better supported than it is.
+    """
+    expected = (
+        check.expected
+        if interpretation.revised_expected is None
+        else interpretation.revised_expected
+    )
+    operator = interpretation.revised_operator or check.operator
+    revised_check = check.replace(
+        expected=expected,
+        operator=operator,
+        supporting_evidence_ids=(),
+    )
+    verifier_id, check_id = _revised_identity(spec, revised_check)
+    revised_check = revised_check.replace(check_id=check_id)
+    return spec.replace(
+        verifier_id=verifier_id,
+        checks=tuple(revised_check if c.check_id == check.check_id else c for c in spec.checks),
+        provenance="human",
+        status=VerifierStatus.EXECUTABLE,
+        validation_artifact_id=None,
+        human_acceptance_id=None,
+    )
+
+
+def _combined_spec(left: VerifierSpec, right: VerifierSpec) -> VerifierSpec:
+    """Fold two verifiers into one.
+
+    ``unknown_when`` is the union, so the combination is unknown whenever
+    either half is — the same fail-closed rule ``Result`` applies to an
+    aggregate score. Weights are carried unchanged: ``Result`` already weights
+    subscores, and renormalising here would quietly restate what each check was
+    worth.
+    """
+    checks = tuple(
+        check.replace(supporting_evidence_ids=()) for check in left.checks + right.checks
+    )
+    # Each check hashes as one whole tuple, and the tuples are sorted together.
+    # Sorting claims and expected values in separate lists loses which value
+    # belonged to which claim, so `A==1` with `B==2` and `A==2` with `B==1` hash
+    # alike; dropping the operator collides `equals` with `exact_output`; and
+    # `str()` collapses `1` into `"1"`. All three are different verifiers that
+    # would have shared one content-addressed identity.
+    verifier_id = _spec_id(
+        left.family_id,
+        "combination",
+        sorted(
+            [check.claim, check.operator.value, _stable_value(check.expected), check.weight]
+            for check in checks
+        ),
+    )
+    seen: dict[str, None] = {}
+    for value in left.unknown_when + right.unknown_when:
+        seen.setdefault(value, None)
+    return left.replace(
+        verifier_id=verifier_id,
+        checks=checks,
+        inputs=tuple(dict.fromkeys(left.inputs + right.inputs)),
+        unknown_when=tuple(seen),
+        blind_spots=tuple(dict.fromkeys(left.blind_spots + right.blind_spots)),
+        gaming_hypotheses=tuple(dict.fromkeys(left.gaming_hypotheses + right.gaming_hypotheses)),
+        source_verifier_ids=(left.verifier_id, right.verifier_id),
+        provenance="human",
+        status=VerifierStatus.EXECUTABLE,
+        validation_artifact_id=None,
+        human_acceptance_id=None,
+    )
+
+
+def apply_decision(interview: VerifierInterview, review: CheckReview) -> VerifierInterview:
+    """Record one confirmed decision and apply it to the draft.
+
+    The decision is the human's. ``review.interpretation`` is what the model
+    proposed, recorded whether or not it was followed.
+
+    Four decisions, not six. An earlier draft of #14 also offered
+    ``insufficient`` and ``unauthoritative``. ``insufficient`` is what
+    ``reject`` already means once review runs more than once — the check returns
+    in a later round with more evidence behind it, and there is no state to
+    carry in between. ``unauthoritative`` had no machinery behind it: nothing
+    here routes a check to another reviewer, so it would have been a state
+    nobody acts on, and its real content is a rejection with a reason. Keeping
+    either would also have meant widening ``VerifierStatus`` with values that
+    are review outcomes rather than lifecycle positions, putting the promotion
+    invariants in ``models.py::validate_lifecycle`` at risk for no gain.
+    """
+    if (review.verifier_id, review.check_id) not in interview.pending:
+        raise ValueError(f"check {review.check_id!r} is not awaiting a decision")
+
+    spec, check = find_check(interview.draft, review.verifier_id, review.check_id)
+    interpretation = review.interpretation
+    verifiers = list(interview.draft.verifiers)
+    index = verifiers.index(spec)
+    reviews = list(interview.reviews)
+    pending = [item for item in interview.pending if item != (review.verifier_id, review.check_id)]
+
+    if review.decision is InterviewDecision.ACCEPT:
+        verifiers[index] = _with_extractions(spec, interpretation)
+    elif review.decision is InterviewDecision.REJECT:
+        # Marked, not dropped. #14 asks that rejected proposals stay auditable
+        # with their rationale, and a verifier removed from the draft takes the
+        # reason it was rejected with it — leaving a later round free to redraft
+        # the same check with nothing recording that it was already refused.
+        verifiers[index] = _with_extractions(spec, interpretation).replace(
+            status=VerifierStatus.REJECTED
+        )
+    elif review.decision is InterviewDecision.REVISE:
+        if interpretation is None:
+            raise ValueError("a revise decision needs an interpretation to revise from")
+        if interpretation.revised_expected is None and interpretation.revised_operator is None:
+            # A revision that changes neither value nor operator would keep the
+            # check's content-addressed id — identity follows content — while
+            # clearing the evidence selected for it and marking it human-authored.
+            # The same id would then denote a check with less behind it than
+            # before. Refused here as well as in the interpreter, because a human
+            # overruling some other reading into a revise arrives with an
+            # interpretation that names nothing to revise.
+            raise ValueError("a revise decision needs a revised value or operator")
+        verifiers[index] = _apply_revision(
+            _with_extractions(spec, interpretation), check, interpretation
+        )
+    else:
+        if interpretation is None or not interpretation.combine_with:
+            raise ValueError("a combine decision needs a resolved target check")
+        other_spec, _ = _find_by_check(interview.draft, interpretation.combine_with)
+        if other_spec.verifier_id == spec.verifier_id:
+            raise ValueError("a check cannot be combined with its own verifier")
+        combined = _combined_spec(_with_extractions(spec, interpretation), other_spec)
+        verifiers = [
+            v for v in verifiers if v.verifier_id not in {spec.verifier_id, other_spec.verifier_id}
+        ]
+        verifiers.insert(min(index, len(verifiers)), combined)
+        # The other check leaves the queue with this decision; if it was already
+        # decided, that earlier decision is superseded rather than overwritten.
+        pending = [item for item in pending if item[0] != other_spec.verifier_id]
+        reviews = [
+            item.replace(superseded_by=review.review_id)
+            if item.verifier_id == other_spec.verifier_id and not item.superseded_by
+            else item
+            for item in reviews
+        ]
+
+    # Stamped here rather than trusted from the caller, so a decision is always
+    # attributed to the round that actually made it.
+    reviews.append(review.replace(round_number=interview.round_number))
+    return interview.replace(
+        draft=_redrafted(interview.draft, tuple(verifiers)),
+        reviews=tuple(reviews),
+        pending=tuple(pending),
+        complete=not pending,
+    )
+
+
+def _find_by_check(draft: VerifierDraft, check_id: str) -> tuple[VerifierSpec, CheckSpec]:
+    for spec in draft.verifiers:
+        for check in spec.checks:
+            if check.check_id == check_id:
+                return spec, check
+    raise ValueError(f"no check {check_id!r} in this draft")
+
+
+def prior_decisions(interview: VerifierInterview, check_id: str) -> tuple[str, ...]:
+    """What earlier rounds decided about this check, oldest first.
+
+    Read by the interpreter prompt: without it, a second-round "still fine"
+    about a check already known to be weak is indistinguishable from a first
+    look.
+    """
+    lines = []
+    for review in interview.reviews:
+        if review.check_id != check_id:
+            continue
+        # Only rounds before this one. A decision made in this round is not a
+        # prior decision, and showing it back would tell the interpreter the
+        # reviewer had already settled the check it is being asked about.
+        if review.round_number >= interview.round_number:
+            continue
+        note = " (superseded)" if review.superseded_by else ""
+        lines.append(f"round {review.round_number}: {review.decision.value}{note} — {review.reply}")
+    return tuple(lines)
