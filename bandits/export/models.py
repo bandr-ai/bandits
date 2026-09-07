@@ -222,6 +222,117 @@ class RejectedTrace(Contract):
         return self.model_dump(mode="json")
 
 
+class LengthSummary(Contract):
+    """How one per-row measurement is spread across a dataset.
+
+    Message and character counts, never token counts. No tokenizer is
+    configured anywhere in this pipeline, and a character count converted to
+    tokens by a rule of thumb is a number that reads as measured and is not.
+    These are tokenizer-independent approximations of what a row costs, and a
+    caller that needs exact tokens must count them with the tokenizer it will
+    actually train under.
+    """
+
+    rows: int
+    minimum: int = 0
+    median: float = 0.0
+    p90: float = 0.0
+    maximum: int = 0
+    total: int = 0
+
+
+class PartitionComposition(Contract):
+    """What one side of an export looks like in aggregate rather than row by row.
+
+    Every gate in the exporter asks whether a single trace is good enough. None
+    of them can see that four fifths of what passed came from one lineage, one
+    source, or one tool — which is the difference between a dataset and a
+    transcript of the busiest week in the corpus.
+    """
+
+    rows: int
+    rows_by_family: dict[str, int] = {}
+    rows_by_source: dict[str, int] = {}
+    rows_by_model: dict[str, int] = {}
+    """Generating model, as the trace recorded it. A row may count under several."""
+
+    rows_by_scaffold: dict[str, int] = {}
+    rows_by_tool: dict[str, int] = {}
+    """How many rows call each tool at least once — the share, not the volume."""
+
+    tool_calls_by_tool: dict[str, int] = {}
+    """How many calls each tool receives in total, which a row share hides."""
+
+    lineages: int = 0
+    repeated_lineages: dict[str, int] = {}
+    """Lineages contributing more than one row, and how many each contributes.
+
+    A lineage is a retry chain or a session. Several rows from one is not a
+    defect on its own, and it is the shape most likely to be mistaken for
+    independent evidence of the same behavior.
+    """
+
+    messages_per_row: LengthSummary
+    characters_per_row: LengthSummary
+
+
+class DuplicateGroup(Contract):
+    """Traces whose transcripts normalize to the same thing."""
+
+    signature: str
+    trace_ids: tuple[str, ...]
+
+
+class CompositionReport(Contract):
+    """A deterministic description of what an export selected, and out of what.
+
+    Reports; never decides. Nothing here changes which rows are exported — that
+    is what :class:`SamplingCaps` is for, and the caps exist because this report
+    is what tells a caller which limits are worth setting.
+    """
+
+    schema_version: int = 1
+    offered_traces: int
+    """Traces the partition offered, including any the corpus could not supply."""
+
+    offered: PartitionComposition
+    """Every offered trace whose transcript could be rebuilt, gated or not."""
+
+    selected: PartitionComposition
+    unresolved_reasons: dict[str, int] = {}
+    warning_reasons: dict[str, int] = {}
+    duplicate_groups: tuple[DuplicateGroup, ...] = ()
+    """Normalized-duplicate groups across the offered partition, largest first."""
+
+
+class SamplingCaps(Contract):
+    """Explicit limits on the composition of the selected dataset.
+
+    Deliberately opt-in and deliberately blunt. An unconfigured cap is not a
+    default of infinity chosen by this module; it is the caller declining to
+    limit that dimension, which keeps an export backward compatible with one
+    run before any of this existed. A row a cap removes is quarantined with the
+    cap that removed it, never dropped quietly, because a cap is a curation
+    decision and the rows it costs are the evidence for revisiting it.
+    """
+
+    max_rows_per_family: int | None = None
+    max_rows_per_lineage: int | None = None
+    max_messages_per_row: int | None = None
+    max_characters_per_row: int | None = None
+
+    @model_validator(mode="after")
+    def caps_admit_something(self) -> SamplingCaps:
+        for field, value in self.model_dump().items():
+            if value is not None and value < 1:
+                raise ValueError(f"{field} must be at least 1, or unset to mean no limit")
+        return self
+
+    @property
+    def configured(self) -> bool:
+        return any(value is not None for value in self.model_dump().values())
+
+
 class ExportManifest(Contract):
     schema_version: int = 1
     format: ExportKind
@@ -248,6 +359,19 @@ class ExportManifest(Contract):
     max_median_multiplier: float | None = None
     """The step-count bound applied, for exports where trajectory quality matters."""
 
+    caps: SamplingCaps | None = None
+    """The sampling caps this export ran under. None means none were configured."""
+
+    selection_policy: str | None = None
+    """The order rows were considered in, and how ties in it were broken.
+
+    Recorded because caps make order load-bearing: which rows a cap keeps is
+    decided entirely by which ones it reached first.
+    """
+
+    composition_schema_version: int | None = None
+    """Which version of the composition report this export carries, if any."""
+
     rows: int
     unresolved: int
     warnings: tuple[str, ...] = ()
@@ -257,6 +381,7 @@ class ExportBundle(Contract):
     manifest: ExportManifest
     rows: tuple[EvalCase | SFTExample, ...]
     unresolved: tuple[RejectedTrace, ...] = ()
+    composition: CompositionReport | None = None
 
     @model_validator(mode="after")
     def counts_and_types_match(self) -> ExportBundle:
@@ -267,6 +392,13 @@ class ExportBundle(Contract):
         expected = EvalCase if self.manifest.format is ExportKind.EVAL else SFTExample
         if any(not isinstance(row, expected) for row in self.rows):
             raise ValueError("export contains a row of the wrong format")
+        if self.composition is not None:
+            if self.manifest.format is not ExportKind.SFT:
+                raise ValueError("a composition report describes a training set, not an eval set")
+            if self.manifest.composition_schema_version != self.composition.schema_version:
+                raise ValueError("manifest and composition report disagree about schema version")
+            if self.composition.selected.rows != len(self.rows):
+                raise ValueError("composition report does not describe the rows exported")
         return self
 
 
@@ -299,9 +431,25 @@ def _atomic_jsonl(path: Path, values: tuple[EvalCase | SFTExample | RejectedTrac
     os.replace(temporary, path)
 
 
-def write_jsonl(bundle: ExportBundle, output: Path) -> tuple[Path, Path]:
-    """Write accepted rows and a sibling quarantine file, even when either is empty."""
+def write_jsonl(bundle: ExportBundle, output: Path) -> tuple[Path, Path, Path | None]:
+    """Write accepted rows, a sibling quarantine file, and the composition report.
+
+    The first two are written even when empty: an export that quarantined
+    everything and one that ran over an empty partition look identical if the
+    file is simply absent. The third is written only when the bundle carries a
+    report, and its path is returned as None when it does not.
+    """
     unresolved = output.with_name(f"{output.stem}.unresolved.jsonl")
     _atomic_jsonl(output, bundle.rows)
     _atomic_jsonl(unresolved, bundle.unresolved)
-    return output, unresolved
+    if bundle.composition is None:
+        return output, unresolved, None
+
+    composition = output.with_name(f"{output.stem}.composition.json")
+    temporary = composition.with_suffix(composition.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(bundle.composition.model_dump(mode="json"), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, composition)
+    return output, unresolved, composition

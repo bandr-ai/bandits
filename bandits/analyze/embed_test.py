@@ -76,6 +76,8 @@ def _mine(analysis, cache, **overrides):
         "analysis-x",
         budget=10,
         distance=embedding_distance(cache),
+        backend="embedding",
+        embedding_model=cache.model,
         proposed_by="model",
         **overrides,
     )

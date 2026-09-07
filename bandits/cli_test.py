@@ -9,9 +9,14 @@ from unittest import mock
 import pytest
 from typer.testing import CliRunner
 
-from bandits.analyze import load_analysis, load_task_set
+from bandits.analyze import (
+    DEFAULT_DUPLICATE_SIMILARITY,
+    load_analysis,
+    load_task_set,
+    save_task_set,
+)
 from bandits.analyze.audit import AuditError
-from bandits.analyze.embed import EmbeddingError
+from bandits.analyze.embed import EmbeddingError, descriptors, load_cache, requests
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -961,3 +966,156 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
     assert (output / "selection-report.json").exists()
+
+
+def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    report = output.with_name("sft.composition.json")
+    assert report.exists()
+    payload = json.loads(report.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["offered_traces"] >= payload["selected"]["rows"]
+    assert "composition:" in result.stdout
+
+
+def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path) -> None:
+    """An ignored cap would produce an eval set that looks curated and is not."""
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "eval.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "eval",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-family",
+            "1",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "sft only" in result.stdout
+    assert not output.exists()
+
+
+def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-lineage",
+            "0",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "at least 1" in result.stdout
+    assert not output.exists()
+
+
+def test_mine_reports_the_backend_threshold_and_vectors_it_grouped_with(tmp_path) -> None:
+    """The one difference between two task sets from one analysis, said out loud."""
+    task_set_id = _mined(tmp_path)
+
+    result = runner.invoke(app, ["families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "clustering:" in result.stdout
+    assert "embedding at similarity" in result.stdout
+
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+    assert task_set.clustering.backend == "embedding"
+    assert task_set.clustering.embedding_cache_id
+    assert task_set.clustering.embedding_model
+
+
+def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(tmp_path) -> None:
+    """An artifact from before this was recorded is the one case it cannot be recovered for."""
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(_mined(tmp_path), store)
+    older = save_task_set(task_set.replace(clustering=None), store).artifact_id
+
+    result = runner.invoke(app, ["families", older, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "records nothing about how it" in result.stdout
+
+
+def test_mine_embeds_the_requests_duplicate_detection_compares(tmp_path) -> None:
+    """Descriptors alone leave every sameness comparison reading maximally far."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(task_set_id, store)
+    cache = load_cache(task_set.clustering.embedding_cache_id, store)
+
+    analysis = load_analysis(task_set.analysis_id, store)
+    assert set(requests(analysis)) <= set(cache.vectors)
+    assert set(descriptors(analysis)) <= set(cache.vectors)
+    assert task_set.clustering.duplicate_similarity == DEFAULT_DUPLICATE_SIMILARITY
+
+
+def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tmp_path) -> None:
+    """A ranked list with nothing behind it invites the top row to be taken as the answer."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "frequency-based hypothesis" in result.stdout
+    draft = load_verifier_draft(result.stdout.split()[1], store)
+    assert draft.candidates
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(item.considered for item in draft.candidates)

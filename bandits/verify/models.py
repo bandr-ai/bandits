@@ -165,12 +165,95 @@ class Result(Contract):
         return self
 
 
+class CandidateStats(Contract):
+    """How one drafted candidate actually behaved on the traces it was drawn from.
+
+    A proposal ranked by how often a value appears says only that the corpus
+    recorded it often. In a corpus where failures dominate, the most frequent
+    terminal status is the failing one, and frequency alone would put it forward
+    as the check that establishes success. What separates a success check from a
+    common one is contrast — and contrast needs outcomes to compare against.
+    """
+
+    verifier_id: str
+    derivation: Literal["frequency", "contrast", "human"]
+    """Where the proposal came from: what the corpus repeated, what the labels
+    distinguished, or what a person composed."""
+
+    considered: int
+    """Fit traces this candidate was measured over."""
+
+    scorable: int
+    unknown: int
+    """Traces it could not score at all. A check that abstains on most of a
+    family is not a strong check, however well it does on the rest."""
+
+    accepted: int
+    rejected: int
+
+    labeled_successes: int = 0
+    labeled_failures: int = 0
+    success_support: int = 0
+    """Labeled successes it accepted."""
+
+    failure_rejection: int = 0
+    """Labeled failures it rejected."""
+
+    false_positives: int = 0
+    """Labeled failures it accepted. The number a success check exists to keep at zero."""
+
+    false_negatives: int = 0
+    unknown_on_labeled: int = 0
+    rationale: str = ""
+    """Why this candidate was proposed, in the terms it was proposed on."""
+
+    @property
+    def calibrated(self) -> bool:
+        """Whether any adjudicated outcome was available to measure this against."""
+        return bool(self.labeled_successes or self.labeled_failures)
+
+    @property
+    def coverage(self) -> float:
+        """Share of the family it can score. Zero traces is zero coverage, not one."""
+        return self.scorable / self.considered if self.considered else 0.0
+
+    @property
+    def contradictions(self) -> int:
+        """Traces where this candidate disagrees with an adjudicated label."""
+        return self.false_positives + self.false_negatives
+
+    @property
+    def discrimination(self) -> float:
+        """How far this candidate separates labeled success from labeled failure.
+
+        Informedness: the rate it accepts successes minus the rate it accepts
+        failures, on the traces it can score. Zero when nothing is labeled, so an
+        uncalibrated draft falls back to the order it already had rather than
+        being ranked on a number that measured nothing.
+        """
+        if not self.calibrated:
+            return 0.0
+        successes = self.success_support + self.false_negatives
+        failures = self.failure_rejection + self.false_positives
+        hit = self.success_support / successes if successes else 0.0
+        false_alarm = self.false_positives / failures if failures else 0.0
+        return hit - false_alarm
+
+
 class VerifierDraft(Contract):
     schema_version: int = 1
     task_set_id: str
     analysis_id: str
     family_id: str
     verifiers: tuple[VerifierSpec, ...]
+    candidates: tuple[CandidateStats, ...] = ()
+    """One row per drafted verifier, in the order they were ranked.
+
+    Kept beside the specs rather than on them: a spec's identity is what it
+    checks, and folding a measurement into it would give one check two ids
+    depending on which corpus happened to be available when it was drafted.
+    """
+
     unresolved: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -181,6 +264,11 @@ class VerifierDraft(Contract):
         for spec in self.verifiers:
             if spec.family_id != self.family_id or spec.task_set_id != self.task_set_id:
                 raise ValueError("verifier draft contains a spec for another family or task set")
+        described = [stats.verifier_id for stats in self.candidates]
+        if len(described) != len(set(described)):
+            raise ValueError("verifier draft describes one candidate twice")
+        if self.candidates and set(described) != set(ids):
+            raise ValueError("candidate statistics do not describe the drafted verifiers")
         return self
 
 
