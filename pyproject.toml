@@ -10,6 +10,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+audit = [
+    # The family coherence audit only. Kept out of the core install so the
+    # pipeline keeps its three runtime dependencies and CI never needs a model
+    # or a REPL sandbox; the audit's own tests inject a predictor instead.
+    "dspy[deno]>=3.3.1",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

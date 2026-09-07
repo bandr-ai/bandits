@@ -207,8 +207,13 @@ Completion = Callable[[str, str, float], str]
 """(model, prompt, temperature) -> the model's reply text."""
 
 
-def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
-    """Call Fireworks. The key is read per call so it is never held in an artifact."""
+def resolve_api_key() -> str:
+    """The Fireworks key, read per call so it is never held in an artifact.
+
+    Shared with the family audit, which reaches the same backend through a
+    different client: two lookups would drift and one of them would start
+    reporting a missing key that is plainly there.
+    """
     api_key = os.environ.get("FIREWORKS_API_KEY")
     if not api_key:
         # Keep local dogfooding one command wide without executing arbitrary
@@ -222,6 +227,12 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
                     break
     if not api_key:
         raise JudgeError("FIREWORKS_API_KEY is not set and was not found in .env")
+    return api_key
+
+
+def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
+    """Call Fireworks with one rendered rubric prompt."""
+    api_key = resolve_api_key()
 
     request = urllib.request.Request(
         "https://api.fireworks.ai/inference/v1/chat/completions",

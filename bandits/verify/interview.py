@@ -133,7 +133,7 @@ def answer_question(interview: VerifierInterview, value: str) -> VerifierIntervi
 
     index = interview.next_question_index + 1
     return interview.replace(
-        draft=interview.draft.replace(verifiers=tuple(revised)),
+        draft=_redrafted(interview.draft, tuple(revised)),
         answers=interview.answers
         + (InterviewAnswer(question_id=question.question_id, value=value),),
         next_question_index=index,
@@ -194,10 +194,11 @@ def start_review(
     if prior is not None:
         # A rejected check is decided, not pending: reopening it every round
         # would ask the reviewer to re-refuse it indefinitely.
-        draft = prior.draft.replace(
-            verifiers=tuple(
+        draft = _redrafted(
+            prior.draft,
+            tuple(
                 spec for spec in prior.draft.verifiers if spec.status is not VerifierStatus.REJECTED
-            )
+            ),
         )
     pending = tuple(
         (spec.verifier_id, check.check_id) for spec in draft.verifiers for check in spec.checks
@@ -230,6 +231,28 @@ def find_check(
             if check.check_id == check_id:
                 return spec, check
     raise ValueError(f"no check {check_id!r} on verifier {verifier_id!r}")
+
+
+def _redrafted(draft: VerifierDraft, verifiers: tuple[VerifierSpec, ...]) -> VerifierDraft:
+    """Replace a draft's verifiers, keeping the candidate rows that still apply.
+
+    ``candidates`` describes every drafted verifier or none of them: the draft
+    refuses to validate on any other split. A revision or combination mints an
+    id that drafting never ranked, so the rows can no longer describe the set
+    and a round that changed anything would leave a draft that cannot be
+    written back.
+
+    Dropped rather than filtered down. A subset would still fail the same
+    check, and carrying the surviving rows alone would offer a ranking of the
+    candidates that happened to survive a review — which is not what drafting
+    measured, and not a comparison anything should read.
+    """
+    ids = {spec.verifier_id for spec in verifiers}
+    described = {item.verifier_id for item in draft.candidates}
+    return draft.replace(
+        verifiers=verifiers,
+        candidates=draft.candidates if described == ids else (),
+    )
 
 
 def _revised_identity(spec: VerifierSpec, check: CheckSpec) -> tuple[str, str]:
@@ -416,7 +439,7 @@ def apply_decision(interview: VerifierInterview, review: CheckReview) -> Verifie
     # attributed to the round that actually made it.
     reviews.append(review.replace(round_number=interview.round_number))
     return interview.replace(
-        draft=interview.draft.replace(verifiers=tuple(verifiers)),
+        draft=_redrafted(interview.draft, tuple(verifiers)),
         reviews=tuple(reviews),
         pending=tuple(pending),
         complete=not pending,

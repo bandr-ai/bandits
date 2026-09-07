@@ -101,8 +101,53 @@ uv run bandits export <task-set-id> --format sft \
 
 Every export also writes a sibling `<name>.unresolved.jsonl`. Ineligible or unscorable traces are quarantined with reasons instead of vanishing from the dataset.
 
+An SFT export additionally writes `<name>.composition.json`: a versioned report describing the partition offered and the rows selected, broken down by task family, source, generating model, tool, and lineage, with message and character distributions and the duplicate groups it collapsed. Every gate in the exporter judges one trace at a time, so none of them can see that most of what passed came from a single lineage or a single tool.
+
+Sampling caps act on what that report shows. They are unset by default, and a row a cap removes is quarantined naming the cap that removed it:
+
+```bash
+uv run bandits export <task-set-id> --format sft \
+  --verifier <reviewed-verifier-id> --output sft.jsonl \
+  --max-rows-per-lineage 3 --max-rows-per-family 200
+```
+
+> [!NOTE]
+> Message and character counts are tokenizer-independent approximations of what a row costs. No tokenizer is configured anywhere in this pipeline, and nothing in the report may be read as a token count.
+
 > [!NOTE]
 > SFT defaults to the `fit` partition; eval defaults to `held_out`. Passing `--split all` is allowed but recorded as an overlap warning in the export manifest.
+
+### Duplicates and the held-out split
+
+The fit/held-out split moves whole lineage groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so two runs of the same request from different sessions arrive as independent groups — and a source that declares no lineage at all leaves every trace its own.
+
+Before splitting, lineage groups are unioned by duplicate evidence: identical requests, and — where a backend can measure it — requests above a much stricter similarity than the one used for grouping. Sameness is measured on requests with their identifiers intact, never on the masked descriptors grouping compares, because under those `refund order 7741` and `refund order 8802` are one string.
+
+The joins are recorded on the family as auditable edges rather than applied silently, and survive a reviewer's correction: `merge-families` reads the analysis so it can find lineages the two families disagreed about, moves any that end up on both sides whole to one side, and says it did. Without them, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
+
+### What produced a grouping
+
+A task set records the clustering that formed its families: the distance backend, the resolved similarity threshold and neighbor count, and — where vectors were compared — the embedding model and the cache artifact holding them. Resolved values, not the flags that were passed, so an omitted flag records the default that actually applied.
+
+Mining the same analysis twice under different settings produces two task sets that differ in content, and therefore in id. This is what explains why. It is also what an embedding grouping needs in order to be reproducible at all: `EmbeddingCache` refuses to mix vectors from two models because they are not comparable, and a task set grouped by those vectors inherits the constraint.
+### Ranking drafted checks against outcomes
+
+Drafting proposes checks from values observed across a family's fit traces, and measures every candidate over those traces by executing it. The draft carries the results: success support, failure rejection, false positives, scorable coverage, and unknown count.
+
+```bash
+uv run bandits draft-verifier <task-set-id> --family <family-id> --labels <label-set-id>
+```
+
+Without labels there is nothing to contrast against, so candidates stay ordered by evidence authority and are marked as the frequency-based hypotheses they are — a value can be common because failures dominate the corpus, and `status == pending` is a perfectly frequent terminal state in a corpus that mostly failed.
+
+With labels, candidates are ranked by how far they separate labeled success from labeled failure, after evidence authority and before coverage. Two effects follow:
+
+- a check whose value appears only among failures is not put forward as the check that establishes success;
+- an invariant that fails on failed runs is no longer retired by them. Unlabeled, one counterexample retires a proposed invariant; labeled, only a counterexample among successes can, because a relation that fails on a failed run is the relation working.
+
+Where the evidence supports it, a conjunction is proposed alongside — never instead of — the checks it was built from, so validation can compare them. Conjunction is never inferred from co-occurrence: the pair must reject a labeled failure the first check accepts while keeping every labeled success it keeps, and the draft records that reason. Two checks on one field are refused, since they could never both hold.
+
+A recorded score is classified as a trusted evaluator's only where the source names the evaluator. An anonymous number on a span is evidence read off a trace and ranks as one — otherwise it would outrank the human label that would have had to settle a disagreement with it.
 
 ### Tasks without deterministic outcome state
 
@@ -160,7 +205,8 @@ Demonstration selection additionally rejects or quarantines trajectories with pr
 - repeated identical tool actions;
 - unusually long trajectories relative to their task family;
 - verifier inputs that are unavailable;
-- near-duplicates of already selected examples.
+- near-duplicates of already selected examples;
+- rows beyond a configured family, lineage, or per-row size cap.
 
 These are demonstration-quality gates, not claims that a successful outcome alone makes behavior worth imitating.
 
@@ -171,9 +217,10 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `ingest` | Normalize, redact, and store a trace export |
 | `list` / `show` | Browse corpora, traces, spans, and ingest issues |
 | `analyze` | Extract task candidates and outcome evidence |
-| `mine` / `families` | Group tasks, split lineages, and select representative runs |
+| `mine` / `families` | Group tasks, split lineages without separating duplicates, and select representative runs, recording the clustering that produced them |
 | `merge-families` / `split-family` | Record human corrections to proposed groupings |
-| `draft-verifier` | Propose deterministic checks and replay them on history |
+| `draft-verifier` | Propose deterministic checks, rank them against labeled outcomes, and replay them on history |
+| `audit-families` | Advisory model read of family coherence; proposes splits only |
 | `interview-verifier` | Refine a draft through a bounded owner interview |
 | `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
 | `label` | Label disagreements and the remaining family runs |
@@ -181,7 +228,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `interview-review` | Review a draft's checks in free text, read by a model, confirmed by you |
 | `review-verifier` | Promote a calibrated verifier a review round accepted |
 | `judge` | Sample a rubric judge for unstructured outcomes |
-| `export` | Write verifier-gated eval or SFT JSONL plus quarantine |
+| `export` | Write verifier-gated eval or SFT JSONL plus quarantine and composition report |
 
 Run `uv run bandits <command> --help` for every option.
 
@@ -205,6 +252,16 @@ uv sync --extra dev
 uv run ruff check .
 uv run pytest --cov=bandits --cov-report=term-missing
 ```
+
+The family coherence audit is an optional extra, since it pulls a REPL sandbox
+and reaches a model:
+
+```bash
+uv sync --extra audit
+```
+
+The test suite injects a predictor instead of calling one, so neither the extra
+nor a credential is needed to run it.
 
 The test suite exercises ingestion fidelity, redaction, content-addressed storage, task mining, verifier execution and validation, model-judge behavior, and both verifier-gated export formats.
 

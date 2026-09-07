@@ -62,6 +62,22 @@ class Span(Contract):
     output: Any = None
     """Tool response, or the completion text for a model call."""
 
+    call_recorded: bool = True
+    """Whether the source paired this tool result with a call the agent made.
+
+    False marks a result the source left orphaned: no assistant call it answers,
+    so nothing recorded that the agent ever asked for it. The result is kept —
+    it happened, and analysis may still read it — but a transcript rebuilt from
+    it would have to invent the call that produced it, and a demonstration built
+    that way teaches an action inferred only from its own outcome.
+
+    True is what every other span means. A MODEL span is itself the record of
+    what the model did, and a TOOL span the source declares as an executed call —
+    an OTLP ``execute_tool`` span carrying its own arguments — records the
+    action, not merely its result. Only an adapter that can watch a result
+    arrive with nothing to answer may set this False.
+    """
+
     attributes: dict[str, Any] = Field(default_factory=dict)
     """Anything else the source declared that doesn't have a dedicated field."""
 

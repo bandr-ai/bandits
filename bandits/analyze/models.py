@@ -270,6 +270,34 @@ class FamilyCoherence(Contract):
         return self.diameter > self.diameter_factor * self.link_threshold
 
 
+class DuplicateEdge(Contract):
+    """Two lineage groups held together because they answer the same request.
+
+    Kept as evidence rather than merged silently. A reviewer looking at a family
+    whose held-out side is smaller than they expected needs to see which pairs
+    were joined and on what basis, because a wrong merge costs measurement and a
+    missing one costs the meaning of the number that measurement produces.
+    """
+
+    left: str
+    right: str
+    """The two lineage groups, ordered so one edge has one representation."""
+
+    trace_ids: tuple[str, str]
+    """The pair of traces that evidenced it, one from each group."""
+
+    basis: Literal["identical_descriptor", "near_identical_descriptor"]
+    similarity: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def edge_joins_two_groups(self) -> DuplicateEdge:
+        if self.left == self.right:
+            raise ValueError("a duplicate edge joins two different lineage groups")
+        if self.left > self.right:
+            raise ValueError("a duplicate edge records its groups in sorted order")
+        return self
+
+
 class TaskFamily(Contract):
     """A group of episodes proposed as the same repeatable task."""
 
@@ -292,12 +320,187 @@ class TaskFamily(Contract):
     coherence: FamilyCoherence | None = None
     """How wide this family is, and against what it was judged. None before mining
     recorded it, or after a correction that could not recompute it."""
+    duplicate_lineages: tuple[DuplicateEdge, ...] = ()
+    """Lineage groups this family held together before splitting, and why.
+
+    Lineage ids are read from the source and never inferred, so two runs of one
+    request from different sessions arrive as independent groups. Splitting them
+    across the boundary would let a verifier drafted on one be measured against
+    the other, and held-out agreement would then be reporting memorisation.
+    """
 
     limitations: tuple[str, ...] = ()
 
     @property
     def over_merged(self) -> bool:
         return self.coherence is not None and self.coherence.over_merged
+
+
+class ClusteringProvenance(Contract):
+    """How one task set's families were grouped, as the run actually resolved it.
+
+    Grouping is the one model-influenced step whose configuration used to
+    disappear into the result. Two task sets mined from the same analysis at
+    different thresholds differ in content, so their ids differ and nothing is
+    corrupted — but nothing explained the difference either, and neither could
+    be reproduced without knowing which flags were passed.
+
+    Recorded for the same reason as ``TraceCorpus.redaction_ruleset``: the same
+    inputs under a changed setting produce a different artifact, and without the
+    setting there is nothing to explain why two artifacts sharing a parent do
+    not match. Resolved values, never the raw flags — an omitted flag records
+    the default that was actually applied rather than ``None``.
+    """
+
+    backend: str
+    """What measured the distance between two descriptors.
+
+    Declared by the caller, because a task set is grouped by an opaque callable
+    and no default here could be anything but a guess about what was behind it.
+    """
+
+    similarity: float = Field(ge=0, le=1)
+    neighbors: int = Field(ge=1)
+    embedding_model: str | None = None
+    """The model whose vectors were compared, when the backend used any.
+
+    ``EmbeddingCache`` refuses to mix vectors from two models because they are
+    not comparable. A task set grouped by those vectors inherits that constraint
+    and would otherwise record none of it.
+    """
+
+    embedding_cache_id: str | None = None
+
+    duplicate_similarity: float = Field(default=1.0, ge=0, le=1)
+    """Above this, two descriptors were treated as the same request and their
+    lineage groups held to one side of the split. Deliberately far stricter than
+    ``similarity``: grouping asks whether two runs are the same kind of task,
+    this asks whether they are the same task. 1.0 records that only identical
+    descriptors were joined."""
+
+    @model_validator(mode="after")
+    def cached_vectors_name_their_model(self) -> ClusteringProvenance:
+        if self.embedding_cache_id and not self.embedding_model:
+            raise ValueError("an embedding cache id is meaningless without the model it pins")
+        if not self.backend.strip():
+            raise ValueError("clustering provenance must name the backend that grouped")
+        if self.duplicate_similarity < self.similarity:
+            # A duplicate bar looser than the grouping bar says every member of
+            # a family is a retry of every other, which collapses the family to
+            # one lineage group and leaves nothing to hold out.
+            raise ValueError(
+                "the duplicate threshold must be at least as strict as the grouping threshold"
+            )
+        return self
+
+
+class FamilyAudit(Contract):
+    """A model's advisory read of one family's coherence.
+
+    Never an input to grouping. Clustering stays reproducible without a model,
+    so this is a second pass that annotates families and proposes work for a
+    human, and the task set it describes is never rewritten by it.
+
+    Splits may be proposed; merges never are. A wrongly split family yields two
+    coherent families that each draft a valid verifier, which costs redundancy.
+    A wrongly merged one yields a single family whose evidence disagrees with
+    itself, and ``draft_verifiers`` keys a check to whichever value happened to
+    be most common — a wrong verifier that looks fine.
+    """
+
+    family_id: str
+    coherent: bool
+    """Whether the members read as one task. Semantic, and independent of
+    :attr:`FamilyCoherence.over_merged`, which measures embedding distance."""
+
+    outlier_trace_ids: tuple[str, ...] = ()
+    proposed_subgroups: tuple[tuple[str, ...], ...] = ()
+    """Suggested fragmentation, for a human to act on via ``split-family``.
+    Advisory: nothing here splits a family on its own."""
+
+    generated_name: str | None = None
+    """A legible name for reports. Presentation only — never feeds ``family_id``
+    or ``fingerprint()``, which stay derived from the mechanical descriptor."""
+
+    rationale: str
+    model: str
+    prompt_digest: str
+    """Pins the wording that produced this. A verdict is only interpretable
+    alongside the prompt that asked for it."""
+
+    @model_validator(mode="after")
+    def validate_subgroups(self) -> FamilyAudit:
+        """Reject an audit that names the same trace twice or contradicts itself.
+
+        A model writes these ids, so they are checked at the boundary rather
+        than trusted: a subgroup naming one trace twice would silently drop a
+        member on the way to a split.
+        """
+        seen: set[str] = set()
+        for group in self.proposed_subgroups:
+            if not group:
+                raise ValueError(f"audit for {self.family_id} proposes an empty subgroup")
+            repeated = seen.intersection(group)
+            if repeated or len(set(group)) != len(group):
+                raise ValueError(
+                    f"audit for {self.family_id} places a trace in two subgroups: "
+                    f"{sorted(repeated or {t for t in group if group.count(t) > 1})}"
+                )
+            seen.update(group)
+
+        if len(self.proposed_subgroups) == 1:
+            raise ValueError(
+                f"audit for {self.family_id} proposes a single subgroup, which is "
+                "the family it already is"
+            )
+        if self.coherent and self.proposed_subgroups:
+            raise ValueError(
+                f"audit for {self.family_id} calls the family coherent and still "
+                "proposes splitting it"
+            )
+        if not self.rationale.strip():
+            raise ValueError(f"audit for {self.family_id} carries no rationale")
+        return self
+
+
+class SkippedAudit(Contract):
+    """A family the audit did not read, and why. Never silently absent."""
+
+    family_id: str
+    reason: str
+
+
+class FamilyAuditRun(Contract):
+    """One advisory audit pass over a task set's families.
+
+    Its own artifact, parented to the task set: an audit must never rewrite the
+    grouping it read, and re-mining without this pass must reproduce the same
+    families byte for byte.
+    """
+
+    schema_version: int = 1
+    task_set_id: str
+    audits: tuple[FamilyAudit, ...] = ()
+    skipped: tuple[SkippedAudit, ...] = ()
+    model: str
+    limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_audits(self) -> FamilyAuditRun:
+        audited = [a.family_id for a in self.audits]
+        if len(audited) != len(set(audited)):
+            raise ValueError("audit run reports the same family twice")
+        overlap = set(audited).intersection(s.family_id for s in self.skipped)
+        if overlap:
+            raise ValueError(f"families both audited and skipped: {sorted(overlap)}")
+        return self
+
+    def audit_by_family(self) -> dict[str, FamilyAudit]:
+        return {a.family_id: a for a in self.audits}
+
+    def incoherent(self) -> tuple[FamilyAudit, ...]:
+        """What a reviewer should look at, in a stable order."""
+        return tuple(sorted((a for a in self.audits if not a.coherent), key=lambda a: a.family_id))
 
 
 class TaskSet(Contract):
@@ -308,6 +511,10 @@ class TaskSet(Contract):
     analysis_id: str
     families: tuple[TaskFamily, ...]
     selected: tuple[SelectedTask, ...]
+
+    clustering: ClusteringProvenance | None = None
+    """What produced this grouping. None only for an artifact mined before this
+    was recorded, which is exactly the case it cannot be reconstructed for."""
 
     total_workload_mass: int
     workload_coverage: float
