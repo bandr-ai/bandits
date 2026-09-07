@@ -80,8 +80,9 @@ def two_family_set():
         }
     )
     groups = {
-        "refund order <order_id>": "refund",
-        "reset the password for user <user_id>": "reset",
+        "refund order 1111": "refund",
+        "refund order 2222": "refund",
+        "reset the password for user 3333": "reset",
     }
     task_set = mine_task_set(
         analysis,
@@ -231,8 +232,10 @@ def test_one_failing_family_does_not_lose_the_others():
         }
     )
     groups = {
-        "refund order <order_id>": "refund",
-        "reset the password for user <user_id>": "reset",
+        "refund order 1111": "refund",
+        "refund order 2222": "refund",
+        "reset the password for user 3333": "reset",
+        "reset the password for user 4444": "reset",
     }
     task_set = mine_task_set(
         analysis,

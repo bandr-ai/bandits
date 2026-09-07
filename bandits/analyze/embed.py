@@ -208,20 +208,14 @@ def load_cache(cache_id: str, store: DerivedStore) -> EmbeddingCache:
 
 
 def requests(analysis: CorpusAnalysis) -> list[str]:
-    """The exact strings duplicate detection will compare, so the cache covers them.
-
-    Not the same strings as :func:`descriptors`. Grouping compares instructions
-    with their identifiers masked out, and two runs against different orders
-    reduce to one descriptor there — which is the point of it, and the reason
-    sameness has to be measured on text that kept its identifiers.
-    """
+    """The exact strings duplicate detection will compare, so the cache covers them."""
     return sorted({normalize_request(t.instruction) for t in analysis.tasks if t.instruction})
 
 
 def descriptors(analysis: CorpusAnalysis) -> list[str]:
     """The exact strings clustering will compare, so the cache covers all of them.
 
-    Grouping runs over normalized descriptors rather than raw instructions, and
+    Grouping runs over normalized, value-preserving text rather than raw instructions, and
     :func:`embedding_distance` treats anything absent as maximally far. Deriving
     this list anywhere but here would let the two drift apart and silently push
     every uncovered pair to distance 1.0.

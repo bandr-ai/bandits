@@ -261,7 +261,7 @@ def test_eval_exports_every_prompt_safe_case_with_full_lineage(export_case) -> N
     assert all(row.grader["status"] == "reviewed" for row in bundle.rows)
 
 
-def test_sft_requires_success_and_imitation_quality_and_deduplicates(export_case) -> None:
+def test_sft_requires_success_and_imitation_quality_without_hiding_distinct_ids(export_case) -> None:
     corpus, analysis, task_set, task_set_id, _, _, reviewed = export_case
     reviewed_id = compute_reviewed_verifier_id(reviewed)
 
@@ -269,9 +269,9 @@ def test_sft_requires_success_and_imitation_quality_and_deduplicates(export_case
         corpus, task_set, task_set_id, analysis, reviewed, reviewed_id, partition=Partition.ALL
     )
 
-    assert [row.trace_id for row in bundle.rows] == ["good-1"]
+    assert [row.trace_id for row in bundle.rows] == ["good-1", "good-2"]
     rejected = {item.trace_id: item.reasons for item in bundle.unresolved}
-    assert any("near-duplicate" in reason for reason in rejected["good-2"])
+    assert "good-2" not in rejected
     assert any("did not establish success" in reason for reason in rejected["failed"])
     assert any("error or recovery" in reason for reason in rejected["recovered"])
     assert bundle.rows[0].messages[0].role == "user"
@@ -858,7 +858,7 @@ def test_a_split_verdict_is_scored_against_the_frozen_threshold(export_case) -> 
         partition=Partition.ALL,
     )
 
-    assert [row.trace_id for row in lenient.rows] == ["good-1"]
+    assert [row.trace_id for row in lenient.rows] == ["good-1", "good-2"]
     assert not strict.rows
     assert any(
         "did not establish success" in reason
@@ -1090,14 +1090,12 @@ def test_a_trace_with_no_declared_lineage_is_its_own_rather_than_pooled() -> Non
     assert bundle.composition.selected.repeated_lineages == {}
 
 
-def test_duplicate_groups_are_reported_and_not_only_dropped() -> None:
-    """Deduplication already removes them; how many there were is what it hides."""
-    bundle = _composition_case((_trace("dup-1", 100, "changed"), _trace("dup-2", 200, "changed")))
+def test_distinct_call_ids_are_not_hidden_for_deduplication() -> None:
+    """Value-preserving signatures keep separately identified calls distinct."""
+    bundle = _composition_case((_trace("dup-1", 100, "changed"), _trace("dup-2", 100, "changed")))
 
-    assert bundle.composition.selected.rows == 1
-    assert [group.trace_ids for group in bundle.composition.duplicate_groups] == [
-        ("dup-1", "dup-2")
-    ]
+    assert bundle.composition.selected.rows == 2
+    assert bundle.composition.duplicate_groups == ()
 
 
 def test_the_report_and_the_selection_are_identical_across_runs() -> None:
