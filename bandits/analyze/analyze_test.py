@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from bandits.analyze import analyze_corpus, extract_task, load_analysis, save_analysis
-from bandits.analyze.models import EvidenceKind, Visibility
+from bandits.analyze.models import Evidence, EvidenceKind, Visibility
 from bandits.analyze.outcomes import _state_fields, extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
@@ -199,8 +199,43 @@ def test_recorded_score_outranks_the_agents_own_claim() -> None:
 
     evidence = {e.claim: e for e in extract_outcome_evidence(trace)}
 
-    assert evidence["recorded_score"].kind is EvidenceKind.TRUSTED_EVALUATOR
+    # Above the agent's own word, and no higher: nothing here says who scored.
+    assert evidence["recorded_score"].kind is EvidenceKind.OBSERVED_TRACE
     assert evidence["recorded_score"].trust_rank > evidence["final_output"].trust_rank
+
+
+def test_a_score_is_a_trusted_evaluators_only_when_the_source_names_one() -> None:
+    """An anonymous number would otherwise outrank the human label settling it."""
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def scored(**attributes: object) -> Evidence:
+        trace = Trace(
+            trace_id="scored",
+            source="otlp",
+            source_digest="a" * 64,
+            task="Do the thing",
+            spans=(
+                Span(
+                    span_id="reply",
+                    kind=SpanKind.MODEL,
+                    name="assistant",
+                    started_at=start,
+                    ended_at=start,
+                    output="All done!",
+                    attributes={"score": 0.9, **attributes},
+                ),
+            ),
+        )
+        return next(e for e in extract_outcome_evidence(trace) if e.claim == "recorded_score")
+
+    anonymous = scored()
+    named = scored(evaluator="refund-grader-v2")
+
+    assert anonymous.kind is EvidenceKind.OBSERVED_TRACE
+    assert "evaluator" not in anonymous.value
+    assert named.kind is EvidenceKind.TRUSTED_EVALUATOR
+    assert named.value["evaluator"] == "refund-grader-v2"
+    assert named.trust_rank > anonymous.trust_rank
 
 
 def test_initial_and_terminal_state_are_both_extracted() -> None:

@@ -86,6 +86,7 @@ def two_family_set():
     task_set = mine_task_set(
         analysis,
         "analysis-test",
+        backend="test",
         distance=_distance(groups),
         similarity=0.6,
         held_out=0.0,
@@ -234,7 +235,12 @@ def test_one_failing_family_does_not_lose_the_others():
         "reset the password for user <user_id>": "reset",
     }
     task_set = mine_task_set(
-        analysis, "analysis-test", distance=_distance(groups), similarity=0.6, held_out=0.0
+        analysis,
+        "analysis-test",
+        backend="test",
+        distance=_distance(groups),
+        similarity=0.6,
+        held_out=0.0,
     )
     assert len(task_set.families) == 2
 
@@ -426,6 +432,7 @@ def test_the_member_view_shows_the_tools_an_episode_actually_called():
     task_set = mine_task_set(
         analysis,
         "analysis-test",
+        backend="test",
         distance=lambda left, right: 0.0 if left == right else 0.9,
         similarity=0.6,
         held_out=0.0,

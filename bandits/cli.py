@@ -5,11 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from bandits.analyze import (
     DEFAULT_BUDGET,
+    DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
     DEFAULT_NEIGHBORS,
     analyze_corpus,
@@ -44,10 +46,13 @@ from bandits.analyze.embed import (
     descriptors,
     embedding_distance,
     load_cache,
+    requests,
     save_cache,
 )
 from bandits.export import (
+    CompositionReport,
     Partition,
+    SamplingCaps,
     build_direct_sft,
     build_eval_export,
     build_sft_export,
@@ -247,7 +252,10 @@ def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[Embeddi
     nothing. Vectors from two models are never mixed — a cache pinned to another
     model is passed over rather than extended.
     """
-    wanted = descriptors(analysis)
+    # Both halves of what mining compares: masked descriptors for grouping, and
+    # requests with their identifiers intact for duplicate detection. Building
+    # only the first leaves every duplicate comparison reading maximally far.
+    wanted = descriptors(analysis) + requests(analysis)
     existing: EmbeddingCache | None = None
     reused_id = ""
     for envelope in store.list(kind="embeddings"):
@@ -287,6 +295,26 @@ def _report(task_set, envelope_id: str) -> None:
     )
     if task_set.underfilled:
         console.print("[yellow]underfilled:[/yellow] eligibility ran out before the budget did")
+
+    # Printed with the families rather than buried in the artifact: two task sets
+    # from one analysis differ only by this, and the summary above them reads the
+    # same either way.
+    clustering = task_set.clustering
+    if clustering is None:
+        console.print(
+            "[yellow]clustering:[/yellow] this task set records nothing about how it "
+            "was grouped and cannot be reproduced from the artifact alone"
+        )
+    else:
+        pinned = (
+            f", {clustering.embedding_model} ({clustering.embedding_cache_id})"
+            if clustering.embedding_model
+            else ""
+        )
+        console.print(
+            f"clustering:  {clustering.backend} at similarity {clustering.similarity:g}, "
+            f"{clustering.neighbors} neighbor(s){pinned}"
+        )
 
     # A grouping stage that grouped nothing is not obviously broken from the
     # summary above: coverage still reads high when every trace is its own
@@ -441,6 +469,11 @@ def mine(
     neighbors: int = typer.Option(
         DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
     ),
+    duplicate_similarity: float = typer.Option(
+        DEFAULT_DUPLICATE_SIMILARITY,
+        "--duplicate-similarity",
+        help="Above this two requests are the same one, and never straddle the split.",
+    ),
     embedding_model: str = typer.Option(
         EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
     ),
@@ -476,6 +509,11 @@ def mine(
         similarity=similarity,
         neighbors=neighbors,
         distance=embedding_distance(cache),
+        duplicate_distance=embedding_distance(cache),
+        duplicate_similarity=duplicate_similarity,
+        backend="embedding",
+        embedding_model=embedding_model,
+        embedding_cache_id=cache_id,
         proposed_by="model",
     )
     envelope = save_task_set(task_set, store)
@@ -597,14 +635,17 @@ def merge_families_command(
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Record a reviewer's decision that several families are the same task."""
+    store = _derived(project)
     task_set = _load_task_set(task_set_id, project)
     try:
-        corrected = merge_families(task_set, tuple(family_ids))
-    except ValueError as exc:
+        corrected = merge_families(
+            task_set, tuple(family_ids), load_analysis(task_set.analysis_id, store)
+        )
+    except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    envelope = save_task_set(corrected, _derived(project))
+    envelope = save_task_set(corrected, store)
     _report(corrected, envelope.artifact_id)
 
 
@@ -632,6 +673,11 @@ def draft_verifier_command(
     task_set_id: str,
     family_id: str = typer.Option(..., "--family", help="Family to draft checks for."),
     limit: int = typer.Option(3, "--limit", help="Maximum independent verifier drafts."),
+    labels_id: str = typer.Option(
+        None,
+        "--labels",
+        help="Adjudicated labels to rank candidates against, and to compose from.",
+    ),
     interview: bool = typer.Option(
         False, "--interview", help="Immediately run the bounded owner-review interview."
     ),
@@ -642,7 +688,10 @@ def draft_verifier_command(
     task_set = _load_task_set(task_set_id, project)
     try:
         analysis = load_analysis(task_set.analysis_id, store)
-        draft = draft_verifiers(task_set, task_set_id, analysis, family_id, limit=limit)
+        labels = load_label_set(labels_id, store) if labels_id else None
+        draft = draft_verifiers(
+            task_set, task_set_id, analysis, family_id, limit=limit, labels=labels
+        )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -664,6 +713,7 @@ def draft_verifier_command(
                 check.evidence_kind.value,
             )
     console.print(table)
+    _show_candidates(draft)
     for unresolved in draft.unresolved:
         console.print(f"[yellow]unresolved:[/yellow] {unresolved}")
 
@@ -674,6 +724,28 @@ def draft_verifier_command(
 
     if interview:
         _run_verifier_interview(draft, envelope.artifact_id, store)
+
+
+def _show_candidates(draft) -> None:
+    """How each proposal behaved, next to what it proposes.
+
+    A ranked list with nothing behind it invites the top row to be taken as the
+    answer. The numbers are what let an owner disagree with the ranking.
+    """
+    if not draft.candidates:
+        return
+    table = Table("verifier_id", "from", "successes", "failures", "false pos", "coverage", "why")
+    for stats in draft.candidates:
+        table.add_row(
+            stats.verifier_id,
+            stats.derivation,
+            f"{stats.success_support}/{stats.labeled_successes}" if stats.calibrated else "—",
+            f"{stats.failure_rejection}/{stats.labeled_failures}" if stats.calibrated else "—",
+            str(stats.false_positives) if stats.calibrated else "—",
+            f"{stats.coverage:.0%} ({stats.unknown} unknown)",
+            stats.rationale,
+        )
+    console.print(table)
 
 
 def _show_draft_run(run) -> None:
@@ -918,6 +990,45 @@ def review_verifier_command(
         console.print(f"[yellow]accepted risk:[/yellow] {risk.code} — {risk.detail}")
 
 
+_SKEW_WARNING = 0.5
+"""Share of a dataset one family, source, model or tool may hold before it is
+worth saying out loud. Not a limit — nothing is refused for crossing it — but a
+dataset half made of one thing is rarely the dataset someone believes they
+asked for, and the summary above it reads the same either way."""
+
+
+def _report_composition(report: CompositionReport | None) -> None:
+    """Say what the selected dataset is mostly made of, when it is mostly one thing."""
+    if report is None or not report.selected.rows:
+        return
+    rows = report.selected.rows
+    console.print(
+        f"composed of: {report.selected.lineages} lineage(s) over "
+        f"{rows} row(s), median {report.selected.messages_per_row.median:g} message(s) "
+        f"and {report.selected.characters_per_row.median:g} character(s) per row"
+    )
+    for dimension, counts in (
+        ("family", report.selected.rows_by_family),
+        ("source", report.selected.rows_by_source),
+        ("model", report.selected.rows_by_model),
+        ("tool", report.selected.rows_by_tool),
+    ):
+        if len(counts) < 2:
+            continue
+        name, count = next(iter(counts.items()))
+        if count > _SKEW_WARNING * rows:
+            console.print(
+                f"[yellow]skew:[/yellow] {count} of {rows} row(s) share one {dimension} "
+                f"({name}); see the composition report"
+            )
+    repeated = report.selected.repeated_lineages
+    if repeated:
+        console.print(
+            f"[yellow]repeated lineage:[/yellow] {len(repeated)} lineage(s) contribute "
+            f"more than one row, the largest {max(repeated.values())}"
+        )
+
+
 @app.command(name="export")
 def export_command(
     task_set_id: str,
@@ -929,11 +1040,35 @@ def export_command(
         "--split",
         help="fit, held_out or all. Defaults to fit for sft and held_out for eval.",
     ),
+    max_rows_per_family: int = typer.Option(
+        None, "--max-rows-per-family", help="SFT only. Unset means no limit."
+    ),
+    max_rows_per_lineage: int = typer.Option(
+        None, "--max-rows-per-lineage", help="SFT only. Caps one retry chain or session."
+    ),
+    max_messages_per_row: int = typer.Option(None, "--max-messages-per-row", help="SFT only."),
+    max_characters_per_row: int = typer.Option(
+        None, "--max-characters-per-row", help="SFT only. Characters, never tokens."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Write reviewed eval or SFT rows plus an unresolved quarantine file."""
     if format_ not in {"eval", "sft"}:
         console.print("[red]error:[/red] --format must be one of: eval, sft")
+        raise typer.Exit(code=1)
+    try:
+        caps = SamplingCaps(
+            max_rows_per_family=max_rows_per_family,
+            max_rows_per_lineage=max_rows_per_lineage,
+            max_messages_per_row=max_messages_per_row,
+            max_characters_per_row=max_characters_per_row,
+        )
+    except ValidationError as exc:
+        console.print(f"[red]error:[/red] {exc.errors()[0]['msg']}")
+        raise typer.Exit(code=1) from exc
+    if format_ == "eval" and caps.configured:
+        # Silently ignoring them would produce an eval set that looks capped.
+        console.print("[red]error:[/red] sampling caps apply to --format sft only")
         raise typer.Exit(code=1)
     default_split = Partition.FIT if format_ == "sft" else Partition.HELD_OUT
     try:
@@ -947,6 +1082,9 @@ def export_command(
         analysis = load_analysis(task_set.analysis_id, store)
         corpus = ArtifactStore(project / ".bandits").read(task_set.corpus_id)
         reviewed = load_reviewed_verifier(reviewed_verifier_id, store)
+        arguments = {"partition": partition}
+        if format_ == "sft":
+            arguments["caps"] = caps
         builder = build_eval_export if format_ == "eval" else build_sft_export
         bundle = builder(
             corpus,
@@ -955,14 +1093,14 @@ def export_command(
             analysis,
             reviewed,
             reviewed_verifier_id,
-            partition=partition,
+            **arguments,
         )
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     envelope = save_export(bundle, store)
-    accepted_path, unresolved_path = write_jsonl(bundle, output)
+    accepted_path, unresolved_path, composition_path = write_jsonl(bundle, output)
     console.print(f"export_id:   {envelope.artifact_id}")
     console.print(f"format:      {format_}")
     console.print(
@@ -974,6 +1112,9 @@ def export_command(
     console.print(f"unresolved:  {len(bundle.unresolved)}")
     console.print(f"output:      {accepted_path}")
     console.print(f"quarantine:  {unresolved_path}")
+    if composition_path is not None:
+        console.print(f"composition: {composition_path}")
+    _report_composition(bundle.composition)
     for code in bundle.manifest.accepted_risks:
         console.print(f"[yellow]accepted risk:[/yellow] {code}")
     for warning in bundle.manifest.warnings:

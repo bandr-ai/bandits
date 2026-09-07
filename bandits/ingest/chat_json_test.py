@@ -186,3 +186,76 @@ def test_an_explicitly_empty_toolset_survives_the_adapter(tmp_path) -> None:
     trace = load_chat_json(path).traces[0]
 
     assert trace.tools_available == ()
+
+
+def test_a_paired_tool_result_records_that_its_call_was_recorded() -> None:
+    corpus = load_chat_json(FIXTURE)
+
+    tool_span = next(s for s in corpus.traces[0].spans if s.kind is SpanKind.TOOL)
+    assert tool_span.call_recorded is True
+
+
+def test_a_result_with_no_call_id_is_kept_but_marked_unpaired(tmp_path) -> None:
+    """The observation is real; the call that produced it is not recorded anywhere."""
+    path = tmp_path / "orphan.json"
+    path.write_text(
+        '[{"role": "user", "content": "Refund order 7741"},'
+        ' {"role": "tool", "name": "refund", "content": "{\\"status\\": \\"refunded\\"}"},'
+        ' {"role": "assistant", "content": "done"}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    tool_span = next(s for s in corpus.traces[0].spans if s.kind is SpanKind.TOOL)
+    assert tool_span.output == {"status": "refunded"}
+    assert tool_span.call_recorded is False
+    assert any(issue.kind == "unpaired_tool_result" for issue in corpus.issues)
+
+
+def test_a_result_answering_an_unknown_call_id_is_marked_unpaired(tmp_path) -> None:
+    """An id naming a call this conversation never contains pairs with nothing."""
+    path = tmp_path / "unknown.json"
+    path.write_text(
+        '[{"role": "user", "content": "Refund order 7741"},'
+        ' {"role": "tool", "tool_call_id": "call-elsewhere", "name": "refund",'
+        '  "content": "{\\"status\\": \\"refunded\\"}"},'
+        ' {"role": "assistant", "content": "done"}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    assert next(s for s in corpus.traces[0].spans if s.kind is SpanKind.TOOL).call_recorded is False
+
+
+def test_a_call_id_can_pair_with_only_one_result(tmp_path) -> None:
+    path = tmp_path / "reused.json"
+    path.write_text(
+        '[{"role": "user", "content": "Refund order 7741"},'
+        ' {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",'
+        '  "function": {"name": "refund", "arguments": "{}"}}]},'
+        ' {"role": "tool", "tool_call_id": "c1", "name": "refund", "content": "first"},'
+        ' {"role": "tool", "tool_call_id": "c1", "name": "refund", "content": "second"}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    tool_spans = [s for s in corpus.traces[0].spans if s.kind is SpanKind.TOOL]
+    assert [span.call_recorded for span in tool_spans] == [True, False]
+    assert any(issue.kind == "unpaired_tool_result" for issue in corpus.issues)
+
+
+def test_a_result_cannot_replace_the_recorded_call_name(tmp_path) -> None:
+    path = tmp_path / "mismatched-name.json"
+    path.write_text(
+        '[{"role": "user", "content": "Charge order 7741"},'
+        ' {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",'
+        '  "function": {"name": "charge", "arguments": "{}"}}]},'
+        ' {"role": "tool", "tool_call_id": "c1", "name": "refund", "content": "done"}]'
+    )
+
+    corpus = load_chat_json(path)
+
+    tool_span = next(s for s in corpus.traces[0].spans if s.kind is SpanKind.TOOL)
+    assert tool_span.name == "charge"
+    assert tool_span.call_recorded is False
+    assert any(issue.kind == "mismatched_tool_result" for issue in corpus.issues)
