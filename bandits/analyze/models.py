@@ -300,6 +300,115 @@ class TaskFamily(Contract):
         return self.coherence is not None and self.coherence.over_merged
 
 
+class FamilyAudit(Contract):
+    """A model's advisory read of one family's coherence.
+
+    Never an input to grouping. Clustering stays reproducible without a model,
+    so this is a second pass that annotates families and proposes work for a
+    human, and the task set it describes is never rewritten by it.
+
+    Splits may be proposed; merges never are. A wrongly split family yields two
+    coherent families that each draft a valid verifier, which costs redundancy.
+    A wrongly merged one yields a single family whose evidence disagrees with
+    itself, and ``draft_verifiers`` keys a check to whichever value happened to
+    be most common — a wrong verifier that looks fine.
+    """
+
+    family_id: str
+    coherent: bool
+    """Whether the members read as one task. Semantic, and independent of
+    :attr:`FamilyCoherence.over_merged`, which measures embedding distance."""
+
+    outlier_trace_ids: tuple[str, ...] = ()
+    proposed_subgroups: tuple[tuple[str, ...], ...] = ()
+    """Suggested fragmentation, for a human to act on via ``split-family``.
+    Advisory: nothing here splits a family on its own."""
+
+    generated_name: str | None = None
+    """A legible name for reports. Presentation only — never feeds ``family_id``
+    or ``fingerprint()``, which stay derived from the mechanical descriptor."""
+
+    rationale: str
+    model: str
+    prompt_digest: str
+    """Pins the wording that produced this. A verdict is only interpretable
+    alongside the prompt that asked for it."""
+
+    @model_validator(mode="after")
+    def validate_subgroups(self) -> FamilyAudit:
+        """Reject an audit that names the same trace twice or contradicts itself.
+
+        A model writes these ids, so they are checked at the boundary rather
+        than trusted: a subgroup naming one trace twice would silently drop a
+        member on the way to a split.
+        """
+        seen: set[str] = set()
+        for group in self.proposed_subgroups:
+            if not group:
+                raise ValueError(f"audit for {self.family_id} proposes an empty subgroup")
+            repeated = seen.intersection(group)
+            if repeated or len(set(group)) != len(group):
+                raise ValueError(
+                    f"audit for {self.family_id} places a trace in two subgroups: "
+                    f"{sorted(repeated or {t for t in group if group.count(t) > 1})}"
+                )
+            seen.update(group)
+
+        if len(self.proposed_subgroups) == 1:
+            raise ValueError(
+                f"audit for {self.family_id} proposes a single subgroup, which is "
+                "the family it already is"
+            )
+        if self.coherent and self.proposed_subgroups:
+            raise ValueError(
+                f"audit for {self.family_id} calls the family coherent and still "
+                "proposes splitting it"
+            )
+        if not self.rationale.strip():
+            raise ValueError(f"audit for {self.family_id} carries no rationale")
+        return self
+
+
+class SkippedAudit(Contract):
+    """A family the audit did not read, and why. Never silently absent."""
+
+    family_id: str
+    reason: str
+
+
+class FamilyAuditRun(Contract):
+    """One advisory audit pass over a task set's families.
+
+    Its own artifact, parented to the task set: an audit must never rewrite the
+    grouping it read, and re-mining without this pass must reproduce the same
+    families byte for byte.
+    """
+
+    schema_version: int = 1
+    task_set_id: str
+    audits: tuple[FamilyAudit, ...] = ()
+    skipped: tuple[SkippedAudit, ...] = ()
+    model: str
+    limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_audits(self) -> FamilyAuditRun:
+        audited = [a.family_id for a in self.audits]
+        if len(audited) != len(set(audited)):
+            raise ValueError("audit run reports the same family twice")
+        overlap = set(audited).intersection(s.family_id for s in self.skipped)
+        if overlap:
+            raise ValueError(f"families both audited and skipped: {sorted(overlap)}")
+        return self
+
+    def audit_by_family(self) -> dict[str, FamilyAudit]:
+        return {a.family_id: a for a in self.audits}
+
+    def incoherent(self) -> tuple[FamilyAudit, ...]:
+        """What a reviewer should look at, in a stable order."""
+        return tuple(sorted((a for a in self.audits if not a.coherent), key=lambda a: a.family_id))
+
+
 class TaskSet(Contract):
     """Mined families plus the selection drawn from them."""
 
