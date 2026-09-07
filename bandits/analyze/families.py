@@ -101,78 +101,17 @@ _SEMANTIC_RESERVE_LIMIT = (
     "depend on what the work meant need a domain extension to select for"
 )
 
-_ID_NOUNS = (
-    "order",
-    "invoice",
-    "ticket",
-    "issue",
-    "case",
-    "account",
-    "customer",
-    "user",
-    "session",
-    "payment",
-    "transaction",
-    "id",
-)
-"""Words that announce the thing after them is a reference, not a quantity.
-
-Deliberately short, and deliberately free of words that also read as verbs:
-``run 3 tests`` and ``build 2`` are counts, and a list that included them would
-mask the count as a reference."""
-
-_TYPED_ID = re.compile(
-    r"\b(" + "|".join(_ID_NOUNS) + r")s?\b(?:\s+(?:id|number|no\.?))?[\s:#-]*([a-z]*[-_]?\d[\w-]*)"
-)
-"""``order 7741`` and ``ticket #A-92`` — a named reference and its value."""
-
-_MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"), " <email> "),
-    (re.compile(r"\bhttps?://\S+"), " <url> "),
-    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), " <uuid> "),
-    (re.compile(r"\b[0-9a-f]{16,}\b"), " <hash> "),
-    (re.compile(r"\b\d+(?:\.\d+)+\b"), lambda m: " " + m.group(0).replace(".", "_") + " "),
-    (_TYPED_ID, lambda m: f" {m.group(1)} <{m.group(1)}_id> "),
-    (re.compile(r"#\d+\b"), " <ref_id> "),
-    (re.compile(r"\b[\w-]*\d{4,}[\w-]*\b"), " <id> "),
-)
-"""Value masks, applied in order. Identifiers are what vary between runs of the
-same task, so masking them is what makes two runs recognizable as one family.
-
-Only values that read as references are masked, and each keeps the noun that
-named it. Masking every digit-bearing word instead collapsed distinctions the
-task depends on — ``http 404`` and ``http 500`` normalized identically, so
-"handle the 404" and "handle the 500" became one family under one drafted
-verifier — and split ``python 3.12`` into two tokens at the dot. A quantity
-(``retry 3 times``), a version (``python 3.12``) and a status code stay as
-written — a dotted version joined into one token, since the tokenizer would
-otherwise split it at the dot. What varies run to run is a reference, and the
-last rule catches the unnamed ones by the only shape that reliably tells them
-apart from a quantity: a run of four or more digits."""
-
 _NON_TOKEN = re.compile(r"[^a-z0-9<>_]+")
 
 
 def normalize_instruction(instruction: str) -> str:
-    """Reduce an instruction to the shape it shares with others like it."""
-    text = instruction.lower()
-    for pattern, replacement in _MASKS:
-        text = pattern.sub(replacement, text)  # type: ignore[arg-type]
-    return " ".join(_NON_TOKEN.sub(" ", text).split())
+    """Normalize case and separators without hiding any values."""
+    return " ".join(_NON_TOKEN.sub(" ", instruction.lower()).split())
 
 
 def normalize_request(instruction: str) -> str:
-    """Reduce an instruction to the shape it shares only with the same request.
-
-    The opposite end of :func:`normalize_instruction`, and deliberately so.
-    Grouping masks identifiers because that is what makes two runs recognizable
-    as one family; sameness cannot use the same reduction, because under it
-    "refund order 7741" and "refund order 8802" are one string, and treating
-    those as the same request would collapse a whole family into one lineage
-    group and leave nothing to hold out. Case and punctuation go; every
-    identifier stays exactly where it was.
-    """
-    return " ".join(_NON_TOKEN.sub(" ", instruction.lower()).split())
+    """Normalize a request without hiding any values."""
+    return normalize_instruction(instruction)
 
 
 def fingerprint(instruction: str) -> str:
@@ -316,8 +255,12 @@ def _cluster(
             ((distance(descriptor, other), other) for other in descriptors if other != descriptor),
             key=lambda item: (item[0], item[1]),
         )
+        if not ranked:
+            nearest[descriptor] = set()
+            continue
+        cutoff = ranked[min(neighbors, len(ranked)) - 1][0]
         nearest[descriptor] = {
-            other for score, other in ranked[:neighbors] if score <= max_distance
+            other for score, other in ranked if score <= max_distance and score <= cutoff
         }
 
     graph = {descriptor: set() for descriptor in descriptors}
@@ -401,9 +344,8 @@ def _duplicate_edges(
     side — after which a verifier drafted on the first is measured against the
     second, and held-out agreement reports memorisation as generalisation.
 
-    Compared over requests, not over the masked descriptors grouping uses. Under
-    those, every refund in a family is one string, and every family would become
-    a single lineage group with nothing left to hold out.
+    Compared over normalized requests. Values are preserved, so different
+    identifiers remain different requests and can still land on opposite sides.
     """
     by_request: dict[str, list[_TraceFeatures]] = {}
     for feature in members:
@@ -593,12 +535,10 @@ def mine_task_set(
     The thresholds are read back off the arguments actually applied, so an
     omitted flag records the default that ran and not ``None``.
 
-    ``duplicate_distance`` measures sameness between whole requests, and is a
-    separate callable from ``distance`` because the two compare different text:
-    grouping compares descriptors with their identifiers masked out, and under
-    those every refund in a family reads as the same request. Without it only
-    identical requests are held together, which is what the resolved
-    ``duplicate_similarity`` on the artifact then records.
+    ``duplicate_distance`` measures a stricter notion of sameness than the
+    grouping distance. Both receive value-preserving normalized text. Without a
+    duplicate backend only identical requests are held together, which is what
+    the resolved ``duplicate_similarity`` on the artifact then records.
     """
     features, ungroupable = _features(analysis)
     total_mass = len(analysis.tasks)
