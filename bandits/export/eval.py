@@ -142,7 +142,7 @@ def build_eval_export(
             validation_id=reviewed.validation_id,
             human_acceptance_id=reviewed.human_acceptance_id,
             verifier_status=spec.status.value,
-            accepted_risks=tuple(item.code for item in reviewed.accepted_risks),
+            interview_id=reviewed.interview_id,
             partition=partition,
             partition_trace_count=len(partition_trace_ids(family, partition)),
             success_threshold=reviewed.success_threshold,

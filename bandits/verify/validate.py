@@ -14,6 +14,7 @@ measured gameability result outranks one carrying a prose warning.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -77,11 +78,83 @@ class Agreement(Contract):
     agreement: float | None = None
     """None when nothing was both labeled and scorable — not zero."""
 
+    false_positives: int | None = Field(default=None, ge=0)
+    false_negatives: int | None = Field(default=None, ge=0)
+    """How the disagreements split, and the reason a rate alone is not enough.
+
+    A false positive passes a run a human failed, and admits a failed trajectory
+    into training data; a false negative only withholds credit for real work.
+    ``0.81`` says nothing about which of those happened.
+
+    Counted here rather than derived from ``counterexamples``, which
+    ``_MAX_COUNTEREXAMPLES`` truncates: past ten disagreements the examples are
+    a sample and the split is unrecoverable from them.
+
+    ``None``, never ``0``, when a record does not carry the split — which is how
+    an artifact written before this field reads. Zero would claim the run was
+    measured and found errorless, and a stored disagreement would then contradict
+    its own split. Every record this code writes populates both, so ``None``
+    means only that an older artifact is being read back.
+    """
+
     counterexamples: tuple[Counterexample, ...] = ()
 
     @property
     def scored(self) -> int:
         return self.agreed + self.disagreed
+
+    @property
+    def coverage(self) -> float | None:
+        """Share of labeled runs the verifier could score. None when none were.
+
+        Kept apart from ``agreement``, which divides by ``scored`` and so reads
+        1.00 for one agreed run beside ninety-nine unscorable ones.
+        """
+        return (self.scored / self.labeled) if self.labeled else None
+
+    @property
+    def failure_catch_rate(self) -> float | None:
+        """Of the failures a human recorded and this could score, the share it caught.
+
+        The number plain agreement hides: on a corpus that is mostly successes,
+        a verifier that says success for everything scores well there and zero
+        here. None when no scorable run was labeled a failure, and None when the
+        record never said how its agreements split — a rate guessed from a
+        missing field would flatter exactly the verifier this exists to catch.
+        """
+        caught = self.caught_failures
+        if caught is None or self.false_positives is None:
+            return None
+        failures = self.false_positives + caught
+        return (caught / failures) if failures else None
+
+    @property
+    def caught_failures(self) -> int | None:
+        """Scorable runs a human failed and this verifier also failed.
+
+        Every scored run is one of four things: the two agreements and the two
+        errors. Agreed runs the verifier called a failure are therefore the
+        agreed total less those it called a success — which is what the false
+        negatives, its wrong failure calls, cannot account for.
+
+        None when ``successes_agreed`` was never recorded, which is how an
+        artifact written before this split reads.
+        """
+        if self.successes_agreed is None:
+            return None
+        return max(0, self.agreed - self.successes_agreed)
+
+    successes_agreed: int | None = Field(default=None, ge=0)
+    """Agreed runs both a human and this verifier called a success.
+
+    The other half of ``agreed``, kept so ``caught_failures`` is read from the
+    record rather than inferred from a corpus-wide success rate that says
+    nothing about this split.
+
+    ``None``, never ``0``, when a record does not carry it. Zero would claim
+    every agreed run was a caught failure, which reads as a perfect catch rate
+    for the always-says-success verifier this number exists to expose.
+    """
 
     @model_validator(mode="after")
     def counts_agree_with_the_rate(self) -> Agreement:
@@ -104,6 +177,20 @@ class Agreement(Contract):
             self.agreement is None or abs(self.agreement - expected) > 1e-9
         ):
             raise ValueError(f"stated agreement {self.agreement} does not match {expected}")
+        if self.false_positives is not None and self.false_negatives is not None:
+            # Only checkable when the record carries the split. An older artifact
+            # that predates these fields reads as split unknown, which is true,
+            # rather than as no errors, which is both false and flattering.
+            if self.false_positives + self.false_negatives != self.disagreed:
+                raise ValueError(
+                    f"agreement states {self.disagreed} disagreement(s) but splits into "
+                    f"{self.false_positives + self.false_negatives}"
+                )
+        if self.successes_agreed is not None and self.successes_agreed > self.agreed:
+            raise ValueError(
+                f"agreement states {self.agreed} agreed run(s) but {self.successes_agreed} "
+                "of them agreed on success"
+            )
         if len(self.counterexamples) > self.disagreed:
             raise ValueError("more counterexamples than disagreements")
         if any(
@@ -134,15 +221,14 @@ class GameabilityResult(Contract):
 
     checks_attacked: int = 1
     checks_total: int = 1
+    """What this one attack reached, for reading a composite forgery's breadth.
 
-    @property
-    def complete(self) -> bool:
-        """Whether every check could be attacked at all.
-
-        An incomplete attack that failed proves nothing: the checks no template
-        knows how to forge were never tried.
-        """
-        return self.checks_attacked == self.checks_total
+    Whether the *verifier* was covered is :class:`GameabilityAssessment`'s to
+    say, not this record's. A property here once answered it by comparing these
+    two, and could not: it lives on a result, and the case that matters — no
+    check matching any template, so no result at all — produces nothing for it
+    to be read from.
+    """
 
     forged_facts: int
     """How many facts had to be fabricated for the attack to land.
@@ -155,6 +241,79 @@ class GameabilityResult(Contract):
     """
 
 
+class GameabilityAssessment(Contract):
+    """What was attempted against one verifier, and what came of it.
+
+    Two independent facts, deliberately not folded into one state. A verifier
+    only half of whose checks a template could forge may still have been beaten
+    by the half that was tried, and a four-valued enum would have to choose
+    which of those to report.
+
+    It exists because the per-attack records cannot say what was never
+    attempted: when no check matches a template, ``probe_gameability`` returns
+    nothing at all, and an empty result set read as "no attack succeeded" is
+    indistinguishable from a verifier that resisted everything. This states the
+    absence rather than fabricating an attack that never ran.
+    """
+
+    verifier_id: str
+
+    coverage: Literal["none", "partial", "complete"]
+    """How much of the verifier any template could attack.
+
+    ``complete`` is not a safety claim. It says every check was attacked by the
+    templates that exist, not that no other attack exists.
+    """
+
+    attack_succeeded: bool
+    checks_attacked: int = Field(ge=0)
+    checks_total: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def coverage_matches_the_counts(self) -> GameabilityAssessment:
+        if self.checks_attacked > self.checks_total:
+            raise ValueError(
+                f"assessment attacked {self.checks_attacked} of {self.checks_total} check(s)"
+            )
+        if self.checks_attacked == 0:
+            expected = "none"
+        elif self.checks_attacked == self.checks_total:
+            expected = "complete"
+        else:
+            expected = "partial"
+        if self.coverage != expected:
+            raise ValueError(
+                f"coverage {self.coverage!r} does not match {self.checks_attacked} of "
+                f"{self.checks_total} check(s) attacked"
+            )
+        if self.attack_succeeded and self.checks_attacked == 0:
+            raise ValueError("an attack cannot have succeeded when none was attempted")
+        return self
+
+
+def assess_gameability(
+    spec: VerifierSpec, results: Sequence[GameabilityResult]
+) -> GameabilityAssessment:
+    """Summarise one verifier's attack results, including their absence."""
+    attacked = len({check.check_id for check in spec.checks if _attack(check) is not None})
+    total = len(spec.checks)
+    if attacked == 0:
+        coverage: Literal["none", "partial", "complete"] = "none"
+    elif attacked == total:
+        coverage = "complete"
+    else:
+        coverage = "partial"
+    return GameabilityAssessment(
+        verifier_id=spec.verifier_id,
+        coverage=coverage,
+        attack_succeeded=any(
+            result.passed for result in results if result.verifier_id == spec.verifier_id
+        ),
+        checks_attacked=attacked,
+        checks_total=total,
+    )
+
+
 class Validation(Contract):
     schema_version: int = 1
     source_draft_id: str
@@ -163,6 +322,14 @@ class Validation(Contract):
     success_threshold: float = Field(default=DEFAULT_SUCCESS_THRESHOLD, ge=0, le=1)
     agreements: tuple[Agreement, ...] = ()
     gameability: tuple[GameabilityResult, ...] = ()
+
+    gameability_assessments: tuple[GameabilityAssessment, ...] = ()
+    """One per measured verifier, including those no template could attack.
+
+    ``gameability`` above is the provenance — which attack, built how, and what
+    it cost. This says what was covered, which an empty result set cannot.
+    """
+
     labels_used: int = Field(default=0, ge=0)
     unclear_labels: int = Field(default=0, ge=0)
 
@@ -182,6 +349,32 @@ class Validation(Contract):
         stray = {item.verifier_id for item in self.gameability} - measured
         if stray:
             raise ValueError(f"gameability reported for unmeasured verifier(s): {sorted(stray)}")
+        assessed = [item.verifier_id for item in self.gameability_assessments]
+        if len(assessed) != len(set(assessed)):
+            raise ValueError("validation states two gameability assessments for one verifier")
+        if assessed and (unassessed := measured - set(assessed)):
+            # Partial coverage of the verifiers is worse than none: a reader
+            # seeing assessments for three of four has no way to tell the fourth
+            # apart from one that was assessed and came back clean. Empty stays
+            # legal so validations written before assessments existed still load.
+            raise ValueError(
+                f"gameability assessed for some verifiers but not {sorted(unassessed)}"
+            )
+        stray_assessments = set(assessed) - measured
+        if stray_assessments:
+            raise ValueError(
+                f"gameability assessed for unmeasured verifier(s): {sorted(stray_assessments)}"
+            )
+        for assessment in self.gameability_assessments:
+            landed = any(
+                item.passed
+                for item in self.gameability
+                if item.verifier_id == assessment.verifier_id
+            )
+            if assessment.attack_succeeded != landed:
+                raise ValueError(
+                    f"assessment for {assessment.verifier_id} disagrees with its attack results"
+                )
         if self.success_labels + self.failure_labels > self.labels_used:
             raise ValueError("more adjudicated verdicts than labels used")
         return self
@@ -207,6 +400,7 @@ def _agreement(
     threshold: float,
 ) -> Agreement:
     agreed = disagreed = unscored = 0
+    false_positives = false_negatives = successes_agreed = 0
     counterexamples: list[Counterexample] = []
 
     for trace_id in trace_ids:
@@ -220,8 +414,14 @@ def _agreement(
             continue
         if claim is (verdict is Verdict.SUCCESS):
             agreed += 1
+            if claim:
+                successes_agreed += 1
         else:
             disagreed += 1
+            if claim:
+                false_positives += 1
+            else:
+                false_negatives += 1
             counterexamples.append(
                 Counterexample(
                     trace_id=trace_id,
@@ -240,6 +440,9 @@ def _agreement(
         disagreed=disagreed,
         unscored=unscored,
         agreement=(agreed / scored) if scored else None,
+        false_positives=false_positives,
+        false_negatives=false_negatives,
+        successes_agreed=successes_agreed,
         # A false positive — the check passing a run a human failed — is the one
         # that would reward the wrong behavior, so it is shown first.
         counterexamples=tuple(
@@ -486,6 +689,7 @@ def validate_draft(
 
     agreements: list[Agreement] = []
     gameability: list[GameabilityResult] = []
+    assessments: list[GameabilityAssessment] = []
     for spec in draft.verifiers:
         for split, trace_ids in (
             ("fit", family.fit_trace_ids),
@@ -501,7 +705,9 @@ def validate_draft(
                     threshold=success_threshold,
                 )
             )
-        gameability.extend(probe_gameability(spec, success_threshold=success_threshold))
+        probed = probe_gameability(spec, success_threshold=success_threshold)
+        gameability.extend(probed)
+        assessments.append(assess_gameability(spec, probed))
 
     limitations: list[str] = []
     if not any(a.split == "held_out" and a.labeled for a in agreements):
@@ -526,6 +732,7 @@ def validate_draft(
         success_threshold=success_threshold,
         agreements=tuple(agreements),
         gameability=tuple(gameability),
+        gameability_assessments=tuple(assessments),
         labels_used=len(in_family),
         unclear_labels=unclear,
         success_labels=successes,
@@ -539,17 +746,18 @@ def calibrate(spec: VerifierSpec, validation_id: str) -> VerifierSpec:
     return spec.replace(status=VerifierStatus.CALIBRATED, validation_artifact_id=validation_id)
 
 
-def accept(spec: VerifierSpec, acceptance_id: str, *, over_risk: bool = False) -> VerifierSpec:
-    """Record a human owner accepting a calibrated verifier.
+def accept(spec: VerifierSpec, acceptance_id: str) -> VerifierSpec:
+    """Record a human accepting a calibrated verifier.
 
-    ``over_risk`` marks an acceptance made against the evidence rather than with
-    it, and lands on a different status so nothing downstream has to reconstruct
-    which of the two happened.
+    One outcome, where there were two. ``RISK_ACCEPTED`` existed for an owner
+    promoting past an evidence blocker this stage raised on its own; promotion
+    now rests on a review in which that same evidence was already shown and
+    accepted, so there is no second judgement to go against. The status remains
+    in ``VerifierStatus`` for artifacts written before this.
     """
     if spec.status is not VerifierStatus.CALIBRATED:
         raise ValueError("only a calibrated verifier can be accepted")
-    status = VerifierStatus.RISK_ACCEPTED if over_risk else VerifierStatus.REVIEWED
-    return spec.replace(status=status, human_acceptance_id=acceptance_id)
+    return spec.replace(status=VerifierStatus.REVIEWED, human_acceptance_id=acceptance_id)
 
 
 def compute_validation_id(validation: Validation) -> str:
