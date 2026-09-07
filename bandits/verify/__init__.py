@@ -28,6 +28,7 @@ from bandits.verify.judge import (
     save_judge_run,
 )
 from bandits.verify.models import (
+    CandidateStats,
     CheckOperator,
     CheckSpec,
     InterviewAnswer,
@@ -72,6 +73,7 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "CandidateStats",
     "PromotionBlocker",
     "assess_promotion",
     "Agreement",
