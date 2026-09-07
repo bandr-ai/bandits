@@ -22,6 +22,20 @@ _EXIT_CODE_KEYS = ("exit_code", "exitcode", "returncode", "return_code")
 _SCORE_KEYS = ("score", "rating", "feedback", "user_feedback", "evaluation")
 """Keys under which a source may have recorded its own judgement of the run."""
 
+_EVALUATOR_KEYS = (
+    "evaluator",
+    "evaluator_name",
+    "grader",
+    "judge",
+    "scorer",
+    "gen_ai.evaluation.name",
+)
+"""Keys that name what produced a recorded score.
+
+A score is only as good as whoever computed it. Without one of these the number
+is an anonymous attribute on a span, and nothing about it says a trustworthy
+evaluator was involved rather than the agent grading its own homework."""
+
 _SCALAR = (str, int, float, bool)
 """Only scalars become state fields. A nested object is not a comparable value."""
 
@@ -210,17 +224,27 @@ def extract_outcome_evidence(trace: Trace) -> tuple[Evidence, ...]:
 
         recorded_score = _first_key(span.attributes, _SCORE_KEYS)
         if recorded_score is not None:
-            # Moderate, not strong: the source recorded a judgement but not what
-            # produced it, so its trustworthiness is unknown until someone says.
+            # A score ranks as a trusted evaluator's only when the source says
+            # which evaluator. Without that it is a number on a span and nothing
+            # more: reading it as trusted promotes an anonymous figure above the
+            # human labels that would have had to settle a disagreement with it,
+            # and a verifier resting on it could reach `calibrated` on nothing.
+            evaluator = _first_key(span.attributes, _EVALUATOR_KEYS)
+            named = evaluator is not None and isinstance(evaluator[1], str) and evaluator[1].strip()
+            value = {"key": recorded_score[0], "value": recorded_score[1]}
+            if named:
+                value["evaluator"] = evaluator[1]
             record(
                 _evidence(
                     span,
                     trace_id=trace.trace_id,
                     claim="recorded_score",
-                    value={"key": recorded_score[0], "value": recorded_score[1]},
+                    value=value,
+                    # Moderate even when named: the source says who scored, not
+                    # that the scoring was any good.
                     visibility=Visibility.POST_HOC,
                     strength="moderate",
-                    kind=EvidenceKind.TRUSTED_EVALUATOR,
+                    kind=(EvidenceKind.TRUSTED_EVALUATOR if named else EvidenceKind.OBSERVED_TRACE),
                 )
             )
 

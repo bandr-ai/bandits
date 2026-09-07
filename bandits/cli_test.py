@@ -3,13 +3,20 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 from typer.testing import CliRunner
 
-from bandits.analyze import load_analysis, load_task_set
-from bandits.analyze.embed import EmbeddingError
+from bandits.analyze import (
+    DEFAULT_DUPLICATE_SIMILARITY,
+    load_analysis,
+    load_task_set,
+    save_task_set,
+)
+from bandits.analyze.audit import AuditError
+from bandits.analyze.embed import EmbeddingError, descriptors, load_cache, requests
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -159,6 +166,241 @@ def _mined(tmp_path: Path) -> str:
     mined = runner.invoke(app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)])
     assert mined.exit_code == 0, mined.stdout
     return mined.stdout.split()[1]
+
+
+def _audit_predictor(**fields):
+    """Stand in for the RLM. No model, no sandbox, no credentials in CI."""
+
+    def build(*, model, **_):
+        def predict(*, members, question):
+            return SimpleNamespace(**fields)
+
+        return predict
+
+    return build
+
+
+def test_mine_runs_the_audit_and_saves_it_beside_the_task_set(tmp_path) -> None:
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=False,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="Members describe two different tasks.",
+        ),
+    ):
+        result = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
+        )
+
+    assert result.exit_code == 0
+    assert "audit_id:    family-audit-" in result.stdout
+    store = DerivedStore(tmp_path / ".bandits")
+    assert store.list(kind="family_audit")
+
+    # The audit is its own artifact hanging off the task set, never inside it.
+    task_set_id = result.stdout.split()[1]
+    assert store.list(kind="family_audit")[0].parent_artifact_id == task_set_id
+
+
+def test_mine_output_is_identical_with_and_without_the_audit(tmp_path) -> None:
+    """The issue's acceptance criterion, at the CLI boundary."""
+
+    def mine_into(project: Path, *extra: str) -> str:
+        runner.invoke(
+            app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(project)]
+        )
+        corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+        analysis_id = runner.invoke(
+            app, ["analyze", corpus_id, "--project", str(project)]
+        ).stdout.split()[1]
+        mined = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(project), *extra]
+        )
+        assert mined.exit_code == 0, mined.stdout
+        return mined.stdout.split()[1]
+
+    audited_dir, plain_dir = tmp_path / "audited", tmp_path / "plain"
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=False,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="Two tasks here.",
+        ),
+    ):
+        audited_id = mine_into(audited_dir)
+    plain_id = mine_into(plain_dir, "--no-audit")
+
+    # Content-addressed, so an identical id is an identical task set.
+    assert audited_id == plain_id
+    assert DerivedStore(audited_dir / ".bandits").read_payload(audited_id) == DerivedStore(
+        plain_dir / ".bandits"
+    ).read_payload(plain_id)
+    assert not DerivedStore(plain_dir / ".bandits").list(kind="family_audit")
+
+
+def test_mine_survives_an_audit_that_cannot_run(tmp_path) -> None:
+    """A missing second opinion is not a failed mine."""
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+
+    def missing_extra(**_):
+        raise AuditError("the family audit needs the 'audit' extra")
+
+    with mock.patch("bandits.cli.build_predictor", missing_extra):
+        result = runner.invoke(
+            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
+        )
+
+    assert result.exit_code == 0
+    assert "audit skipped:" in result.stdout
+    assert DerivedStore(tmp_path / ".bandits").list(kind="taskset")
+
+
+def test_audit_families_points_a_split_at_the_split_command(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+    family = next(f for f in task_set.families if len(f.trace_ids) >= 2)
+    first, second = family.trace_ids[0], family.trace_ids[1]
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=False,
+            outlier_trace_ids=[first],
+            proposed_subgroups=[[first], [second]],
+            generated_name="Refund an eligible order",
+            rationale="These are two tasks.",
+        ),
+    ):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "incoherent" in result.stdout
+    assert f"bandits split-family {task_set_id} {family.family_id}" in result.stdout
+    # Advisory: the task set it read is untouched.
+    assert load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits")) == task_set
+
+
+def test_audit_families_reports_both_verdicts_side_by_side(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="One task throughout.",
+        ),
+    ):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "semantic" in result.stdout and "geometric" in result.stdout
+
+
+def test_audit_families_rejects_an_unknown_family(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="x"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "audit-families",
+                task_set_id,
+                "--family",
+                "family-does-not-exist",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "unknown family id" in result.stdout
+
+
+def test_audit_families_can_reprint_a_saved_audit(tmp_path) -> None:
+    task_set_id = _mined(tmp_path)
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="One task throughout.",
+        ),
+    ):
+        first = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+    audit_id = first.stdout.split("audit_id:")[1].split()[0]
+
+    result = runner.invoke(
+        app, ["audit-families", task_set_id, "--show", audit_id, "--project", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0
+    assert "Refund an eligible order" in result.stdout
+
+
+def test_audit_families_refuses_an_audit_of_another_task_set(tmp_path) -> None:
+    """The audit and the task set are loaded independently, so nothing else
+    notices they disagree.
+
+    Geometric coherence is looked up by family id, so families the supplied task
+    set never had read as "not measured" rather than as wrong, and the printed
+    `split-family` line would name the audit's task set beside a family judged
+    against another one.
+    """
+    task_set_id = _mined(tmp_path)
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analysis_id = runner.invoke(
+        app, ["analyze", corpus_id, "--project", str(tmp_path)]
+    ).stdout.split()[1]
+    other = runner.invoke(app, ["mine", analysis_id, "--budget", "4", "--project", str(tmp_path)])
+    other_task_set_id = other.stdout.split()[1]
+    assert other_task_set_id != task_set_id
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="One task."
+        ),
+    ):
+        first = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+    audit_id = first.stdout.split("audit_id:")[1].split()[0]
+
+    result = runner.invoke(
+        app,
+        ["audit-families", other_task_set_id, "--show", audit_id, "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert task_set_id in result.stdout
+    assert other_task_set_id in result.stdout
 
 
 def test_mine_reports_coverage_and_unfilled_slots(tmp_path) -> None:
@@ -1012,3 +1254,156 @@ def test_a_manual_revise_after_an_unreadable_reply_is_applied(tmp_path: Path) ->
     assert first.interpretation.source == "human"
     assert first.interpretation.revised_expected == "shipped"
     assert any(check.expected == "shipped" for s in interview.draft.verifiers for check in s.checks)
+
+
+def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    report = output.with_name("sft.composition.json")
+    assert report.exists()
+    payload = json.loads(report.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["offered_traces"] >= payload["selected"]["rows"]
+    assert "composition:" in result.stdout
+
+
+def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path) -> None:
+    """An ignored cap would produce an eval set that looks curated and is not."""
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "eval.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "eval",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-family",
+            "1",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "sft only" in result.stdout
+    assert not output.exists()
+
+
+def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None:
+    task_set_id, reviewed_id = _reviewed_refund_verifier(tmp_path)
+    output = tmp_path / "out" / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            task_set_id,
+            "--format",
+            "sft",
+            "--verifier",
+            reviewed_id,
+            "--output",
+            str(output),
+            "--max-rows-per-lineage",
+            "0",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "at least 1" in result.stdout
+    assert not output.exists()
+
+
+def test_mine_reports_the_backend_threshold_and_vectors_it_grouped_with(tmp_path) -> None:
+    """The one difference between two task sets from one analysis, said out loud."""
+    task_set_id = _mined(tmp_path)
+
+    result = runner.invoke(app, ["families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "clustering:" in result.stdout
+    assert "embedding at similarity" in result.stdout
+
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+    assert task_set.clustering.backend == "embedding"
+    assert task_set.clustering.embedding_cache_id
+    assert task_set.clustering.embedding_model
+
+
+def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(tmp_path) -> None:
+    """An artifact from before this was recorded is the one case it cannot be recovered for."""
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(_mined(tmp_path), store)
+    older = save_task_set(task_set.replace(clustering=None), store).artifact_id
+
+    result = runner.invoke(app, ["families", older, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "records nothing about how it" in result.stdout
+
+
+def test_mine_embeds_the_requests_duplicate_detection_compares(tmp_path) -> None:
+    """Descriptors alone leave every sameness comparison reading maximally far."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(task_set_id, store)
+    cache = load_cache(task_set.clustering.embedding_cache_id, store)
+
+    analysis = load_analysis(task_set.analysis_id, store)
+    assert set(requests(analysis)) <= set(cache.vectors)
+    assert set(descriptors(analysis)) <= set(cache.vectors)
+    assert task_set.clustering.duplicate_similarity == DEFAULT_DUPLICATE_SIMILARITY
+
+
+def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tmp_path) -> None:
+    """A ranked list with nothing behind it invites the top row to be taken as the answer."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "frequency-based hypothesis" in result.stdout
+    draft = load_verifier_draft(result.stdout.split()[1], store)
+    assert draft.candidates
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(item.considered for item in draft.candidates)
