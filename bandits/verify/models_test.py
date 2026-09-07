@@ -6,10 +6,15 @@ from pydantic import ValidationError
 from bandits.analyze.models import EvidenceKind
 from bandits.verify.models import (
     CheckOperator,
+    CheckReview,
     CheckSpec,
+    Interpretation,
+    InterviewDecision,
     InterviewQuestion,
     Result,
     SubScore,
+    VerifierDraft,
+    VerifierInterview,
     VerifierMode,
     VerifierSpec,
     VerifierStatus,
@@ -152,3 +157,109 @@ def test_one_stronger_check_lifts_the_verifier_off_self_report() -> None:
 def test_an_expected_question_must_name_its_check() -> None:
     with pytest.raises(ValidationError, match="must name the check"):
         InterviewQuestion(question_id="q1", verifier_id="v1", field="expected", prompt="?")
+
+
+def _draft() -> VerifierDraft:
+    return VerifierDraft(
+        task_set_id="taskset-one",
+        analysis_id="analysis-one",
+        family_id="family-one",
+        verifiers=(_spec(),),
+    )
+
+
+def _interpretation(**overrides: object) -> Interpretation:
+    return Interpretation(
+        **{"decision": InterviewDecision.ACCEPT, "rationale": "reads the right signal", **overrides}
+    )
+
+
+def test_only_a_revise_carries_a_revised_value() -> None:
+    with pytest.raises(ValidationError, match="revised value or operator"):
+        _interpretation(revised_expected="shipped")
+
+
+def test_only_a_revise_carries_a_revised_operator() -> None:
+    with pytest.raises(ValidationError, match="revised value or operator"):
+        _interpretation(revised_operator=CheckOperator.EXACT_OUTPUT)
+
+
+def test_only_a_combine_names_another_check() -> None:
+    with pytest.raises(ValidationError, match="name another check"):
+        _interpretation(combine_with="check-two")
+
+
+def test_a_combine_cannot_both_resolve_and_drop_its_target() -> None:
+    with pytest.raises(ValidationError, match="resolve and drop"):
+        _interpretation(
+            decision=InterviewDecision.COMBINE,
+            combine_with="check-two",
+            dropped_combine_target="check-nope",
+        )
+
+
+def test_a_dropped_combine_target_survives_without_a_resolved_one() -> None:
+    """The decision stands; the human retargets it. Losing it would discard
+    the parts of the interpretation the model got right."""
+    interpretation = _interpretation(
+        decision=InterviewDecision.COMBINE, dropped_combine_target="check-nope"
+    )
+    assert interpretation.combine_with is None
+    assert interpretation.dropped_combine_target == "check-nope"
+
+
+def _review(**overrides: object) -> CheckReview:
+    return CheckReview(
+        **{
+            "review_id": "review-one",
+            "verifier_id": "verifier-one",
+            "check_id": "check-one",
+            "reply": "fine",
+            "decision": InterviewDecision.ACCEPT,
+            **overrides,
+        }
+    )
+
+
+def test_a_failed_interpretation_cannot_carry_a_result() -> None:
+    with pytest.raises(ValidationError, match="failed interpretation"):
+        _review(failure="timeout", interpretation=_interpretation())
+
+
+def test_interview_rejects_duplicate_review_ids() -> None:
+    with pytest.raises(ValidationError, match="duplicate review ids"):
+        VerifierInterview(
+            source_draft_id="draft-one",
+            draft=_draft(),
+            reviews=(_review(), _review(check_id="check-two")),
+        )
+
+
+def test_interview_rejects_a_supersede_pointing_nowhere() -> None:
+    with pytest.raises(ValidationError, match="superseded by unknown review"):
+        VerifierInterview(
+            source_draft_id="draft-one",
+            draft=_draft(),
+            reviews=(_review(superseded_by="review-missing"),),
+        )
+
+
+def test_a_review_may_be_superseded_by_a_later_one() -> None:
+    interview = VerifierInterview(
+        source_draft_id="draft-one",
+        draft=_draft(),
+        reviews=(
+            _review(superseded_by="review-two"),
+            _review(
+                review_id="review-two", check_id="check-two", decision=InterviewDecision.COMBINE
+            ),
+        ),
+    )
+    assert interview.reviews[0].superseded_by == "review-two"
+
+
+def test_an_interview_needs_no_questions() -> None:
+    """The free-text flow records reviews, not question answers."""
+    interview = VerifierInterview(source_draft_id="draft-one", draft=_draft())
+    assert interview.questions == ()
+    assert interview.reviews == ()

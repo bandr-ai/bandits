@@ -73,10 +73,16 @@ from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
 from bandits.verify import (
     answer_question,
+    apply_decision,
+    build_check_summary,
     draft_verifiers,
+    find_check,
+    load_interview,
     load_reviewed_verifier,
     load_verifier_draft,
+    next_check,
     next_question,
+    prior_decisions,
     review_verifier,
     run_draft,
     save_draft_run,
@@ -84,6 +90,15 @@ from bandits.verify import (
     save_reviewed_verifier,
     save_verifier_draft,
     start_interview,
+    start_review,
+)
+from bandits.verify.interpret import (
+    DEFAULT_MODEL as INTERPRETER_MODEL,
+)
+from bandits.verify.interpret import (
+    InterpretationFailure,
+    interpret_reply,
+    parse_expected,
 )
 from bandits.verify.judge import (
     DEFAULT_MODEL,
@@ -92,8 +107,16 @@ from bandits.verify.judge import (
     judge_traces,
     save_judge_run,
 )
+from bandits.verify.models import (
+    CheckOperator,
+    CheckReview,
+    CheckSpec,
+    Interpretation,
+    InterviewDecision,
+)
 from bandits.verify.validate import (
     load_validation,
+    probe_gameability,
     save_validation,
     validate_draft,
 )
@@ -1206,6 +1229,365 @@ def judge(
             f"[yellow]contested:[/yellow] {', '.join(contested)} — the judge disagreed "
             "with itself; these score unknown until a human settles them"
         )
+
+
+_INTERPRETER: object | None = None
+"""Overridden by tests so the interview never reaches the network.
+
+None means ``interpret_reply`` resolves its own default client. Injecting here
+rather than threading a parameter through the command keeps the CLI signature
+about the review and not about which model client is in use.
+"""
+
+
+def _interpreter():
+    return _INTERPRETER
+
+
+_DECISION_KEYS = {
+    "a": InterviewDecision.ACCEPT,
+    "r": InterviewDecision.REJECT,
+    "v": InterviewDecision.REVISE,
+    "c": InterviewDecision.COMBINE,
+}
+
+
+def _show_check_summary(summary, check, spec) -> None:
+    console.print(f"\n[bold]{check.claim}[/bold]  [dim]{check.check_id}[/dim]")
+    console.print(f"  {check.description}")
+    console.print(
+        f"  scored: [green]{summary.passed} passed[/green], "
+        f"[red]{summary.failed} failed[/red], {summary.unscorable} unscorable"
+    )
+    if summary.passed and not summary.failed:
+        console.print(
+            "  [yellow]passed every run it could score[/yellow]: nothing here shows it "
+            "telling success from failure"
+        )
+    if summary.example_trace_ids:
+        console.print(f"  examples: {', '.join(summary.example_trace_ids)}")
+    console.print(f"  evidence: {summary.evidence_kind}")
+    for agreement in summary.agreements:
+        rate = "unmeasured" if agreement.agreement is None else f"{agreement.agreement:.0%}"
+        console.print(
+            f"  [cyan]agreement ({agreement.split})[/cyan]: {rate} of "
+            f"{agreement.labeled} labeled run(s)"
+        )
+    for attack in summary.gameability:
+        if attack.passed:
+            console.print(
+                f"  [red]gameable[/red]: {attack.hypothesis} ({attack.forged_facts} forged fact(s))"
+            )
+    for blind in summary.blind_spots:
+        console.print(f"  [dim]blind spot:[/dim] {blind}")
+    for gaming in summary.gaming_hypotheses:
+        console.print(f"  [dim]gaming:[/dim] {gaming}")
+
+
+def _probe_hypotheses(spec, check, interpretation) -> None:
+    """Run any named gaming hypothesis through the real attack machinery.
+
+    A hypothesis an owner names is worth only as much as what tests it. Where a
+    template exists for the operator, the attack is constructed and scored;
+    where none does, that is said plainly rather than left looking tested.
+    """
+    if interpretation is None or not interpretation.gaming_hypotheses:
+        return
+    # Out of scope for #14: synthesising forged evidence for a hypothesis no
+    # template matches. ``_attack()`` dispatches on the operator, so a novel
+    # attack against an operator that already has a template gets that
+    # template's canned attack rather than the one the reviewer described. The
+    # gap is reported below rather than hidden; closing it means teaching
+    # ``_attack`` to build evidence from an interpreted hypothesis, which is a
+    # change to the attack machinery and deserves its own issue.
+    single = spec.replace(checks=(check,))
+    results = probe_gameability(single)
+    for hypothesis in interpretation.gaming_hypotheses:
+        console.print(f"\n  [dim]probing:[/dim] {hypothesis}")
+        if not results:
+            console.print(
+                f"  [yellow]no attack template for {check.operator.value}[/yellow]: "
+                "recorded, but nothing here tests it"
+            )
+            continue
+        for result in results:
+            verdict = "[red]passed[/red]" if result.passed else "[green]held[/green]"
+            console.print(f"  {verdict}: {result.hypothesis}")
+
+
+def _manual_decision(reason: str) -> InterviewDecision | None:
+    console.print(f"  [yellow]{reason}[/yellow]")
+    raw = typer.prompt("  decide directly [a]ccept/[r]eject/re[v]ise/[c]ombine", default="")
+    return _DECISION_KEYS.get(raw.strip().lower()[:1])
+
+
+def _manual_interpretation(
+    decision: InterviewDecision,
+    check: CheckSpec,
+    known_check_ids: tuple[str, ...],
+) -> Interpretation | None:
+    """Collect what a revise or combine needs when the model did not supply it.
+
+    A decision enum alone cannot carry either action: a revise needs the value
+    or operator the check becomes, and a combine needs a target that resolves.
+    Without them the decision is refused downstream and the check stays pending,
+    so the reviewer would be re-asked forever with no way to answer.
+
+    ``accept`` and ``reject`` need nothing beyond the enum and return ``None``,
+    which is what ``apply_decision`` already expects for them.
+    """
+    if decision is InterviewDecision.REVISE:
+        rationale = typer.prompt("  why this revision", default="entered by the reviewer")
+        raw_value = typer.prompt("  new expected value (blank to keep)", default="")
+        raw_operator = typer.prompt(
+            f"  new operator (blank to keep {check.operator.value})", default=""
+        )
+        operator = None
+        if raw_operator.strip():
+            try:
+                operator = CheckOperator(raw_operator.strip().lower())
+            except ValueError:
+                console.print(f"  [yellow]unknown operator {raw_operator!r}[/yellow]")
+                return None
+        # Parsed the way the model path parses it, so a value entered by hand and
+        # the same value proposed by the model resolve to one check identity.
+        expected = parse_expected(raw_value) if raw_value.strip() else None
+        if expected is None and operator is None:
+            console.print("  [yellow]a revision needs a new value or operator[/yellow]")
+            return None
+        return Interpretation(
+            source="human",
+            decision=decision,
+            rationale=rationale,
+            revised_expected=expected,
+            revised_operator=operator,
+        )
+
+    if decision is InterviewDecision.COMBINE:
+        targets = tuple(c for c in known_check_ids if c != check.check_id)
+        if not targets:
+            console.print("  [yellow]no other check to combine with[/yellow]")
+            return None
+        console.print(f"  other checks: {', '.join(targets)}")
+        rationale = typer.prompt("  why this combination", default="entered by the reviewer")
+        target = typer.prompt("  combine with which check_id", default="").strip()
+        if target not in targets:
+            console.print(f"  [yellow]no check named {target!r}[/yellow]")
+            return None
+        return Interpretation(
+            source="human", decision=decision, rationale=rationale, combine_with=target
+        )
+
+    return None
+
+
+# Named ``interview-review`` rather than ``review-verifier``: that name is
+# already the acceptance command above, which promotes a calibrated verifier to
+# reviewed. Two commands whose names differ only by word order, one refining a
+# hypothesis and one promoting it past validation, is a mistake waiting to be
+# typed. ``interview-verifier`` keeps the older fixed-question flow, which still
+# works and is still tested.
+@app.command(name="interview-review")
+def interview_review_command(
+    verifier_draft_id: str,
+    validation_id: str = typer.Option(None, "--validation", help="Results of an earlier round."),
+    prior_interview_id: str = typer.Option(None, "--prior", help="The round before this one."),
+    round_number: int = typer.Option(
+        1, "--round", min=1, help="Ignored with --prior, which derives the round from the chain."
+    ),
+    model: str = typer.Option(INTERPRETER_MODEL, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Review a verifier draft by saying what you think, in your own words.
+
+    One open question per check. A model reads the reply and proposes a
+    decision; you confirm it before anything is applied.
+    """
+    store = _derived(project)
+    try:
+        draft = load_verifier_draft(verifier_draft_id, store)
+        task_set = load_task_set(draft.task_set_id, store)
+        analysis = load_analysis(draft.analysis_id, store)
+        validation = load_validation(validation_id, store) if validation_id else None
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Each invocation opens a new round rather than extending an existing
+    # interview. ``DerivedStore.write`` is content-addressed, so appending to one
+    # record would mint a fresh id on every save regardless — the chain exists
+    # either way, and ``prior_interview_id`` makes it explicit instead of
+    # leaving a series of ids that each claim to be the whole history. It also
+    # keeps a round's payload from re-serialising every earlier round on each
+    # per-decision save.
+    prior = None
+    if prior_interview_id:
+        try:
+            prior = load_interview(prior_interview_id, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no interview {prior_interview_id!r}")
+            raise typer.Exit(code=1) from exc
+        if prior.source_draft_id != verifier_draft_id:
+            console.print(
+                f"[red]error:[/red] interview {prior_interview_id} reviewed draft "
+                f"{prior.source_draft_id}, not {verifier_draft_id}"
+            )
+            raise typer.Exit(code=1)
+        if not prior.complete:
+            console.print(
+                f"[red]error:[/red] interview {prior_interview_id} has "
+                f"{len(prior.pending)} check(s) still undecided"
+            )
+            raise typer.Exit(code=1)
+        # Derived, not taken on trust: a round number that disagreed with the
+        # chain would misorder the decisions a later reader walks back through.
+        if round_number != 1 and round_number != prior.round_number + 1:
+            console.print(
+                f"[yellow]note:[/yellow] --round {round_number} ignored; "
+                f"{prior_interview_id} is round {prior.round_number}"
+            )
+        round_number = prior.round_number + 1
+
+    interview = start_review(
+        draft,
+        verifier_draft_id,
+        validation_id=validation_id,
+        prior_interview_id=prior_interview_id,
+        round_number=round_number,
+        prior=prior,
+    )
+    # Executed after the round opens, over the draft the round actually holds.
+    # A revision or combination in an earlier round mints a new verifier id, and
+    # a run built from the originally loaded draft carries outcomes for the ids
+    # that round replaced. ``build_check_summary`` matches on ``verifier_id``,
+    # so those summaries came out zero-passed, zero-failed and zero-unscorable —
+    # a check that looks unscored rather than one that was never run.
+    run = run_draft(interview.draft, analysis, task_set)
+    if prior is not None:
+        console.print(
+            f"[dim]round {round_number}, continuing {prior_interview_id} "
+            f"({len(prior.reviews)} earlier decision(s))[/dim]"
+        )
+    envelope = save_interview(interview, store)
+
+    while (target := next_check(interview)) is not None:
+        verifier_id, check_id = target
+        spec, check = find_check(interview.draft, verifier_id, check_id)
+        summary = build_check_summary(spec, check, run, validation=validation)
+        _show_check_summary(summary, check, spec)
+
+        for line in prior_decisions(interview, check_id):
+            console.print(f"  [dim]earlier:[/dim] {line}")
+
+        reply = typer.prompt("\n  what do you think?", default="", show_default=False)
+        authoritative = typer.confirm(
+            "  is this evidence source authoritative for the claim?", default=True
+        )
+        why = typer.prompt("  why", default="", show_default=False)
+
+        known = tuple(c.check_id for s in interview.draft.verifiers for c in s.checks)
+        interpretation = prompt_text = response = None
+        failure = None
+        manual = False
+        try:
+            interpretation, prompt_text, response = interpret_reply(
+                check,
+                spec,
+                reply,
+                predict=_interpreter(),
+                model=model,
+                summary_lines=summary.prompt_lines(),
+                prior_reviews=prior_decisions(interview, check_id),
+                known_check_ids=known,
+            )
+        except InterpretationFailure as exc:
+            failure = f"{exc.kind}: {exc}"
+            decision = _manual_decision(f"could not read that reply — {failure}")
+            manual = decision is not None
+        else:
+            console.print(f"\n  [bold]read as:[/bold] {interpretation.decision.value}")
+            console.print(f"  rationale: {interpretation.rationale}")
+            if interpretation.revised_expected is not None:
+                console.print(f"  new expected: {interpretation.revised_expected!r}")
+            if interpretation.combine_with:
+                console.print(f"  combine with: {interpretation.combine_with}")
+            if interpretation.dropped_combine_target:
+                console.print(
+                    f"  [yellow]no check named {interpretation.dropped_combine_target!r}[/yellow]"
+                )
+            _probe_hypotheses(spec, check, interpretation)
+            if typer.confirm("\n  apply this?", default=True):
+                decision = interpretation.decision
+            else:
+                decision = _manual_decision("overruled")
+                # The model's reading was refused, so its revise or combine
+                # payload is not the reviewer's either; it is collected again
+                # below rather than carried over.
+                manual = decision is not None
+
+        if decision is None:
+            console.print("[yellow]stopped[/yellow] — nothing applied for this check")
+            break
+
+        # What the model proposed, kept whether or not it was followed: an
+        # overruled reading is exactly what a later reader needs to see.
+        proposed = interpretation
+        applied = interpretation
+        if manual:
+            # A decision the reviewer entered carries no payload of its own. For
+            # revise and combine that payload is the decision, so it is asked for
+            # here; without it the guards below would refuse the action and leave
+            # the check pending, re-asking a question the reviewer cannot answer.
+            applied = _manual_interpretation(decision, check, known)
+
+        if decision is InterviewDecision.COMBINE and (applied is None or not applied.combine_with):
+            console.print("  [yellow]no resolved target to combine with[/yellow]; skipped")
+            continue
+
+        if decision is InterviewDecision.REVISE and (
+            applied is None
+            or (applied.revised_expected is None and applied.revised_operator is None)
+        ):
+            # Reachable by overruling some other reading into a revise: the
+            # interpretation on hand names nothing to revise, and applying it
+            # would strip the check's evidence without changing the check.
+            console.print("  [yellow]nothing named to revise[/yellow]; skipped")
+            continue
+
+        review = CheckReview(
+            review_id=f"review-{len(interview.reviews) + 1:03d}-{check_id}",
+            verifier_id=verifier_id,
+            check_id=check_id,
+            reply=reply,
+            decision=decision,
+            authoritative=authoritative,
+            authoritative_why=why,
+            # `apply_decision` acts on this, so a manual revise or combine records
+            # the payload it acted on; every other case records what the model
+            # proposed, followed or not. A failure carries neither: the validator
+            # refuses an interpretation beside one, and there was no reading to keep.
+            interpretation=applied
+            if applied is not None
+            else (proposed if failure is None else None),
+            model=model,
+            prompt=prompt_text or "",
+            response=response or "",
+            failure=failure,
+        )
+        interview = apply_decision(interview, review)
+        # Saved after every decision: the store is content-addressed, so each
+        # save is its own artifact and the latest id is where a resume starts.
+        envelope = save_interview(interview, store)
+
+    console.print(f"\ninterview_id: {envelope.artifact_id}")
+    console.print(f"round:        {interview.round_number}")
+    console.print(
+        f"reviewed:     {len(interview.reviews)} of {len(interview.pending) + len(interview.reviews)}"
+    )
+    console.print(
+        "[yellow]note:[/yellow] review refined the hypothesis; validation is still required "
+        "before calibrated or reviewed status"
+    )
 
 
 if __name__ == "__main__":

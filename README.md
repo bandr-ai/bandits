@@ -220,6 +220,7 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `draft-verifier` | Propose deterministic checks, rank them against labeled outcomes, and replay them on history |
 | `audit-families` | Advisory model read of family coherence; proposes splits only |
 | `interview-verifier` | Refine a draft through a bounded owner interview |
+| `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
 | `label` | Label disagreements and the remaining family runs |
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
 | `review-verifier` | Record explicit acceptance of a calibrated verifier |

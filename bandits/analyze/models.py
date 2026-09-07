@@ -393,6 +393,7 @@ class ClusteringProvenance(Contract):
             )
         return self
 
+
 class FamilyAudit(Contract):
     """A model's advisory read of one family's coherence.
 
@@ -500,6 +501,7 @@ class FamilyAuditRun(Contract):
     def incoherent(self) -> tuple[FamilyAudit, ...]:
         """What a reviewer should look at, in a stable order."""
         return tuple(sorted((a for a in self.audits if not a.coherent), key=lambda a: a.family_id))
+
 
 class TaskSet(Contract):
     """Mined families plus the selection drawn from them."""

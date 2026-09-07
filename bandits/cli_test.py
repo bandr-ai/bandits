@@ -246,10 +246,9 @@ def test_mine_output_is_identical_with_and_without_the_audit(tmp_path) -> None:
 
     # Content-addressed, so an identical id is an identical task set.
     assert audited_id == plain_id
-    assert (
-        DerivedStore(audited_dir / ".bandits").read_payload(audited_id)
-        == DerivedStore(plain_dir / ".bandits").read_payload(plain_id)
-    )
+    assert DerivedStore(audited_dir / ".bandits").read_payload(audited_id) == DerivedStore(
+        plain_dir / ".bandits"
+    ).read_payload(plain_id)
     assert not DerivedStore(plain_dir / ".bandits").list(kind="family_audit")
 
 
@@ -292,9 +291,7 @@ def test_audit_families_points_a_split_at_the_split_command(tmp_path) -> None:
             rationale="These are two tasks.",
         ),
     ):
-        result = runner.invoke(
-            app, ["audit-families", task_set_id, "--project", str(tmp_path)]
-        )
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "incoherent" in result.stdout
@@ -316,9 +313,7 @@ def test_audit_families_reports_both_verdicts_side_by_side(tmp_path) -> None:
             rationale="One task throughout.",
         ),
     ):
-        result = runner.invoke(
-            app, ["audit-families", task_set_id, "--project", str(tmp_path)]
-        )
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "semantic" in result.stdout and "geometric" in result.stdout
@@ -329,9 +324,7 @@ def test_audit_families_rejects_an_unknown_family(tmp_path) -> None:
 
     with mock.patch(
         "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="x"
-        ),
+        _audit_predictor(coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="x"),
     ):
         result = runner.invoke(
             app,
@@ -966,6 +959,301 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
     assert (output / "selection-report.json").exists()
+
+
+def _review_draft(tmp_path: Path) -> str:
+    """A saved two-verifier draft for the free-text review to work over."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    task_set = load_task_set(task_set_id, store)
+    analysis = load_analysis(task_set.analysis_id, store)
+    family = next(item for item in task_set.families if "refund" in item.descriptor)
+    draft = draft_verifiers(task_set, task_set_id, analysis, family.family_id, limit=8)
+    return save_verifier_draft(draft, store).artifact_id
+
+
+def _fake_interpreter(*payloads: str):
+    queue = list(payloads)
+
+    def predict(model: str, prompt: str, temperature: float) -> str:
+        item = queue.pop(0) if queue else payloads[-1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return predict
+
+
+def _decision(decision: str, **fields) -> str:
+    return json.dumps({"decision": decision, "rationale": "as the reviewer said", **fields})
+
+
+def _run_review(tmp_path: Path, draft_id: str, interpreter, keys: str, *extra: str):
+    with mock.patch("bandits.cli._INTERPRETER", interpreter):
+        return runner.invoke(
+            app,
+            ["interview-review", draft_id, "--project", str(tmp_path), *extra],
+            input=keys,
+        )
+
+
+def test_a_free_text_review_accepts_a_check(tmp_path: Path) -> None:
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nit is the system of record\ny\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+    assert "read as: accept" in result.output
+    assert "interview_id:" in result.output
+
+
+def test_a_review_records_the_reply_and_the_model_response(tmp_path: Path) -> None:
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("reject")),
+        "wrong signal entirely\nn\nnobody owns it\ny\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    interview_id = [
+        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(interview_id, store)
+    first = interview.reviews[0]
+    assert first.reply == "wrong signal entirely"
+    assert first.decision.value == "reject"
+    assert first.authoritative is False
+    assert first.authoritative_why == "nobody owns it"
+    assert first.response  # the raw model reply is kept for audit
+    assert first.prompt
+
+
+def test_an_overruled_interpretation_takes_the_humans_decision(tmp_path: Path) -> None:
+    """The model proposes; the human decides."""
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "actually no\ny\nwhy not\nn\nr\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+    assert "overruled" in result.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    interview_id = [
+        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(interview_id, store)
+    assert interview.reviews[0].decision.value == "reject"
+    # What the model said is still recorded, even though it was not followed.
+    assert interview.reviews[0].interpretation.decision.value == "accept"
+
+
+def test_a_failed_interpretation_falls_back_to_manual_entry(tmp_path: Path) -> None:
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter("this is not json"),
+        "fine\ny\nowned\na\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+    assert "could not read that reply" in result.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    interview_id = [
+        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(interview_id, store)
+    assert interview.reviews[0].decision.value == "accept"
+    assert interview.reviews[0].failure
+    assert interview.reviews[0].interpretation is None
+
+
+def test_the_review_never_promotes_past_the_draft(tmp_path: Path) -> None:
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "fine\ny\nowned\ny\n" * 12,
+    )
+    assert "validation is still required" in result.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    interview_id = [
+        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(interview_id, store)
+    for spec in interview.draft.verifiers:
+        assert spec.status.value in {"executable", "suggested", "rejected"}
+
+
+def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None:
+    """The chain has to be loaded, not merely named.
+
+    `--prior` once stored the id and nothing else, so a later round rebuilt from
+    the original draft with no reviews: `prior_decisions` returned nothing and
+    the interpreter saw a second-round reply as a first look.
+    """
+    draft_id = _review_draft(tmp_path)
+    first = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nsystem of record\ny\n" * 12,
+    )
+    assert first.exit_code == 0, first.output
+    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+        0
+    ]
+
+    second = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "still fine\ny\nsystem of record\ny\n" * 12,
+        "--prior",
+        first_id,
+    )
+
+    assert second.exit_code == 0, second.output
+    assert "round 2" in second.output
+    assert "earlier:" in second.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    second_id = [
+        line.split()[-1] for line in second.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(second_id, store)
+    assert interview.round_number == 2
+    assert interview.prior_interview_id == first_id
+    assert {review.round_number for review in interview.reviews} == {1, 2}
+
+
+def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path) -> None:
+    """The round's own draft is what the round has to execute.
+
+    The historical run was built from the originally loaded draft, before
+    `start_review` swapped in the draft the previous round left. A revision
+    mints a new verifier id, so no outcome matched the spec the reviewer was
+    being shown and every second-round summary read zero passed, zero failed,
+    zero unscorable — a check that looks unscored rather than one never run.
+    """
+    draft_id = _review_draft(tmp_path)
+    first = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("revise", revised_expected="shipped")),
+        "change it\ny\nsystem of record\ny\n" * 12,
+    )
+    assert first.exit_code == 0, first.output
+    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+        0
+    ]
+
+    store = DerivedStore(tmp_path / ".bandits")
+    revised = load_interview(first_id, store)
+    assert any(
+        check.expected == "shipped" for s in revised.draft.verifiers for check in s.checks
+    ), "round one did not revise anything, so the regression cannot be observed"
+
+    second = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "fine now\ny\nsystem of record\ny\n" * 12,
+        "--prior",
+        first_id,
+    )
+
+    assert second.exit_code == 0, second.output
+    scored = [line for line in second.output.splitlines() if "scored:" in line]
+    assert scored, second.output
+    assert any("0 passed, 0 failed, 0 unscorable" not in line for line in scored), (
+        f"every second-round summary scored nothing: {scored}"
+    )
+
+
+def test_a_review_refuses_a_prior_interview_that_does_not_exist(tmp_path: Path) -> None:
+    """An unknown chain id was accepted and silently produced an unchained round."""
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nwhy\ny\n",
+        "--prior",
+        "interview-nope",
+    )
+
+    assert result.exit_code == 1
+    assert "no interview" in result.output
+
+
+def test_a_review_refuses_a_prior_interview_of_another_draft(tmp_path: Path) -> None:
+    draft_id = _review_draft(tmp_path)
+    first = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nwhy\ny\n" * 12,
+    )
+    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+        0
+    ]
+
+    other_draft = _review_draft(tmp_path / "other")
+    result = _run_review(
+        tmp_path / "other",
+        other_draft,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nwhy\ny\n",
+        "--prior",
+        first_id,
+    )
+
+    assert result.exit_code == 1
+
+
+def test_a_manual_revise_after_an_unreadable_reply_is_applied(tmp_path: Path) -> None:
+    """The fallback has to be able to carry out the decision it offers.
+
+    A manual revise once captured only the decision enum, so the revised value
+    was never asked for, the decision was refused for naming nothing, and the
+    check returned to the queue — re-asking a question the reviewer had no way
+    to answer.
+    """
+    draft_id = _review_draft(tmp_path)
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter("not json at all"),
+        # reply, authoritative, why, manual decision, rationale, value, operator
+        'change it\ny\nwhy\nv\nby hand\n"shipped"\n\n' * 12,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "could not read that reply" in result.output
+
+    store = DerivedStore(tmp_path / ".bandits")
+    interview_id = [
+        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+    ][0]
+    interview = load_interview(interview_id, store)
+    first = interview.reviews[0]
+    assert first.decision.value == "revise"
+    assert first.interpretation is not None
+    assert first.interpretation.source == "human"
+    assert first.interpretation.revised_expected == "shipped"
+    assert any(check.expected == "shipped" for s in interview.draft.verifiers for check in s.checks)
 
 
 def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> None:

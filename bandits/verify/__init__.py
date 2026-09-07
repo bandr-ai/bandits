@@ -7,13 +7,24 @@ from bandits.verify.draft import (
     save_verifier_draft,
 )
 from bandits.verify.execute import execute_verifier
+from bandits.verify.interpret import (
+    InterpretationFailure,
+    Interpreter,
+    interpret_reply,
+    render_interview_prompt,
+)
 from bandits.verify.interview import (
     answer_question,
+    apply_decision,
     compute_interview_id,
+    find_check,
     load_interview,
+    next_check,
     next_question,
+    prior_decisions,
     save_interview,
     start_interview,
+    start_review,
 )
 from bandits.verify.judge import (
     JudgeError,
@@ -30,8 +41,11 @@ from bandits.verify.judge import (
 from bandits.verify.models import (
     CandidateStats,
     CheckOperator,
+    CheckReview,
     CheckSpec,
+    Interpretation,
     InterviewAnswer,
+    InterviewDecision,
     InterviewQuestion,
     Result,
     SubScore,
@@ -51,9 +65,11 @@ from bandits.verify.review import (
     save_reviewed_verifier,
 )
 from bandits.verify.run import (
+    CheckSummary,
     Disagreement,
     DraftRun,
     TraceOutcome,
+    build_check_summary,
     compute_run_id,
     load_draft_run,
     run_draft,
@@ -73,6 +89,20 @@ from bandits.verify.validate import (
 )
 
 __all__ = [
+    "build_check_summary",
+    "CheckSummary",
+    "start_review",
+    "prior_decisions",
+    "next_check",
+    "find_check",
+    "apply_decision",
+    "render_interview_prompt",
+    "interpret_reply",
+    "Interpreter",
+    "InterpretationFailure",
+    "Interpretation",
+    "InterviewDecision",
+    "CheckReview",
     "CandidateStats",
     "PromotionBlocker",
     "assess_promotion",
