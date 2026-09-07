@@ -896,6 +896,50 @@ def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None
     assert {review.round_number for review in interview.reviews} == {1, 2}
 
 
+def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path) -> None:
+    """The round's own draft is what the round has to execute.
+
+    The historical run was built from the originally loaded draft, before
+    `start_review` swapped in the draft the previous round left. A revision
+    mints a new verifier id, so no outcome matched the spec the reviewer was
+    being shown and every second-round summary read zero passed, zero failed,
+    zero unscorable — a check that looks unscored rather than one never run.
+    """
+    draft_id = _review_draft(tmp_path)
+    first = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("revise", revised_expected="shipped")),
+        "change it\ny\nsystem of record\ny\n" * 12,
+    )
+    assert first.exit_code == 0, first.output
+    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+        0
+    ]
+
+    store = DerivedStore(tmp_path / ".bandits")
+    revised = load_interview(first_id, store)
+    assert any(
+        check.expected == "shipped" for s in revised.draft.verifiers for check in s.checks
+    ), "round one did not revise anything, so the regression cannot be observed"
+
+    second = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "fine now\ny\nsystem of record\ny\n" * 12,
+        "--prior",
+        first_id,
+    )
+
+    assert second.exit_code == 0, second.output
+    scored = [line for line in second.output.splitlines() if "scored:" in line]
+    assert scored, second.output
+    assert any("0 passed, 0 failed, 0 unscorable" not in line for line in scored), (
+        f"every second-round summary scored nothing: {scored}"
+    )
+
+
 def test_a_review_refuses_a_prior_interview_that_does_not_exist(tmp_path: Path) -> None:
     """An unknown chain id was accepted and silently produced an unchained round."""
     draft_id = _review_draft(tmp_path)
