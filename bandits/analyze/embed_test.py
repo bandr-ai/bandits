@@ -121,14 +121,14 @@ def test_an_overly_strict_cosine_threshold_rejects_a_real_paraphrase_pair() -> N
 
 
 def test_descriptors_are_the_strings_clustering_compares() -> None:
-    """Two order numbers are one descriptor, so they are embedded once."""
+    """Values remain visible in every descriptor sent to the embedder."""
     analysis = _analysis("Refund order 7741", "Refund order 8820", "")
 
-    assert descriptors(analysis) == ["refund order <order_id>"]
+    assert descriptors(analysis) == ["refund order 7741", "refund order 8820"]
 
 
 def test_a_status_code_is_embedded_as_itself_rather_than_as_an_identifier() -> None:
-    """Masking feeds the embedder, so collapsing these would be one family."""
+    """Task-defining status codes remain distinct embedding inputs."""
     analysis = _analysis("Handle the HTTP 404", "Handle the HTTP 500", "")
 
     assert descriptors(analysis) == ["handle the http 404", "handle the http 500"]

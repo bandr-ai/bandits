@@ -275,8 +275,8 @@ def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[Embeddi
     nothing. Vectors from two models are never mixed — a cache pinned to another
     model is passed over rather than extended.
     """
-    # Both halves of what mining compares: masked descriptors for grouping, and
-    # requests with their identifiers intact for duplicate detection. Building
+    # Both halves of what mining compares. Values remain visible in descriptors
+    # and requests, so task-defining identifiers reach both distance backends. Building
     # only the first leaves every duplicate comparison reading maximally far.
     wanted = descriptors(analysis) + requests(analysis)
     existing: EmbeddingCache | None = None

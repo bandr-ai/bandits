@@ -67,7 +67,7 @@ _INSTRUCTION = """You are auditing one group of agent episodes that an automatic
 clustering step claims are all the same repeatable task.
 
 The variable `members` is a list of dicts, each with keys: trace_id, instruction, \
-normalized (the masked form clustering compared), tool_names, span_count.
+normalized (the value-preserving form clustering compared), tool_names, span_count.
 
 Decide whether these episodes are genuinely one task. Judge by what the human \
 was asking for, not by surface wording: two differently-phrased requests for the \
@@ -99,7 +99,7 @@ class _Predictor(Protocol):
 def _member_view(family: TaskFamily, analysis: CorpusAnalysis) -> list[dict[str, Any]]:
     """What the model reads: one row per member, ordered like the family.
 
-    The instruction, the masked form clustering compared, and structural shape.
+    The instruction, the normalized form clustering compared, and structural shape.
     No outcome and no label: either would let the audit call a family incoherent
     because its episodes *ended* differently, which is a fact about the runs and
     not about the grouping. The tools called and the span count are shape rather
