@@ -39,6 +39,7 @@ from bandits.verify.judge import (
     save_judge_run,
 )
 from bandits.verify.models import (
+    CandidateStats,
     CheckOperator,
     CheckReview,
     CheckSpec,
@@ -102,6 +103,7 @@ __all__ = [
     "Interpretation",
     "InterviewDecision",
     "CheckReview",
+    "CandidateStats",
     "PromotionBlocker",
     "assess_promotion",
     "Agreement",

@@ -11,12 +11,17 @@ from bandits.export.direct_sft import (
 )
 from bandits.export.eval import build_eval_export
 from bandits.export.models import (
+    CompositionReport,
+    DuplicateGroup,
     EvalCase,
     ExportBundle,
     ExportKind,
     ExportManifest,
+    LengthSummary,
     Partition,
+    PartitionComposition,
     RejectedTrace,
+    SamplingCaps,
     SFTExample,
     ToolCall,
     ToolFunction,
@@ -29,12 +34,17 @@ from bandits.export.models import (
 from bandits.export.sft import build_sft_export, build_transcript
 
 __all__ = [
+    "CompositionReport",
+    "DuplicateGroup",
     "EvalCase",
     "ExportBundle",
     "ExportKind",
     "ExportManifest",
+    "LengthSummary",
     "Partition",
+    "PartitionComposition",
     "RejectedTrace",
+    "SamplingCaps",
     "SFTExample",
     "ToolCall",
     "ToolFunction",
