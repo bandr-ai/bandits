@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
 from bandits.analyze.models import EvidenceKind
 from bandits.ingest import load_corpus
+from bandits.labels import LabelSet, Verdict, make_label
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, Trace, TraceCorpus
 from bandits.verify import (
@@ -15,6 +19,7 @@ from bandits.verify import (
     load_verifier_draft,
     save_verifier_draft,
 )
+from bandits.verify.execute import execute_verifier
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
@@ -152,7 +157,9 @@ def test_a_recorded_evaluator_score_becomes_a_check(tmp_path) -> None:
     claims = {check.claim: check for spec in draft.verifiers for check in spec.checks}
 
     assert "recorded_score:score" in claims
-    assert claims["recorded_score:score"].evidence_kind is EvidenceKind.TRUSTED_EVALUATOR
+    # An anonymous number is not a trusted evaluator's verdict. Extraction
+    # decides that, and the check carries whatever the evidence was classified as.
+    assert claims["recorded_score:score"].evidence_kind is EvidenceKind.OBSERVED_TRACE
 
 
 def test_stronger_evidence_survives_the_draft_limit(tmp_path) -> None:
@@ -365,3 +372,449 @@ def test_a_prose_outcome_says_what_kind_of_verifier_it_would_need(tmp_path) -> N
 
     assert draft.verifiers == ()
     assert any("judge or a domain extractor" in reason for reason in draft.unresolved)
+
+
+def _skewed_corpus(
+    *, failures: int = 7, successes: int = 3, amount_matches_on_success: bool = True
+) -> TraceCorpus:
+    """The issue's own example: failures dominate, so the failing value is the common one.
+
+    Every episode looks up an order and then refunds it. The failures leave the
+    order pending; the successes mark it refunded and return the amount that was
+    charged. Frequency alone puts ``status == pending`` forward.
+    """
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    traces: list[Trace] = []
+    for index in range(failures + successes):
+        succeeded = index >= failures
+        charged = 100 + index
+        refunded = charged if (succeeded and amount_matches_on_success) else 0
+        traces.append(
+            Trace(
+                trace_id=f"{'ok' if succeeded else 'bad'}-{index}",
+                source="otlp",
+                source_digest=f"{index:064d}",
+                task=f"Refund order {7000 + index}",
+                spans=(
+                    Span(
+                        span_id=f"look-{index}",
+                        kind=SpanKind.TOOL,
+                        name="lookup_order",
+                        started_at=start,
+                        ended_at=start,
+                        arguments={"order_id": 7000 + index},
+                        output={"charged_amount": charged},
+                    ),
+                    Span(
+                        span_id=f"refund-{index}",
+                        kind=SpanKind.TOOL,
+                        name="refund_order",
+                        started_at=start,
+                        ended_at=start,
+                        arguments={"order_id": 7000 + index},
+                        output={
+                            "status": "refunded" if succeeded else "pending",
+                            "refunded_amount": refunded,
+                        },
+                    ),
+                ),
+            )
+        )
+    return TraceCorpus(source="otlp", traces=tuple(traces))
+
+
+def _skewed(**corpus_options):
+    corpus = _skewed_corpus(**corpus_options)
+    analysis = analyze_corpus(corpus)
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    return analysis, task_set, family
+
+
+def _labels(family_id: str, trace_ids: list[str]) -> LabelSet:
+    return LabelSet(
+        task_set_id="taskset-test",
+        family_id=family_id,
+        labels=tuple(
+            make_label(
+                trace_id=trace_id,
+                family_id=family_id,
+                verdict=Verdict.SUCCESS if trace_id.startswith("ok") else Verdict.FAILURE,
+                labeler="reviewer",
+            )
+            for trace_id in trace_ids
+        ),
+    )
+
+
+def test_a_value_common_only_among_failures_is_not_the_primary_success_verifier() -> None:
+    """Seventy pending, thirty refunded: frequency proposes exactly the wrong check."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    primary = draft.verifiers[0]
+    assert "pending" not in json.dumps(
+        [check.model_dump(mode="json") for check in primary.checks], default=str
+    )
+    ranked = {spec.verifier_id: index for index, spec in enumerate(draft.verifiers)}
+    status_checks = {
+        check.expected: spec.verifier_id
+        for spec in draft.verifiers
+        for check in spec.checks
+        if check.claim == "final_state_field:refund_order.status"
+    }
+    assert "refunded" in status_checks
+    if "pending" in status_checks:
+        assert ranked[status_checks["refunded"]] < ranked[status_checks["pending"]]
+
+
+def test_a_candidate_reports_its_support_rejection_coverage_and_unknowns() -> None:
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    stats = {item.verifier_id: item for item in draft.candidates}
+    assert set(stats) == {spec.verifier_id for spec in draft.verifiers}
+    refunded = next(
+        stats[spec.verifier_id]
+        for spec in draft.verifiers
+        if any(check.expected == "refunded" for check in spec.checks)
+    )
+    assert refunded.derivation == "contrast"
+    assert refunded.calibrated
+    assert refunded.success_support == refunded.labeled_successes
+    assert refunded.failure_rejection == refunded.labeled_failures
+    assert refunded.false_positives == 0
+    assert refunded.coverage == 1.0
+    assert refunded.unknown == 0
+    assert refunded.discrimination == 1.0
+
+
+def test_without_labels_every_candidate_is_marked_an_uncalibrated_hypothesis() -> None:
+    analysis, task_set, family = _skewed()
+
+    draft = draft_verifiers(task_set, "taskset-test", analysis, family.family_id, limit=8)
+
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(not item.calibrated for item in draft.candidates)
+    assert all(item.discrimination == 0.0 for item in draft.candidates)
+    assert any("frequency-based hypothesis" in item for item in draft.unresolved)
+
+
+def _two_condition_corpus() -> TraceCorpus:
+    """A family where success needs both conditions and neither alone decides.
+
+    Two independent failure modes. One leaves the order pending while refunding
+    the right amount, so the amount invariant holds on a failed run. The other
+    marks the order refunded and moves no money, so the status holds on a failed
+    run. Only the conjunction rejects both, and only the labels can show it.
+    """
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    shapes = [
+        *(("ok", "refunded", True) for _ in range(4)),
+        *(("bad-status", "pending", True) for _ in range(3)),
+        *(("bad-amount", "refunded", False) for _ in range(3)),
+    ]
+    traces = []
+    for index, (prefix, status, paid) in enumerate(shapes):
+        charged = 100 + index
+        traces.append(
+            Trace(
+                trace_id=f"{prefix}-{index}",
+                source="otlp",
+                source_digest=f"{index:064d}",
+                task=f"Refund order {7000 + index}",
+                spans=(
+                    Span(
+                        span_id=f"look-{index}",
+                        kind=SpanKind.TOOL,
+                        name="lookup_order",
+                        started_at=start,
+                        ended_at=start,
+                        arguments={"order_id": 7000 + index},
+                        output={"charged_amount": charged},
+                    ),
+                    Span(
+                        span_id=f"refund-{index}",
+                        kind=SpanKind.TOOL,
+                        name="refund_order",
+                        started_at=start,
+                        ended_at=start,
+                        arguments={"order_id": 7000 + index},
+                        output={"status": status, "refunded_amount": charged if paid else 0},
+                    ),
+                ),
+            )
+        )
+    return TraceCorpus(source="otlp", traces=tuple(traces))
+
+
+def test_a_two_condition_success_produces_a_justified_composite() -> None:
+    """Status alone accepts a run that moved no money; the amount alone accepts a pending one."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    composites = [spec for spec in draft.verifiers if len(spec.checks) > 1]
+    assert composites, "a family needing two conditions must produce a conjunction"
+    stats = {item.verifier_id: item for item in draft.candidates}
+    composite = composites[0]
+    assert stats[composite.verifier_id].rationale
+    assert "labeled failure" in stats[composite.verifier_id].rationale
+    assert stats[composite.verifier_id].false_positives == 0
+    # The standalone checks survive, so validation can compare them with the pair.
+    assert any(len(spec.checks) == 1 for spec in draft.verifiers)
+
+
+def test_a_composite_keeps_its_subscores_and_fails_closed_on_an_unknown_check() -> None:
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+    composite = next((spec for spec in draft.verifiers if len(spec.checks) > 1), draft.verifiers[0])
+    known = tuple(item for item in analysis.evidence if item.trace_id == family.fit_trace_ids[0])
+
+    partial = execute_verifier(composite, tuple(known[:1]))
+
+    assert partial.score is None, "one unknown check must make the verifier unknown"
+    assert len(partial.subscores) == len(composite.checks)
+    assert any(part.score is not None for part in partial.subscores) or all(
+        part.score is None for part in partial.subscores
+    )
+
+
+def test_drafting_is_deterministic_under_labels() -> None:
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    first = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+    second = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def test_a_contradicting_check_is_ranked_below_one_that_separates() -> None:
+    """A check disagreeing with the labels is exactly what the ranking must demote."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    stats = [item for item in draft.candidates]
+    contradicting = [item for item in stats if item.contradictions]
+    clean = [item for item in stats if not item.contradictions and item.calibrated]
+    if contradicting and clean:
+        assert stats.index(clean[0]) < stats.index(contradicting[0])
+
+
+def test_labels_from_another_family_are_refused() -> None:
+    analysis, task_set, family = _skewed()
+
+    with pytest.raises(ValueError, match="another family"):
+        draft_verifiers(
+            task_set,
+            "taskset-test",
+            analysis,
+            family.family_id,
+            labels=_labels("family-elsewhere", list(family.fit_trace_ids)),
+        )
+
+
+def test_a_contradictory_conjunction_is_never_proposed() -> None:
+    """Two equality checks on one field would score zero forever and read as strict."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=12, labels=labels
+    )
+
+    for spec in draft.verifiers:
+        claims = [check.claim for check in spec.checks]
+        assert len(claims) == len(set(claims))
+    assert all(
+        stats.success_support > 0
+        for stats in draft.candidates
+        if len(next(s for s in draft.verifiers if s.verifier_id == stats.verifier_id).checks) > 1
+    )
+
+
+def test_an_invariant_is_not_retired_by_the_failures_it_exists_to_catch() -> None:
+    """Unlabeled, one counterexample retires it; labeled, only a success can."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+
+    blind = draft_verifiers(task_set, "taskset-test", analysis, family.family_id, limit=12)
+    informed = draft_verifiers(
+        task_set,
+        "taskset-test",
+        analysis,
+        family.family_id,
+        limit=12,
+        labels=_labels(family.family_id, list(family.fit_trace_ids)),
+    )
+
+    def invariants(draft):
+        return [
+            check.claim
+            for spec in draft.verifiers
+            for check in spec.checks
+            if check.claim.startswith("invariant:")
+        ]
+
+    assert not invariants(blind)
+    assert "invariant:refund_order.refunded_amount==lookup_order.charged_amount" in invariants(
+        informed
+    )
+
+
+def test_a_label_set_from_another_task_set_is_refused() -> None:
+    """Family ids are descriptor-derived, so the same id recurs across task sets."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    with pytest.raises(ValueError, match="adjudicated against task set"):
+        draft_verifiers(
+            task_set, "taskset-from-another-mine", analysis, family.family_id, labels=labels
+        )
+
+
+def test_a_stale_label_set_is_refused_rather_than_read_as_uncalibrated() -> None:
+    """Silently dropping unknown trace ids makes a wrong label set look merely thin."""
+    analysis, task_set, family = _skewed()
+    labels = _labels(family.family_id, [*family.fit_trace_ids, "trace-from-elsewhere"])
+
+    with pytest.raises(ValueError, match="outside family"):
+        draft_verifiers(task_set, "taskset-test", analysis, family.family_id, labels=labels)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 8])
+def test_a_composite_never_appears_without_the_checks_it_was_built_from(limit: int) -> None:
+    """Validation exists to compare the conjunction against its sources."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=limit, labels=labels
+    )
+
+    standalone = {spec.checks[0].claim for spec in draft.verifiers if len(spec.checks) == 1}
+    for spec in draft.verifiers:
+        if len(spec.checks) > 1:
+            assert all(check.claim in standalone for check in spec.checks)
+
+
+def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() -> None:
+    """A derived candidate does not consume a slot a caller was choosing between."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.fit_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=2, labels=labels
+    )
+
+    assert len([spec for spec in draft.verifiers if len(spec.checks) == 1]) == 2
+    assert any(len(spec.checks) > 1 for spec in draft.verifiers)
+
+
+def test_labels_covering_only_the_held_out_side_do_not_claim_calibration() -> None:
+    """Drafting reads the fit side, so a label elsewhere measures nothing here."""
+    analysis = analyze_corpus(_two_condition_corpus())
+    task_set = mine_task_set(
+        analysis,
+        compute_analysis_id(analysis),
+        distance=lambda left, right: 0.0,
+        backend="first-word",
+        similarity=0.5,
+        budget=10,
+    )
+    family = task_set.families[0]
+    labels = _labels(family.family_id, list(family.held_out_trace_ids))
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=labels
+    )
+
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(not item.calibrated for item in draft.candidates)
+    assert any("outside the side these checks were drafted from" in u for u in draft.unresolved)
+
+
+def test_an_empty_label_set_reads_as_no_labels_rather_than_as_contrast() -> None:
+    analysis, task_set, family = _skewed()
+    empty = LabelSet(task_set_id="taskset-test", family_id=family.family_id, labels=())
+
+    draft = draft_verifiers(
+        task_set, "taskset-test", analysis, family.family_id, limit=8, labels=empty
+    )
+
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert any("no adjudicated label" in u for u in draft.unresolved)

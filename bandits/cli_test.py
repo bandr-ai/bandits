@@ -847,3 +847,31 @@ def test_mine_embeds_the_requests_duplicate_detection_compares(tmp_path) -> None
     assert set(requests(analysis)) <= set(cache.vectors)
     assert set(descriptors(analysis)) <= set(cache.vectors)
     assert task_set.clustering.duplicate_similarity == DEFAULT_DUPLICATE_SIMILARITY
+
+
+def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tmp_path) -> None:
+    """A ranked list with nothing behind it invites the top row to be taken as the answer."""
+    task_set_id = _mined(tmp_path)
+    store = DerivedStore(tmp_path / ".bandits")
+    family = next(
+        item for item in load_task_set(task_set_id, store).families if "refund" in item.descriptor
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft-verifier",
+            task_set_id,
+            "--family",
+            family.family_id,
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "frequency-based hypothesis" in result.stdout
+    draft = load_verifier_draft(result.stdout.split()[1], store)
+    assert draft.candidates
+    assert all(item.derivation == "frequency" for item in draft.candidates)
+    assert all(item.considered for item in draft.candidates)
