@@ -28,6 +28,7 @@ from pydantic import model_validator
 
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
+from bandits.verify.draft import _stable_value
 from bandits.verify.models import (
     CheckReview,
     InterviewDecision,
@@ -187,6 +188,26 @@ class ReviewedVerifier(Contract):
         return self
 
 
+def _executable_content(spec: VerifierSpec) -> tuple:
+    """What the verifier actually does, as the validation measured it.
+
+    Blind spots and gaming hypotheses are excluded deliberately: they record
+    what a reader should watch for, not what the verifier tests, and a review
+    that adds one has not changed anything the validation scored. Status,
+    provenance and the artifact ids move with the lifecycle rather than the
+    behaviour, and supporting evidence records which traces suggested a check,
+    not what it checks.
+    """
+    return (
+        spec.mode,
+        spec.inputs,
+        tuple(
+            (check.claim, check.operator, _stable_value(check.expected), check.weight)
+            for check in spec.checks
+        ),
+    )
+
+
 def review_verifier(
     draft: VerifierDraft,
     draft_id: str,
@@ -213,14 +234,31 @@ def review_verifier(
         raise ValueError(
             f"the review read validation {interview.validation_id}, not {validation_id}"
         )
-    spec = next((item for item in draft.verifiers if item.verifier_id == verifier_id), None)
-    if spec is None:
+    drafted = next((item for item in draft.verifiers if item.verifier_id == verifier_id), None)
+    if drafted is None:
         raise ValueError(f"unknown verifier id: {verifier_id!r}")
 
     blockers = assess_promotion(validation, verifier_id, interview, interview_id)
     if blockers:
         detail = "; ".join(f"{item.code}: {item.detail}" for item in blockers)
         raise ValueError(f"no confirmed review supports promoting {verifier_id!r} — {detail}")
+
+    # Promoted from the draft the round produced, not the one it opened from.
+    # A review can add blind spots and gaming hypotheses the reviewer named, and
+    # those do not change what the verifier executes, so ``_with_extractions``
+    # leaves the id alone. Reading the spec from ``draft`` therefore promoted the
+    # shape from before the review and dropped what the reviewer had just said —
+    # while the artifact went on citing the interview as its reasoning.
+    spec = next(item for item in interview.draft.verifiers if item.verifier_id == verifier_id)
+    if _executable_content(spec) != _executable_content(drafted):
+        # Reachable only if some later path changes what a check does without
+        # minting a new id. Revision and combination do mint one, so they are
+        # already refused above as absent from the reviewed draft; this is what
+        # stops an unmeasured verifier being promoted on this validation.
+        raise ValueError(
+            f"the reviewed {verifier_id!r} no longer checks what validation "
+            f"{validation_id} measured; it has to be validated again"
+        )
 
     reviewed = accept(calibrate(spec, validation_id), interview_id)
     return ReviewedVerifier(
