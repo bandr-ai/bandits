@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import model_validator
 
-from bandits.analyze.families import normalize_instruction
+from bandits.analyze.families import normalize_instruction, normalize_request
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
 
@@ -205,6 +205,17 @@ def save_cache(cache: EmbeddingCache, store: DerivedStore, corpus_id: str) -> De
 
 def load_cache(cache_id: str, store: DerivedStore) -> EmbeddingCache:
     return EmbeddingCache.model_validate_json(store.read_payload(cache_id))
+
+
+def requests(analysis: CorpusAnalysis) -> list[str]:
+    """The exact strings duplicate detection will compare, so the cache covers them.
+
+    Not the same strings as :func:`descriptors`. Grouping compares instructions
+    with their identifiers masked out, and two runs against different orders
+    reduce to one descriptor there — which is the point of it, and the reason
+    sameness has to be measured on text that kept its identifiers.
+    """
+    return sorted({normalize_request(t.instruction) for t in analysis.tasks if t.instruction})
 
 
 def descriptors(analysis: CorpusAnalysis) -> list[str]:
