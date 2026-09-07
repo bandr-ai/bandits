@@ -8,6 +8,7 @@ from bandits.verify.models import (
     CheckOperator,
     CheckReview,
     CheckSpec,
+    Interpretation,
     InterviewDecision,
     VerifierDraft,
     VerifierMode,
@@ -192,6 +193,64 @@ def test_a_confirmed_review_promotes_and_is_referenced() -> None:
     # copying a sentence out of it.
     assert reviewed.interview_id == "i1"
     assert reviewed.human_acceptance_id == "i1"
+
+
+def test_promotion_carries_what_the_review_added() -> None:
+    """The reviewer's own findings have to reach the artifact citing them.
+
+    Accepting a check can name a blind spot or a gaming hypothesis, and neither
+    changes what the verifier executes, so the id stays put. Promotion read the
+    spec from the draft the round opened from and dropped the addition, leaving
+    a reviewed verifier that pointed at an interview whose content it did not
+    carry.
+    """
+    draft, validation = _inputs()
+    interview = start_review(draft, "d1", validation_id="val1", round_number=2)
+    verifier_id, check_id = interview.pending[0]
+    interview = apply_decision(
+        interview,
+        CheckReview(
+            review_id="review-001",
+            verifier_id=verifier_id,
+            check_id=check_id,
+            reply="fine, but it says nothing about a partial write",
+            decision=InterviewDecision.ACCEPT,
+            authoritative=True,
+            interpretation=Interpretation(
+                decision=InterviewDecision.ACCEPT,
+                rationale="accepted, with a gap named",
+                blind_spots=("a partial write still exits zero",),
+                gaming_hypotheses=("write nothing and exit zero",),
+            ),
+        ),
+    )
+
+    reviewed = review_verifier(
+        draft, "d1", validation, "val1", verifier_id, interview, "interview-1"
+    )
+
+    assert "a partial write still exits zero" in reviewed.spec.blind_spots
+    assert "write nothing and exit zero" in reviewed.spec.gaming_hypotheses
+    assert "wrong command" in reviewed.spec.blind_spots
+
+
+def test_promotion_refuses_a_spec_that_no_longer_checks_what_was_measured() -> None:
+    """Identity is the guard, and this is what catches it failing.
+
+    Revision and combination mint a new id and are refused earlier as absent
+    from the reviewed draft. If anything ever changes a check without doing so,
+    the validation no longer describes the verifier being promoted.
+    """
+    draft, validation = _inputs()
+    interview = _review(draft)
+    spec = interview.draft.verifiers[0]
+    tampered = spec.replace(
+        checks=(spec.checks[0].replace(expected=1),),
+    )
+    interview = interview.replace(draft=interview.draft.replace(verifiers=(tampered,)))
+
+    with pytest.raises(ValueError, match="validated again"):
+        review_verifier(draft, "d1", validation, "val1", "v1", interview, "interview-1")
 
 
 def test_review_round_trips_as_immutable_derived_artifact(tmp_path) -> None:
