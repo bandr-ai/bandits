@@ -78,6 +78,7 @@ from bandits.verify.run import (
 from bandits.verify.validate import (
     Agreement,
     Counterexample,
+    GameabilityAssessment,
     GameabilityResult,
     Validation,
     accept,
@@ -108,6 +109,7 @@ __all__ = [
     "assess_promotion",
     "Agreement",
     "Counterexample",
+    "GameabilityAssessment",
     "GameabilityResult",
     "JudgeError",
     "JudgeRun",
