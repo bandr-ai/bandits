@@ -1135,7 +1135,6 @@ def interview_review_command(
             )
         round_number = prior.round_number + 1
 
-    run = run_draft(draft, analysis, task_set)
     interview = start_review(
         draft,
         verifier_draft_id,
@@ -1144,6 +1143,13 @@ def interview_review_command(
         round_number=round_number,
         prior=prior,
     )
+    # Executed after the round opens, over the draft the round actually holds.
+    # A revision or combination in an earlier round mints a new verifier id, and
+    # a run built from the originally loaded draft carries outcomes for the ids
+    # that round replaced. ``build_check_summary`` matches on ``verifier_id``,
+    # so those summaries came out zero-passed, zero-failed and zero-unscorable —
+    # a check that looks unscored rather than one that was never run.
+    run = run_draft(interview.draft, analysis, task_set)
     if prior is not None:
         console.print(
             f"[dim]round {round_number}, continuing {prior_interview_id} "
