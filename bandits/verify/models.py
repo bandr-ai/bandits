@@ -223,12 +223,19 @@ class InterviewDecision(str, Enum):
 
 
 class Interpretation(Contract):
-    """A model's structured read of one free-text reply.
+    """A structured read of one free-text reply.
 
-    Never applied on its own: a human confirms it first. Recorded whole so a
-    later reader can see what the model proposed, including where it was
-    overruled.
+    Usually the model's, and never applied on its own: a human confirms it
+    first. Recorded whole so a later reader can see what was proposed, including
+    where it was overruled.
+
+    The reviewer can also author one directly, when the model failed to read the
+    reply or its reading was refused. ``source`` says which, so a record that
+    was entered by hand is never read back as a model proposal.
     """
+
+    source: Literal["model", "human"] = "model"
+    """Who authored this reading. ``model`` unless a reviewer entered it."""
 
     decision: InterviewDecision
     rationale: str
@@ -285,10 +292,23 @@ class CheckReview(Contract):
     superseded_by: str | None = None
     """Set when a later combine reopened this decision."""
 
+    round_number: int = Field(default=1, ge=1)
+    """The round that made this decision.
+
+    Carried on the review rather than read from the interview, because a later
+    round inherits earlier reviews and would otherwise relabel them all as its
+    own. Defaults to 1, which is what a record written before rounds carried it
+    reads back as — and what it was.
+    """
+
     @model_validator(mode="after")
     def failure_means_no_interpretation(self) -> CheckReview:
+        # A failed *model* reading cannot also carry a result. One the reviewer
+        # authored after that failure is not a model reading, and has to be
+        # recorded: it is what the decision was applied from.
         if self.failure and self.interpretation is not None:
-            raise ValueError("a failed interpretation cannot also carry a result")
+            if self.interpretation.source != "human":
+                raise ValueError("a failed interpretation cannot also carry a result")
         return self
 
 

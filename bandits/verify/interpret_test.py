@@ -159,6 +159,19 @@ def test_a_missing_rationale_fails() -> None:
         )
 
 
+def test_a_revise_that_names_nothing_fails() -> None:
+    """A vague "yeah change that" the model read as a revise but could not fill in.
+
+    The schema permits both revised fields to be null. Applied, that revision
+    would keep the check's content-addressed id while clearing the evidence
+    chosen for it, so it falls back to a decision the reviewer enters directly.
+    """
+    with pytest.raises(InterpretationFailure, match="named nothing to revise"):
+        interpret_reply(
+            _check(), _spec(), "yeah change that", predict=_replies(_payload(decision="revise"))
+        )
+
+
 def test_an_unknown_operator_fails() -> None:
     with pytest.raises(InterpretationFailure) as caught:
         interpret_reply(
