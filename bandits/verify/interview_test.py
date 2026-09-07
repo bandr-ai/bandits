@@ -286,12 +286,56 @@ def test_a_revise_without_an_interpretation_is_refused() -> None:
         apply_decision(interview, _review("check-one", InterviewDecision.REVISE))
 
 
-def test_prior_decisions_reads_back_what_a_round_decided() -> None:
+def test_a_revise_that_names_nothing_is_refused() -> None:
+    """A revision that changes nothing must not strip the check's evidence.
+
+    Identity follows content, so a revise with neither field set keeps the
+    verifier id while clearing supporting evidence and marking the spec
+    human-authored — the same id then standing for a check with less behind it.
+    Reachable by overruling another reading into a revise, so it is refused
+    where it would be applied and not only where it is read.
+    """
     interview = start_review(_two_check_draft(), "draft-one")
-    interview = apply_decision(
-        interview, _review("check-one", InterviewDecision.ACCEPT, reply="looks right")
+    empty = Interpretation(decision=InterviewDecision.ACCEPT, rationale="looks fine")
+
+    with pytest.raises(ValueError, match="needs a revised value or operator"):
+        apply_decision(
+            interview,
+            _review("check-one", InterviewDecision.REVISE, interpretation=empty),
+        )
+
+
+def test_an_operator_only_revision_changes_identity() -> None:
+    """Identity follows content, and the operator is content.
+
+    A revision that kept its id could satisfy a promotion bound to the review of
+    the shape the reviewer actually accepted.
+    """
+    from bandits.verify.interview import _revised_identity, find_check
+
+    spec, check = find_check(_two_check_draft(), "verifier-one", "check-one")
+
+    before, _ = _revised_identity(spec, check)
+    after, _ = _revised_identity(spec, check.replace(operator=CheckOperator.EXACT_OUTPUT))
+
+    assert before != after
+
+
+def test_prior_decisions_reads_back_what_an_earlier_round_decided() -> None:
+    """Earlier rounds only, labelled with the round that decided them."""
+    first = start_review(_two_check_draft(), "draft-one")
+    first = apply_decision(
+        first, _review("check-one", InterviewDecision.ACCEPT, reply="looks right")
     )
-    assert prior_decisions(interview, "check-one") == ("round 1: accept — looks right",)
+
+    # Within the round that made it, a decision is not a prior decision.
+    assert prior_decisions(first, "check-one") == ()
+
+    second = start_review(
+        first.draft, "draft-one", prior=first, prior_interview_id="interview-one", round_number=2
+    )
+
+    assert prior_decisions(second, "check-one") == ("round 1: accept — looks right",)
 
 
 def test_a_later_round_chains_to_the_one_before() -> None:
@@ -308,17 +352,119 @@ def test_a_later_round_chains_to_the_one_before() -> None:
     assert second.round_number == 2
 
 
-def test_an_operator_only_revision_changes_identity() -> None:
-    """Identity follows content, and the operator is content.
+def _combining(
+    claim: str, expected, operator: CheckOperator = CheckOperator.EQUALS
+) -> VerifierSpec:
+    n = f"{claim}-{expected!r}-{operator.value}"
+    return VerifierSpec(
+        verifier_id=f"verifier-{n}",
+        family_id="family-one",
+        task_set_id="taskset-one",
+        mode=VerifierMode.REPLAY,
+        status=VerifierStatus.EXECUTABLE,
+        inputs=(f"terminal_evidence:{claim}",),
+        checks=(
+            CheckSpec(
+                check_id=f"check-{n}",
+                claim=claim,
+                operator=operator,
+                expected=expected,
+                supporting_evidence_ids=(),
+                description="d",
+            ),
+        ),
+        unknown_when=(),
+        blind_spots=(),
+        gaming_hypotheses=(),
+    )
 
-    A revision that kept its id could satisfy a promotion bound to the review of
-    the shape the reviewer actually accepted.
+
+def test_a_combined_identity_keeps_each_value_with_its_own_claim() -> None:
+    """Sorting claims and values in separate lists loses which belongs to which.
+
+    `A == 1` with `B == 2` and `A == 2` with `B == 1` are different verifiers,
+    and a shared id would let one promote on the other's review.
     """
-    from bandits.verify.interview import _revised_identity, find_check
+    from bandits.verify.interview import _combined_spec
 
-    spec, check = find_check(_draft(), "verifier-one", "check-one")
+    left = _combined_spec(_combining("A", 1), _combining("B", 2))
+    right = _combined_spec(_combining("A", 2), _combining("B", 1))
 
-    before, _ = _revised_identity(spec, check)
-    after, _ = _revised_identity(spec, check.replace(operator=CheckOperator.EXACT_OUTPUT))
+    assert left.verifier_id != right.verifier_id
 
-    assert before != after
+
+def test_a_combined_identity_separates_operators_and_value_types() -> None:
+    """The operator is content, and `1` is not `"1"`."""
+    from bandits.verify.interview import _combined_spec
+
+    equals = _combined_spec(_combining("A", 1), _combining("B", 2))
+    exact = _combined_spec(
+        _combining("A", 1, CheckOperator.EXACT_OUTPUT),
+        _combining("B", 2, CheckOperator.EXACT_OUTPUT),
+    )
+    strings = _combined_spec(_combining("A", "1"), _combining("B", "2"))
+
+    assert len({equals.verifier_id, exact.verifier_id, strings.verifier_id}) == 3
+
+
+def test_a_combined_identity_does_not_depend_on_which_side_was_reviewed() -> None:
+    """The same two checks fold to one verifier however they were reached."""
+    from bandits.verify.interview import _combined_spec
+
+    forward = _combined_spec(_combining("A", 1), _combining("B", 2))
+    backward = _combined_spec(_combining("B", 2), _combining("A", 1))
+
+    assert forward.verifier_id == backward.verifier_id
+
+
+def test_a_later_round_opens_over_the_draft_the_last_one_left() -> None:
+    """A second round must not re-ask the first round's questions.
+
+    Without the prior interview the round rebuilds from the original draft, so
+    a revision made in round one is silently discarded and its decision is
+    invisible to the interpreter.
+    """
+    first = start_review(_two_check_draft(), "draft-one")
+    first = apply_decision(
+        first,
+        _review(
+            "check-one",
+            InterviewDecision.REVISE,
+            reply="should be shipped",
+            interpretation=Interpretation(
+                decision=InterviewDecision.REVISE,
+                rationale="a different value",
+                revised_expected="shipped",
+            ),
+        ),
+    )
+    revised = next(c for s in first.draft.verifiers for c in s.checks if c.expected == "shipped")
+
+    second = start_review(
+        first.draft, "draft-one", prior=first, prior_interview_id="interview-one", round_number=2
+    )
+
+    assert revised.check_id in {check_id for _, check_id in second.pending}
+    assert second.reviews == first.reviews
+    assert second.round_number == 2
+
+
+def test_a_later_round_does_not_reopen_a_rejected_check() -> None:
+    """A rejected check is decided. Reopening it asks for the same refusal again."""
+    first = start_review(_two_check_draft(), "draft-one")
+    first = apply_decision(first, _review("check-one", InterviewDecision.REJECT))
+
+    second = start_review(first.draft, "draft-one", prior=first, round_number=2)
+
+    assert "check-one" not in {check_id for _, check_id in second.pending}
+    assert "check-two" in {check_id for _, check_id in second.pending}
+
+
+def test_a_decision_is_attributed_to_the_round_that_made_it() -> None:
+    first = start_review(_two_check_draft(), "draft-one")
+    first = apply_decision(first, _review("check-one", InterviewDecision.ACCEPT))
+    second = start_review(first.draft, "draft-one", prior=first, round_number=2)
+    second = apply_decision(second, _review("check-two", InterviewDecision.ACCEPT))
+
+    by_check = {review.check_id: review.round_number for review in second.reviews}
+    assert by_check == {"check-one": 1, "check-two": 2}
