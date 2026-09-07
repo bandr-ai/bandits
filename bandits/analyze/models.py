@@ -303,7 +303,7 @@ class TaskFamily(Contract):
 
     family_id: str
     descriptor: str
-    """The normalized instruction shared by the family, with values masked out."""
+    """The normalized instruction represented by the family, with values preserved."""
 
     trace_ids: tuple[str, ...]
     medoid_trace_id: str

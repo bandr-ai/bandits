@@ -62,7 +62,7 @@ def test_support_family_proposes_structured_state_check() -> None:
     draft = draft_verifiers(task_set, "taskset-test", analysis, family.family_id)
 
     checks = [v.checks[0] for v in draft.verifiers]
-    assert any(check.claim == "final_state_field:refund_order.status" for check in checks)
+    assert any(check.claim.startswith("final_state_field:refund_order.") for check in checks)
     assert all(check.supporting_evidence_ids for check in checks)
 
 

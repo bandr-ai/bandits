@@ -382,18 +382,16 @@ def _structured(value: str) -> Any | None:
     return parsed if isinstance(parsed, (dict, list)) else None
 
 
-def _normalized(value: Any, field: str | None = None) -> Any:
-    if field and (field == "id" or field.endswith("_id")) and isinstance(value, (str, int)):
-        return "<id>"
+def _normalized(value: Any) -> Any:
     if isinstance(value, str):
         structured = _structured(value)
         if structured is not None:
-            return _normalized(structured, field)
+            return _normalized(structured)
         return normalize_instruction(value)
     if isinstance(value, dict):
-        return {key: _normalized(item, key) for key, item in sorted(value.items())}
+        return {key: _normalized(item) for key, item in sorted(value.items())}
     if isinstance(value, (list, tuple)):
-        return [_normalized(item, field) for item in value]
+        return [_normalized(item) for item in value]
     return value
 
 

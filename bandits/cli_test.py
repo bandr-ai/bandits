@@ -151,7 +151,7 @@ def offline_embedder(monkeypatch):
 
 def hash_token(token: str) -> int:
     """Stable across processes, unlike hash(), so vectors do not shift per run."""
-    return int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
+    return int(hashlib.sha256(token.encode()).hexdigest()[:16], 16)
 
 
 def _partial_embed(embedder):
