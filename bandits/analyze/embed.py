@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import model_validator
 
+from bandits import ledger
 from bandits.analyze.families import normalize_instruction, normalize_request
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
@@ -85,13 +86,25 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
         data=json.dumps({"model": model, "input": list(texts)}).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+
     def send() -> object:
         with urllib.request.urlopen(request, timeout=120) as response:
             return json.load(response)
 
     payload: object = None
     try:
-        payload = request_with_retry(send)
+        with ledger.model_call(
+            provider="fireworks", model=model, request={"input_count": len(texts)}
+        ) as call:
+            payload = request_with_retry(send)
+            # Vectors are large and say nothing a reader wants; the usage and
+            # the shape are what the call cost and what it returned.
+            body = payload if isinstance(payload, dict) else {}
+            data = body.get("data")
+            call["response"] = {
+                "usage": body.get("usage"),
+                "vectors": len(data) if isinstance(data, list) else 0,
+            }
     except (urllib.error.URLError, TimeoutError) as exc:
         raise EmbeddingError(f"embedding request failed: {exc}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

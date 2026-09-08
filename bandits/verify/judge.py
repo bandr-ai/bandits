@@ -27,6 +27,7 @@ from pathlib import Path
 
 from pydantic import Field, model_validator
 
+from bandits import ledger
 from bandits.analyze.models import Evidence, EvidenceKind, Visibility
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, SpanKind, SpanStatus, Trace
@@ -250,14 +251,23 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
         ).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+
     def send() -> object:
         with urllib.request.urlopen(request, timeout=90) as response:
             return json.load(response)
 
-    try:
-        payload = request_with_retry(send)
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise JudgeError(f"judge request failed: {exc}") from exc
+    with ledger.model_call(
+        provider="fireworks",
+        model=model,
+        request={"temperature": temperature, "max_tokens": 2000, "prompt": prompt},
+    ) as call:
+        try:
+            payload = request_with_retry(send)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise JudgeError(f"judge request failed: {exc}") from exc
+        # The whole body, not the text read out of it: `usage` is the only
+        # record of what the call cost, and it was discarded one line later.
+        call["response"] = payload
     return payload["choices"][0]["message"]["content"]
 
 
