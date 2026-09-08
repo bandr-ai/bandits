@@ -16,7 +16,7 @@ from bandits.analyze.models import Evidence, EvidenceKind, Visibility
 from bandits.analyze.outcomes import _state_fields, extract_outcome_evidence
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
-from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus
+from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus, TraceIssue
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
@@ -107,6 +107,19 @@ def test_unnormalizable_source_records_are_surfaced(commerce: TraceCorpus) -> No
     analysis = analyze_corpus(commerce)
 
     assert any("could not be normalized" in limitation for limitation in analysis.limitations)
+
+
+def test_redactions_are_not_reported_as_unnormalizable_records() -> None:
+    corpus = TraceCorpus(
+        source="otlp",
+        traces=(),
+        issues=(TraceIssue(kind="redaction", detail="redacted email"),),
+    )
+
+    analysis = analyze_corpus(corpus)
+
+    assert not any("could not be normalized" in item for item in analysis.limitations)
+    assert any("1 sensitive value occurrence" in item for item in analysis.limitations)
 
 
 def test_analysis_round_trips_through_the_derived_store(tmp_path, coding: TraceCorpus) -> None:
