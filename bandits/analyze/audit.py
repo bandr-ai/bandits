@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -193,6 +194,26 @@ def build_predictor(
     return predict
 
 
+def _rendered(prediction: Any) -> str:
+    """The auditor's reply as text, for a reader comparing it to what was stored.
+
+    Read off the fields the signature declares rather than by serializing the
+    prediction, whose backend type carries trace state a reviewer has no use
+    for. Best effort: this exists to be read, so a backend that returns
+    something unreadable costs the record, never the audit.
+    """
+    fields = ("coherent", "outlier_trace_ids", "proposed_subgroups", "generated_name", "rationale")
+    try:
+        return json.dumps(
+            {name: getattr(prediction, name, None) for name in fields},
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return str(prediction)
+
+
 def _clean_ids(raw: Any, members: set[str]) -> tuple[str, ...]:
     """Keep only ids that are really members, in a stable order.
 
@@ -222,15 +243,15 @@ def audit_family(
     if not rows:
         raise AuditError(f"family {family.family_id} has no readable members to audit")
 
+    members_json = json.dumps(rows, indent=2, sort_keys=True, default=str)
+    started = time.monotonic()
     try:
-        prediction = predict(
-            members=json.dumps(rows, indent=2, sort_keys=True, default=str),
-            question=_INSTRUCTION,
-        )
+        prediction = predict(members=members_json, question=_INSTRUCTION)
     except AuditError:
         raise
     except Exception as exc:  # noqa: BLE001 - any backend failure is one failure here
         raise AuditError(f"audit of {family.family_id} failed: {exc}") from exc
+    duration = time.monotonic() - started
 
     members = {row["trace_id"] for row in rows}
     outliers = _clean_ids(getattr(prediction, "outlier_trace_ids", ()), members)
@@ -265,6 +286,9 @@ def audit_family(
         rationale=rationale or "the auditor returned no rationale",
         model=model,
         prompt_digest=prompt_digest(model),
+        prompt=f"{_INSTRUCTION}\n\nmembers:\n{members_json}",
+        response=_rendered(prediction),
+        duration_seconds=duration,
     )
 
 

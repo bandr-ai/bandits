@@ -407,7 +407,7 @@ def _report_audit(run, run_id: str, task_set) -> None:
         return
 
     coherence_of = {f.family_id: f.coherence for f in task_set.families}
-    table = Table("family_id", "semantic", "geometric", "outliers", "proposed split")
+    table = Table("family_id", "semantic", "geometric", "outliers", "proposed split", "took")
     for audit in sorted(run.audits, key=lambda a: (a.coherent, a.family_id)):
         measured = coherence_of.get(audit.family_id)
         # Printed beside each other and never reconciled: one read the
@@ -424,9 +424,20 @@ def _report_audit(run, run_id: str, task_set) -> None:
             geometric,
             str(len(audit.outlier_trace_ids)),
             " | ".join(str(len(g)) for g in audit.proposed_subgroups) or "-",
+            "-" if audit.duration_seconds is None else f"{audit.duration_seconds:.1f}s",
         )
     if run.audits:
         console.print(table)
+        # The per-family budget is thirty model calls and nothing reported what
+        # a family actually spent, so a slow audit was only visible as a long
+        # wait. Timed families only: a mix of timed and untimed would total to
+        # less than the run took and read as the whole of it.
+        timed = [a.duration_seconds for a in run.audits if a.duration_seconds is not None]
+        if timed:
+            console.print(
+                f"[dim]{len(timed)} family audit(s) took {sum(timed):.1f}s, "
+                f"slowest {max(timed):.1f}s[/dim]"
+            )
 
     # Names go under the table rather than in it: a generated name is prose and
     # a column narrow enough to fit beside five others would truncate the one

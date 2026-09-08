@@ -136,6 +136,50 @@ def test_a_coherent_family_reports_no_outliers(two_family_set):
     assert audit.outlier_trace_ids == ()
 
 
+def test_an_audit_records_the_call_that_produced_it(two_family_set):
+    """A verdict is only checkable against what was asked and what came back.
+
+    The audit is the most expensive call the pipeline makes and stored only a
+    digest of its prompt, so `incoherent` could be read and never verified.
+    `_clean_ids` and the split-overrides-coherent rule also mean the stored
+    verdict is not always what the model said, which is invisible without the
+    reply beside it.
+    """
+    analysis, task_set = two_family_set
+    family = _family_of(task_set)
+
+    audit = audit_family(
+        family,
+        analysis,
+        predict=_predictor(
+            coherent=False,
+            outlier_trace_ids=[],
+            proposed_subgroups=[[t] for t in sorted(family.trace_ids)],
+            generated_name="Refund an eligible order",
+            rationale="two different orders",
+        ),
+    )
+    assert "auditing one group of agent episodes" in audit.prompt
+    assert family.trace_ids[0] in audit.prompt, "the members shown have to be recoverable"
+    assert "two different orders" in audit.response
+    assert audit.duration_seconds is not None and audit.duration_seconds >= 0
+
+
+def test_an_audit_written_before_its_call_was_recorded_still_loads():
+    """The three fields are additive; an older run predates all of them."""
+    audit = FamilyAudit(
+        family_id="family-1",
+        coherent=True,
+        rationale="one task",
+        model="m",
+        prompt_digest="d",
+    )
+
+    assert audit.prompt == ""
+    assert audit.response == ""
+    assert audit.duration_seconds is None
+
+
 def test_hallucinated_trace_ids_are_dropped_rather_than_losing_the_audit(two_family_set):
     analysis, task_set = two_family_set
     audit = audit_family(

@@ -428,6 +428,33 @@ class FamilyAudit(Contract):
     """Pins the wording that produced this. A verdict is only interpretable
     alongside the prompt that asked for it."""
 
+    prompt: str = ""
+    """The members and question the auditor was actually shown.
+
+    A digest proves two runs asked the same thing and says nothing about what
+    was asked. This is the most expensive call the pipeline makes — a reasoning
+    model rewriting and rerunning code over a family — and it was the only one
+    whose input was not kept, so a verdict of incoherent could be read but never
+    checked. Empty on audits written before it was recorded.
+    """
+
+    response: str = ""
+    """What the auditor returned, before the fields below were parsed out of it.
+
+    ``_clean_ids`` drops hallucinated and repeated trace ids, and a split
+    proposal overrides a contradicting ``coherent``. Both are right, and both
+    mean the stored verdict is not what the model said. Keeping the raw reply is
+    what makes that difference visible instead of silently applied.
+    """
+
+    duration_seconds: float | None = Field(default=None, ge=0)
+    """Wall clock for the call. ``None`` on audits written before it was timed.
+
+    Recorded because the budget is per family and invisible: ``max_llm_calls``
+    bounds a run at thirty calls, and nothing said whether a family cost two or
+    thirty until the bill arrived.
+    """
+
     @model_validator(mode="after")
     def validate_subgroups(self) -> FamilyAudit:
         """Reject an audit that names the same trace twice or contradicts itself.
