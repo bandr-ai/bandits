@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import model_validator
 
+from bandits import ledger
 from bandits.analyze.families import normalize_instruction, normalize_request
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
@@ -75,6 +76,27 @@ Embedder = Callable[[str, Sequence[str]], list[list[float]]]
 """(model, texts) -> one vector per text, in order."""
 
 
+def _batch_identity(texts: Sequence[str]) -> dict[str, object]:
+    """Which ordered batch was sent, without copying the corpus into the log.
+
+    A count proved nothing: two runs embedding different text in different
+    orders produced identical records, so a cache that returned the wrong
+    vectors could not be caught. Digests pin the exact strings and their order
+    — order matters because the response is positional, and a batch permuted
+    between runs silently reassigns every vector.
+
+    Digests rather than the text itself: the strings are already in the
+    analysis artifact this batch was built from, and duplicating a corpus into
+    a log is how a log becomes the thing that leaks it.
+    """
+    per_input = [hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] for text in texts]
+    return {
+        "input_count": len(texts),
+        "input_digest": hashlib.sha256("\n".join(per_input).encode("utf-8")).hexdigest()[:16],
+        "input_digests": per_input,
+    }
+
+
 def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
     api_key = os.environ.get("FIREWORKS_API_KEY")
     if not api_key:
@@ -85,13 +107,25 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
         data=json.dumps({"model": model, "input": list(texts)}).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+
     def send() -> object:
         with urllib.request.urlopen(request, timeout=120) as response:
             return json.load(response)
 
     payload: object = None
     try:
-        payload = request_with_retry(send)
+        with ledger.model_call(
+            provider="fireworks", model=model, request=_batch_identity(texts)
+        ) as call:
+            payload = request_with_retry(send)
+            # Vectors are large and say nothing a reader wants; the usage and
+            # the shape are what the call cost and what it returned.
+            body = payload if isinstance(payload, dict) else {}
+            data = body.get("data")
+            call["response"] = {
+                "usage": body.get("usage"),
+                "vectors": len(data) if isinstance(data, list) else 0,
+            }
     except (urllib.error.URLError, TimeoutError) as exc:
         raise EmbeddingError(f"embedding request failed: {exc}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

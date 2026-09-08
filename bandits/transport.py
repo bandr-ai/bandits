@@ -21,6 +21,8 @@ import time
 import urllib.error
 from collections.abc import Callable
 
+from bandits import ledger
+
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 """429 rate limit, and the transient server-side failures around it."""
 
@@ -84,5 +86,9 @@ def request_with_retry(
                 raise
             last = exc
             http = exc if isinstance(exc, urllib.error.HTTPError) else None
-            sleep(backoff_delay(attempt, http))
+            delay = backoff_delay(attempt, http)
+            # Recorded before the sleep, so a run killed mid-backoff still says
+            # what it was waiting for and how long it meant to wait.
+            ledger.record_attempt(attempt=attempt, error=exc, delay=delay)
+            sleep(delay)
     raise last  # unreachable: the loop either returns or raises

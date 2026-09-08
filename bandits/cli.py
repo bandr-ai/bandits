@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import functools
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -9,6 +12,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
+from bandits import ledger
 from bandits.analyze import (
     DEFAULT_BUDGET,
     DEFAULT_DUPLICATE_SIMILARITY,
@@ -395,6 +399,66 @@ def _report(task_set, envelope_id: str) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
+def _report_audit_spend(run) -> None:
+    """What the pass cost, and which family cost the most of it.
+
+    A total on its own is not actionable: the reason to report a slowest family
+    is to go and look at it, and a bare duration named nothing to look at. Every
+    figure here is reported only over the families that actually carry it, so a
+    partial total is never printed as if it were the whole.
+    """
+    timed = [
+        (a.duration_seconds, a.family_id) for a in run.audits if a.duration_seconds is not None
+    ]
+    if timed:
+        slowest_seconds, slowest_family = max(timed)
+        console.print(
+            f"[dim]{len(timed)} family audit(s) took {sum(t for t, _ in timed):.1f}s, "
+            f"slowest {slowest_family} at {slowest_seconds:.1f}s[/dim]"
+        )
+
+    # The per-family budget is thirty calls, so what matters is whether a family
+    # is approaching it — a total alone would hide one family spending thirty
+    # among nine spending two.
+    counted = [(a.llm_calls, a.family_id) for a in run.audits if a.llm_calls is not None]
+    if counted:
+        most_calls, priciest = max(counted)
+        console.print(
+            f"[dim]{sum(c for c, _ in counted)} model call(s) over {len(counted)} family(ies), "
+            f"most {priciest} at {most_calls}[/dim]"
+        )
+    unreported = [a for a in run.audits if a.llm_calls is None]
+    if unreported:
+        # Said out loud rather than left as a dash in a column: a total that
+        # silently omits families reads as the whole bill.
+        console.print(
+            f"[dim]{len(unreported)} family(ies) reported no call count; "
+            "the totals above exclude them[/dim]"
+        )
+
+    totals: dict[str, int] = {}
+    for audit in run.audits:
+        for field, value in audit.tokens.items():
+            totals[field] = totals.get(field, 0) + value
+    if totals:
+        console.print(
+            "[dim]tokens: " + ", ".join(f"{k} {v}" for k, v in sorted(totals.items())) + "[/dim]"
+        )
+    else:
+        # Never estimated. A token count computed here from characters would be
+        # wrong in a way that looks authoritative on a bill.
+        console.print("[dim]no token usage was reported by the backend[/dim]")
+
+    failures = run.failed()
+    if failures:
+        console.print(
+            f"\n[yellow]{len(failures)} family audit(s) failed and reached no verdict[/yellow]"
+        )
+        for audit in failures:
+            spent = "" if audit.llm_calls is None else f" after {audit.llm_calls} call(s)"
+            console.print(f"  [yellow]failed[/yellow] {audit.family_id}{spent}: {audit.error}")
+
+
 def _report_audit(run, run_id: str, task_set) -> None:
     """Advisory findings, kept visibly separate from what mining decided.
 
@@ -407,8 +471,11 @@ def _report_audit(run, run_id: str, task_set) -> None:
         return
 
     coherence_of = {f.family_id: f.coherence for f in task_set.families}
-    table = Table("family_id", "semantic", "geometric", "outliers", "proposed split")
-    for audit in sorted(run.audits, key=lambda a: (a.coherent, a.family_id)):
+    concluded = run.concluded()
+    table = Table(
+        "family_id", "semantic", "geometric", "outliers", "proposed split", "calls", "took"
+    )
+    for audit in sorted(concluded, key=lambda a: (a.coherent, a.family_id)):
         measured = coherence_of.get(audit.family_id)
         # Printed beside each other and never reconciled: one read the
         # instructions, the other measured embedding distance. Where they
@@ -424,14 +491,20 @@ def _report_audit(run, run_id: str, task_set) -> None:
             geometric,
             str(len(audit.outlier_trace_ids)),
             " | ".join(str(len(g)) for g in audit.proposed_subgroups) or "-",
+            "-" if audit.llm_calls is None else str(audit.llm_calls),
+            "-" if audit.duration_seconds is None else f"{audit.duration_seconds:.1f}s",
         )
-    if run.audits:
+    if concluded:
         console.print(table)
+    # Not gated on the table: a pass where every family failed has no rows and
+    # is exactly the run whose cost and failures most need reporting.
+    if run.audits:
+        _report_audit_spend(run)
 
     # Names go under the table rather than in it: a generated name is prose and
     # a column narrow enough to fit beside five others would truncate the one
     # thing that made it worth generating.
-    for audit in sorted(run.audits, key=lambda a: a.family_id):
+    for audit in sorted(concluded, key=lambda a: a.family_id):
         if audit.generated_name:
             console.print(
                 f"[dim]name[/dim] {audit.family_id}: {audit.generated_name}",
@@ -457,6 +530,10 @@ def _report_audit(run, run_id: str, task_set) -> None:
             )
 
     for skip in run.skipped:
+        # Failures are reported above with what they spent; repeating them here
+        # as skips would read as two families lost rather than one.
+        if skip.failed:
+            continue
         console.print(f"[dim]skipped[/dim] {skip.family_id}: {skip.reason}")
     for limitation in run.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
@@ -465,16 +542,31 @@ def _report_audit(run, run_id: str, task_set) -> None:
 def _run_audit(task_set, task_set_id: str, analysis, store, *, model: str, family_ids=None):
     """Audit a task set and persist the result beside it. Never rewrites it."""
     predict = build_predictor(model=model)
-    run = audit_task_set(
-        task_set,
-        task_set_id,
-        analysis,
-        predict=predict,
-        model=model,
-        family_ids=family_ids,
-        on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
-    )
-    envelope = save_audit_run(run, store)
+    with ledger.stage("audit_run", task_set_id=task_set_id, model=model):
+        run = audit_task_set(
+            task_set,
+            task_set_id,
+            analysis,
+            predict=predict,
+            model=model,
+            family_ids=family_ids,
+            on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
+        )
+        envelope = save_audit_run(run, store)
+        # Lineage rather than contents: the run is already an immutable
+        # artifact, so the ledger records which one this pass produced and lets
+        # the store hold what is in it.
+        ledger.record(
+            {
+                "event_type": "stage_complete",
+                "stage_name": "audit_run",
+                "input_artifact_id": task_set_id,
+                "output_artifact_id": envelope.artifact_id,
+                "audited": len(run.concluded()),
+                "failed": len(run.failed()),
+                "skipped": len(run.skipped),
+            }
+        )
     _report_audit(run, envelope.artifact_id, task_set)
     return run
 
@@ -1253,6 +1345,171 @@ _DECISION_KEYS = {
 }
 
 
+def _interpretation_record(interpretation) -> dict[str, object] | None:
+    """A reading in full, not just the decision it reached.
+
+    ``decision`` and ``rationale`` say what was proposed and not what it would
+    have done. The revised value, the operator, the combine target and the
+    target that could not be found are the proposal; a record holding only the
+    first two cannot say what a reviewer accepted or refused.
+    """
+    if interpretation is None:
+        return None
+    return {
+        "decision": interpretation.decision.value,
+        "rationale": interpretation.rationale,
+        "source": getattr(interpretation, "source", None),
+        "revised_expected": getattr(interpretation, "revised_expected", None),
+        "revised_operator": getattr(
+            getattr(interpretation, "revised_operator", None), "value", None
+        ),
+        "combine_with": getattr(interpretation, "combine_with", None),
+        "dropped_combine_target": getattr(interpretation, "dropped_combine_target", None),
+        "blind_spots": list(getattr(interpretation, "blind_spots", ()) or ()),
+        "gaming_hypotheses": list(getattr(interpretation, "gaming_hypotheses", ()) or ()),
+    }
+
+
+def _record_turn(
+    outcome: str,
+    *,
+    verifier_id: str,
+    check_id: str,
+    round_number: int,
+    shown_at: str,
+    answered_seconds: float,
+    shown: dict,
+    reply: str,
+    authoritative: bool,
+    authoritative_why: str,
+    interpretation,
+    applied,
+    manual: bool,
+    failure: str | None,
+    **extra: object,
+) -> None:
+    """One interview turn, however it ended.
+
+    ``outcome`` is what happened to the answer: applied, stopped, or skipped
+    because the decision named nothing that could be acted on. A turn that
+    ended in a skip still cost the reviewer the reading and the reply, and
+    dropping it would make the review look shorter than it was.
+    """
+    ledger.record(
+        {
+            "event_type": "interview_turn",
+            "outcome": outcome,
+            "verifier_id": verifier_id,
+            "check_id": check_id,
+            "round_number": round_number,
+            "shown_at": shown_at,
+            "answered_seconds": answered_seconds,
+            "shown": shown,
+            "reply": reply,
+            "authoritative": authoritative,
+            "authoritative_why": authoritative_why,
+            # Both readings, whole. A decision and a rationale describe what was
+            # proposed and not what it would have done: the revised value, the
+            # operator and the combine target are the proposal. Where a reviewer
+            # overruled the model, `CheckReview.interpretation` holds their
+            # replacement, so keeping only one of these loses whichever was not
+            # taken — and the pair is the whole point of recording an overrule.
+            "proposed_interpretation": _interpretation_record(interpretation),
+            "applied_interpretation": _interpretation_record(applied),
+            "proposed_decision": (
+                interpretation.decision.value if interpretation is not None else None
+            ),
+            "proposed_rationale": (
+                interpretation.rationale if interpretation is not None else None
+            ),
+            "decision_source": _decision_source(interpretation, manual, failure),
+            # True only where a reading existed and was refused. A manual
+            # decision after an interpretation failure overrules nothing.
+            "model_overruled": interpretation is not None and manual,
+            "failure": failure,
+            **extra,
+        }
+    )
+
+
+def _decision_source(interpretation, manual: bool, failure: str | None) -> str:
+    """How the decision was arrived at, which is not a single boolean.
+
+    Three cases, and flattening them misreports the evidence: a reading the
+    reviewer accepted, a reading they refused and replaced, and a decision they
+    entered because no reading existed. Only the middle one is an override —
+    calling the third an override invents a model opinion that was never given.
+    """
+    if failure is not None or interpretation is None:
+        return "manual_after_failure"
+    return "model_overruled" if manual else "model_accepted"
+
+
+def _displayed_context(summary, check, spec, interview, check_id: str) -> dict[str, object]:
+    """Everything the reviewer had in front of them when they answered.
+
+    The prompt lines alone were not it. The terminal also showed the check's
+    own wording, the operator and expected value being asserted, the evidence
+    kind, the agreement and error counts, the gameability findings, the blind
+    spots and every earlier decision on this check. All of it is input to a
+    human judgement, so a record that kept only part of it cannot explain the
+    answer that came back.
+
+    A structured snapshot rather than the rendered text: the console output is
+    styled for a terminal, and re-reading markup is not the same as reading
+    what it said.
+    """
+    return {
+        "prompt_lines": list(summary.prompt_lines()),
+        "check": {
+            "check_id": check.check_id,
+            "claim": check.claim,
+            "description": check.description,
+            "operator": getattr(check, "operator", None),
+            "expected": getattr(check, "expected", None),
+        },
+        "verifier_id": spec.verifier_id,
+        "scored": {
+            "passed": summary.passed,
+            "failed": summary.failed,
+            "unscorable": summary.unscorable,
+            "example_trace_ids": list(summary.example_trace_ids),
+            "evidence_kind": str(summary.evidence_kind),
+        },
+        "agreements": [
+            {
+                "split": a.split,
+                "agreement": a.agreement,
+                "labeled": a.labeled,
+                "scored": a.scored,
+                "false_positives": a.false_positives,
+                "false_negatives": a.false_negatives,
+                "coverage": a.coverage,
+            }
+            for a in summary.agreements
+        ],
+        "gameability": [
+            {"hypothesis": g.hypothesis, "passed": g.passed, "forged_facts": g.forged_facts}
+            for g in summary.gameability
+        ],
+        # Coverage is shown beside the attacks and says something they cannot:
+        # that checks no template could attack were never tried, so a clean
+        # sheet above is not evidence they resist one.
+        "gameability_assessment": (
+            None
+            if summary.assessment is None
+            else {
+                "coverage": summary.assessment.coverage,
+                "checks_attacked": summary.assessment.checks_attacked,
+                "checks_total": summary.assessment.checks_total,
+            }
+        ),
+        "blind_spots": list(summary.blind_spots),
+        "gaming_hypotheses": list(summary.gaming_hypotheses),
+        "prior_decisions": list(prior_decisions(interview, check_id)),
+    }
+
+
 def _show_check_summary(summary, check, spec) -> None:
     console.print(f"\n[bold]{check.claim}[/bold]  [dim]{check.check_id}[/dim]")
     console.print(f"  {check.description}")
@@ -1517,27 +1774,39 @@ def interview_review_command(
         for line in prior_decisions(interview, check_id):
             console.print(f"  [dim]earlier:[/dim] {line}")
 
+        # Marked before the prompt goes up: the interval a reviewer spent on a
+        # check is part of how much its answer is worth, and it is unrecoverable
+        # once the answer is stored on its own.
+        shown_at = datetime.now(UTC).isoformat()
+        asked = time.monotonic()
         reply = typer.prompt("\n  what do you think?", default="", show_default=False)
         authoritative = typer.confirm(
             "  is this evidence source authoritative for the claim?", default=True
         )
         why = typer.prompt("  why", default="", show_default=False)
+        answered_seconds = round(time.monotonic() - asked, 3)
 
         known = tuple(c.check_id for s in interview.draft.verifiers for c in s.checks)
         interpretation = prompt_text = response = None
         failure = None
         manual = False
         try:
-            interpretation, prompt_text, response = interpret_reply(
-                check,
-                spec,
-                reply,
-                predict=_interpreter(),
-                model=model,
-                summary_lines=summary.prompt_lines(),
-                prior_reviews=prior_decisions(interview, check_id),
-                known_check_ids=known,
-            )
+            with ledger.stage(
+                "interview_interpret",
+                verifier_id=verifier_id,
+                check_id=check_id,
+                round_number=interview.round_number,
+            ):
+                interpretation, prompt_text, response = interpret_reply(
+                    check,
+                    spec,
+                    reply,
+                    predict=_interpreter(),
+                    model=model,
+                    summary_lines=summary.prompt_lines(),
+                    prior_reviews=prior_decisions(interview, check_id),
+                    known_check_ids=known,
+                )
         except InterpretationFailure as exc:
             failure = f"{exc.kind}: {exc}"
             decision = _manual_decision(f"could not read that reply — {failure}")
@@ -1563,8 +1832,32 @@ def interview_review_command(
                 # below rather than carried over.
                 manual = decision is not None
 
+        # Every exit below records an outcome. A reviewer who stopped, or whose
+        # answer could not be applied, interacted with the system just as much
+        # as one whose decision landed; a record that kept only the successes
+        # would overstate how much of the review actually concluded. Bound
+        # explicitly rather than closed over, so the record cannot drift from
+        # the iteration that produced it.
+        turn = functools.partial(
+            _record_turn,
+            verifier_id=verifier_id,
+            check_id=check_id,
+            round_number=interview.round_number,
+            shown_at=shown_at,
+            answered_seconds=answered_seconds,
+            shown=_displayed_context(summary, check, spec, interview, check_id),
+            reply=reply,
+            authoritative=authoritative,
+            authoritative_why=why,
+            interpretation=interpretation,
+            applied=None,
+            manual=manual,
+            failure=failure,
+        )
+
         if decision is None:
             console.print("[yellow]stopped[/yellow] — nothing applied for this check")
+            turn("stopped", applied_decision=None)
             break
 
         # What the model proposed, kept whether or not it was followed: an
@@ -1578,8 +1871,14 @@ def interview_review_command(
             # the check pending, re-asking a question the reviewer cannot answer.
             applied = _manual_interpretation(decision, check, known)
 
+        # Rebound once `applied` exists: a turn recorded before this point had
+        # no replacement to name, and one recorded after has to carry both
+        # readings or an overrule loses whichever the reviewer did not take.
+        turn = functools.partial(turn, applied=applied)
+
         if decision is InterviewDecision.COMBINE and (applied is None or not applied.combine_with):
             console.print("  [yellow]no resolved target to combine with[/yellow]; skipped")
+            turn("skipped_invalid_combine", applied_decision=decision.value)
             continue
 
         if decision is InterviewDecision.REVISE and (
@@ -1590,6 +1889,7 @@ def interview_review_command(
             # interpretation on hand names nothing to revise, and applying it
             # would strip the check's evidence without changing the check.
             console.print("  [yellow]nothing named to revise[/yellow]; skipped")
+            turn("skipped_empty_revision", applied_decision=decision.value)
             continue
 
         review = CheckReview(
@@ -1612,10 +1912,24 @@ def interview_review_command(
             response=response or "",
             failure=failure,
         )
+        previous_interview_id = envelope.artifact_id
         interview = apply_decision(interview, review)
         # Saved after every decision: the store is content-addressed, so each
         # save is its own artifact and the latest id is where a resume starts.
         envelope = save_interview(interview, store)
+
+        # The chain, in one event: what was shown, what the reviewer said, what
+        # the model read it as, whether that reading survived, and which
+        # artifact the answer produced. The pieces exist scattered across the
+        # draft, the interpretation and the interview; what was missing is the
+        # order they happened in and whether the human agreed.
+        turn(
+            "applied",
+            applied_decision=decision.value,
+            review_id=review.review_id,
+            input_artifact_id=previous_interview_id,
+            output_artifact_id=envelope.artifact_id,
+        )
 
     console.print(f"\ninterview_id: {envelope.artifact_id}")
     console.print(f"round:        {interview.round_number}")
