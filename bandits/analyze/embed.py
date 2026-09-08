@@ -25,6 +25,7 @@ from pydantic import model_validator
 from bandits.analyze.families import normalize_instruction, normalize_request
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
+from bandits.transport import request_with_retry
 
 if TYPE_CHECKING:
     from bandits.analyze.models import CorpusAnalysis
@@ -84,10 +85,13 @@ def fireworks_embedder(model: str, texts: Sequence[str]) -> list[list[float]]:
         data=json.dumps({"model": model, "input": list(texts)}).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+    def send() -> object:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.load(response)
+
     payload: object = None
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = json.load(response)
+        payload = request_with_retry(send)
     except (urllib.error.URLError, TimeoutError) as exc:
         raise EmbeddingError(f"embedding request failed: {exc}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
