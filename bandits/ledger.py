@@ -184,23 +184,31 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
         raise
     finally:
         response = slot.get("response")
-        record(
-            {
-                "event_type": "model_call",
-                "logical_call_id": call_id,
-                "provider": provider,
-                "model": model,
-                "request": request,
-                "response": response,
-                "usage": (response or {}).get("usage") if isinstance(response, dict) else None,
-                "status": status,
-                "error": error,
-                "started_at": started_at,
-                "finished_at": _now(),
-                "duration_seconds": round(time.monotonic() - started, 4),
-            }
-        )
-        _local.context = previous
+        # Restoring the context gets its own `finally`. Under strict mode
+        # `record` raises, and a raise here would leave this call's
+        # `logical_call_id` on the context for whatever ran next to inherit,
+        # attributing later retries to a call that had already finished.
+        try:
+            record(
+                {
+                    "event_type": "model_call",
+                    "logical_call_id": call_id,
+                    "provider": provider,
+                    "model": model,
+                    "request": request,
+                    "response": response,
+                    "usage": (
+                        (response or {}).get("usage") if isinstance(response, dict) else None
+                    ),
+                    "status": status,
+                    "error": error,
+                    "started_at": started_at,
+                    "finished_at": _now(),
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                }
+            )
+        finally:
+            _local.context = previous
 
 
 def record_attempt(*, attempt: int, error: Exception, delay: float) -> None:

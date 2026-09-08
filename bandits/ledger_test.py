@@ -256,3 +256,23 @@ def test_strict_mode_is_inert_while_the_ledger_is_off(tmp_path, monkeypatch):
 
     ledger.record({"event_type": "marker"})  # must not raise
     assert ledger.strict() is False
+
+
+def test_a_strict_write_failure_does_not_leak_the_call_it_was_recording(tmp_path, monkeypatch):
+    """A raise on the way out must still clear the call from the context.
+
+    `record` raises under strict mode, and the restoration used to sit after it
+    in the same `finally`. A failed write therefore left the finished call's
+    `logical_call_id` in place for whatever ran next to inherit, attributing
+    later retries to a call that had already returned.
+    """
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("BANDITS_LEDGER", str(blocker / "run.jsonl"))
+    monkeypatch.setenv("BANDITS_LEDGER_STRICT", "1")
+
+    with pytest.raises(ledger.LedgerWriteError):
+        with ledger.model_call(provider="p", model="m", request={}):
+            pass
+
+    assert "logical_call_id" not in ledger._context()

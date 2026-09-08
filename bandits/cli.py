@@ -1345,6 +1345,31 @@ _DECISION_KEYS = {
 }
 
 
+def _interpretation_record(interpretation) -> dict[str, object] | None:
+    """A reading in full, not just the decision it reached.
+
+    ``decision`` and ``rationale`` say what was proposed and not what it would
+    have done. The revised value, the operator, the combine target and the
+    target that could not be found are the proposal; a record holding only the
+    first two cannot say what a reviewer accepted or refused.
+    """
+    if interpretation is None:
+        return None
+    return {
+        "decision": interpretation.decision.value,
+        "rationale": interpretation.rationale,
+        "source": getattr(interpretation, "source", None),
+        "revised_expected": getattr(interpretation, "revised_expected", None),
+        "revised_operator": getattr(
+            getattr(interpretation, "revised_operator", None), "value", None
+        ),
+        "combine_with": getattr(interpretation, "combine_with", None),
+        "dropped_combine_target": getattr(interpretation, "dropped_combine_target", None),
+        "blind_spots": list(getattr(interpretation, "blind_spots", ()) or ()),
+        "gaming_hypotheses": list(getattr(interpretation, "gaming_hypotheses", ()) or ()),
+    }
+
+
 def _record_turn(
     outcome: str,
     *,
@@ -1358,6 +1383,7 @@ def _record_turn(
     authoritative: bool,
     authoritative_why: str,
     interpretation,
+    applied,
     manual: bool,
     failure: str | None,
     **extra: object,
@@ -1382,6 +1408,14 @@ def _record_turn(
             "reply": reply,
             "authoritative": authoritative,
             "authoritative_why": authoritative_why,
+            # Both readings, whole. A decision and a rationale describe what was
+            # proposed and not what it would have done: the revised value, the
+            # operator and the combine target are the proposal. Where a reviewer
+            # overruled the model, `CheckReview.interpretation` holds their
+            # replacement, so keeping only one of these loses whichever was not
+            # taken — and the pair is the whole point of recording an overrule.
+            "proposed_interpretation": _interpretation_record(interpretation),
+            "applied_interpretation": _interpretation_record(applied),
             "proposed_decision": (
                 interpretation.decision.value if interpretation is not None else None
             ),
@@ -1458,7 +1492,20 @@ def _displayed_context(summary, check, spec, interview, check_id: str) -> dict[s
             {"hypothesis": g.hypothesis, "passed": g.passed, "forged_facts": g.forged_facts}
             for g in summary.gameability
         ],
+        # Coverage is shown beside the attacks and says something they cannot:
+        # that checks no template could attack were never tried, so a clean
+        # sheet above is not evidence they resist one.
+        "gameability_assessment": (
+            None
+            if summary.assessment is None
+            else {
+                "coverage": summary.assessment.coverage,
+                "checks_attacked": summary.assessment.checks_attacked,
+                "checks_total": summary.assessment.checks_total,
+            }
+        ),
         "blind_spots": list(summary.blind_spots),
+        "gaming_hypotheses": list(summary.gaming_hypotheses),
         "prior_decisions": list(prior_decisions(interview, check_id)),
     }
 
@@ -1803,6 +1850,7 @@ def interview_review_command(
             authoritative=authoritative,
             authoritative_why=why,
             interpretation=interpretation,
+            applied=None,
             manual=manual,
             failure=failure,
         )
@@ -1822,6 +1870,11 @@ def interview_review_command(
             # here; without it the guards below would refuse the action and leave
             # the check pending, re-asking a question the reviewer cannot answer.
             applied = _manual_interpretation(decision, check, known)
+
+        # Rebound once `applied` exists: a turn recorded before this point had
+        # no replacement to name, and one recorded after has to carry both
+        # readings or an overrule loses whichever the reviewer did not take.
+        turn = functools.partial(turn, applied=applied)
 
         if decision is InterviewDecision.COMBINE and (applied is None or not applied.combine_with):
             console.print("  [yellow]no resolved target to combine with[/yellow]; skipped")

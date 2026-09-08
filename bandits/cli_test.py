@@ -1605,6 +1605,61 @@ def test_an_overruled_reading_is_visible_as_overruled_in_the_ledger(tmp_path, mo
     assert turn["model_overruled"] is True
 
 
+def test_an_overruled_proposal_is_kept_whole_beside_what_replaced_it(tmp_path, monkeypatch) -> None:
+    """A decision and a rationale are not the proposal.
+
+    The revised value, the operator and the combine target are what a reading
+    would have done, and they are what a reviewer accepted or refused. Keeping
+    only the decision leaves an overrule showing that something was rejected
+    and not what.
+    """
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("revise", revised_expected="shipped")),
+        # reply, authoritative, why, refuse, manual reject
+        "change it\ny\nwhy\nn\nr\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
+    proposed = turn["proposed_interpretation"]
+    assert proposed["decision"] == "revise"
+    assert proposed["revised_expected"] == "shipped", "the payload the reviewer refused"
+    # A manual reject carries no payload of its own, so nothing replaced the
+    # proposal; `applied_decision` is where the reviewer's choice lands.
+    assert turn["applied_interpretation"] is None
+    assert turn["applied_decision"] == "reject"
+
+
+def test_the_gameability_coverage_the_reviewer_saw_is_recorded(tmp_path, monkeypatch) -> None:
+    """Coverage says the attacks that were never tried, which the attacks cannot.
+
+    `_show_check_summary` prints it and the record omitted it, so a reviewer
+    who was told no template could attack a check read as one shown a clean
+    sheet.
+    """
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right\ny\nsystem of record\ny\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
+    assert "gameability_assessment" in turn["shown"]
+    assert "gaming_hypotheses" in turn["shown"]
+
+
 def test_an_audit_run_records_the_artifact_it_produced(tmp_path, monkeypatch) -> None:
     """Lineage the ledger references rather than copies."""
     path = tmp_path / "ledger.jsonl"
