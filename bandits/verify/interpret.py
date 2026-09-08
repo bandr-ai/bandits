@@ -221,6 +221,11 @@ def interpret_reply(
     except Exception:
         # One retry, and only here: a transport error is the failure that a
         # second attempt actually fixes. A malformed reply is not.
+        #
+        # Rate limits and transient server errors are handled below this seam,
+        # in ``transport.request_with_retry``, which sleeps between attempts.
+        # This retry is immediate and stays for the injected-predict case and
+        # for whatever the backoff gave up on.
         try:
             response = predict(model, prompt, TEMPERATURE)
         except Exception as exc:

@@ -30,6 +30,7 @@ from pydantic import Field, model_validator
 from bandits.analyze.models import Evidence, EvidenceKind, Visibility
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, SpanKind, SpanStatus, Trace
+from bandits.transport import request_with_retry
 
 DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
 DEFAULT_SAMPLES = 5
@@ -249,9 +250,12 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
         ).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
-    try:
+    def send() -> object:
         with urllib.request.urlopen(request, timeout=90) as response:
-            payload = json.load(response)
+            return json.load(response)
+
+    try:
+        payload = request_with_retry(send)
     except (urllib.error.URLError, TimeoutError) as exc:
         raise JudgeError(f"judge request failed: {exc}") from exc
     return payload["choices"][0]["message"]["content"]
