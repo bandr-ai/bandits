@@ -83,7 +83,10 @@ def _family(task_set: TaskSet, word: str) -> TaskFamily:
         ("Ticket #A-9928 is stuck", "ticket a 9928 is stuck"),
         ("Email alice@example.com", "email alice example com"),
         ("Fetch https://example.com/x", "fetch https example com x"),
-        ("Check 3f2504e0-4f89-11d3-9a0c-0305e82c3301", "check 3f2504e0 4f89 11d3 9a0c 0305e82c3301"),
+        (
+            "Check 3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "check 3f2504e0 4f89 11d3 9a0c 0305e82c3301",
+        ),
     ],
 )
 def test_normalization_preserves_values(instruction: str, expected: str) -> None:
@@ -358,9 +361,7 @@ def test_merge_then_split_preserves_members_while_separating_values(task_set, an
         if trace_id in set(refunds.trace_ids + cancels.trace_ids)
     }
     assert restored_traces == set(refunds.trace_ids + cancels.trace_ids)
-    assert sum(
-        bool(set(family.trace_ids) & restored_traces) for family in restored.families
-    ) > 2
+    assert sum(bool(set(family.trace_ids) & restored_traces) for family in restored.families) > 2
 
 
 def test_splitting_preserves_which_side_each_trace_was_on(task_set, analysis) -> None:
@@ -392,7 +393,9 @@ def test_splitting_a_family_with_distinct_values_separates_those_values(task_set
 
     split = split_family(task_set, cancels.family_id, analysis)
 
-    replacements = [family for family in split.families if set(family.trace_ids) <= set(cancels.trace_ids)]
+    replacements = [
+        family for family in split.families if set(family.trace_ids) <= set(cancels.trace_ids)
+    ]
     assert len(replacements) == len(cancels.trace_ids)
 
 

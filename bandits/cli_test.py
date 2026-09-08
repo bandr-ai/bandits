@@ -1550,10 +1550,20 @@ def test_an_interview_turn_is_reconstructable_from_the_ledger(tmp_path, monkeypa
     turn = turns[0]
 
     assert turn["reply"] == "looks right to me"
-    assert turn["shown"], "the evidence the reviewer saw has to be recoverable"
+    assert turn["outcome"] == "applied"
     assert turn["proposed_decision"] == "accept"
     assert turn["applied_decision"] == "accept"
-    assert turn["overruled"] is False
+    assert turn["decision_source"] == "model_accepted"
+    assert turn["model_overruled"] is False
+
+    # Everything the reviewer had in front of them, not just the prompt lines.
+    shown = turn["shown"]
+    assert shown["prompt_lines"]
+    assert shown["check"]["check_id"]
+    assert shown["check"]["claim"]
+    assert "passed" in shown["scored"]
+    assert "agreements" in shown and "gameability" in shown
+    assert "blind_spots" in shown and "prior_decisions" in shown
     assert turn["authoritative"] is True
     assert turn["authoritative_why"] == "the log is the source"
     assert turn["answered_seconds"] >= 0
@@ -1591,7 +1601,8 @@ def test_an_overruled_reading_is_visible_as_overruled_in_the_ledger(tmp_path, mo
     turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
     assert turn["proposed_decision"] == "accept", "what the model said"
     assert turn["applied_decision"] == "reject", "what the reviewer decided instead"
-    assert turn["overruled"] is True
+    assert turn["decision_source"] == "model_overruled"
+    assert turn["model_overruled"] is True
 
 
 def test_an_audit_run_records_the_artifact_it_produced(tmp_path, monkeypatch) -> None:
@@ -1618,3 +1629,49 @@ def test_an_audit_run_records_the_artifact_it_produced(tmp_path, monkeypatch) ->
     store = DerivedStore(tmp_path / ".bandits")
     run = load_audit_run(done["output_artifact_id"], store)
     assert len(run.concluded()) == done["audited"]
+
+
+def test_a_manual_decision_after_a_failure_is_not_called_an_override(tmp_path, monkeypatch) -> None:
+    """There was no reading to overrule, so calling it one invents an opinion.
+
+    A model that failed to parse gave no recommendation. Recording that as an
+    override would report a disagreement that never happened.
+    """
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter("this is not json"),
+        "no idea\ny\nbecause\na\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
+    assert turn["failure"], "the interpretation really did fail"
+    assert turn["proposed_decision"] is None, "no reading existed"
+    assert turn["decision_source"] == "manual_after_failure"
+    assert turn["model_overruled"] is False, "nothing was overruled"
+
+
+def test_a_reviewer_who_stops_still_leaves_a_record(tmp_path, monkeypatch) -> None:
+    """Stopping is an interaction. A turn that vanished would shorten the review."""
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter("this is not json"),
+        "no idea\ny\nbecause\nq\n",
+    )
+    assert result.exit_code == 0, result.output
+
+    turns = [row for row in _ledger_rows(path) if row["event_type"] == "interview_turn"]
+    assert turns, "a reviewer who quit still answered a question first"
+    assert turns[-1]["outcome"] == "stopped"
+    assert turns[-1]["applied_decision"] is None
+    assert turns[-1]["reply"] == "no idea"

@@ -7,11 +7,15 @@ that can score those, and it enters the system as ordinary evidence with
 an external system asserted, and unpromotable until calibrated against labels.
 
 Uncertainty comes from sampling, not from token probabilities. Measured against
-deepseek-v4-flash, a greedy decode reports the runner-up score around eighteen
-logprobs down even on a genuinely contestable run — the model reasons itself
-into confidence it has not earned. Sampling the same rubric K times separates
-the two cases honestly: a clear run returns the same score every time, while a
-contestable one splits, and that split is the signal worth spending a label on.
+deepseek-v4-flash, which was the default when this was written, a greedy decode
+reports the runner-up score around eighteen logprobs down even on a genuinely
+contestable run — the model reasons itself into confidence it has not earned.
+Sampling the same rubric K times separates the two cases honestly: a clear run
+returns the same score every time, while a contestable one splits, and that
+split is the signal worth spending a label on.
+
+The measurement has not been repeated against the current default, so it is
+recorded as what it is: the reason sampling is here, taken on another model.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, SpanKind, SpanStatus, Trace
 from bandits.transport import request_with_retry
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 DEFAULT_SAMPLES = 5
 DEFAULT_TEMPERATURE = 0.7
 """Greedy decoding hides disagreement; this is what makes the spread meaningful."""
