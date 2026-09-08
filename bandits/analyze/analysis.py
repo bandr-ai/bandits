@@ -31,10 +31,16 @@ def analyze_corpus(corpus: TraceCorpus) -> CorpusAnalysis:
         evidence.extend(outcome_evidence)
 
     limitations: list[str] = []
-    if corpus.issues:
+    normalization_issues = [issue for issue in corpus.issues if issue.kind != "redaction"]
+    redactions = [issue for issue in corpus.issues if issue.kind == "redaction"]
+    if normalization_issues:
         limitations.append(
-            f"{len(corpus.issues)} source record(s) could not be normalized; "
+            f"{len(normalization_issues)} source record(s) could not be normalized; "
             "the corpus is not a complete view of the export"
+        )
+    if redactions:
+        limitations.append(
+            f"{len(redactions)} sensitive value occurrence(s) were redacted before analysis"
         )
     tasks_without_outcome = sum(1 for t in tasks if not t.outcome_evidence_ids)
     if tasks_without_outcome:
