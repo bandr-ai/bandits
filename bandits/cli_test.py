@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -15,7 +16,7 @@ from bandits.analyze import (
     load_task_set,
     save_task_set,
 )
-from bandits.analyze.audit import AuditError
+from bandits.analyze.audit import AuditError, load_audit_run
 from bandits.analyze.embed import EmbeddingError, descriptors, load_cache, requests
 from bandits.cli import app
 from bandits.export import direct_sft
@@ -326,6 +327,90 @@ def test_audit_families_reports_both_verdicts_side_by_side(tmp_path) -> None:
 
     assert result.exit_code == 0
     assert "semantic" in result.stdout and "geometric" in result.stdout
+
+
+def test_the_audit_report_names_the_slowest_family(tmp_path) -> None:
+    """A duration nobody can attribute is not something a reviewer can act on.
+
+    The point of reporting a slowest family is to go and look at it, so the
+    figure has to arrive with the id it belongs to.
+    """
+    task_set_id = _mined(tmp_path)
+
+    def build(*, model, **_):
+        seen: list[str] = []
+
+        def predict(*, members, question):
+            seen.append(members)
+            # The second family audited sleeps, so the slowest is a known one
+            # rather than whichever happened to win a race.
+            if len(seen) == 2:
+                time.sleep(0.05)
+            return SimpleNamespace(
+                coherent=True,
+                outlier_trace_ids=[],
+                proposed_subgroups=[],
+                generated_name="Refund an eligible order",
+                rationale="One task.",
+            )
+
+        return predict
+
+    with mock.patch("bandits.cli.build_predictor", build):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    slowest = [line for line in result.stdout.splitlines() if "slowest" in line]
+    assert slowest, result.stdout
+    assert "family-" in slowest[0], "the slowest duration has to name the family it belongs to"
+
+
+def test_the_audit_report_says_when_no_token_usage_was_reported(tmp_path) -> None:
+    """Never estimated. A count derived here would be wrong and look official."""
+    task_set_id = _mined(tmp_path)
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="One task.",
+        ),
+    ):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "no token usage was reported" in result.stdout
+
+
+def test_a_failed_family_is_reported_with_what_it_spent(tmp_path) -> None:
+    """A failure that spent budget must not read as a family nobody tried."""
+    task_set_id = _mined(tmp_path)
+
+    def build(*, model, **_):
+        def predict(*, members, question):
+            raise RuntimeError("connection reset")
+
+        predict.spend = lambda: (4, {"total_tokens": 250})
+        return predict
+
+    with mock.patch("bandits.cli.build_predictor", build):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    assert "reached no verdict" in result.stdout
+    assert "connection reset" in result.stdout
+    assert "after 4 call(s)" in result.stdout
+
+    # And the attempt is persisted, not only printed.
+    store = DerivedStore(tmp_path / ".bandits")
+    run = load_audit_run(store.list(kind="family_audit")[0].artifact_id, store)
+    failures = run.failed()
+    assert failures and failures[0].llm_calls == 4
+    assert failures[0].tokens == {"total_tokens": 250}
+    assert run.concluded() == (), "a failed attempt must never count as a verdict"
 
 
 def test_audit_families_rejects_an_unknown_family(tmp_path) -> None:
@@ -1434,3 +1519,102 @@ def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tm
     assert draft.candidates
     assert all(item.derivation == "frequency" for item in draft.candidates)
     assert all(item.considered for item in draft.candidates)
+
+
+def _ledger_rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_an_interview_turn_is_reconstructable_from_the_ledger(tmp_path, monkeypatch) -> None:
+    """The chain the ledger exists for, end to end.
+
+    What was shown to the reviewer, what they replied, what the model read it
+    as, whether that reading survived, and which artifact the answer produced.
+    Each piece existed somewhere already; what was missing was the order they
+    happened in and whether the human agreed with the model.
+    """
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "looks right to me\ny\nthe log is the source\ny\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    turns = [row for row in _ledger_rows(path) if row["event_type"] == "interview_turn"]
+    assert turns, "a review that decided a check has to leave a turn behind"
+    turn = turns[0]
+
+    assert turn["reply"] == "looks right to me"
+    assert turn["shown"], "the evidence the reviewer saw has to be recoverable"
+    assert turn["proposed_decision"] == "accept"
+    assert turn["applied_decision"] == "accept"
+    assert turn["overruled"] is False
+    assert turn["authoritative"] is True
+    assert turn["authoritative_why"] == "the log is the source"
+    assert turn["answered_seconds"] >= 0
+    assert turn["shown_at"]
+
+    # Lineage, not duplication: the turn names the artifacts either side of it
+    # and the store holds what is in them.
+    assert turn["output_artifact_id"] != turn["input_artifact_id"]
+    store = DerivedStore(tmp_path / ".bandits")
+    interview = load_interview(turn["output_artifact_id"], store)
+    assert any(r.review_id == turn["review_id"] for r in interview.reviews), (
+        "the turn has to name a review that really exists in the artifact it produced"
+    )
+
+
+def test_an_overruled_reading_is_visible_as_overruled_in_the_ledger(tmp_path, monkeypatch) -> None:
+    """Accepting the model and overruling it must never look the same.
+
+    A decision the reviewer had to enter after refusing the model's reading is
+    weaker evidence than one they agreed with, and a record that flattened the
+    two would misrepresent every overruled check.
+    """
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    draft_id = _review_draft(tmp_path)
+
+    result = _run_review(
+        tmp_path,
+        draft_id,
+        _fake_interpreter(_decision("accept")),
+        "actually no\ny\nwhy not\nn\nr\n" * 12,
+    )
+    assert result.exit_code == 0, result.output
+
+    turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
+    assert turn["proposed_decision"] == "accept", "what the model said"
+    assert turn["applied_decision"] == "reject", "what the reviewer decided instead"
+    assert turn["overruled"] is True
+
+
+def test_an_audit_run_records_the_artifact_it_produced(tmp_path, monkeypatch) -> None:
+    """Lineage the ledger references rather than copies."""
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    task_set_id = _mined(tmp_path)
+
+    with mock.patch(
+        "bandits.cli.build_predictor",
+        _audit_predictor(
+            coherent=True,
+            outlier_trace_ids=[],
+            proposed_subgroups=[],
+            generated_name="Refund an eligible order",
+            rationale="One task.",
+        ),
+    ):
+        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+
+    done = next(row for row in _ledger_rows(path) if row["event_type"] == "stage_complete")
+    assert done["input_artifact_id"] == task_set_id
+    store = DerivedStore(tmp_path / ".bandits")
+    run = load_audit_run(done["output_artifact_id"], store)
+    assert len(run.concluded()) == done["audited"]

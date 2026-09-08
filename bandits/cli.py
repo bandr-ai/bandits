@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -9,6 +11,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
+from bandits import ledger
 from bandits.analyze import (
     DEFAULT_BUDGET,
     DEFAULT_DUPLICATE_SIMILARITY,
@@ -395,6 +398,66 @@ def _report(task_set, envelope_id: str) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
+def _report_audit_spend(run) -> None:
+    """What the pass cost, and which family cost the most of it.
+
+    A total on its own is not actionable: the reason to report a slowest family
+    is to go and look at it, and a bare duration named nothing to look at. Every
+    figure here is reported only over the families that actually carry it, so a
+    partial total is never printed as if it were the whole.
+    """
+    timed = [
+        (a.duration_seconds, a.family_id) for a in run.audits if a.duration_seconds is not None
+    ]
+    if timed:
+        slowest_seconds, slowest_family = max(timed)
+        console.print(
+            f"[dim]{len(timed)} family audit(s) took {sum(t for t, _ in timed):.1f}s, "
+            f"slowest {slowest_family} at {slowest_seconds:.1f}s[/dim]"
+        )
+
+    # The per-family budget is thirty calls, so what matters is whether a family
+    # is approaching it — a total alone would hide one family spending thirty
+    # among nine spending two.
+    counted = [(a.llm_calls, a.family_id) for a in run.audits if a.llm_calls is not None]
+    if counted:
+        most_calls, priciest = max(counted)
+        console.print(
+            f"[dim]{sum(c for c, _ in counted)} model call(s) over {len(counted)} family(ies), "
+            f"most {priciest} at {most_calls}[/dim]"
+        )
+    unreported = [a for a in run.audits if a.llm_calls is None]
+    if unreported:
+        # Said out loud rather than left as a dash in a column: a total that
+        # silently omits families reads as the whole bill.
+        console.print(
+            f"[dim]{len(unreported)} family(ies) reported no call count; "
+            "the totals above exclude them[/dim]"
+        )
+
+    totals: dict[str, int] = {}
+    for audit in run.audits:
+        for field, value in audit.tokens.items():
+            totals[field] = totals.get(field, 0) + value
+    if totals:
+        console.print(
+            "[dim]tokens: " + ", ".join(f"{k} {v}" for k, v in sorted(totals.items())) + "[/dim]"
+        )
+    else:
+        # Never estimated. A token count computed here from characters would be
+        # wrong in a way that looks authoritative on a bill.
+        console.print("[dim]no token usage was reported by the backend[/dim]")
+
+    failures = run.failed()
+    if failures:
+        console.print(
+            f"\n[yellow]{len(failures)} family audit(s) failed and reached no verdict[/yellow]"
+        )
+        for audit in failures:
+            spent = "" if audit.llm_calls is None else f" after {audit.llm_calls} call(s)"
+            console.print(f"  [yellow]failed[/yellow] {audit.family_id}{spent}: {audit.error}")
+
+
 def _report_audit(run, run_id: str, task_set) -> None:
     """Advisory findings, kept visibly separate from what mining decided.
 
@@ -407,8 +470,11 @@ def _report_audit(run, run_id: str, task_set) -> None:
         return
 
     coherence_of = {f.family_id: f.coherence for f in task_set.families}
-    table = Table("family_id", "semantic", "geometric", "outliers", "proposed split", "took")
-    for audit in sorted(run.audits, key=lambda a: (a.coherent, a.family_id)):
+    concluded = run.concluded()
+    table = Table(
+        "family_id", "semantic", "geometric", "outliers", "proposed split", "calls", "took"
+    )
+    for audit in sorted(concluded, key=lambda a: (a.coherent, a.family_id)):
         measured = coherence_of.get(audit.family_id)
         # Printed beside each other and never reconciled: one read the
         # instructions, the other measured embedding distance. Where they
@@ -424,25 +490,20 @@ def _report_audit(run, run_id: str, task_set) -> None:
             geometric,
             str(len(audit.outlier_trace_ids)),
             " | ".join(str(len(g)) for g in audit.proposed_subgroups) or "-",
+            "-" if audit.llm_calls is None else str(audit.llm_calls),
             "-" if audit.duration_seconds is None else f"{audit.duration_seconds:.1f}s",
         )
-    if run.audits:
+    if concluded:
         console.print(table)
-        # The per-family budget is thirty model calls and nothing reported what
-        # a family actually spent, so a slow audit was only visible as a long
-        # wait. Timed families only: a mix of timed and untimed would total to
-        # less than the run took and read as the whole of it.
-        timed = [a.duration_seconds for a in run.audits if a.duration_seconds is not None]
-        if timed:
-            console.print(
-                f"[dim]{len(timed)} family audit(s) took {sum(timed):.1f}s, "
-                f"slowest {max(timed):.1f}s[/dim]"
-            )
+    # Not gated on the table: a pass where every family failed has no rows and
+    # is exactly the run whose cost and failures most need reporting.
+    if run.audits:
+        _report_audit_spend(run)
 
     # Names go under the table rather than in it: a generated name is prose and
     # a column narrow enough to fit beside five others would truncate the one
     # thing that made it worth generating.
-    for audit in sorted(run.audits, key=lambda a: a.family_id):
+    for audit in sorted(concluded, key=lambda a: a.family_id):
         if audit.generated_name:
             console.print(
                 f"[dim]name[/dim] {audit.family_id}: {audit.generated_name}",
@@ -468,6 +529,10 @@ def _report_audit(run, run_id: str, task_set) -> None:
             )
 
     for skip in run.skipped:
+        # Failures are reported above with what they spent; repeating them here
+        # as skips would read as two families lost rather than one.
+        if skip.failed:
+            continue
         console.print(f"[dim]skipped[/dim] {skip.family_id}: {skip.reason}")
     for limitation in run.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
@@ -476,16 +541,31 @@ def _report_audit(run, run_id: str, task_set) -> None:
 def _run_audit(task_set, task_set_id: str, analysis, store, *, model: str, family_ids=None):
     """Audit a task set and persist the result beside it. Never rewrites it."""
     predict = build_predictor(model=model)
-    run = audit_task_set(
-        task_set,
-        task_set_id,
-        analysis,
-        predict=predict,
-        model=model,
-        family_ids=family_ids,
-        on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
-    )
-    envelope = save_audit_run(run, store)
+    with ledger.stage("audit_run", task_set_id=task_set_id, model=model):
+        run = audit_task_set(
+            task_set,
+            task_set_id,
+            analysis,
+            predict=predict,
+            model=model,
+            family_ids=family_ids,
+            on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
+        )
+        envelope = save_audit_run(run, store)
+        # Lineage rather than contents: the run is already an immutable
+        # artifact, so the ledger records which one this pass produced and lets
+        # the store hold what is in it.
+        ledger.record(
+            {
+                "event_type": "stage_complete",
+                "stage_name": "audit_run",
+                "input_artifact_id": task_set_id,
+                "output_artifact_id": envelope.artifact_id,
+                "audited": len(run.concluded()),
+                "failed": len(run.failed()),
+                "skipped": len(run.skipped),
+            }
+        )
     _report_audit(run, envelope.artifact_id, task_set)
     return run
 
@@ -1528,27 +1608,39 @@ def interview_review_command(
         for line in prior_decisions(interview, check_id):
             console.print(f"  [dim]earlier:[/dim] {line}")
 
+        # Marked before the prompt goes up: the interval a reviewer spent on a
+        # check is part of how much its answer is worth, and it is unrecoverable
+        # once the answer is stored on its own.
+        shown_at = datetime.now(UTC).isoformat()
+        asked = time.monotonic()
         reply = typer.prompt("\n  what do you think?", default="", show_default=False)
         authoritative = typer.confirm(
             "  is this evidence source authoritative for the claim?", default=True
         )
         why = typer.prompt("  why", default="", show_default=False)
+        answered_seconds = round(time.monotonic() - asked, 3)
 
         known = tuple(c.check_id for s in interview.draft.verifiers for c in s.checks)
         interpretation = prompt_text = response = None
         failure = None
         manual = False
         try:
-            interpretation, prompt_text, response = interpret_reply(
-                check,
-                spec,
-                reply,
-                predict=_interpreter(),
-                model=model,
-                summary_lines=summary.prompt_lines(),
-                prior_reviews=prior_decisions(interview, check_id),
-                known_check_ids=known,
-            )
+            with ledger.stage(
+                "interview_interpret",
+                verifier_id=verifier_id,
+                check_id=check_id,
+                round_number=interview.round_number,
+            ):
+                interpretation, prompt_text, response = interpret_reply(
+                    check,
+                    spec,
+                    reply,
+                    predict=_interpreter(),
+                    model=model,
+                    summary_lines=summary.prompt_lines(),
+                    prior_reviews=prior_decisions(interview, check_id),
+                    known_check_ids=known,
+                )
         except InterpretationFailure as exc:
             failure = f"{exc.kind}: {exc}"
             decision = _manual_decision(f"could not read that reply — {failure}")
@@ -1623,10 +1715,42 @@ def interview_review_command(
             response=response or "",
             failure=failure,
         )
+        previous_interview_id = envelope.artifact_id
         interview = apply_decision(interview, review)
         # Saved after every decision: the store is content-addressed, so each
         # save is its own artifact and the latest id is where a resume starts.
         envelope = save_interview(interview, store)
+
+        # The chain, in one event: what was shown, what the reviewer said, what
+        # the model read it as, whether that reading survived, and which
+        # artifact the answer produced. The pieces exist scattered across the
+        # draft, the interpretation and the interview; what was missing is the
+        # order they happened in and whether the human agreed.
+        ledger.record(
+            {
+                "event_type": "interview_turn",
+                "verifier_id": verifier_id,
+                "check_id": check_id,
+                "round_number": interview.round_number,
+                "shown_at": shown_at,
+                "answered_seconds": answered_seconds,
+                "shown": summary.prompt_lines(),
+                "reply": reply,
+                "authoritative": authoritative,
+                "authoritative_why": why,
+                "proposed_decision": proposed.decision.value if proposed else None,
+                "proposed_rationale": proposed.rationale if proposed else None,
+                "applied_decision": decision.value,
+                # The distinction the record exists for: a decision the model
+                # proposed and the reviewer accepted is not the same evidence as
+                # one the reviewer had to enter after refusing it.
+                "overruled": manual,
+                "failure": failure,
+                "review_id": review.review_id,
+                "input_artifact_id": previous_interview_id,
+                "output_artifact_id": envelope.artifact_id,
+            }
+        )
 
     console.print(f"\ninterview_id: {envelope.artifact_id}")
     console.print(f"round:        {interview.round_number}")
