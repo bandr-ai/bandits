@@ -7,11 +7,15 @@ that can score those, and it enters the system as ordinary evidence with
 an external system asserted, and unpromotable until calibrated against labels.
 
 Uncertainty comes from sampling, not from token probabilities. Measured against
-deepseek-v4-flash, a greedy decode reports the runner-up score around eighteen
-logprobs down even on a genuinely contestable run — the model reasons itself
-into confidence it has not earned. Sampling the same rubric K times separates
-the two cases honestly: a clear run returns the same score every time, while a
-contestable one splits, and that split is the signal worth spending a label on.
+deepseek-v4-flash, which was the default when this was written, a greedy decode
+reports the runner-up score around eighteen logprobs down even on a genuinely
+contestable run — the model reasons itself into confidence it has not earned.
+Sampling the same rubric K times separates the two cases honestly: a clear run
+returns the same score every time, while a contestable one splits, and that
+split is the signal worth spending a label on.
+
+The measurement has not been repeated against the current default, so it is
+recorded as what it is: the reason sampling is here, taken on another model.
 """
 
 from __future__ import annotations
@@ -27,12 +31,13 @@ from pathlib import Path
 
 from pydantic import Field, model_validator
 
+from bandits import ledger
 from bandits.analyze.models import Evidence, EvidenceKind, Visibility
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, SpanKind, SpanStatus, Trace
 from bandits.transport import request_with_retry
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 DEFAULT_SAMPLES = 5
 DEFAULT_TEMPERATURE = 0.7
 """Greedy decoding hides disagreement; this is what makes the spread meaningful."""
@@ -250,14 +255,23 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
         ).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
+
     def send() -> object:
         with urllib.request.urlopen(request, timeout=90) as response:
             return json.load(response)
 
-    try:
-        payload = request_with_retry(send)
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise JudgeError(f"judge request failed: {exc}") from exc
+    with ledger.model_call(
+        provider="fireworks",
+        model=model,
+        request={"temperature": temperature, "max_tokens": 2000, "prompt": prompt},
+    ) as call:
+        try:
+            payload = request_with_retry(send)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise JudgeError(f"judge request failed: {exc}") from exc
+        # The whole body, not the text read out of it: `usage` is the only
+        # record of what the call cost, and it was discarded one line later.
+        call["response"] = payload
     return payload["choices"][0]["message"]["content"]
 
 

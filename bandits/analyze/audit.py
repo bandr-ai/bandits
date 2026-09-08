@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
+from bandits import ledger
 from bandits.analyze.families import normalize_instruction
 from bandits.analyze.models import (
     CorpusAnalysis,
@@ -53,7 +56,7 @@ from bandits.store import DerivedEnvelope, DerivedStore
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 """Matches the rubric judge's default, so one credential covers both passes."""
 
 DEFAULT_MAX_ITERATIONS = 12
@@ -88,6 +91,68 @@ Split when in doubt; never propose merging this family with anything else."""
 
 class AuditError(RuntimeError):
     """The auditor could not be built or returned nothing usable."""
+
+
+class AuditFailed(AuditError):
+    """One family's audit failed, carrying the record of the attempt.
+
+    An error string says what went wrong and nothing about what it cost. The
+    attached audit is a real ``FamilyAudit`` with ``status="error"``, so a
+    failure is stored the same way a success is and a run that lost a family
+    can still say what that family was asked and what the attempt spent.
+    """
+
+    def __init__(self, audit: FamilyAudit) -> None:
+        super().__init__(audit.error)
+        self.audit = audit
+
+
+def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
+    """What the predictor says its last prediction cost, if it says anything.
+
+    Optional by design: the injected predictors the tests use are plain
+    functions, and a backend that cannot report its own history should leave
+    the count unknown rather than have one invented for it.
+    """
+    spend = getattr(predict, "spend", None)
+    if spend is None:
+        return None, {}
+    try:
+        return spend()
+    except Exception:  # noqa: BLE001 - a bookkeeping failure must not lose the audit
+        return None, {}
+
+
+def _failed_audit(
+    family: TaskFamily,
+    *,
+    model: str,
+    inputs: dict[str, str],
+    error: str,
+    duration: float,
+    llm_calls: int | None,
+    tokens: dict[str, int],
+) -> FamilyAudit:
+    """The record of an attempt that produced no verdict.
+
+    ``coherent`` is true and the outlier and subgroup fields are empty, because
+    the contract has no third state and a failed audit must not read as a
+    finding: nothing was concluded. ``status`` is what distinguishes it, and
+    every caller that counts findings filters on that.
+    """
+    return FamilyAudit(
+        family_id=family.family_id,
+        coherent=True,
+        rationale=f"the audit failed and reached no verdict: {error}",
+        model=model,
+        prompt_digest=prompt_digest(model),
+        inputs=inputs,
+        llm_calls=llm_calls,
+        tokens=tokens,
+        duration_seconds=duration,
+        status="error",
+        error=error,
+    )
 
 
 class _Predictor(Protocol):
@@ -190,7 +255,149 @@ def build_predictor(
         with dspy.context(lm=language_model):
             return rlm(members=members, question=question)
 
-    return predict
+    return scoped_to_history(predict, language_model)
+
+
+class _Spend:
+    """The calls the last prediction added to a shared history, and their cost."""
+
+    def __init__(self) -> None:
+        self.entries: list[Any] = []
+
+    def __call__(self) -> tuple[int | None, dict[str, int]]:
+        return _summarize_history(self.entries)
+
+
+def scoped_to_history(predict: _Predictor, language_model: Any) -> _Predictor:
+    """Wrap a predictor so it reports only the calls *it* made.
+
+    ``lm.history`` is one mutable list the language model appends to for the
+    life of the process, shared across every family audited in a run. Reading
+    it whole would charge each family for all its predecessors, so the length
+    is marked before the prediction and only the entries added after that point
+    are attributed to it.
+
+    The slice is copied immediately rather than held as a reference, because
+    the list keeps growing: a reference read after the next family started
+    would describe that family's calls too.
+    """
+    spend = _Spend()
+
+    def wrapped(*, members: str, question: str) -> Any:
+        before = len(getattr(language_model, "history", ()) or ())
+        try:
+            return predict(members=members, question=question)
+        finally:
+            # In `finally` because a failed audit still spent calls, and those
+            # are exactly the ones a rerun that behaved differently needs.
+            history = getattr(language_model, "history", None)
+            spend.entries = list(history[before:]) if isinstance(history, list) else []
+            _record_history(spend.entries)
+
+    wrapped.spend = spend  # type: ignore[attr-defined]
+    return wrapped
+
+
+_CODE_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
+
+
+def _record_history(entries: Sequence[Any]) -> None:
+    """Write each RLM subcall to the ledger as the physical call it was.
+
+    The audit reaches Fireworks through DSPy rather than through
+    ``transport.request_with_retry``, so ``ledger.model_call`` never sees these
+    and the stage would otherwise record one event for what is really a dozen
+    requests. Verified against a real run: each entry carries the messages
+    sent, the text returned, the code the root model wrote, per-call token
+    usage and the provider's own cost figure.
+
+    What is still not visible here: the REPL's stdout appears only inside the
+    *next* entry's prompt, as the ``repl_history`` the model is shown, so a
+    final iteration's output is unrecoverable from history alone. Retries and
+    failures inside litellm are invisible too — a call that failed and was
+    retried appears as one entry, or as none.
+    """
+    if not ledger.enabled():
+        return
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        outputs = entry.get("outputs") or []
+        text = ""
+        if outputs:
+            first = outputs[0]
+            text = first.get("text", "") if isinstance(first, dict) else str(first)
+        code = _CODE_BLOCK.findall(text)
+        ledger.record(
+            {
+                "event_type": "model_call",
+                "provider": "dspy",
+                "model": entry.get("model"),
+                "iteration": index + 1,
+                "request": {"messages": entry.get("messages")},
+                "response": {"text": text},
+                # Pulled out of the reply rather than left inside it: the code
+                # is what the root model actually did, and grepping a ledger
+                # for it should not mean parsing markdown fences back out.
+                "generated_code": code,
+                "usage": entry.get("usage"),
+                "cost_usd": entry.get("cost"),
+                "provider_request_id": entry.get("uuid"),
+                "timestamp": entry.get("timestamp"),
+                "status": "success",
+            }
+        )
+
+
+_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+"""What a provider reports. Never derived: a total computed here from a sum
+that is missing a call reads as authoritative and is not."""
+
+
+def _summarize_history(entries: Sequence[Any]) -> tuple[int | None, dict[str, int]]:
+    """How many DSPy history entries those are, and what they reported.
+
+    One entry is one request DSPy issued, verified against a real run. It is
+    not necessarily one *physical* HTTP request: litellm retries below this
+    layer, so a call that failed and succeeded on retry appears once, and a
+    call that failed permanently may not appear at all. The count is therefore
+    a floor on what was spent, which is the honest reading of it.
+
+    Tokens are summed only over the entries that actually reported them. A call
+    whose backend said nothing contributes nothing rather than a zero, because
+    a zero would silently understate the bill; when no call reported at all the
+    result is empty, which reads as unknown.
+    """
+    totals: dict[str, int] = {}
+    for entry in entries:
+        usage = entry.get("usage") if isinstance(entry, dict) else getattr(entry, "usage", None)
+        if not isinstance(usage, dict):
+            continue
+        for field in _USAGE_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, int):
+                totals[field] = totals.get(field, 0) + value
+    return len(entries), totals
+
+
+def _rendered(prediction: Any) -> str:
+    """The auditor's reply as text, for a reader comparing it to what was stored.
+
+    Read off the fields the signature declares rather than by serializing the
+    prediction, whose backend type carries trace state a reviewer has no use
+    for. Best effort: this exists to be read, so a backend that returns
+    something unreadable costs the record, never the audit.
+    """
+    fields = ("coherent", "outlier_trace_ids", "proposed_subgroups", "generated_name", "rationale")
+    try:
+        return json.dumps(
+            {name: getattr(prediction, name, None) for name in fields},
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return str(prediction)
 
 
 def _clean_ids(raw: Any, members: set[str]) -> tuple[str, ...]:
@@ -222,15 +429,31 @@ def audit_family(
     if not rows:
         raise AuditError(f"family {family.family_id} has no readable members to audit")
 
+    members_json = json.dumps(rows, indent=2, sort_keys=True, default=str)
+    inputs = {"members": members_json, "question": _INSTRUCTION}
+    started = time.monotonic()
     try:
-        prediction = predict(
-            members=json.dumps(rows, indent=2, sort_keys=True, default=str),
-            question=_INSTRUCTION,
-        )
-    except AuditError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - any backend failure is one failure here
-        raise AuditError(f"audit of {family.family_id} failed: {exc}") from exc
+        with ledger.stage("family_audit", family_id=family.family_id, model=model):
+            prediction = predict(members=members_json, question=_INSTRUCTION)
+    except Exception as exc:
+        # The failure gets the same record as a success, minus a verdict. An
+        # audit that vanished into a skip reason lost what it was asked, what
+        # it spent before dying and how long it ran — and a failed call has
+        # already cost rate-limit budget and possibly tokens.
+        calls, tokens = _spend_of(predict)
+        raise AuditFailed(
+            _failed_audit(
+                family,
+                model=model,
+                inputs=inputs,
+                error=str(exc),
+                duration=time.monotonic() - started,
+                llm_calls=calls,
+                tokens=tokens,
+            )
+        ) from exc
+    duration = time.monotonic() - started
+    llm_calls, tokens = _spend_of(predict)
 
     members = {row["trace_id"] for row in rows}
     outliers = _clean_ids(getattr(prediction, "outlier_trace_ids", ()), members)
@@ -265,6 +488,11 @@ def audit_family(
         rationale=rationale or "the auditor returned no rationale",
         model=model,
         prompt_digest=prompt_digest(model),
+        inputs=inputs,
+        rendered_prediction=_rendered(prediction),
+        llm_calls=llm_calls,
+        tokens=tokens,
+        duration_seconds=duration,
     )
 
 
@@ -308,6 +536,16 @@ def audit_task_set(
             continue
         try:
             audit = audit_family(family, analysis, predict=predict, model=model)
+        except AuditFailed as exc:
+            # Both, and deliberately: the skip is what stops this family being
+            # read as audited, and the record beside it is what the attempt
+            # cost. Storing only the reason string was how a failure became
+            # indistinguishable from a family nobody tried.
+            audits.append(exc.audit)
+            skipped.append(SkippedAudit(family_id=family.family_id, reason=str(exc), failed=True))
+            if on_error is not None:
+                on_error(family.family_id, str(exc))
+            continue
         except AuditError as exc:
             skipped.append(SkippedAudit(family_id=family.family_id, reason=str(exc)))
             if on_error is not None:
@@ -318,7 +556,7 @@ def audit_task_set(
         if dropped:  # pragma: no cover - _clean_ids already filters these
             limitations.append(f"audit of {family.family_id} named traces it does not contain")
 
-    if audits:
+    if any(a.status == "success" for a in audits):
         limitations.append(
             "audit output is advisory and uncalibrated: it proposes splits for a "
             "human to apply and never changes grouping, and it has not been "
