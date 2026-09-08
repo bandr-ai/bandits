@@ -56,7 +56,7 @@ from bandits.store import DerivedEnvelope, DerivedStore
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 """Matches the rubric judge's default, so one credential covers both passes."""
 
 DEFAULT_MAX_ITERATIONS = 12

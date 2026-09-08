@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1344,6 +1345,124 @@ _DECISION_KEYS = {
 }
 
 
+def _record_turn(
+    outcome: str,
+    *,
+    verifier_id: str,
+    check_id: str,
+    round_number: int,
+    shown_at: str,
+    answered_seconds: float,
+    shown: dict,
+    reply: str,
+    authoritative: bool,
+    authoritative_why: str,
+    interpretation,
+    manual: bool,
+    failure: str | None,
+    **extra: object,
+) -> None:
+    """One interview turn, however it ended.
+
+    ``outcome`` is what happened to the answer: applied, stopped, or skipped
+    because the decision named nothing that could be acted on. A turn that
+    ended in a skip still cost the reviewer the reading and the reply, and
+    dropping it would make the review look shorter than it was.
+    """
+    ledger.record(
+        {
+            "event_type": "interview_turn",
+            "outcome": outcome,
+            "verifier_id": verifier_id,
+            "check_id": check_id,
+            "round_number": round_number,
+            "shown_at": shown_at,
+            "answered_seconds": answered_seconds,
+            "shown": shown,
+            "reply": reply,
+            "authoritative": authoritative,
+            "authoritative_why": authoritative_why,
+            "proposed_decision": (
+                interpretation.decision.value if interpretation is not None else None
+            ),
+            "proposed_rationale": (
+                interpretation.rationale if interpretation is not None else None
+            ),
+            "decision_source": _decision_source(interpretation, manual, failure),
+            # True only where a reading existed and was refused. A manual
+            # decision after an interpretation failure overrules nothing.
+            "model_overruled": interpretation is not None and manual,
+            "failure": failure,
+            **extra,
+        }
+    )
+
+
+def _decision_source(interpretation, manual: bool, failure: str | None) -> str:
+    """How the decision was arrived at, which is not a single boolean.
+
+    Three cases, and flattening them misreports the evidence: a reading the
+    reviewer accepted, a reading they refused and replaced, and a decision they
+    entered because no reading existed. Only the middle one is an override —
+    calling the third an override invents a model opinion that was never given.
+    """
+    if failure is not None or interpretation is None:
+        return "manual_after_failure"
+    return "model_overruled" if manual else "model_accepted"
+
+
+def _displayed_context(summary, check, spec, interview, check_id: str) -> dict[str, object]:
+    """Everything the reviewer had in front of them when they answered.
+
+    The prompt lines alone were not it. The terminal also showed the check's
+    own wording, the operator and expected value being asserted, the evidence
+    kind, the agreement and error counts, the gameability findings, the blind
+    spots and every earlier decision on this check. All of it is input to a
+    human judgement, so a record that kept only part of it cannot explain the
+    answer that came back.
+
+    A structured snapshot rather than the rendered text: the console output is
+    styled for a terminal, and re-reading markup is not the same as reading
+    what it said.
+    """
+    return {
+        "prompt_lines": list(summary.prompt_lines()),
+        "check": {
+            "check_id": check.check_id,
+            "claim": check.claim,
+            "description": check.description,
+            "operator": getattr(check, "operator", None),
+            "expected": getattr(check, "expected", None),
+        },
+        "verifier_id": spec.verifier_id,
+        "scored": {
+            "passed": summary.passed,
+            "failed": summary.failed,
+            "unscorable": summary.unscorable,
+            "example_trace_ids": list(summary.example_trace_ids),
+            "evidence_kind": str(summary.evidence_kind),
+        },
+        "agreements": [
+            {
+                "split": a.split,
+                "agreement": a.agreement,
+                "labeled": a.labeled,
+                "scored": a.scored,
+                "false_positives": a.false_positives,
+                "false_negatives": a.false_negatives,
+                "coverage": a.coverage,
+            }
+            for a in summary.agreements
+        ],
+        "gameability": [
+            {"hypothesis": g.hypothesis, "passed": g.passed, "forged_facts": g.forged_facts}
+            for g in summary.gameability
+        ],
+        "blind_spots": list(summary.blind_spots),
+        "prior_decisions": list(prior_decisions(interview, check_id)),
+    }
+
+
 def _show_check_summary(summary, check, spec) -> None:
     console.print(f"\n[bold]{check.claim}[/bold]  [dim]{check.check_id}[/dim]")
     console.print(f"  {check.description}")
@@ -1666,8 +1785,31 @@ def interview_review_command(
                 # below rather than carried over.
                 manual = decision is not None
 
+        # Every exit below records an outcome. A reviewer who stopped, or whose
+        # answer could not be applied, interacted with the system just as much
+        # as one whose decision landed; a record that kept only the successes
+        # would overstate how much of the review actually concluded. Bound
+        # explicitly rather than closed over, so the record cannot drift from
+        # the iteration that produced it.
+        turn = functools.partial(
+            _record_turn,
+            verifier_id=verifier_id,
+            check_id=check_id,
+            round_number=interview.round_number,
+            shown_at=shown_at,
+            answered_seconds=answered_seconds,
+            shown=_displayed_context(summary, check, spec, interview, check_id),
+            reply=reply,
+            authoritative=authoritative,
+            authoritative_why=why,
+            interpretation=interpretation,
+            manual=manual,
+            failure=failure,
+        )
+
         if decision is None:
             console.print("[yellow]stopped[/yellow] — nothing applied for this check")
+            turn("stopped", applied_decision=None)
             break
 
         # What the model proposed, kept whether or not it was followed: an
@@ -1683,6 +1825,7 @@ def interview_review_command(
 
         if decision is InterviewDecision.COMBINE and (applied is None or not applied.combine_with):
             console.print("  [yellow]no resolved target to combine with[/yellow]; skipped")
+            turn("skipped_invalid_combine", applied_decision=decision.value)
             continue
 
         if decision is InterviewDecision.REVISE and (
@@ -1693,6 +1836,7 @@ def interview_review_command(
             # interpretation on hand names nothing to revise, and applying it
             # would strip the check's evidence without changing the check.
             console.print("  [yellow]nothing named to revise[/yellow]; skipped")
+            turn("skipped_empty_revision", applied_decision=decision.value)
             continue
 
         review = CheckReview(
@@ -1726,30 +1870,12 @@ def interview_review_command(
         # artifact the answer produced. The pieces exist scattered across the
         # draft, the interpretation and the interview; what was missing is the
         # order they happened in and whether the human agreed.
-        ledger.record(
-            {
-                "event_type": "interview_turn",
-                "verifier_id": verifier_id,
-                "check_id": check_id,
-                "round_number": interview.round_number,
-                "shown_at": shown_at,
-                "answered_seconds": answered_seconds,
-                "shown": summary.prompt_lines(),
-                "reply": reply,
-                "authoritative": authoritative,
-                "authoritative_why": why,
-                "proposed_decision": proposed.decision.value if proposed else None,
-                "proposed_rationale": proposed.rationale if proposed else None,
-                "applied_decision": decision.value,
-                # The distinction the record exists for: a decision the model
-                # proposed and the reviewer accepted is not the same evidence as
-                # one the reviewer had to enter after refusing it.
-                "overruled": manual,
-                "failure": failure,
-                "review_id": review.review_id,
-                "input_artifact_id": previous_interview_id,
-                "output_artifact_id": envelope.artifact_id,
-            }
+        turn(
+            "applied",
+            applied_decision=decision.value,
+            review_id=review.review_id,
+            input_artifact_id=previous_interview_id,
+            output_artifact_id=envelope.artifact_id,
         )
 
     console.print(f"\ninterview_id: {envelope.artifact_id}")

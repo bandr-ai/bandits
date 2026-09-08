@@ -261,7 +261,9 @@ def test_eval_exports_every_prompt_safe_case_with_full_lineage(export_case) -> N
     assert all(row.grader["status"] == "reviewed" for row in bundle.rows)
 
 
-def test_sft_requires_success_and_imitation_quality_without_hiding_distinct_ids(export_case) -> None:
+def test_sft_requires_success_and_imitation_quality_without_hiding_distinct_ids(
+    export_case,
+) -> None:
     corpus, analysis, task_set, task_set_id, _, _, reviewed = export_case
     reviewed_id = compute_reviewed_verifier_id(reviewed)
 

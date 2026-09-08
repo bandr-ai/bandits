@@ -26,7 +26,7 @@ from bandits.verify.models import (
     VerifierSpec,
 )
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 TEMPERATURE = 0.0
 """Deterministic: the same reply and evidence should read the same way twice."""
 
