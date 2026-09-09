@@ -125,7 +125,11 @@ def main() -> int:
     )
     parser.add_argument("--corpus", default=None, help="Defaults to the newest corpus.")
     parser.add_argument(
-        "--lineages", type=int, default=3, help="Task lineages to sample (all trials of each)."
+        "--lineages",
+        type=int,
+        default=1,
+        help="Task lineages to sample (all trials of each). One answers whether a "
+        "contract comes out at all; raise it to judge the taxonomy.",
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -230,7 +234,23 @@ def main() -> int:
         priced,
         "" if priced else "--max-usd cannot be enforced against this backend",
     )
-    print(f"  contracts: {[(c.contract_id, c.name) for c in draft.contracts]}")
+    for contract in draft.contracts:
+        print(f"\n  [kept] {contract.contract_id}  {contract.name}")
+        print(f"    definition: {contract.definition}")
+        for line in contract.required_outcome_shape:
+            print(f"    outcome:    {line}")
+
+    # Printed, not just stored. A contract the parser refused is the most
+    # informative thing a failed run produces — it says what the model actually
+    # proposed — and having to open the artifact to read it is how three runs
+    # went by without anyone seeing the real output.
+    rejected = [raw for chunk in draft.chunks for raw in chunk.dropped_contracts]
+    if rejected:
+        print(f"\n  {len(rejected)} contract(s) the parser refused:")
+        for raw in rejected[:6]:
+            print(f"    {raw[:220]}")
+        if len(rejected) > 6:
+            print(f"    … {len(rejected) - 6} more (all kept in the saved draft)")
     print(
         f"  stop_reason: {draft.stop_reason.value} "
         f"(passes {draft.completed_passes}/{draft.requested_passes})"
