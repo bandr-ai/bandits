@@ -579,6 +579,7 @@ def mine_taxonomy(
     budget: Budget | None = None,
     on_chunk: Callable[[ChunkResult], None] | None = None,
     session: Any = None,
+    resume: Any = None,
 ) -> TaxonomyDraft:
     """Read the corpus through complete passes, then pause for review.
 
@@ -596,6 +597,24 @@ def mine_taxonomy(
     budget = budget or Budget()
     state = _TaxonomyState()
 
+    # A resumed run starts from the workspace the crash left rather than from
+    # nothing. Restoring the taxonomy and the placements is most of it; the rest
+    # is knowing which pass was in flight, which traces it had already read, and
+    # the order it was reading them in — without that last one a resume would
+    # reshuffle, reread some traces and never reach others.
+    resume_pass = 0
+    resume_seen: set[str] = set()
+    resume_order: tuple[str, ...] = ()
+    if resume is not None:
+        state.contracts = {c.contract_id: c for c in resume.contracts}
+        state.assignments = dict(resume.assignments)
+        state.ambiguous = set(resume.ambiguous_trace_ids)
+        state.uncovered = set(resume.uncovered_trace_ids)
+        state.seen = set(resume.assignments) | state.ambiguous | state.uncovered
+        resume_pass = resume.pass_index
+        resume_seen = set(resume.seen_this_pass)
+        resume_order = resume.pass_order
+
     eligible = list(corpus.readable_trace_ids())
     unreadable = corpus.unreadable_trace_ids()
     if not eligible:
@@ -611,20 +630,25 @@ def mine_taxonomy(
     cost_reported = False
     started = time.monotonic()
     stop_reason: StopReason | None = None
-    completed_passes = 0
+    completed_passes = resume.completed_passes if resume is not None else 0
 
     if session is not None:
         session.begin(
             traces_total=len(eligible), requested_passes=budget.passes, seed=seed
         )
 
-    for pass_index in range(budget.passes):
+    for pass_index in range(resume_pass, budget.passes):
         # Reshuffled per pass with a seed derived from the run's, so each pass
         # reads the corpus in a different order — chunk composition cannot
         # become family structure — while staying reproducible from the draft.
         pass_seed = seed + pass_index
-        order = list(eligible)
-        random.Random(pass_seed).shuffle(order)
+        if pass_index == resume_pass and resume_order:
+            # The order the interrupted pass was working through, so what it had
+            # already read stays read and what it had not is what gets finished.
+            order = [tid for tid in resume_order if tid in set(eligible)]
+        else:
+            order = list(eligible)
+            random.Random(pass_seed).shuffle(order)
 
         previous_placement = dict(state.assignments)
         contracts_before = tuple(sorted(state.contracts))
@@ -634,7 +658,7 @@ def mine_taxonomy(
         # tracked traces seen across the whole run, so once every trace had been
         # read once the "have we swept" test was permanently true and two quiet
         # chunks could end the run.
-        seen_this_pass: set[str] = set()
+        seen_this_pass: set[str] = set(resume_seen) if pass_index == resume_pass else set()
         pass_complete = True
 
         failed_this_pass: set[str] = set()
