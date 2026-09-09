@@ -2,7 +2,7 @@
 
 The discovery loop argues itself into a taxonomy, and the reasoning that
 produced a family is exactly the reasoning least able to see what is wrong with
-it. So the audit runs in a fresh context holding only the contracts and their
+it. So the audit runs in a fresh context holding the contract, its siblings, and their
 members: it did not see the chunk that motivated a split, so it cannot inherit
 the assumption behind it.
 
@@ -38,14 +38,16 @@ from bandits.analyze.rlm_models import (
 from bandits.store import DerivedEnvelope, DerivedStore
 
 DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 
 _INSTRUCTION_HEAD = """You are auditing one proposed task-family contract by trying to \
 break it. Be adversarial: your job is to find what is wrong with it, not to agree.
 
 {view}
 
-The variable `contract` is the proposed family. The variable `members` lists the \
+The variable `contract` is the proposed family. The variable `sibling_contracts` \
+lists every other proposed contract, so you can detect an unnecessarily split \
+boundary. The variable `members` lists the \
 traces it claims, each with trace_id and messages. The variable `outsiders` lists \
 traces it does not claim, in the same shape.
 
@@ -61,10 +63,14 @@ two members.
 Null if none is close.
 - topical_only: true if the members share a subject but would need materially \
 different verifiers. This is the failure you are most looking for.
-- recommendation: "keep", "revise", "split", or "uncertain".
+- recommendation: "keep", "revise", "split", "merge", or "uncertain".
+- merge_with_contract_id: for "merge", the sibling contract_id whose requested \
+work and required outcome can use the same parameterized verifier; otherwise null.
 - rationale: two or three sentences on what decided it.
 
-Prefer split over keep when in doubt. Never recommend merging two contracts."""
+Prefer split over keep when in doubt. Recommend merge only when the two contracts \
+can genuinely share one verifier contract, not merely because their topics overlap. \
+Recommendations are advisory; never rewrite or combine contracts yourself."""
 
 
 def instruction_for(view: TraceView) -> str:
@@ -92,7 +98,9 @@ class FreezeRefused(RuntimeError):
 
 
 class _Predictor(Protocol):
-    def __call__(self, *, contract: str, members: str, outsiders: str, question: str) -> Any: ...
+    def __call__(
+        self, *, contract: str, sibling_contracts: str, members: str, outsiders: str, question: str
+    ) -> Any: ...
 
 
 def prompt_digest(model: str) -> str:
@@ -112,6 +120,7 @@ def build_predictor(
     *,
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
+    view: TraceView = TraceView.USER_MESSAGES,
     max_iterations: int = 12,
     max_llm_calls: int = 30,
 ) -> _Predictor:
@@ -128,18 +137,41 @@ def build_predictor(
 
     key = api_key or resolve_api_key()
     language_model = dspy.LM(f"fireworks_ai/{model}", api_key=key, temperature=0.0)
-    signature = (
-        "contract: str, members: str, outsiders: str, question: str -> "
-        "recommendation: str, least_compatible_pair: list[str], "
-        "strongest_outsider_trace_id: str, topical_only: bool, rationale: str"
-    )
+    # Instructions on the signature, not in an input field: an input field
+    # becomes a REPL variable and is shown as a 1000-character peek, which is
+    # how the mining prompt's schema went unread. See rlm_mine.instruction_for.
+    class _Audit(dspy.Signature):
+        contract: str = dspy.InputField(desc="the family under attack")
+        sibling_contracts: str = dspy.InputField(desc="every other proposed contract")
+        members: str = dspy.InputField(desc="traces this contract claims")
+        outsiders: str = dspy.InputField(desc="traces it does not claim")
+        recommendation: str = dspy.OutputField()
+        least_compatible_pair: list[str] = dspy.OutputField()
+        strongest_outsider_trace_id: str = dspy.OutputField()
+        merge_with_contract_id: str = dspy.OutputField()
+        topical_only: bool = dspy.OutputField()
+        rationale: str = dspy.OutputField()
+
+    _Audit.__doc__ = instruction_for(view)
     rlm = dspy.RLM(
-        signature, max_iters=max_iterations, max_llm_calls=max_llm_calls, sub_lm=language_model
+        _Audit, max_iters=max_iterations, max_llm_calls=max_llm_calls, sub_lm=language_model
     )
 
-    def predict(*, contract: str, members: str, outsiders: str, question: str) -> Any:
+    def predict(
+        *,
+        contract: str,
+        sibling_contracts: str,
+        members: str,
+        outsiders: str,
+        question: str = "",
+    ) -> Any:
         with dspy.context(lm=language_model):
-            return rlm(contract=contract, members=members, outsiders=outsiders, question=question)
+            return rlm(
+                contract=contract,
+                sibling_contracts=sibling_contracts,
+                members=members,
+                outsiders=outsiders,
+            )
 
     return scoped_to_history(predict, language_model)
 
@@ -173,6 +205,7 @@ def _raw_reply(prediction: Any) -> str:
         "recommendation",
         "least_compatible_pair",
         "strongest_outsider_trace_id",
+        "merge_with_contract_id",
         "topical_only",
         "rationale",
     )
@@ -184,6 +217,61 @@ def _raw_reply(prediction: Any) -> str:
         )
     except (TypeError, ValueError):
         return str(prediction)
+
+
+_PEEK_LIMIT = 1000
+"""What ``REPLVariable.from_value`` shows of a variable before eliding its middle."""
+
+def _compact_siblings(contracts: tuple[FamilyContract, ...]) -> str:
+    """Sibling contracts, trimmed to what a merge judgement actually needs.
+
+    Compact because this is a REPL variable, and anything past a thousand
+    characters is shown to the root model as a peek: the first five hundred
+    characters, an ellipsis, then the last five hundred. Six contracts dumped in
+    full serialize to roughly twice that, so a model reading only the peek would
+    see some ids and not others — and could name a merge target it had never
+    been shown, or miss the one that mattered.
+
+    Identity, the claim, and the outcome. The rules and the evidence are what a
+    reviewer reads; they are not what decides whether one verifier covers two
+    contracts.
+    """
+    if not contracts:
+        return "[]"
+
+    # Measured rather than estimated. A per-row character budget guessed from
+    # the key names was still overflowing on long definitions, and an overflow
+    # here is not cosmetic: past the peek the root model sees an elided middle
+    # and can name a merge target it was never shown. So the text is trimmed
+    # until the serialized result actually fits.
+    def render(budget: int) -> str:
+        def clip(text: str) -> str:
+            flat = " ".join(text.split())
+            return flat if len(flat) <= budget else flat[: max(budget - 1, 1)] + "…"
+
+        return json.dumps(
+            [
+                {
+                    "contract_id": item.contract_id,
+                    "name": clip(item.name),
+                    "definition": clip(item.definition),
+                    "required_outcome_shape": [clip(line) for line in item.required_outcome_shape[:1]],
+                }
+                for item in contracts
+            ],
+            separators=(",", ":"),
+            default=str,
+        )
+
+    for budget in (160, 110, 70, 45, 25, 12):
+        rendered = render(budget)
+        if len(rendered) <= _PEEK_LIMIT:
+            return rendered
+    # Nothing fits: ids alone still answer "is this target real", which is the
+    # one question a merge recommendation has to be checked against.
+    return json.dumps(
+        [{"contract_id": item.contract_id} for item in contracts], separators=(",", ":")
+    )
 
 
 def _clean_pair(raw: Any, members: set[str]) -> tuple[str, str] | None:
@@ -202,18 +290,20 @@ def audit_contract(
     *,
     members: tuple[str, ...],
     outsiders: tuple[str, ...],
+    sibling_contracts: tuple[FamilyContract, ...],
     predict: _Predictor,
 ) -> AuditFinding:
     """Challenge one contract and report what the attack found."""
     prediction = predict(
         contract=contract.model_dump_json(indent=2),
+        sibling_contracts=_compact_siblings(sibling_contracts),
         members=_rows(corpus, members),
         outsiders=_rows(corpus, outsiders),
         question=instruction_for(corpus.view),
     )
 
     raw_recommendation = str(getattr(prediction, "recommendation", "") or "").strip().lower()
-    if raw_recommendation not in ("keep", "revise", "split", "uncertain"):
+    if raw_recommendation not in ("keep", "revise", "split", "merge", "uncertain"):
         # An unreadable recommendation becomes "uncertain", never "keep". A
         # parse failure that defaulted to keep would silently clear the freeze
         # gate, which is the one outcome an audit must never produce by accident.
@@ -221,6 +311,11 @@ def audit_contract(
 
     raw_reply = _raw_reply(prediction)
     outsider = str(getattr(prediction, "strongest_outsider_trace_id", "") or "").strip()
+    merge_with = str(getattr(prediction, "merge_with_contract_id", "") or "").strip()
+    sibling_ids = {item.contract_id for item in sibling_contracts}
+    if raw_recommendation == "merge" and merge_with not in sibling_ids:
+        raw_recommendation = "uncertain"
+        merge_with = ""
     rationale = str(getattr(prediction, "rationale", "") or "").strip()
     return AuditFinding(
         contract_id=contract.contract_id,
@@ -229,6 +324,7 @@ def audit_contract(
             getattr(prediction, "least_compatible_pair", None), set(members)
         ),
         strongest_outsider_trace_id=outsider if outsider in set(outsiders) else None,
+        merge_with_contract_id=merge_with or None,
         topical_only=bool(getattr(prediction, "topical_only", False)),
         rationale=rationale or "the auditor returned no rationale",
         raw_reply=raw_reply,
@@ -270,6 +366,11 @@ def audit_taxonomy(
                         corpus,
                         members=members,
                         outsiders=outsiders,
+                        sibling_contracts=tuple(
+                            sibling
+                            for sibling in draft.contracts
+                            if sibling.contract_id != contract.contract_id
+                        ),
                         predict=predict,
                     )
                 )
@@ -283,6 +384,7 @@ def audit_taxonomy(
             )
             limitations.append(f"the audit of {contract.contract_id} failed: {exc}")
 
+    findings = _normalize_reciprocal_merges(findings)
     if findings:
         limitations.append(
             "audit output is advisory and uncalibrated: it never edits a contract, and "
@@ -295,6 +397,45 @@ def audit_taxonomy(
         prompt_digest=prompt_digest(model),
         limitations=tuple(dict.fromkeys(limitations)),
     )
+
+
+def _normalize_reciprocal_merges(findings: list[AuditFinding]) -> list[AuditFinding]:
+    """Collapse a mutual merge proposal into one.
+
+    Two contracts that each nominate the other are one proposal about the pair,
+    not two independent findings. Left as two, a reviewer sees the same merge
+    twice and the freeze gate counts it twice, so accepting it once would still
+    leave the taxonomy blocked by its own mirror image.
+
+    The finding on the lexically first contract is kept, because a stable choice
+    keeps the artifact reproducible; the other becomes an ordinary keep whose
+    rationale records where the proposal went.
+    """
+    proposals = {
+        f.contract_id: f.merge_with_contract_id
+        for f in findings
+        if f.recommendation == "merge" and f.merge_with_contract_id
+    }
+    superseded = {
+        other
+        for one, other in proposals.items()
+        if proposals.get(other) == one and other > one
+    }
+    if not superseded:
+        return findings
+    return [
+        f.replace(
+            recommendation="keep",
+            merge_with_contract_id=None,
+            rationale=(
+                f"{f.rationale} (this merge is recorded once, on "
+                f"{f.merge_with_contract_id})"
+            ),
+        )
+        if f.contract_id in superseded
+        else f
+        for f in findings
+    ]
 
 
 def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
@@ -369,8 +510,8 @@ def freeze_taxonomy(
         unresolved = audit.unresolved()
         if unresolved and not force:
             raise FreezeRefused(
-                f"{len(unresolved)} audit finding(s) recommend revising or splitting a "
-                f"contract and have not been resolved: "
+                f"{len(unresolved)} audit finding(s) recommend revising, splitting or "
+                f"merging a contract and have not been resolved: "
                 f"{', '.join(f.contract_id for f in unresolved)}"
             )
 
@@ -388,7 +529,7 @@ def freeze_taxonomy(
     elif audit.unresolved():
         limitations.append(
             f"frozen over {len(audit.unresolved())} unresolved audit finding(s) "
-            "recommending revision or a split"
+            "recommending a revision, a split or a merge"
         )
 
     return FrozenTaxonomy(

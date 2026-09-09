@@ -527,7 +527,9 @@ def _draft(**overrides):
 def test_audit_challenges_every_contract() -> None:
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "cancel")))
 
-    def predict(*, contract: str, members: str, outsiders: str, question: str):
+    def predict(
+        *, contract: str, sibling_contracts: str, members: str, outsiders: str, question: str
+    ):
         return SimpleNamespace(
             recommendation="split",
             least_compatible_pair=[],
@@ -540,6 +542,50 @@ def test_audit_challenges_every_contract() -> None:
     assert len(audit.findings) == 1
     assert audit.findings[0].topical_only
     assert audit.unresolved()
+
+
+def test_audit_can_recommend_a_merge_only_with_a_real_sibling() -> None:
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "return")))
+    draft = _draft(contracts=(_contract("c1"), _contract("c2")))
+
+    def predict(**kwargs):
+        import json
+
+        siblings = json.loads(kwargs["sibling_contracts"])
+        target = siblings[0]["contract_id"]
+        return SimpleNamespace(
+            recommendation="merge",
+            merge_with_contract_id=target,
+            rationale="both contracts require the same parameterized outcome",
+        )
+
+    audit = audit_taxonomy(draft, "draft-1", corpus, predict=predict)
+    # Both contracts nominate each other, which is one proposal about the pair.
+    # Recorded once, on the lexically first, so accepting it cannot leave the
+    # taxonomy blocked by the same merge's mirror image.
+    merges = [f for f in audit.findings if f.recommendation == "merge"]
+    assert [f.contract_id for f in merges] == ["c1"]
+    assert merges[0].merge_with_contract_id == "c2"
+    assert len(audit.unresolved()) == 1
+    superseded = next(f for f in audit.findings if f.contract_id == "c2")
+    assert superseded.recommendation == "keep"
+    assert "recorded once" in superseded.rationale
+
+
+def test_merge_recommendation_with_unknown_sibling_becomes_uncertain() -> None:
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    audit = audit_taxonomy(
+        _draft(),
+        "draft-1",
+        corpus,
+        predict=lambda **_: SimpleNamespace(
+            recommendation="merge",
+            merge_with_contract_id="invented",
+            rationale="looks similar",
+        ),
+    )
+    assert audit.findings[0].recommendation == "uncertain"
+    assert audit.findings[0].merge_with_contract_id is None
 
 
 def test_an_unparseable_recommendation_becomes_uncertain_never_keep() -> None:
@@ -2336,3 +2382,147 @@ def test_chunk_ledger_rows_name_their_pass_and_session(tmp_path, monkeypatch) ->
     assert calls
     assert all("pass_index" in r and "chunk_index" in r for r in calls)
     assert all(r.get("session_id") == "sess-led" for r in calls)
+
+
+# --- prompt visibility, typed output, repair --------------------------------
+
+
+def test_the_whole_prompt_reaches_the_model() -> None:
+    """The root cause of three empty runs: the schema sat in an elided middle.
+
+    An input field becomes a REPL variable and is shown as a 1000-character
+    peek. Signature instructions are interpolated into the prompt whole.
+    """
+    from bandits.analyze.rlm_mine import instruction_for
+
+    text = instruction_for(TraceView.USER_MESSAGES)
+    assert len(text) > 1000, "the regression only bites above the peek limit"
+    for required in ("required_outcome_shape", "Reset my password", "KEEP"):
+        assert required in text
+        # Everything load-bearing used to live past the first 500 characters.
+        assert required not in text[:500] or required == "KEEP"
+
+
+def test_a_topic_cannot_be_submitted_as_a_typed_contract() -> None:
+    """`list[dict]` accepted {name, description}; the typed model must not."""
+    from bandits.analyze.rlm_models import ProposedContract
+
+    with pytest.raises(ValidationError):
+        ProposedContract.model_validate({"name": "compensation", "description": "x"})
+    kept = ProposedContract.model_validate(
+        {"name": "n", "definition": "d", "required_outcome_shape": ["o"]}
+    )
+    assert kept.required_outcome_shape == ["o"]
+
+
+def test_a_typed_contract_tolerates_extra_keys() -> None:
+    """A stray field is still an answer; rejecting it would repeat the failure."""
+    from bandits.analyze.rlm_models import ProposedContract
+
+    kept = ProposedContract.model_validate(
+        {"name": "n", "definition": "d", "required_outcome_shape": ["o"], "notes": "x"}
+    )
+    assert kept.name == "n"
+
+
+def test_rejected_contracts_are_repaired_rather_than_dropped() -> None:
+    """The paid run's exact failure: topics returned, everything discarded."""
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        calls["n"] += 1
+        if "Rejected contracts" in question:
+            return SimpleNamespace(
+                contracts=[_RAW_CONTRACT],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        return SimpleNamespace(
+            contracts=[{"name": "topic", "description": "no outcome"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    assert any("corrected on a second attempt" in limit for limit in draft.limitations)
+
+
+def test_repair_is_attempted_at_most_once_per_chunk() -> None:
+    """An uncapped loop would spend a chunk's whole budget arguing with itself."""
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        calls["n"] += 1
+        return SimpleNamespace(
+            contracts=[{"name": "topic", "description": "still no outcome"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    assert draft.contracts == ()
+    # One chunk: the original call plus a single repair, and never a third
+    # however many times the model repeats the same invalid answer.
+    assert len(draft.chunks) == 1
+    assert calls["n"] == 2
+    assert any("the parser refused" in limit for limit in draft.limitations)
+
+
+def test_a_failing_repair_keeps_the_original_evidence() -> None:
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        if "Rejected contracts" in question:
+            raise RuntimeError("repair call failed")
+        return SimpleNamespace(
+            contracts=[{"name": "topic"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert any(chunk.dropped_contracts for chunk in draft.chunks)
+
+
+def test_a_non_merge_finding_may_not_name_a_merge_target() -> None:
+    from bandits.analyze.rlm_models import AuditFinding
+
+    with pytest.raises(ValidationError, match="without recommending a merge"):
+        AuditFinding(
+            contract_id="c1",
+            recommendation="keep",
+            merge_with_contract_id="c2",
+            rationale="x",
+        )
+    with pytest.raises(ValidationError, match="cannot merge with itself"):
+        AuditFinding(
+            contract_id="c1",
+            recommendation="merge",
+            merge_with_contract_id="c1",
+            rationale="x",
+        )
+
+
+def test_sibling_contracts_stay_inside_the_peek_limit() -> None:
+    """Past 1000 characters the model sees a peek and can name an id it never saw."""
+    from bandits.analyze.rlm_audit import _compact_siblings
+
+    siblings = tuple(
+        _contract(f"c{i}", f"definition number {i} " + "x" * 60) for i in range(6)
+    )
+    compact = _compact_siblings(siblings)
+    assert len(compact) < 1000, len(compact)
+    for i in range(6):
+        assert f"c{i}" in compact

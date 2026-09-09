@@ -2331,11 +2331,13 @@ def audit_rlm_taxonomy_command(
             console.print(
                 f"    [dim]strongest outsider: {finding.strongest_outsider_trace_id}[/dim]"
             )
+        if finding.merge_with_contract_id:
+            console.print(f"    [dim]merge with: {finding.merge_with_contract_id}[/dim]")
 
     unresolved = audit.unresolved()
     if unresolved:
         console.print(
-            f"\n[yellow]{len(unresolved)} finding(s) recommend revising or splitting a "
+            f"\n[yellow]{len(unresolved)} finding(s) recommend revising, splitting, or merging a "
             "contract and are unresolved[/yellow]"
         )
     if not freeze:

@@ -141,7 +141,11 @@ Use a fresh RLM context to challenge every provisional contract:
 - Identify differences in requested work and required outcomes.
 - Find the strongest apparent member currently outside it.
 - Detect topical groupings whose members require different verifiers.
-- Recommend keep, revise, split, or uncertain.
+- Compare against the sibling contracts for boundaries that were split too narrowly.
+- Recommend keep, revise, split, merge (with a target contract ID), or uncertain.
+
+Audit recommendations are advisory. A merge is applied only by discovery or a
+reviewer, after which the changed contracts must be audited again.
 
 The discovery RLM must explicitly resolve or preserve every audit finding.
 

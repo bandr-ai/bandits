@@ -99,6 +99,7 @@ def build_predictor(
     *,
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
+    view: TraceView = TraceView.USER_MESSAGES,
     max_iterations: int = 12,
     max_llm_calls: int = 30,
 ) -> _Predictor:
@@ -115,16 +116,24 @@ def build_predictor(
 
     key = api_key or resolve_api_key()
     language_model = dspy.LM(f"fireworks_ai/{model}", api_key=key, temperature=0.0)
+    # Instructions on the signature rather than in an input field, so the whole
+    # prompt reaches the root model. See rlm_mine.instruction_for for why.
+    class _Assign(dspy.Signature):
+        taxonomy: str = dspy.InputField(desc="the fixed contracts to classify against")
+        batch: str = dspy.InputField(desc="the traces to classify")
+        results: list[dict] = dspy.OutputField()
+
+    _Assign.__doc__ = instruction_for(view)
     rlm = dspy.RLM(
-        "taxonomy: str, batch: str, question: str -> results: list[dict]",
+        _Assign,
         max_iters=max_iterations,
         max_llm_calls=max_llm_calls,
         sub_lm=language_model,
     )
 
-    def predict(*, taxonomy: str, batch: str, question: str) -> Any:
+    def predict(*, taxonomy: str, batch: str, question: str = "") -> Any:
         with dspy.context(lm=language_model):
-            return rlm(taxonomy=taxonomy, batch=batch, question=question)
+            return rlm(taxonomy=taxonomy, batch=batch)
 
     return scoped_to_history(predict, language_model)
 
