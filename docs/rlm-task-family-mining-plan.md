@@ -144,8 +144,11 @@ Use a fresh RLM context to challenge every provisional contract:
 - Compare against the sibling contracts for boundaries that were split too narrowly.
 - Recommend keep, revise, split, merge (with a target contract ID), or uncertain.
 
-Audit recommendations are advisory. A merge is applied only by discovery or a
-reviewer, after which the changed contracts must be audited again.
+Audit recommendations are advisory and nothing applies them. Discovery may carry
+out a MERGE during a later pass; there is no reviewer command that applies an
+audit's merge recommendation, and no re-audit of a merged contract, so a merge
+finding is discharged today by resolving it or by freezing over it. Both remain
+Phase C work.
 
 The discovery RLM must explicitly resolve or preserve every audit finding.
 

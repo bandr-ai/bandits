@@ -314,7 +314,13 @@ def audit_contract(
     merge_with = str(getattr(prediction, "merge_with_contract_id", "") or "").strip()
     sibling_ids = {item.contract_id for item in sibling_contracts}
     if raw_recommendation == "merge" and merge_with not in sibling_ids:
+        # A target that names nothing real cannot be acted on, and downgrading
+        # is safer than dropping the field and keeping the recommendation.
         raw_recommendation = "uncertain"
+        merge_with = ""
+    elif raw_recommendation != "merge":
+        # A target on a keep or a split is a contradiction the contract rejects
+        # outright, which would lose the whole finding over a stray field.
         merge_with = ""
     rationale = str(getattr(prediction, "rationale", "") or "").strip()
     return AuditFinding(
