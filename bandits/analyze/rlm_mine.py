@@ -306,8 +306,68 @@ def _rows(value: Any) -> list[Any]:
     return []
 
 
+def _raw_reply(prediction: Any) -> str:
+    """Everything the backend returned, serialized for a human to read.
+
+    Best effort and truncated: this exists to make a failed run diagnosable
+    without paying for another one, so an unserializable reply costs the record
+    rather than the chunk.
+    """
+    fields = (
+        "contracts",
+        "operations",
+        "assignments",
+        "ambiguous_trace_ids",
+        "uncovered_trace_ids",
+    )
+    try:
+        return json.dumps(
+            {name: getattr(prediction, name, None) for name in fields},
+            indent=2,
+            default=str,
+        )[:20000]
+    except (TypeError, ValueError):
+        return str(prediction)[:20000]
+
+
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _field(raw: dict, *names: str) -> Any:
+    """The first of several spellings a model might use for one field.
+
+    A model writes these keys, and it does not read the schema as strictly as
+    the schema is checked. Asked for ``required_outcome_shape`` it may return
+    ``required_outcome``, ``outcome_shape``, or the camelCase form, and asked
+    for ``definition`` it may write ``description``. Every one of those is the
+    field that was asked for, and rejecting the contract over the spelling
+    discards work the run already paid for.
+    """
+    for name in names:
+        if name in raw and raw[name] not in (None, "", [], {}):
+            return raw[name]
+    return None
+
+
+def _lines(raw: Any) -> tuple[str, ...]:
+    """A list of statements, however the model chose to express one.
+
+    A single statement arrives as a bare string far more often than as a list
+    of one — "the reservation is cancelled" rather than ``["..."]`` — and
+    treating that as absent was rejecting well-formed contracts for their
+    punctuation.
+    """
+    decoded = _decoded(raw)
+    if isinstance(decoded, str):
+        text = decoded.strip()
+        return (text,) if text else ()
+    if isinstance(decoded, dict):
+        # e.g. {"outcome": "..."} — take the values, which are the statements.
+        return tuple(str(v).strip() for v in decoded.values() if str(v).strip())
+    if isinstance(decoded, (list, tuple)):
+        return tuple(str(item).strip() for item in decoded if str(item).strip())
+    return ()
 
 
 def _string_tuple(raw: Any, *, allowed: set[str] | None = None) -> tuple[str, ...]:
@@ -343,10 +403,24 @@ def _parse_contract(raw: Any, *, known_traces: set[str]) -> FamilyContract | Non
     """
     if not isinstance(raw, dict):
         return None
-    contract_id = _text(raw.get("contract_id")) or _text(raw.get("id"))
-    name = _text(raw.get("name"))
-    definition = _text(raw.get("definition"))
-    outcome = _string_tuple(raw.get("required_outcome_shape"))
+    contract_id = _text(_field(raw, "contract_id", "id", "family_id"))
+    name = _text(_field(raw, "name", "family_name", "title"))
+    definition = _text(_field(raw, "definition", "description", "definition_text"))
+    outcome = _lines(
+        _field(
+            raw,
+            "required_outcome_shape",
+            "required_outcome",
+            "outcome_shape",
+            "requiredOutcomeShape",
+            "required_outcomes",
+            "outcome",
+        )
+    )
+    if not name and definition:
+        # A contract that argued its claim but skipped the label is worth more
+        # than its missing name; the definition's first clause stands in.
+        name = definition.split(".")[0][:60]
     if not (name and definition and outcome):
         return None
     if not contract_id:
@@ -354,16 +428,22 @@ def _parse_contract(raw: Any, *, known_traces: set[str]) -> FamilyContract | Non
         # contract proposed twice in one run lands on one id instead of two.
         contract_id = f"contract-{hashlib.sha256(definition.lower().encode()).hexdigest()[:12]}"
 
-    supporting = _string_tuple(raw.get("supporting_trace_ids"), allowed=known_traces)
-    counter = _string_tuple(raw.get("counterexample_trace_ids"), allowed=known_traces)
+    supporting = _string_tuple(
+        _field(raw, "supporting_trace_ids", "supporting_traces", "members", "trace_ids"),
+        allowed=known_traces,
+    )
+    counter = _string_tuple(
+        _field(raw, "counterexample_trace_ids", "counterexamples", "counterexample_traces"),
+        allowed=known_traces,
+    )
     revision = raw.get("revision")
     try:
         return FamilyContract(
             contract_id=contract_id,
             name=name,
             definition=definition,
-            inclusion_rules=_string_tuple(raw.get("inclusion_rules")),
-            exclusion_rules=_string_tuple(raw.get("exclusion_rules")),
+            inclusion_rules=_lines(_field(raw, "inclusion_rules", "includes", "inclusion")),
+            exclusion_rules=_lines(_field(raw, "exclusion_rules", "excludes", "exclusion")),
             required_outcome_shape=outcome,
             supporting_trace_ids=supporting,
             # A trace cannot both support and refute one contract; support wins
@@ -984,18 +1064,19 @@ def _run_chunk(
 
     known = set(corpus.list_trace_ids())
     raw_contracts = _rows(getattr(prediction, "contracts", ()))
-    contracts = [
-        contract
-        for contract in (
-            _parse_contract(raw, known_traces=known) for raw in raw_contracts
-        )
-        if contract is not None
-    ]
-    dropped = len(list(raw_contracts)) - len(contracts)
-    if dropped > 0:
+    contracts = []
+    dropped_contracts: list[str] = []
+    for raw in raw_contracts:
+        parsed = _parse_contract(raw, known_traces=known)
+        if parsed is None:
+            # Kept verbatim, because a count cannot say what was wrong with it.
+            dropped_contracts.append(json.dumps(raw, default=str)[:2000])
+        else:
+            contracts.append(parsed)
+    if dropped_contracts:
         limitations.append(
-            f"chunk {index} proposed {dropped} contract(s) with no definition or no "
-            "required outcome shape; they name topics rather than families and were dropped"
+            f"chunk {index} proposed {len(dropped_contracts)} contract(s) the parser "
+            "refused; see the chunk's dropped_contracts for exactly what was returned"
         )
 
     # Merged with what already exists so an assignment may name a contract from
@@ -1051,6 +1132,8 @@ def _run_chunk(
         tokens=tokens,
         cost_usd=cost,
         duration_seconds=duration,
+        raw_reply=_raw_reply(prediction),
+        dropped_contracts=tuple(dropped_contracts),
     )
 
 

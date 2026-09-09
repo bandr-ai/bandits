@@ -419,7 +419,10 @@ def test_contracts_with_no_outcome_shape_are_dropped_and_reported() -> None:
     )
     draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
     assert draft.contracts == ()
-    assert any("name topics rather than families" in limit for limit in draft.limitations)
+    assert any("the parser refused" in limit for limit in draft.limitations)
+    # The rejected contract is kept verbatim, so a failed run can be diagnosed
+    # without paying for another one.
+    assert any(chunk.dropped_contracts for chunk in draft.chunks)
 
 
 def test_hallucinated_trace_ids_are_dropped_rather_than_losing_the_chunk() -> None:
@@ -2185,3 +2188,43 @@ def test_assignment_survives_a_scalar_reply() -> None:
         _taxonomy(), "tax-1", corpus, predict=lambda **_: SimpleNamespace(results="1")
     )
     assert run.by_status(AssignmentStatus.UNCOVERED)[0].trace_id == "t1"
+
+
+def test_every_chunk_keeps_what_the_model_actually_returned() -> None:
+    """Two paid runs were lost guessing at why contracts were rejected."""
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [{"name": "Topic only"}]}]),
+        chunk_size=2,
+    )
+    chunk = draft.chunks[0]
+    assert "Topic only" in chunk.raw_reply
+    assert chunk.dropped_contracts
+    assert "Topic only" in chunk.dropped_contracts[0]
+
+
+def test_a_contract_is_kept_however_the_model_spells_its_fields() -> None:
+    """The real failure: 22 contracts proposed, all refused on field spelling."""
+    from bandits.analyze.rlm_mine import _parse_contract
+
+    for raw in (
+        {"name": "C", "definition": "cancel a reservation", "required_outcome_shape": "cancelled"},
+        {"name": "C", "definition": "cancel a reservation", "required_outcome": ["cancelled"]},
+        {"name": "C", "definition": "cancel a reservation", "outcome_shape": "cancelled"},
+        {"name": "C", "definition": "cancel a reservation", "requiredOutcomeShape": ["cancelled"]},
+        {"name": "C", "description": "cancel a reservation", "required_outcome_shape": ["x"]},
+        {"definition": "cancel a reservation for a user", "required_outcome_shape": ["x"]},
+    ):
+        assert _parse_contract(raw, known_traces=set()) is not None, raw
+
+
+def test_a_contract_with_nothing_to_verify_is_still_refused() -> None:
+    """Loosening the spelling must not admit a topic with no stated outcome."""
+    from bandits.analyze.rlm_mine import _parse_contract
+
+    assert _parse_contract({"name": "Refunds"}, known_traces=set()) is None
+    assert _parse_contract(
+        {"name": "Refunds", "definition": "refund things"}, known_traces=set()
+    ) is None
