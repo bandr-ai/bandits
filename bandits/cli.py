@@ -72,6 +72,7 @@ from bandits.analyze.rlm_audit import (
 from bandits.analyze.rlm_audit import (
     FreezeRefused,
     TaxonomyAuditError,
+    _draft_members,
     audit_taxonomy,
     freeze_taxonomy,
     load_taxonomy,
@@ -79,6 +80,9 @@ from bandits.analyze.rlm_audit import (
 )
 from bandits.analyze.rlm_audit import (
     build_predictor as build_taxonomy_audit_predictor,
+)
+from bandits.analyze.rlm_audit import (
+    load_audit as load_rlm_audit,
 )
 from bandits.analyze.rlm_audit import (
     save_audit as save_rlm_audit,
@@ -113,6 +117,12 @@ from bandits.analyze.rlm_models import (
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_stability import compare_runs, save_stability_report
 from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
+from bandits.analyze.rlm_view import (
+    family_card,
+    live_panel,
+    print_pass_history,
+    taxonomy_overview,
+)
 from bandits.export import (
     CompositionReport,
     Partition,
@@ -2219,12 +2229,15 @@ def mine_rlm_command(
             f"[yellow]incomplete:[/yellow]  stopped on {draft.stop_reason.value} "
             "before finishing its passes"
         )
-    for contract in draft.contracts:
-        console.print(f"  {contract.contract_id}  {contract.name}")
+    console.print("")
+    console.print(taxonomy_overview(draft.contracts, members=_draft_members(draft)))
     # What the second look changed. The question a reviewer has at a pause, and
     # one no total over the whole run answers.
-    for line in draft.pass_diff():
-        console.print(f"[dim]{line}[/dim]")
+    console.print("")
+    print_pass_history(draft, console)
+    console.print(
+        f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}[/dim]"
+    )
     _report_unresolved(
         len(draft.ambiguous_trace_ids),
         len(draft.uncovered_trace_ids),
@@ -2457,10 +2470,25 @@ def materialize_rlm_taskset_command(
 def rlm_session_command(
     session_id: str = typer.Argument(None, help="Omit to list every session."),
     events: int = typer.Option(0, "--events", help="Show the last N progress events."),
+    watch: bool = typer.Option(
+        False, "--watch", help="Redraw as the run progresses. Exits when it finishes."
+    ),
+    interval: float = typer.Option(1.0, "--interval", help="Seconds between redraws."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Inspect a mining session, including one still running."""
     store = SessionStore(project / ".bandits")
+    if watch:
+        if session_id is None:
+            # Watching means watching one run. Defaulting to the newest is what
+            # a person means by "watch it" right after starting a run.
+            latest = store.list()
+            if not latest:
+                console.print("[dim]no mining sessions[/dim]")
+                return
+            session_id = latest[0].session_id
+        _watch_session(store, session_id, interval)
+        return
     if session_id is None:
         sessions = store.list()
         if not sessions:
@@ -2513,3 +2541,106 @@ def rlm_session_command(
                 if k not in ("at", "event") and v not in ("", [], None)
             )
             console.print(f"[dim]{event.get('at', '')[:19]}  {name}  {detail}[/dim]")
+
+
+def _watch_session(store, session_id: str, interval: float) -> None:
+    """Redraw one session until it stops running.
+
+    Reads the session file rather than hooking into the run, so this works on a
+    run started in another terminal, in CI, or by someone else — and cannot
+    slow the run down or lose it if the viewer dies.
+    """
+    from rich.live import Live
+
+    try:
+        state = store.read(session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no session {session_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    with Live(console=console, refresh_per_second=4, screen=False) as live:
+        while True:
+            live.update(live_panel(state, recent=store.read_events(session_id, limit=6)))
+            if state.status != "running":
+                break
+            time.sleep(interval)
+            try:
+                state = store.read(session_id)
+            except (FileNotFoundError, ValueError):
+                # A read landing mid-write is expected: the writer replaces the
+                # file atomically, so the next poll gets a whole one.
+                continue
+
+    if state.status == "awaiting_review":
+        console.print(
+            "\n[green]paused for review.[/green] "
+            "[dim]families: bandits rlm-families <draft_id>[/dim]"
+        )
+
+
+@app.command(name="rlm-families")
+def rlm_families_command(
+    draft_id: str,
+    family: str = typer.Option(None, "--family", help="Show one family's card in full."),
+    audit_id: str = typer.Option(None, "--audit", help="Overlay an audit's verdicts."),
+    overview: bool = typer.Option(
+        False, "--overview", help="Table only, without the per-family cards."
+    ),
+    examples: int = typer.Option(4, "--examples", help="Member requests to show per family."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Read a mined taxonomy as reviewable family cards, not id lists."""
+    store = _derived(project)
+    try:
+        draft = load_draft(draft_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no draft {draft_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    audit = None
+    if audit_id:
+        try:
+            audit = load_rlm_audit(audit_id, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no audit {audit_id!r}")
+            raise typer.Exit(code=1) from exc
+
+    # Best effort: the cards are far more useful with the requests beside the
+    # ids, but a draft whose corpus has moved must still be readable.
+    corpus = None
+    try:
+        _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
+    except typer.Exit:
+        console.print("[dim]corpus unavailable; showing ids without requests[/dim]")
+
+    members = _draft_members(draft)
+    contracts = draft.contracts
+    if family is not None:
+        contracts = tuple(c for c in contracts if c.contract_id == family)
+        if not contracts:
+            console.print(f"[red]error:[/red] no family {family!r} in this draft")
+            raise typer.Exit(code=1)
+
+    console.print(taxonomy_overview(contracts, members=members, audit=audit))
+    if not overview:
+        for contract in contracts:
+            console.print("")
+            console.print(
+                family_card(
+                    contract,
+                    members=members.get(contract.contract_id, ()),
+                    corpus=corpus,
+                    audit=audit,
+                    max_examples=examples,
+                )
+            )
+
+    console.print("")
+    print_pass_history(draft, console)
+    _report_unresolved(
+        len(draft.ambiguous_trace_ids),
+        len(draft.uncovered_trace_ids),
+        len(draft.unreadable_trace_ids),
+    )
+    for limitation in draft.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")

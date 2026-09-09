@@ -1688,3 +1688,141 @@ def test_a_path_u_family_makes_no_behaviour_caveat() -> None:
     family = materialize_task_set(run, taxonomy, corpus_id="corpus-1").families[0]
     assert any("user-messages view" in limit for limit in family.limitations)
     assert not any("execution behaviour" in limit for limit in family.limitations)
+
+
+# --- viewing -----------------------------------------------------------------
+
+
+def _render(renderable) -> str:
+    from rich.console import Console
+
+    console = Console(width=100, record=True, file=open("/dev/null", "w"))
+    console.print(renderable)
+    return console.export_text()
+
+
+def test_a_family_card_shows_the_outcome_that_decides_membership() -> None:
+    """Two families with similar definitions differ here, so it cannot be buried."""
+    from bandits.analyze.rlm_view import family_card
+
+    contract = _contract("c1").replace(
+        inclusion_rules=("refund a damaged item",),
+        exclusion_rules=("ask whether a refund is allowed",),
+    )
+    text = _render(family_card(contract, members=("t1",)))
+    assert "Required outcome" in text
+    assert "the order is refunded" in text
+    assert "refund a damaged item" in text
+    assert "ask whether a refund is allowed" in text
+
+
+def test_a_family_card_shows_real_requests_beside_ids() -> None:
+    """An id list is unreviewable; the point is judging without the corpus open."""
+    from bandits.analyze.rlm_view import family_card
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "please refund order A-1001")))
+    text = _render(family_card(_contract("c1"), members=("t1",), corpus=corpus))
+    assert "please refund order A-1001" in text
+
+
+def test_a_card_renders_without_a_corpus() -> None:
+    from bandits.analyze.rlm_view import family_card
+
+    assert "t1" in _render(family_card(_contract("c1"), members=("t1",)))
+
+
+def test_a_card_surfaces_an_audit_verdict_and_topical_flag() -> None:
+    from bandits.analyze.rlm_models import AuditFinding
+    from bandits.analyze.rlm_view import family_card
+
+    audit = TaxonomyAudit(
+        draft_id="d1",
+        findings=(
+            AuditFinding(
+                contract_id="c1",
+                recommendation="split",
+                topical_only=True,
+                rationale="members share a topic but need different verifiers",
+                least_compatible_pair=("t1", "t2"),
+            ),
+        ),
+        model="m",
+        prompt_digest="d",
+    )
+    text = _render(family_card(_contract("c1"), members=("t1", "t2"), audit=audit))
+    assert "split" in text
+    assert "topical grouping" in text
+    assert "t1 vs t2" in text
+
+
+def test_the_overview_orders_by_size_and_shows_verdicts() -> None:
+    from bandits.analyze.rlm_view import taxonomy_overview
+
+    contracts = (_contract("c-small"), _contract("c-big", "cancel an order"))
+    members = {"c-small": ("t1",), "c-big": ("t2", "t3", "t4")}
+    text = _render(taxonomy_overview(contracts, members=members))
+    assert text.index("c-big") < text.index("c-small")
+
+
+def test_the_live_panel_shows_progress_within_an_unfinished_pass() -> None:
+    """The question while watching is how far through it is, not just that it runs."""
+    from bandits.analyze.rlm_session import SessionState
+    from bandits.analyze.rlm_view import live_panel
+
+    state = SessionState(
+        session_id="s1",
+        analysis_id="a1",
+        view=TraceView.USER_MESSAGES,
+        model="m",
+        seed=42,
+        requested_passes=2,
+        traces_total=24,
+        traces_seen_this_pass=12,
+        chunk_index=3,
+        llm_calls=6,
+        cost_usd=0.0027,
+        contracts=(_contract("c1"),),
+        assignments={"t1": "c1"},
+    )
+    text = _render(live_panel(state))
+    assert "12/24" in text
+    assert "pass" in text and "1 of 2" in text
+    assert "$0.0027" in text
+    assert "Refund an order" in text
+
+
+def test_the_live_panel_says_when_a_run_died() -> None:
+    from bandits.analyze.rlm_session import SessionState
+    from bandits.analyze.rlm_view import live_panel
+
+    state = SessionState(
+        session_id="s1",
+        analysis_id="a1",
+        view=TraceView.USER_MESSAGES,
+        model="m",
+        seed=1,
+        requested_passes=2,
+        status="failed",
+        last_error="provider down",
+    )
+    text = _render(live_panel(state))
+    assert "failed" in text
+    assert "provider down" in text
+
+
+def test_pass_history_marks_a_partial_pass() -> None:
+    from rich.console import Console
+
+    from bandits.analyze.rlm_view import print_pass_history
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=5,
+        budget=Budget(max_iterations=2),
+    )
+    console = Console(width=100, record=True, file=open("/dev/null", "w"))
+    print_pass_history(draft, console)
+    assert "partial" in console.export_text()
