@@ -25,8 +25,9 @@ Exits non-zero when a check fails, so it can gate the real run.
 from __future__ import annotations
 
 import argparse
+import random
 import sys
-from datetime import UTC, datetime
+from pathlib import Path
 
 from bandits.analyze.rlm_assign import assign_traces
 from bandits.analyze.rlm_assign import build_predictor as build_assigner
@@ -42,54 +43,55 @@ from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_mine import build_predictor, mine_taxonomy
 from bandits.analyze.rlm_models import AssignmentStatus, Budget, TraceView
 from bandits.analyze.rlm_taskset import materialize_task_set
-from bandits.traces import Span, SpanKind, Trace, TraceCorpus, UserTurn
-
-_MOMENT = datetime(2024, 1, 1, tzinfo=UTC)
-
-# Two families a competent reader cannot confuse, so a failure here is a failure
-# of the machinery rather than a hard judgement call. Both carry tool spans so
-# the full-trajectory arm has something to read, and both carry a planted score
-# so the redaction and leakage checks have something to catch.
-_REQUESTS = [
-    ("refund-1", "I want a refund for order A-1001, it arrived broken.", "refund"),
-    ("refund-2", "Please refund order B-2002. Wrong item shipped.", "refund"),
-    ("refund-3", "Can you give me my money back for order C-3003?", "refund"),
-    ("flight-1", "Book me a flight from SFO to Tokyo on the 3rd.", "book_flight"),
-    ("flight-2", "I need a one-way ticket to Berlin next Tuesday.", "book_flight"),
-    ("flight-3", "Reserve a seat on the morning flight to Delhi.", "book_flight"),
-]
+from bandits.store import ArtifactStore
 
 
-def _corpus() -> TraceCorpus:
-    traces = []
-    for trace_id, message, tool in _REQUESTS:
-        traces.append(
-            Trace(
-                trace_id=trace_id,
-                source="chat-json",
-                source_digest="0" * 64,
-                task=message,
-                user_turns=(UserTurn(text=message),),
-                spans=(
-                    Span(
-                        span_id=f"{trace_id}:s1",
-                        kind=SpanKind.TOOL,
-                        name=tool,
-                        started_at=_MOMENT,
-                        ended_at=_MOMENT,
-                        arguments={"request": message},
-                        # The planted outcome. Redaction must remove it and the
-                        # leakage audit must confirm it never reached the miner.
-                        output={"confirmation": f"{trace_id}-ok", "score": 0.9931},
-                    ),
-                ),
-            )
-        )
-    return TraceCorpus(source="chat-json", traces=tuple(traces))
+def _load_corpus(project: Path, corpus_id: str | None, lineages: int, seed: int):
+    """A few real lineages from an ingested corpus, chosen reproducibly.
+
+    Real traces rather than invented ones, because the invented ones only ever
+    tested whether a model can tell "refund" from "book a flight" — which it
+    can, and which says nothing about the corpus this is meant to run on. Real
+    requests are long, mix several asks in one message, and carry the surface
+    detail that makes two superficially similar requests need different
+    verifiers. That is the case worth paying to test.
+
+    Sampled by *lineage*, never by trace: four trials of one task are near
+    duplicates, and a sample that split them would let the miner look good by
+    grouping copies of the same request.
+    """
+    store = ArtifactStore(project / ".bandits")
+    if corpus_id is None:
+        corpora = store.list()
+        if not corpora:
+            raise SystemExit(f"no ingested corpus under {project}/.bandits")
+        corpus_id = corpora[0].artifact_id
+    corpus = store.read(corpus_id)
+
+    by_lineage: dict[str, list] = {}
+    for trace in corpus.traces:
+        by_lineage.setdefault(trace.lineage_id or trace.trace_id, []).append(trace)
+
+    chosen = sorted(by_lineage)
+    random.Random(seed).shuffle(chosen)
+    chosen = chosen[:lineages]
+    traces = tuple(t for name in sorted(chosen) for t in by_lineage[name])
+    return corpus.replace(traces=traces), corpus_id, sorted(chosen)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=Path("work/tau/run/proj"),
+        help="Project holding an ingested corpus.",
+    )
+    parser.add_argument("--corpus", default=None, help="Defaults to the newest corpus.")
+    parser.add_argument(
+        "--lineages", type=int, default=3, help="Task lineages to sample (all trials of each)."
+    )
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--view", default=TraceView.USER_MESSAGES.value)
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-usd", type=float, default=2.0)
@@ -97,11 +99,19 @@ def main() -> int:
     args = parser.parse_args()
 
     view = TraceView(args.view)
-    corpus_obj = _corpus()
     from bandits.analyze.analysis import analyze_corpus
 
+    corpus_obj, corpus_id, lineages = _load_corpus(
+        args.project, args.corpus, args.lineages, args.seed
+    )
     analysis = analyze_corpus(corpus_obj)
     corpus = ReadOnlyCorpus(corpus_obj, view=view)
+    print(f"\ncorpus: {corpus_id}")
+    print(f"  {len(corpus_obj.traces)} trace(s) from {len(lineages)} lineage(s): "
+          f"{', '.join(lineages)}")
+    for trace in corpus_obj.traces[:3]:
+        first = trace.user_turns[0].text if trace.user_turns else ""
+        print(f"  {trace.trace_id}: {' '.join(first.split())[:88]}")
 
     kwargs = {"model": args.model} if args.model else {}
     failures: list[str] = []
@@ -124,7 +134,9 @@ def main() -> int:
         predict=build_predictor(**kwargs),
         analysis=analysis,
         chunk_size=3,
-        budget=Budget(max_iterations=8, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd),
+        budget=Budget(
+            passes=2, max_iterations=20, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
+        ),
         on_chunk=lambda c: print(
             f"  chunk {c.index}: {len(c.trace_ids)} traces, {len(c.operations)} ops, "
             f"{c.llm_calls} calls, ${c.cost_usd if c.cost_usd is not None else 0:.4f}"
@@ -145,7 +157,10 @@ def main() -> int:
         "" if priced else "--max-usd cannot be enforced against this backend",
     )
     print(f"  contracts: {[(c.contract_id, c.name) for c in draft.contracts]}")
-    print(f"  stop_reason: {draft.stop_reason.value} (complete={draft.complete})")
+    print(
+        f"  stop_reason: {draft.stop_reason.value} "
+        f"(passes {draft.completed_passes}/{draft.requested_passes})"
+    )
 
     if not draft.contracts:
         print("\nno contracts: skipping the remaining stages")
@@ -174,14 +189,21 @@ def main() -> int:
     for contract_id, traces in run.members().items():
         print(f"  {contract_id}: {list(traces)}")
 
-    # The substantive check: refunds and flights are different families, and any
-    # taxonomy worth running the real experiment on must separate them.
-    refunds = {t for t, *_ in [(r[0],) for r in _REQUESTS] if t.startswith("refund")}
-    flights = {t for t in (r[0] for r in _REQUESTS) if t.startswith("flight")}
+    # The substantive check, and the one worth paying for: the four trials of a
+    # single task are the same request, so a taxonomy that scatters them across
+    # families is not finding tasks. This is the real corpus's own ground truth,
+    # and it is the only labelled signal used anywhere in this script.
     groups = [set(v) for v in run.members().values()]
+    split_lineages = []
+    for name in lineages:
+        trials = {t.trace_id for t in corpus_obj.traces if (t.lineage_id or t.trace_id) == name}
+        placed = [g & trials for g in groups if g & trials]
+        if len(placed) > 1:
+            split_lineages.append(f"{name} across {len(placed)} families")
     check(
-        "refunds and flights did not land in one family",
-        not any(g & refunds and g & flights for g in groups),
+        "trials of one task landed together",
+        not split_lineages,
+        "; ".join(split_lineages),
     )
 
     if assigned:
