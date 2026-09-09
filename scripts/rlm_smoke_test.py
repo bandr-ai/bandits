@@ -80,6 +80,36 @@ def _load_corpus(project: Path, corpus_id: str | None, lineages: int, seed: int)
     return corpus.replace(traces=traces), corpus_id, sorted(chosen)
 
 
+def _finalize(draft, args, recorder, derived_store) -> None:
+    """Persist the draft, close the session, and report spend and limitations.
+
+    Called before any early exit. A run that cost money and left nothing on disk
+    cannot be re-read, compared against another seed, or assigned against, and a
+    session left marked ``running`` reads as a run still in flight.
+    """
+
+    envelope = save_draft(draft, derived_store)
+    print(f"\n  draft saved: {envelope.artifact_id}")
+    print(
+        f"  read it: bandits rlm-families {envelope.artifact_id} --project {args.project}"
+    )
+    recorder.finish(
+        status="awaiting_review" if draft.complete else "incomplete",
+        stop_reason=draft.stop_reason.value,
+        draft_id=envelope.artifact_id,
+        completed_passes=draft.completed_passes,
+    )
+
+    spent = sum(c.cost_usd or 0.0 for c in draft.chunks)
+    calls = sum(c.llm_calls or 0 for c in draft.chunks)
+    print(f"  spent on discovery: ${spent:.4f} over {calls} call(s)")
+    # Printed before any exit, because these are what distinguish a taxonomy
+    # that came back empty because the model proposed nothing from one whose
+    # proposals were rejected for missing a definition or an outcome shape.
+    for limitation in draft.limitations:
+        print(f"  limitation: {limitation}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -133,6 +163,7 @@ def main() -> int:
     # terminal that has gone quiet. Without it the only sign of progress is a
     # line printed once a chunk finishes, which is a long silence when one chunk
     # is a dozen model calls.
+    derived_store = DerivedStore(args.project / ".bandits")
     session_store = SessionStore(args.project / ".bandits")
     recorder = SessionRecorder(
         session_store,
@@ -182,8 +213,15 @@ def main() -> int:
         f"(passes {draft.completed_passes}/{draft.requested_passes})"
     )
 
+    # Finalized here, above the no-contract exit rather than below it. The exact
+    # run this script exists to catch is the one that produces no contracts, and
+    # that run used to return before saving anything: no draft to re-read, a
+    # session still marked running, and the limitations that would say *why* it
+    # came back empty never printed. A failed run is the one most worth keeping.
+    _finalize(draft, args, recorder, derived_store)
+
     if not draft.contracts:
-        print("\nno contracts: skipping the remaining stages")
+        print("\nno contracts: the stages below need a taxonomy and were skipped")
         return 1
 
     print("\n== adversarial audit ==")
@@ -243,28 +281,6 @@ def main() -> int:
                                         if a.status is not AssignmentStatus.UNREADABLE]), 1),
             f"{task_set.workload_coverage:.1%}",
         )
-
-    # Persisted, not just printed. A run that cost real money and left nothing
-    # on disk cannot be re-read, compared against another seed, audited, or
-    # assigned against — every later stage takes a draft id, so throwing the
-    # draft away means paying again to get back where you already were.
-    derived = DerivedStore(args.project / ".bandits")
-    draft_envelope = save_draft(draft, derived)
-    print(f"\n  draft saved: {draft_envelope.artifact_id}")
-    print(
-        f"  read it: bandits rlm-families {draft_envelope.artifact_id} "
-        f"--project {args.project}"
-    )
-
-    recorder.finish(
-        status="awaiting_review" if draft.complete else "incomplete",
-        stop_reason=draft.stop_reason.value,
-        completed_passes=draft.completed_passes,
-    )
-    spent = sum(c.cost_usd or 0.0 for c in draft.chunks)
-    print(f"\n== spent on discovery: ${spent:.4f} ==")
-    for limitation in draft.limitations:
-        print(f"  limitation: {limitation}")
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
     return 1 if failures else 0

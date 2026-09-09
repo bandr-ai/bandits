@@ -139,11 +139,11 @@ def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
         return None, {}
 
 
-def _decoded(value: Any) -> Any:
-    """Parse a field the backend handed back as JSON text. See rlm_mine._decoded."""
-    from bandits.analyze.rlm_mine import _decoded as decode
+def _rows(value: Any) -> list[Any]:
+    """Decoded model output as a list of rows. See rlm_mine._rows."""
+    from bandits.analyze.rlm_mine import _rows as rows
 
-    return decode(value)
+    return rows(value)
 
 
 def _parse_result(raw: Any, *, known_contracts: set[str]) -> TraceAssignment | None:
@@ -261,10 +261,8 @@ def assign_traces(
         for field, value in batch_tokens.items():
             tokens[field] = tokens.get(field, 0) + value
 
-        raw_results = _decoded(getattr(prediction, "results", ())) if prediction else ()
-        if isinstance(raw_results, dict):
-            raw_results = [raw_results]
-        for raw in raw_results or ():
+        raw_results = _rows(getattr(prediction, "results", ())) if prediction else []
+        for raw in raw_results:
             parsed = _parse_result(raw, known_contracts=known_contracts)
             # Only traces in this batch: a model naming a trace from another
             # batch would overwrite a decision made with different context.

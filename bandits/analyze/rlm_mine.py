@@ -284,6 +284,28 @@ def _decoded(value: Any) -> Any:
         return value
 
 
+def _rows(value: Any) -> list[Any]:
+    """Decoded model output as a list of rows, or nothing.
+
+    Guards the two shapes ``_decoded`` can produce that are not collections of
+    rows. A field holding ``"1"`` decodes to an int, which raises on iteration;
+    a field holding ``'"text"'`` decodes to a string, which iterates one
+    character at a time and would feed the parsers a stream of single letters
+    that each fail quietly. Both are model output, so neither may crash a run
+    nor be mistaken for data.
+
+    A bare dict is wrapped: a model returning one object where a list of one was
+    asked for has answered the question, and rejecting it would discard a real
+    contract on a formatting technicality.
+    """
+    decoded = _decoded(value)
+    if isinstance(decoded, dict):
+        return [decoded]
+    if isinstance(decoded, (list, tuple)):
+        return list(decoded)
+    return []
+
+
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
@@ -296,7 +318,9 @@ def _string_tuple(raw: Any, *, allowed: set[str] | None = None) -> tuple[str, ..
     including the parts it got right — so unknown values are dropped here and
     the drop is reported as a limitation by the caller.
     """
-    if not isinstance(raw, (list, tuple)):
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        # A decoded scalar or bare string is not a list of ids. A string would
+        # otherwise iterate character by character and yield nothing useful.
         return ()
     seen: dict[str, None] = {}
     for item in raw:
@@ -959,10 +983,7 @@ def _run_chunk(
     cost = _cost_of(predict)
 
     known = set(corpus.list_trace_ids())
-    raw_contracts = _decoded(getattr(prediction, "contracts", ())) or ()
-    if isinstance(raw_contracts, dict):
-        # One contract returned bare rather than in a list.
-        raw_contracts = [raw_contracts]
+    raw_contracts = _rows(getattr(prediction, "contracts", ()))
     contracts = [
         contract
         for contract in (
@@ -980,9 +1001,7 @@ def _run_chunk(
     # Merged with what already exists so an assignment may name a contract from
     # an earlier chunk that this one did not restate.
     available = {**state.contracts, **{c.contract_id: c for c in contracts}}
-    raw_operations = _decoded(getattr(prediction, "operations", ())) or ()
-    if isinstance(raw_operations, dict):
-        raw_operations = [raw_operations]
+    raw_operations = _rows(getattr(prediction, "operations", ()))
     operations = [
         op
         for op in (_parse_operation(raw, known_traces=known) for raw in raw_operations)
@@ -995,10 +1014,10 @@ def _run_chunk(
         contract_ids=set(available),
     )
     ambiguous = _string_tuple(
-        _decoded(getattr(prediction, "ambiguous_trace_ids", ())), allowed=chunk_ids
+        _rows(getattr(prediction, "ambiguous_trace_ids", ())), allowed=chunk_ids
     )
     uncovered = _string_tuple(
-        _decoded(getattr(prediction, "uncovered_trace_ids", ())), allowed=chunk_ids
+        _rows(getattr(prediction, "uncovered_trace_ids", ())), allowed=chunk_ids
     )
     # A trace cannot be both assigned and unplaced. The unplaced claim wins: it
     # is the more conservative reading, and forcing a match is the one thing
