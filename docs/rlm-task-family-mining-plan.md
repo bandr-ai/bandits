@@ -20,6 +20,43 @@ This is not semantic preprocessing. The system only recognizes trace boundaries 
 
 Run a separate first-user-message-only arm to measure whether later user turns add useful task information or agent-dependent noise.
 
+## Input-view experiment
+
+Run the pure-RLM miner through two primary input paths:
+
+### Path U: user messages only
+
+The RLM receives every user-role message in the trajectory and no assistant messages, tool activity, outcomes, or rewards.
+
+This path tests whether requested work and later user clarification are sufficient to discover reusable task families.
+
+### Path F: full trajectory
+
+The RLM receives the complete raw conversation, including user and assistant messages, tool calls, and tool results. Rewards and evaluator labels remain hidden.
+
+This path tests whether execution context helps the RLM infer the underlying task or instead makes it cluster by agent behavior, tool choice, or success path.
+
+Both paths must use:
+
+- the same traces;
+- the same model and prompts except for the declared input view;
+- the same chunk size, budgets, seeds, and stop conditions;
+- fresh, independent discovery and assignment contexts;
+- the same human-review and stability evaluation.
+
+Do not allow either path to see the other path's taxonomy. Compare them only after both runs finish.
+
+Report:
+
+- human-accepted family coherence;
+- over-merging and fragmentation;
+- assignment stability across repeated runs;
+- ambiguous and uncovered coverage;
+- correlation between family membership and reward, final tool, tool sequence, model, and trajectory length;
+- downstream verifier transfer to unseen requests.
+
+Path F wins only if it improves semantic family coherence and verifier transfer without primarily separating traces by execution behavior or outcome. If it mostly produces categories such as successful runs, handoffs, refusals, or common tool sequences, it is useful for behavior mining but not as the task-family miner.
+
 ## End-to-end flow
 
     Raw trajectories
@@ -198,8 +235,10 @@ Compare:
 
 1. Current embedding mutual-kNN mining.
 2. One-shot LLM clustering.
-3. Iterative RLM discovery plus fresh assignment.
-4. Iterative RLM discovery, assignment, and adversarial audit.
+3. Iterative RLM over user messages plus fresh assignment.
+4. Iterative RLM over full trajectories plus fresh assignment.
+5. Iterative RLM over user messages with adversarial audit.
+6. Iterative RLM over full trajectories with adversarial audit.
 
 Do not use embedding-mined families as ground truth. Measure:
 
