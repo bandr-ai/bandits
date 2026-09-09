@@ -91,7 +91,8 @@ def _finalize(draft, args, recorder, derived_store) -> None:
     envelope = save_draft(draft, derived_store)
     print(f"\n  draft saved: {envelope.artifact_id}")
     print(
-        f"  read it: bandits rlm-families {envelope.artifact_id} --project {args.project}"
+        f"  read it: uv run bandits rlm-families {envelope.artifact_id} "
+        f"--project {args.project}"
     )
     recorder.finish(
         status="awaiting_review" if draft.complete else "incomplete",
@@ -173,8 +174,10 @@ def main() -> int:
         model=args.model or "default",
     )
     print(f"\n  session: {recorder.session_id}")
+    # `uv run`, because the console script is only on PATH inside the project's
+    # environment and a printed command that does not run is worse than none.
     print(
-        f"  watch it: bandits rlm-session {recorder.session_id} "
+        f"  watch it: uv run bandits rlm-session {recorder.session_id} "
         f"--watch --project {args.project}"
     )
 
