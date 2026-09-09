@@ -449,6 +449,15 @@ class AuditFinding(Contract):
     """
 
     rationale: str
+    raw_reply: str = ""
+    """Exactly what the auditor returned, before parsing.
+
+    The audit decides whether a contract survives the freeze, so a verdict that
+    cannot be traced to what the model actually said is a decision with no
+    evidence behind it. Stored for the same reason as ``ChunkResult.raw_reply``
+    and read by nobody but a person.
+    """
+
     resolved: bool = False
     resolution: str = ""
 
@@ -829,6 +838,18 @@ class AssignmentRun(Contract):
     llm_calls: int | None = Field(default=None, ge=0)
     tokens: dict[str, int] = Field(default_factory=dict)
     duration_seconds: float | None = Field(default=None, ge=0)
+    raw_replies: tuple[str, ...] = ()
+    """What the classifier returned for each batch, before parsing.
+
+    One entry per batch, in order. Assignment is where a trace becomes a member
+    of a family, and a membership nobody can trace back to the reply that
+    produced it cannot be checked.
+    """
+
+    dropped_results: tuple[str, ...] = ()
+    """Rows the parser refused, verbatim. The evidence for a trace that came
+    back uncovered because of a parsing failure rather than a real gap."""
+
     limitations: tuple[str, ...] = ()
 
     @model_validator(mode="after")

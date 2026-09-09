@@ -2228,3 +2228,111 @@ def test_a_contract_with_nothing_to_verify_is_still_refused() -> None:
     assert _parse_contract(
         {"name": "Refunds", "definition": "refund things"}, known_traces=set()
     ) is None
+
+
+# --- durable logging ---------------------------------------------------------
+
+
+def test_raw_replies_are_not_truncated() -> None:
+    """The cap was smaller than the replies it existed to preserve."""
+    big = "x" * 60_000
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        return SimpleNamespace(
+            contracts=[{**_RAW_CONTRACT, "definition": big}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert len(draft.chunks[0].raw_reply) > 50_000
+
+
+def test_a_rejected_contract_is_kept_whole() -> None:
+    big = "y" * 5_000
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        return SimpleNamespace(
+            contracts=[{"name": "Topic", "notes": big}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert len(draft.chunks[0].dropped_contracts[0]) > 4_000
+
+
+def test_the_audit_keeps_what_the_auditor_said() -> None:
+    """A verdict that gates the freeze must be traceable to a reply."""
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    audit = audit_taxonomy(
+        _draft(),
+        "draft-1",
+        corpus,
+        predict=lambda **_: SimpleNamespace(
+            recommendation="split", rationale="two different outcomes"
+        ),
+    )
+    assert "two different outcomes" in audit.findings[0].raw_reply
+
+
+def test_assignment_keeps_its_replies_and_the_rows_it_refused() -> None:
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+
+    def predict(*, taxonomy: str, batch: str, question: str):
+        return SimpleNamespace(
+            results=[
+                {
+                    "trace_id": "t1",
+                    "matching_contract_ids": ["c1"],
+                    "primary_contract_id": "c1",
+                    "reason": "refund",
+                },
+                {"trace_id": "NOT_IN_BATCH", "matching_contract_ids": ["c1"], "reason": "x"},
+            ]
+        )
+
+    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
+    assert run.raw_replies and "t1" in run.raw_replies[0]
+    assert any("NOT_IN_BATCH" in row for row in run.dropped_results)
+    assert any("could not be read" in limit for limit in run.limitations)
+
+
+def test_chunk_ledger_rows_name_their_pass_and_session(tmp_path, monkeypatch) -> None:
+    """A ledger row that cannot say which pass it belongs to cannot be joined
+    back to the run that produced it."""
+    import json
+
+    from bandits import ledger
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+
+    store, recorder = _recorder(tmp_path, "sess-led")
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        ledger.record({"event_type": "model_call", "provider": "test"})
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, session=recorder
+    )
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    calls = [r for r in rows if r.get("event_type") == "model_call"]
+    assert calls
+    assert all("pass_index" in r and "chunk_index" in r for r in calls)
+    assert all(r.get("session_id") == "sess-led" for r in calls)

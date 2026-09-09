@@ -139,6 +139,16 @@ def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
         return None, {}
 
 
+def _raw_reply(prediction: Any) -> str:
+    """Everything the classifier returned for one batch, never truncated."""
+    try:
+        return json.dumps(
+            {"results": getattr(prediction, "results", None)}, indent=2, default=str
+        )
+    except (TypeError, ValueError):
+        return str(prediction)
+
+
 def _rows(value: Any) -> list[Any]:
     """Decoded model output as a list of rows. See rlm_mine._rows."""
     from bandits.analyze.rlm_mine import _rows as rows
@@ -225,6 +235,8 @@ def assign_traces(
     known_contracts = {c.contract_id for c in taxonomy.contracts}
     readable = corpus.readable_trace_ids()
     results: dict[str, TraceAssignment] = {}
+    raw_replies: list[str] = []
+    dropped_results: list[str] = []
     limitations: list[str] = []
     calls: int | None = None
     tokens: dict[str, int] = {}
@@ -242,7 +254,12 @@ def assign_traces(
             default=str,
         )
         try:
-            with ledger.stage("rlm_assign", taxonomy_id=taxonomy_id, traces=len(window)):
+            with ledger.stage(
+                "rlm_assign",
+                taxonomy_id=taxonomy_id,
+                batch_offset=offset,
+                traces=len(window),
+            ):
                 prediction = predict(
                     taxonomy=taxonomy_json,
                     batch=payload,
@@ -261,6 +278,8 @@ def assign_traces(
         for field, value in batch_tokens.items():
             tokens[field] = tokens.get(field, 0) + value
 
+        if prediction is not None:
+            raw_replies.append(_raw_reply(prediction))
         raw_results = _rows(getattr(prediction, "results", ())) if prediction else []
         for raw in raw_results:
             parsed = _parse_result(raw, known_contracts=known_contracts)
@@ -268,6 +287,12 @@ def assign_traces(
             # batch would overwrite a decision made with different context.
             if parsed is not None and parsed.trace_id in set(window):
                 results.setdefault(parsed.trace_id, parsed)
+            else:
+                # A row the parser refused, or one naming a trace outside this
+                # batch. Kept verbatim: a trace reported uncovered because its
+                # row failed to parse is not the same finding as one the
+                # taxonomy genuinely does not reach.
+                dropped_results.append(json.dumps(raw, default=str))
 
         if on_batch is not None:
             on_batch(offset, len(window))
@@ -299,6 +324,12 @@ def assign_traces(
             f"{ambiguous} trace(s) matched several contracts and were left ambiguous; "
             "they are excluded from automatic verifier drafting until reviewed"
         )
+    if dropped_results:
+        limitations.append(
+            f"{len(dropped_results)} result row(s) could not be read and are kept "
+            "verbatim in dropped_results; any trace they named is reported uncovered "
+            "because of that, not because the taxonomy misses it"
+        )
     if uncovered:
         limitations.append(
             f"{uncovered} trace(s) matched no contract; they are excluded from automatic "
@@ -315,6 +346,8 @@ def assign_traces(
         llm_calls=calls,
         tokens=tokens,
         duration_seconds=time.monotonic() - started,
+        raw_replies=tuple(raw_replies),
+        dropped_results=tuple(dropped_results),
         limitations=tuple(dict.fromkeys(limitations)),
     )
 
