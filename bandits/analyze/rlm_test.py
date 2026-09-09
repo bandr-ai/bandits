@@ -2431,7 +2431,7 @@ def test_rejected_contracts_are_repaired_rather_than_dropped() -> None:
 
     def predict(*, chunk: str, taxonomy: str, question: str = ""):
         calls["n"] += 1
-        if "Rejected contracts" in question:
+        if "was rejected" in question:
             return SimpleNamespace(
                 contracts=[_RAW_CONTRACT],
                 operations=[],
@@ -2450,7 +2450,7 @@ def test_rejected_contracts_are_repaired_rather_than_dropped() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
     draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
     assert [c.contract_id for c in draft.contracts] == ["c1"]
-    assert any("corrected on a second attempt" in limit for limit in draft.limitations)
+    assert any("recovered on a second attempt" in limit for limit in draft.limitations)
 
 
 def test_repair_is_attempted_at_most_once_per_chunk() -> None:
@@ -2481,7 +2481,7 @@ def test_repair_is_attempted_at_most_once_per_chunk() -> None:
 
 def test_a_failing_repair_keeps_the_original_evidence() -> None:
     def predict(*, chunk: str, taxonomy: str, question: str = ""):
-        if "Rejected contracts" in question:
+        if "was rejected" in question:
             raise RuntimeError("repair call failed")
         return SimpleNamespace(
             contracts=[{"name": "topic"}],
@@ -2581,7 +2581,9 @@ def test_a_whole_chunk_of_typed_instances_is_read() -> None:
                     required_outcome_shape=["refunded"],
                 )
             ],
-            operations=[ProposedOperation(operation="CREATE", rationale="new")],
+            operations=[
+                ProposedOperation(operation="CREATE", contract_ids=["c1"], rationale="new")
+            ],
             assignments={row["trace_id"]: "c1" for row in rows},
             ambiguous_trace_ids=[],
             uncovered_trace_ids=[],
@@ -2621,7 +2623,7 @@ def test_the_repair_request_actually_reaches_the_model() -> None:
 
     def predict(*, chunk: str, taxonomy: str, question: str = ""):
         seen.append(question)
-        if "Rejected contracts" in question:
+        if "was rejected" in question:
             return SimpleNamespace(
                 contracts=[_RAW_CONTRACT],
                 operations=[],
@@ -2641,7 +2643,7 @@ def test_the_repair_request_actually_reaches_the_model() -> None:
     draft = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    assert any("Rejected contracts" in q for q in seen)
+    assert any("was rejected" in q for q in seen)
     assert any("required_outcome_shape" in q for q in seen)
     assert [c.contract_id for c in draft.contracts] == ["c1"]
 
@@ -2663,3 +2665,198 @@ def test_a_non_merge_reply_carrying_a_target_does_not_lose_the_finding() -> None
     assert finding.recommendation == "keep"
     assert finding.merge_with_contract_id is None
     assert "fine" in finding.rationale
+
+
+# --- the schema as the backend enforces it -----------------------------------
+
+
+def test_an_empty_outcome_cannot_be_submitted() -> None:
+    """A required field still accepts []. That recreated the silent drop."""
+    from bandits.analyze.rlm_models import ProposedContract
+
+    with pytest.raises(ValidationError):
+        ProposedContract(name="n", definition="d", required_outcome_shape=[])
+    assert ProposedContract(
+        name="n", definition="d", required_outcome_shape=["o"]
+    ).required_outcome_shape == ["o"]
+
+
+def test_an_operation_must_name_a_verb_and_a_contract() -> None:
+    """KEEP meaning 'keep my reservation' names no contract to keep."""
+    from bandits.analyze.rlm_models import ProposedOperation
+
+    with pytest.raises(ValidationError):
+        ProposedOperation(operation="FROBNICATE", contract_ids=["c1"], rationale="r")
+    with pytest.raises(ValidationError, match="must name the contract_ids"):
+        ProposedOperation(operation="KEEP", rationale="the user wants to keep it")
+    with pytest.raises(ValidationError):
+        ProposedOperation(operation="CREATE", contract_ids=["c1"], rationale="")
+    with pytest.raises(ValidationError, match="consumes and the one it produces"):
+        ProposedOperation(operation="MERGE", contract_ids=["c1"], rationale="r")
+    assert ProposedOperation(
+        operation="KEEP", contract_ids=["c1"], rationale="unchanged"
+    ).operation == "KEEP"
+
+
+def test_an_assignment_must_decide_rather_than_omit() -> None:
+    """A row omitting the match list became 'uncovered' by accident."""
+    from bandits.analyze.rlm_models import ProposedAssignment
+
+    with pytest.raises(ValidationError):
+        ProposedAssignment(trace_id="t1")
+    assert ProposedAssignment(trace_id="t1", matching_contract_ids=[]).trace_id == "t1"
+
+
+def test_the_correction_never_corrupts_the_taxonomy_variable() -> None:
+    """It was appended to the taxonomy JSON, which the model parses first."""
+    import json
+
+    seen: dict[str, str] = {}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        seen["taxonomy"] = taxonomy
+        seen["question"] = question
+        if "was rejected" in question:
+            return SimpleNamespace(
+                contracts=[_RAW_CONTRACT],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        return SimpleNamespace(
+            contracts=[{"name": "topic", "description": "no outcome"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1))
+    # The correction rides in its own argument; the taxonomy stays parseable.
+    json.loads(seen["taxonomy"])
+    assert "was rejected" in seen["question"]
+    assert "was rejected" not in seen["taxonomy"]
+
+
+def test_a_repair_is_billed_to_the_chunk() -> None:
+    """Counters were snapshotted before the repair, so its spend vanished."""
+    spend = {"calls": 3, "cost": 0.01}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        if "was rejected" in question:
+            spend["calls"] = 9
+            spend["cost"] = 0.05
+            return SimpleNamespace(
+                contracts=[_RAW_CONTRACT],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        return SimpleNamespace(
+            contracts=[{"name": "topic"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    predict.spend = lambda: (spend["calls"], {})
+    predict.cost = lambda: spend["cost"]
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    assert draft.chunks[0].llm_calls == 9
+    assert draft.chunks[0].cost_usd == 0.05
+
+
+def test_every_rejected_contract_is_kept_even_when_some_are_repaired() -> None:
+    """Slicing by the repaired count dropped an arbitrary prefix."""
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        if "was rejected" in question:
+            return SimpleNamespace(
+                contracts=[_RAW_CONTRACT],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        return SimpleNamespace(
+            contracts=[{"name": "first"}, {"name": "second"}, {"name": "third"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    kept = " ".join(draft.chunks[0].dropped_contracts)
+    for name in ("first", "second", "third"):
+        assert name in kept
+
+
+def test_freeze_refuses_an_unresolved_merge() -> None:
+    """The copy mentioned merges; the gate itself was untested for them."""
+    from bandits.analyze.rlm_models import AuditFinding
+
+    audit = TaxonomyAudit(
+        draft_id="draft-1",
+        findings=(
+            AuditFinding(
+                contract_id="c1",
+                recommendation="merge",
+                merge_with_contract_id="c2",
+                rationale="one verifier covers both",
+            ),
+        ),
+        model="m",
+        prompt_digest="d",
+    )
+    with pytest.raises(FreezeRefused, match="merging"):
+        freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="a1")
+    forced = freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="a1", force=True)
+    assert any("merge" in limit for limit in forced.limitations)
+
+
+def test_the_real_signatures_carry_the_instructions_and_no_question_field() -> None:
+    """Asserted on the built signature, not on the instruction string.
+
+    The earlier visibility test only measured the prompt's geometry. It would
+    have passed while the production predictor still passed that prompt as an
+    input field, which is the arrangement that truncated it.
+    """
+    dspy = pytest.importorskip("dspy")
+
+    built: dict[str, object] = {}
+
+    class _Capture:
+        def __init__(self, signature, **kwargs):
+            built["signature"] = signature
+
+        def __call__(self, **kwargs):
+            built["called_with"] = set(kwargs)
+            return SimpleNamespace()
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(dspy, "RLM", _Capture)
+        monkey.setattr(dspy, "LM", lambda *a, **k: SimpleNamespace(history=[]))
+        for module in ("rlm_mine", "rlm_audit", "rlm_assign"):
+            stage = __import__(f"bandits.analyze.{module}", fromlist=["build_predictor"])
+            stage.build_predictor(api_key="test", view=TraceView.FULL_TRAJECTORY)
+            signature = built["signature"]
+            # The prompt is on the signature, where DSPy renders it whole.
+            assert "FULL trajectory" in signature.instructions, module
+            assert len(signature.instructions) > 1000, module
+            # And not an input field, where it would be shown as a peek.
+            assert "question" not in signature.input_fields, module
+    finally:
+        monkey.undo()

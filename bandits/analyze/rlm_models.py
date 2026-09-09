@@ -265,9 +265,15 @@ class ProposedContract(Contract):
 
     name: str
     definition: str
-    required_outcome_shape: list[str]
+    required_outcome_shape: list[str] = Field(min_length=1)
     """What a verifier must establish. The field that makes this a family
-    rather than a topic, and the reason this model is typed at all."""
+    rather than a topic, and the reason this model is typed at all.
+
+    ``min_length=1`` because a required field still accepts ``[]``: a contract
+    submitting an empty outcome would type-check, be dropped by the parser, and
+    recreate the silent loss this type exists to stop. The constraint belongs at
+    SUBMIT, where the model can still be told it got it wrong.
+    """
 
     inclusion_rules: list[str] = Field(default_factory=list)
     exclusion_rules: list[str] = Field(default_factory=list)
@@ -286,10 +292,37 @@ class ProposedOperation(Contract):
 
     model_config = ConfigDict(frozen=True, extra="allow")
 
-    operation: str
+    operation: Literal[
+        "KEEP", "CREATE", "REVISE", "SPLIT", "MERGE", "MARK_AMBIGUOUS", "MARK_UNCOVERED"
+    ]
+    """Constrained rather than free text, so a verb outside the taxonomy's
+    vocabulary is refused at SUBMIT instead of parsed and dropped."""
+
     contract_ids: list[str] = Field(default_factory=list)
     trace_ids: list[str] = Field(default_factory=list)
-    rationale: str = ""
+    rationale: str = Field(min_length=1)
+    """Required. An operation nobody argued for is not a recorded decision, and
+    the stop condition counts mutations — so an unjustified one would either
+    block convergence forever or license a change with no evidence."""
+
+    @model_validator(mode="after")
+    def operations_on_contracts_name_them(self) -> ProposedOperation:
+        """Reject a taxonomy operation that names no contract to act on.
+
+        Typing cannot make ``KEEP`` mean "leave this contract unchanged" rather
+        than "the user wants to keep their reservation" — that is what the
+        worked example in the instructions is for. What it can do is refuse the
+        reading where no contract is named at all, which is the form the
+        reservation sense takes.
+        """
+        needs_contract = {"KEEP", "CREATE", "REVISE", "SPLIT", "MERGE"}
+        if self.operation in needs_contract and not self.contract_ids:
+            raise ValueError(
+                f"a {self.operation} operation must name the contract_ids it acts on"
+            )
+        if self.operation == "MERGE" and len(self.contract_ids) < 2:
+            raise ValueError("a MERGE names the contracts it consumes and the one it produces")
+        return self
 
 
 class ProposedAssignment(Contract):
@@ -303,9 +336,19 @@ class ProposedAssignment(Contract):
     model_config = ConfigDict(frozen=True, extra="allow")
 
     trace_id: str
-    matching_contract_ids: list[str] = Field(default_factory=list)
+    matching_contract_ids: list[str]
+    """Required, and may be empty only by being written empty.
+
+    Defaulting it meant a row that omitted the field submitted cleanly and
+    became ``uncovered`` — a real finding manufactured from a formatting gap.
+    Saying "nothing matched" has to be a decision, not an omission.
+    """
+
     primary_contract_id: str = ""
     reason: str = ""
+    """Status is deliberately absent: the program derives it from the match
+    list, because a model that says "assigned" while naming two contracts has
+    found an ambiguity and mislabelled it."""
 
 
 class Operation(str, Enum):
