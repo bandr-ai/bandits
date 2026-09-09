@@ -27,6 +27,23 @@ def test_a_label_is_evidence_and_ranks_as_a_human_label() -> None:
     assert evidence.strength == "strong"
 
 
+def test_a_model_label_never_masquerades_as_human_evidence() -> None:
+    label = make_label(
+        trace_id="trace-one",
+        family_id="family-one",
+        verdict=Verdict.SUCCESS,
+        labeler="judge-model",
+        source="model",
+    )
+
+    evidence = label.as_evidence()
+
+    assert evidence.claim == "model_label"
+    assert evidence.provenance == "model"
+    assert evidence.kind is EvidenceKind.MODEL_JUDGMENT
+    assert evidence.strength == "moderate"
+
+
 def test_a_verdict_nobody_could_reach_is_weak_evidence() -> None:
     assert _label("trace-one", Verdict.UNCLEAR).as_evidence().strength == "weak"
 
