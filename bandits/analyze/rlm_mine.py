@@ -243,9 +243,15 @@ def build_predictor(
     )
 
     def predict(*, chunk: str, taxonomy: str, question: str = "") -> Any:
-        # ``question`` is accepted and ignored so the injected predictors the
-        # tests use keep one shape across every stage.
+        # ``question`` carries a correction when one is being asked for, and is
+        # empty on an ordinary call. It is appended to the taxonomy variable
+        # rather than dropped: the standing instructions live on the signature
+        # now, so there is no input field left to put it in, and a repair
+        # request that reached nothing would silently re-send the original
+        # question and be charged for the same answer twice.
         with dspy.context(lm=language_model):
+            if question:
+                return rlm(chunk=chunk, taxonomy=f"{taxonomy}\n\n{question}")
             return rlm(chunk=chunk, taxonomy=taxonomy)
 
     return with_cost(scoped_to_history(predict, language_model))
@@ -454,6 +460,30 @@ def _string_tuple(raw: Any, *, allowed: set[str] | None = None) -> tuple[str, ..
     return tuple(seen)
 
 
+def _as_mapping(raw: Any) -> dict[str, Any] | None:
+    """One model-written record as a plain dict, however the backend returned it.
+
+    Typing the signature was supposed to stop topics being submitted, and it
+    does — but it also changes what comes back: DSPy hands over
+    ``ProposedContract`` instances rather than dicts, and every parser here
+    tested ``isinstance(raw, dict)`` and dropped them. The fix for the empty
+    taxonomy would have reproduced the empty taxonomy.
+
+    Both shapes are accepted rather than only the typed one, because the
+    backend is not the only caller: an untyped predictor, a repaired reply and
+    every injected test double still return dicts.
+    """
+    if isinstance(raw, dict):
+        return raw
+    dump = getattr(raw, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="json")
+        except Exception:  # noqa: BLE001 - a odd model must not lose the record
+            return None
+    return None
+
+
 def _parse_contract(raw: Any, *, known_traces: set[str]) -> FamilyContract | None:
     """Build one contract from a model-written dict, or nothing.
 
@@ -462,7 +492,8 @@ def _parse_contract(raw: Any, *, known_traces: set[str]) -> FamilyContract | Non
     counted, because keeping it would put a topic into a taxonomy that is
     supposed to hold only verifiable claims.
     """
-    if not isinstance(raw, dict):
+    raw = _as_mapping(raw)
+    if raw is None:
         return None
     contract_id = _text(_field(raw, "contract_id", "id", "family_id"))
     name = _text(_field(raw, "name", "family_name", "title"))
@@ -518,7 +549,8 @@ def _parse_contract(raw: Any, *, known_traces: set[str]) -> FamilyContract | Non
 
 
 def _parse_operation(raw: Any, *, known_traces: set[str]) -> TaxonomyOperation | None:
-    if not isinstance(raw, dict):
+    raw = _as_mapping(raw)
+    if raw is None:
         return None
     try:
         operation = Operation(_text(raw.get("operation")).upper())

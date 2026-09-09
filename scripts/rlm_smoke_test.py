@@ -169,7 +169,11 @@ def main() -> int:
         first = trace.user_turns[0].text if trace.user_turns else ""
         print(f"  {trace.trace_id}: {' '.join(first.split())[:88]}")
 
-    kwargs = {"model": args.model} if args.model else {}
+    # The view travels with every predictor: each arm's instructions differ,
+    # and a Path F run built with Path U wording would be neither experiment.
+    kwargs: dict[str, object] = {"view": view}
+    if args.model:
+        kwargs["model"] = args.model
     failures: list[str] = []
 
     def check(name: str, ok: bool, detail: str = "") -> None:

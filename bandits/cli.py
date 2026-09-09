@@ -2156,7 +2156,7 @@ def mine_rlm_command(
         max_usd=max_usd,
     )
     try:
-        predict = build_rlm_predictor(model=model)
+        predict = build_rlm_predictor(model=model, view=trace_view)
     except MiningError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -2308,7 +2308,7 @@ def audit_rlm_taxonomy_command(
 
     _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
     try:
-        predict = build_taxonomy_audit_predictor(model=model)
+        predict = build_taxonomy_audit_predictor(model=model, view=draft.view)
     except TaxonomyAuditError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -2377,7 +2377,7 @@ def assign_rlm_taxonomy_command(
 
     _, corpus, _ = _rlm_corpus(taxonomy.analysis_id, project, taxonomy.view.value)
     try:
-        predict = build_assignment_predictor(model=model)
+        predict = build_assignment_predictor(model=model, view=taxonomy.view)
     except AssignmentError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc

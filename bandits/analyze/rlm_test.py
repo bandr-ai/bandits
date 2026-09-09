@@ -2526,3 +2526,140 @@ def test_sibling_contracts_stay_inside_the_peek_limit() -> None:
     assert len(compact) < 1000, len(compact)
     for i in range(6):
         assert f"c{i}" in compact
+
+
+# --- the production path, as the real backend actually returns it ------------
+
+
+def test_typed_model_instances_survive_the_parser() -> None:
+    """The fix for the empty taxonomy would have caused an empty taxonomy.
+
+    Typing the signature stops a topic being submitted, and also changes what
+    comes back: DSPy returns ProposedContract instances, not dicts. Every parser
+    tested isinstance(raw, dict) and dropped them, so a run against the real
+    backend would still have produced nothing.
+    """
+    from bandits.analyze.rlm_mine import _parse_contract, _parse_operation
+    from bandits.analyze.rlm_models import ProposedContract, ProposedOperation
+
+    contract = _parse_contract(
+        ProposedContract(
+            contract_id="c1",
+            name="Refund an order",
+            definition="refund an order",
+            required_outcome_shape=["the order is refunded"],
+            supporting_trace_ids=["t1"],
+        ),
+        known_traces={"t1"},
+    )
+    assert contract is not None
+    assert contract.contract_id == "c1"
+    assert contract.supporting_trace_ids == ("t1",)
+
+    operation = _parse_operation(
+        ProposedOperation(operation="CREATE", contract_ids=["c1"], rationale="new"),
+        known_traces=set(),
+    )
+    assert operation is not None
+    assert operation.operation is Operation.CREATE
+
+
+def test_a_whole_chunk_of_typed_instances_is_read() -> None:
+    """End to end, with the shape the backend really returns."""
+    from bandits.analyze.rlm_models import ProposedContract, ProposedOperation
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        import json
+
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=[
+                ProposedContract(
+                    contract_id="c1",
+                    name="Refund",
+                    definition="refund an order",
+                    required_outcome_shape=["refunded"],
+                )
+            ],
+            operations=[ProposedOperation(operation="CREATE", rationale="new")],
+            assignments={row["trace_id"]: "c1" for row in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    assert len(draft.assignments) == 4
+
+
+def test_typed_assignment_results_are_read() -> None:
+    from bandits.analyze.rlm_models import ProposedAssignment
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    run = assign_traces(
+        _taxonomy(),
+        "tax-1",
+        corpus,
+        predict=lambda **_: SimpleNamespace(
+            results=[
+                ProposedAssignment(
+                    trace_id="t1",
+                    matching_contract_ids=["c1"],
+                    primary_contract_id="c1",
+                    reason="refund",
+                )
+            ]
+        ),
+    )
+    assert run.members() == {"c1": ("t1",)}
+
+
+def test_the_repair_request_actually_reaches_the_model() -> None:
+    """The predictor ignored `question`, so a repair re-sent the original ask."""
+    seen: list[str] = []
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        seen.append(question)
+        if "Rejected contracts" in question:
+            return SimpleNamespace(
+                contracts=[_RAW_CONTRACT],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        return SimpleNamespace(
+            contracts=[{"name": "topic", "description": "no outcome"}],
+            operations=[],
+            assignments={},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    assert any("Rejected contracts" in q for q in seen)
+    assert any("required_outcome_shape" in q for q in seen)
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+
+
+def test_a_non_merge_reply_carrying_a_target_does_not_lose_the_finding() -> None:
+    """Model validation would reject it, costing the whole audit call."""
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    audit = audit_taxonomy(
+        _draft(),
+        "draft-1",
+        corpus,
+        predict=lambda **_: SimpleNamespace(
+            recommendation="keep",
+            merge_with_contract_id="c2",
+            rationale="this family is fine",
+        ),
+    )
+    finding = audit.findings[0]
+    assert finding.recommendation == "keep"
+    assert finding.merge_with_contract_id is None
+    assert "fine" in finding.rationale

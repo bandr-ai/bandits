@@ -292,6 +292,22 @@ class ProposedOperation(Contract):
     rationale: str = ""
 
 
+class ProposedAssignment(Contract):
+    """One classification exactly as the model must return it.
+
+    Typed for the same reason the contract is: an untyped row could omit the
+    match list entirely and still submit, and the trace would then be reported
+    uncovered because of a formatting gap rather than a real one.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="allow")
+
+    trace_id: str
+    matching_contract_ids: list[str] = Field(default_factory=list)
+    primary_contract_id: str = ""
+    reason: str = ""
+
+
 class Operation(str, Enum):
     """What one discovery step did to the taxonomy.
 

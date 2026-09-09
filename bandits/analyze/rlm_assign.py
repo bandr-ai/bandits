@@ -33,6 +33,7 @@ from bandits.analyze.rlm_models import (
     AssignmentRun,
     AssignmentStatus,
     FrozenTaxonomy,
+    ProposedAssignment,
     TraceAssignment,
     TraceView,
 )
@@ -121,7 +122,7 @@ def build_predictor(
     class _Assign(dspy.Signature):
         taxonomy: str = dspy.InputField(desc="the fixed contracts to classify against")
         batch: str = dspy.InputField(desc="the traces to classify")
-        results: list[dict] = dspy.OutputField()
+        results: list[ProposedAssignment] = dspy.OutputField()
 
     _Assign.__doc__ = instruction_for(view)
     rlm = dspy.RLM(
@@ -174,7 +175,10 @@ def _parse_result(raw: Any, *, known_contracts: set[str]) -> TraceAssignment | N
     mislabelled it, and taking its word would erase exactly the uncertainty this
     stage exists to preserve.
     """
-    if not isinstance(raw, dict):
+    from bandits.analyze.rlm_mine import _as_mapping
+
+    raw = _as_mapping(raw)
+    if raw is None:
         return None
     trace_id = str(raw.get("trace_id") or "").strip()
     if not trace_id:
