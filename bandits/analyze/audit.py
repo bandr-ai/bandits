@@ -280,13 +280,20 @@ def scoped_to_history(predict: _Predictor, language_model: Any) -> _Predictor:
     The slice is copied immediately rather than held as a reference, because
     the list keeps growing: a reference read after the next family started
     would describe that family's calls too.
+
+    Takes whatever arguments the predictor it wraps takes. It used to name the
+    family audit's two, which silently made it unusable by every other RLM
+    stage: mining passes ``chunk`` and ``taxonomy``, assignment passes
+    ``batch``, and each raised an unexpected-keyword error on its first real
+    call. Nothing caught it, because the tests inject plain functions and never
+    reach this wrapper — so the failure only appeared against a live model.
     """
     spend = _Spend()
 
-    def wrapped(*, members: str, question: str) -> Any:
+    def wrapped(**inputs: Any) -> Any:
         before = len(getattr(language_model, "history", ()) or ())
         try:
-            return predict(members=members, question=question)
+            return predict(**inputs)
         finally:
             # In `finally` because a failed audit still spent calls, and those
             # are exactly the ones a rerun that behaved differently needs.

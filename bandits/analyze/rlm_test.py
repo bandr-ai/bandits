@@ -2015,3 +2015,34 @@ def test_a_consumed_contract_is_not_rendered_as_a_family() -> None:
     from bandits.analyze.rlm_audit import _draft_members
 
     assert "c2" not in _draft_members(_merged_draft())
+
+
+# --- the live-model boundary -------------------------------------------------
+
+
+def test_the_spend_wrapper_accepts_every_stage_signature() -> None:
+    """The bug the smoke test caught: it hardcoded the family audit's arguments.
+
+    Every RLM stage wraps its predictor in ``scoped_to_history``, and the three
+    stages pass different keywords. Nothing caught this because the tests inject
+    plain functions and never reach the wrapper, so it failed only against a
+    live model — on the first real call of all three paths at once.
+    """
+    from bandits.analyze.audit import scoped_to_history
+
+    language_model = SimpleNamespace(history=[])
+    for kwargs in (
+        {"members": "m", "question": "q"},  # family audit
+        {"chunk": "c", "taxonomy": "t", "question": "q"},  # mining
+        {"contract": "c", "members": "m", "outsiders": "o", "question": "q"},  # taxonomy audit
+        {"taxonomy": "t", "batch": "b", "question": "q"},  # assignment
+    ):
+        wrapped = scoped_to_history(lambda **received: received, language_model)
+        assert wrapped(**kwargs) == kwargs
+
+
+def test_the_cost_wrapper_survives_a_predictor_it_did_not_wrap() -> None:
+    """`with_cost` reads the spend recorder's entries, which may not exist."""
+    from bandits.analyze.rlm_mine import with_cost
+
+    assert with_cost(lambda **_: None).cost() is None
