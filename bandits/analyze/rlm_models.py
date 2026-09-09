@@ -341,6 +341,28 @@ class ChunkResult(Contract):
     status: Literal["success", "error"] = "success"
     error: str = ""
 
+    raw_reply: str = ""
+    """Exactly what the model returned, before any parsing.
+
+    Kept because the parsed result cannot explain itself. A chunk that proposed
+    three contracts and kept none says only that they were rejected; whether
+    they lacked an outcome shape, spelled a field differently, or arrived as
+    JSON text is answerable only from what was actually returned — and without
+    it the answer costs another paid run to guess at.
+
+    Stored verbatim and never trusted as data: nothing reads this to build a
+    taxonomy, and every field the miner uses is parsed from the prediction
+    itself. This exists to be read by a person debugging a run.
+    """
+
+    dropped_contracts: tuple[str, ...] = ()
+    """Contracts this chunk proposed and the parser refused, serialized.
+
+    The specific evidence for the most expensive failure mode: the model doing
+    the work and the code discarding it. A count in a limitation says it
+    happened; these say what was thrown away.
+    """
+
     @property
     def mutated(self) -> bool:
         return any(op.mutating for op in self.operations)
