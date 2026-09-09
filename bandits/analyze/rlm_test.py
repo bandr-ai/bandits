@@ -2046,3 +2046,98 @@ def test_the_cost_wrapper_survives_a_predictor_it_did_not_wrap() -> None:
     from bandits.analyze.rlm_mine import with_cost
 
     assert with_cost(lambda **_: None).cost() is None
+
+
+def test_a_reply_arriving_as_json_text_is_not_thrown_away() -> None:
+    """The first real run's failure: three CREATEs recorded, zero contracts kept.
+
+    DSPy usually returns the declared types, but when the root model runs out of
+    iterations it falls back to an ``extract`` pass whose fields arrive as
+    strings. Every parser type-checked its input, so the whole chunk was
+    silently dropped and the run ended reporting an empty taxonomy it had
+    already paid to build.
+    """
+    import json
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=json.dumps([_RAW_CONTRACT]),
+            operations=json.dumps([{"operation": "CREATE", "rationale": "new family"}]),
+            assignments=json.dumps({r["trace_id"]: "c1" for r in rows}),
+            ambiguous_trace_ids="[]",
+            uncovered_trace_ids="[]",
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(6))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    assert len(draft.assignments) == 6
+    assert any(op.operation is Operation.CREATE for p in draft.passes for op in p.operations)
+
+
+def test_a_fenced_json_reply_is_decoded() -> None:
+    from bandits.analyze.rlm_mine import _decoded
+
+    assert _decoded('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _decoded('{"a": 1}') == {"a": 1}
+
+
+def test_a_single_contract_returned_bare_is_still_read() -> None:
+    """A model that returns one object rather than a list of one."""
+    import json
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=_RAW_CONTRACT,
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+
+
+def test_unparseable_text_is_still_dropped_rather_than_crashing() -> None:
+    """Decoding must not turn a malformed reply into an exception."""
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        return SimpleNamespace(
+            contracts="I could not complete this task",
+            operations="n/a",
+            assignments="none",
+            ambiguous_trace_ids="",
+            uncovered_trace_ids="",
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert draft.contracts == ()
+
+
+def test_assignment_results_arriving_as_json_text_are_read() -> None:
+    import json
+
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+
+    def predict(*, taxonomy: str, batch: str, question: str):
+        return SimpleNamespace(
+            results=json.dumps(
+                [
+                    {
+                        "trace_id": row["trace_id"],
+                        "matching_contract_ids": ["c1"],
+                        "primary_contract_id": "c1",
+                        "reason": "refund",
+                    }
+                    for row in json.loads(batch)
+                ]
+            )
+        )
+
+    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
+    assert run.members() == {"c1": ("t1", "t2")}

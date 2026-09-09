@@ -141,10 +141,17 @@ def build_predictor(
     *,
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
-    max_iterations: int = 12,
-    max_llm_calls: int = 40,
+    max_iterations: int = 25,
+    max_llm_calls: int = 60,
 ) -> _Predictor:
     """A ``dspy.RLM`` over one chunk, imported only when mining actually runs.
+
+    The per-chunk ceilings are what the real model needed rather than what
+    seemed reasonable: measured against tau2 airline requests, one chunk of
+    three traces took 5 to 18 calls, and a chunk that hit the old 12-iteration
+    limit fell back to DSPy's ``extract`` and returned a partial answer. Real
+    customer requests are long and ask for several things at once, so the root
+    model slices them more than a short instruction would.
 
     DSPy and its REPL sandbox are an optional extra: the core install stays at
     three runtime dependencies, and the tests below run against an injected
@@ -247,6 +254,34 @@ def _cost_of(predict: Any) -> float | None:
         return reporter()
     except Exception:  # noqa: BLE001 - bookkeeping must not lose the chunk
         return None
+
+
+def _decoded(value: Any) -> Any:
+    """Parse a field the backend handed back as JSON text rather than a value.
+
+    DSPy usually returns the declared types, but not always: when the root model
+    runs out of iterations it falls back to an ``extract`` pass whose fields
+    arrive as strings, and a model writing JSON into a string field does the
+    same. Every parser below type-checks its input, so an undecoded string was
+    silently dropped — a chunk that recorded three CREATE operations could
+    contribute no contracts at all, and the run ended reporting an empty
+    taxonomy it had actually paid to build.
+
+    Returns the value untouched when it is not a string or does not parse, so a
+    genuinely malformed reply is still handled by the parsers rather than here.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    # Fenced blocks are common when a model writes JSON into a text field.
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return value
 
 
 def _text(value: Any) -> str:
@@ -924,15 +959,18 @@ def _run_chunk(
     cost = _cost_of(predict)
 
     known = set(corpus.list_trace_ids())
+    raw_contracts = _decoded(getattr(prediction, "contracts", ())) or ()
+    if isinstance(raw_contracts, dict):
+        # One contract returned bare rather than in a list.
+        raw_contracts = [raw_contracts]
     contracts = [
         contract
         for contract in (
-            _parse_contract(raw, known_traces=known)
-            for raw in getattr(prediction, "contracts", ()) or ()
+            _parse_contract(raw, known_traces=known) for raw in raw_contracts
         )
         if contract is not None
     ]
-    dropped = len(list(getattr(prediction, "contracts", ()) or ())) - len(contracts)
+    dropped = len(list(raw_contracts)) - len(contracts)
     if dropped > 0:
         limitations.append(
             f"chunk {index} proposed {dropped} contract(s) with no definition or no "
@@ -942,22 +980,26 @@ def _run_chunk(
     # Merged with what already exists so an assignment may name a contract from
     # an earlier chunk that this one did not restate.
     available = {**state.contracts, **{c.contract_id: c for c in contracts}}
+    raw_operations = _decoded(getattr(prediction, "operations", ())) or ()
+    if isinstance(raw_operations, dict):
+        raw_operations = [raw_operations]
     operations = [
         op
-        for op in (
-            _parse_operation(raw, known_traces=known)
-            for raw in getattr(prediction, "operations", ()) or ()
-        )
+        for op in (_parse_operation(raw, known_traces=known) for raw in raw_operations)
         if op is not None
     ]
     chunk_ids = set(trace_ids)
     assignments = _parse_assignments(
-        getattr(prediction, "assignments", None),
+        _decoded(getattr(prediction, "assignments", None)),
         chunk_ids=chunk_ids,
         contract_ids=set(available),
     )
-    ambiguous = _string_tuple(getattr(prediction, "ambiguous_trace_ids", ()), allowed=chunk_ids)
-    uncovered = _string_tuple(getattr(prediction, "uncovered_trace_ids", ()), allowed=chunk_ids)
+    ambiguous = _string_tuple(
+        _decoded(getattr(prediction, "ambiguous_trace_ids", ())), allowed=chunk_ids
+    )
+    uncovered = _string_tuple(
+        _decoded(getattr(prediction, "uncovered_trace_ids", ())), allowed=chunk_ids
+    )
     # A trace cannot be both assigned and unplaced. The unplaced claim wins: it
     # is the more conservative reading, and forcing a match is the one thing
     # this stage must never do.

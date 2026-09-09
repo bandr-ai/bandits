@@ -40,10 +40,11 @@ from bandits.analyze.rlm_audit import (
     build_predictor as build_auditor,
 )
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
-from bandits.analyze.rlm_mine import build_predictor, mine_taxonomy
+from bandits.analyze.rlm_mine import build_predictor, mine_taxonomy, save_draft
 from bandits.analyze.rlm_models import AssignmentStatus, Budget, TraceView
+from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_taskset import materialize_task_set
-from bandits.store import ArtifactStore
+from bandits.store import ArtifactStore, DerivedStore
 
 
 def _load_corpus(project: Path, corpus_id: str | None, lineages: int, seed: int):
@@ -95,7 +96,7 @@ def main() -> int:
     parser.add_argument("--view", default=TraceView.USER_MESSAGES.value)
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-usd", type=float, default=2.0)
-    parser.add_argument("--max-llm-calls", type=int, default=40)
+    parser.add_argument("--max-llm-calls", type=int, default=400)
     args = parser.parse_args()
 
     view = TraceView(args.view)
@@ -128,14 +129,33 @@ def main() -> int:
         check("redaction recorded what it removed", "score" in corpus.withheld_fields())
 
     print("\n== discovery ==")
+    # A session recorder even here, so a run in flight is watchable rather than a
+    # terminal that has gone quiet. Without it the only sign of progress is a
+    # line printed once a chunk finishes, which is a long silence when one chunk
+    # is a dozen model calls.
+    session_store = SessionStore(args.project / ".bandits")
+    recorder = SessionRecorder(
+        session_store,
+        session_id=new_session_id("smoke", view, args.seed),
+        analysis_id="smoke-analysis",
+        view=view,
+        model=args.model or "default",
+    )
+    print(f"\n  session: {recorder.session_id}")
+    print(
+        f"  watch it: bandits rlm-session {recorder.session_id} "
+        f"--watch --project {args.project}"
+    )
+
     draft = mine_taxonomy(
         corpus,
         "smoke-analysis",
         predict=build_predictor(**kwargs),
         analysis=analysis,
+        session=recorder,
         chunk_size=3,
         budget=Budget(
-            passes=2, max_iterations=20, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
+            passes=2, max_iterations=40, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
         ),
         on_chunk=lambda c: print(
             f"  chunk {c.index}: {len(c.trace_ids)} traces, {len(c.operations)} ops, "
@@ -224,6 +244,23 @@ def main() -> int:
             f"{task_set.workload_coverage:.1%}",
         )
 
+    # Persisted, not just printed. A run that cost real money and left nothing
+    # on disk cannot be re-read, compared against another seed, audited, or
+    # assigned against — every later stage takes a draft id, so throwing the
+    # draft away means paying again to get back where you already were.
+    derived = DerivedStore(args.project / ".bandits")
+    draft_envelope = save_draft(draft, derived)
+    print(f"\n  draft saved: {draft_envelope.artifact_id}")
+    print(
+        f"  read it: bandits rlm-families {draft_envelope.artifact_id} "
+        f"--project {args.project}"
+    )
+
+    recorder.finish(
+        status="awaiting_review" if draft.complete else "incomplete",
+        stop_reason=draft.stop_reason.value,
+        completed_passes=draft.completed_passes,
+    )
     spent = sum(c.cost_usd or 0.0 for c in draft.chunks)
     print(f"\n== spent on discovery: ${spent:.4f} ==")
     for limitation in draft.limitations:
