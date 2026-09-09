@@ -117,16 +117,20 @@ def normalize_request(instruction: str) -> str:
 _PARAMETER_RULES = (
     # Read off the raw instruction rather than the normalized form, which drops
     # the punctuation that makes these recognisable at all.
+    re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
     re.compile(r"[\"'“‘]([^\"'”’\n]{1,120})[\"'”’]"),
     re.compile(r"(~?[\w./-]*\.[A-Za-z]{2,5})\b"),
     re.compile(r"(~/[\w./-]+)"),
     re.compile(r"\$?(\d[\d,]*(?:\.\d+)?)"),
     re.compile(
-        r"\b(january|february|march|april|may|june|july|august|september|october|november"
+        r"\b(january|february|march|april|june|july|august|september|october|november"
         r"|december|today|yesterday|tomorrow|this year|last year|this month|last month"
         r"|this week|last week)\b",
         re.IGNORECASE,
     ),
+    # "may" is ordinarily a modal verb. Treat it as the month only with a
+    # preposition that supplies date context.
+    re.compile(r"\b(?:in|on|by|since|before|after|during)\s+(may)\b", re.IGNORECASE),
 )
 """Where a request carries a value that decides what its correct answer is."""
 
@@ -136,19 +140,23 @@ def request_parameters(instruction: str) -> tuple[str, ...]:
 
     A filename, an amount, a date: change one and the correct answer changes
     with it, even though almost every word of the instruction is unchanged.
-    Sorted, so a paraphrase that reorders them still reads as the same request.
+    Kept in textual order so role reversals such as "move A to B" versus
+    "move B to A" remain different requests.
 
     Deliberately lexical. It recognises a value written down, not a scope
     described in prose — 'my playlists' against 'my song library' names two
     different things and yields no parameter here.
     """
-    found: set[str] = set()
+    found: list[tuple[int, int, str]] = []
     for rule in _PARAMETER_RULES:
         for match in rule.finditer(instruction):
             value = match.group(1).strip().lower()
-            if value:
-                found.add(value)
-    return tuple(sorted(found))
+            span = match.span(1)
+            # Higher-priority compound values (notably ISO dates) own their
+            # entire span; do not also extract their numeric components.
+            if value and not any(span[0] < end and start < span[1] for start, end, _ in found):
+                found.append((*span, value))
+    return tuple(value for _, _, value in sorted(found))
 
 
 def fingerprint(instruction: str) -> str:

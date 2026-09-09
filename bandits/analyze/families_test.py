@@ -857,6 +857,22 @@ def test_request_parameters_reads_the_values_that_decide_the_answer() -> None:
     assert request_parameters("the genre I liked most in my song library") == ()
 
 
+def test_request_parameters_do_not_treat_bare_may_as_a_date() -> None:
+    assert request_parameters("I may return the order") == ()
+    assert request_parameters("orders placed in May") == ("may",)
+
+
+def test_request_parameters_keep_dates_whole_and_roles_ordered() -> None:
+    assert request_parameters("move 2024-02-01 to 2024-03-02") == (
+        "2024-02-01",
+        "2024-03-02",
+    )
+    assert request_parameters("move 2024-03-02 to 2024-02-01") == (
+        "2024-03-02",
+        "2024-02-01",
+    )
+
+
 def test_duplicate_evidence_is_transitive() -> None:
     """A joined to B and B to C is one group, not two overlapping pairs."""
     analysis = _requests(
