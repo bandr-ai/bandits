@@ -931,6 +931,50 @@ def interview_verifier_command(
 _VERDICTS = {"s": Verdict.SUCCESS, "f": Verdict.FAILURE, "u": Verdict.UNCLEAR}
 
 
+def _brief(value: object, limit: int = 180) -> str:
+    rendered = str(value).replace("\n", " ").strip()
+    return rendered if len(rendered) <= limit else rendered[: limit - 1] + "…"
+
+
+def _show_label_card(trace_id: str, task, evidence: list, position: int, total: int) -> None:
+    """Show only the facts a reviewer needs; raw evidence remains in the artifact."""
+    console.rule(f"Review {position}/{total} · {trace_id}")
+    console.print("[bold cyan]Request[/bold cyan]")
+    console.print(_brief(task.instruction, 500) if task is not None else "[not recorded]")
+
+    states = [item for item in evidence if item.claim == "final_state_field"]
+    errors = [item for item in evidence if item.claim in {"span_error", "missing_tool_result"}]
+    finals = [item for item in evidence if item.claim == "final_output"]
+    scores = [item for item in evidence if item.claim in {"command_exit_code", "recorded_score"}]
+
+    console.print("\n[bold cyan]What happened[/bold cyan]")
+    if states:
+        by_tool: dict[str, list[str]] = {}
+        for item in states:
+            value = item.value if isinstance(item.value, dict) else {}
+            tool = str(value.get("tool", "result"))
+            key = str(value.get("key", "value"))
+            by_tool.setdefault(tool, []).append(f"{key}={_brief(value.get('value'), 80)}")
+        for tool, facts in list(by_tool.items())[-3:]:
+            visible = facts[:6]
+            suffix = f" (+{len(facts) - 6} more)" if len(facts) > 6 else ""
+            console.print(f"  [magenta]{tool}[/magenta]: {', '.join(visible)}{suffix}")
+    elif not errors and not scores:
+        console.print("  [yellow]No structured outcome was recorded.[/yellow]")
+    for item in errors:
+        console.print(f"  [red]{item.claim}:[/red] {_brief(item.value)}")
+    for item in scores:
+        console.print(f"  {item.claim}: {_brief(item.value)}")
+
+    console.print("\n[bold cyan]Agent's final response[/bold cyan]")
+    if finals:
+        value = finals[-1].value
+        output = value.get("output") if isinstance(value, dict) else value
+        console.print(_brief(output, 600))
+    else:
+        console.print("[yellow]None recorded.[/yellow]")
+
+
 @app.command()
 def label(
     verifier_draft_id: str,
@@ -960,13 +1004,19 @@ def label(
     console.print(f"to label: {len(queue)} run(s), {len(run.disagreements)} disputed first\n")
 
     labels = []
-    for trace_id in queue:
+    tasks = {task.trace_id: task for task in analysis.tasks}
+    evidence_by_trace = {}
+    for item in analysis.evidence:
+        evidence_by_trace.setdefault(item.trace_id, []).append(item)
+    for position, trace_id in enumerate(queue, 1):
         scores = run.scores_for(trace_id)
         rendered = ", ".join(
             f"{vid[:18]}={'unknown' if s is None else s}" for vid, s in sorted(scores.items())
         )
-        console.print(f"[bold]{trace_id}[/bold]  verifiers: {rendered or 'not scored'}")
-        answer = typer.prompt("  succeeded? [s]uccess/[f]ailure/[u]nclear/[q]uit", default="u")
+        task = tasks.get(trace_id)
+        _show_label_card(trace_id, task, evidence_by_trace.get(trace_id, []), position, len(queue))
+        console.print(f"\n[dim]Verifier scores: {rendered or 'not scored'}[/dim]")
+        answer = typer.prompt("Decision [s]uccess / [f]ailure / [u]nclear / [q]uit", default="u")
         if answer.strip().lower().startswith("q"):
             break
         verdict = _VERDICTS.get(answer.strip().lower()[:1], Verdict.UNCLEAR)
