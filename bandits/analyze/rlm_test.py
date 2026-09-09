@@ -2141,3 +2141,47 @@ def test_assignment_results_arriving_as_json_text_are_read() -> None:
 
     run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
     assert run.members() == {"c1": ("t1", "t2")}
+
+
+def test_a_decoded_scalar_is_not_iterated() -> None:
+    """`"1"` decodes to an int, which raises; `'"txt"'` to a string, which
+    iterates one character at a time and silently yields garbage."""
+    from bandits.analyze.rlm_mine import _rows
+
+    for scalar in ('"1"', "1", "true", '"some text"', "null", "", None, 3, True):
+        assert _rows(scalar) == [], scalar
+    assert _rows('[{"a": 1}]') == [{"a": 1}]
+    assert _rows('{"a": 1}') == [{"a": 1}]
+    assert _rows([{"a": 1}]) == [{"a": 1}]
+
+
+def test_a_scalar_reply_does_not_crash_a_chunk() -> None:
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        return SimpleNamespace(
+            contracts="1",
+            operations="true",
+            assignments='"nope"',
+            ambiguous_trace_ids='"t1"',
+            uncovered_trace_ids="42",
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert draft.contracts == ()
+    assert all(chunk.status == "success" for chunk in draft.chunks)
+    assert any("no contracts at all" in limit for limit in draft.limitations)
+
+
+def test_a_bare_string_is_not_read_as_a_list_of_ids() -> None:
+    from bandits.analyze.rlm_mine import _string_tuple
+
+    assert _string_tuple("t1") == ()
+    assert _string_tuple(["t1", "t2"]) == ("t1", "t2")
+
+
+def test_assignment_survives_a_scalar_reply() -> None:
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    run = assign_traces(
+        _taxonomy(), "tax-1", corpus, predict=lambda **_: SimpleNamespace(results="1")
+    )
+    assert run.by_status(AssignmentStatus.UNCOVERED)[0].trace_id == "t1"
