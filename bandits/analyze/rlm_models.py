@@ -307,9 +307,17 @@ class TaxonomyOperation(Contract):
 
 
 class ChunkResult(Contract):
-    """One pass over one chunk of traces, and what it did to the taxonomy."""
+    """One call over one chunk of traces, and what it did to the taxonomy."""
 
     index: int = Field(ge=0)
+    pass_index: int = Field(default=0, ge=0)
+    """Which complete corpus pass this chunk belonged to.
+
+    Recorded per chunk because a pass is the unit the stopping rule is defined
+    over, and a chunk index alone cannot say whether the corpus has been read
+    through again or merely sampled from.
+    """
+
     trace_ids: tuple[str, ...]
     operations: tuple[TaxonomyOperation, ...] = ()
     assignments: dict[str, str] = Field(default_factory=dict)
@@ -336,6 +344,62 @@ class ChunkResult(Contract):
     @property
     def mutated(self) -> bool:
         return any(op.mutating for op in self.operations)
+
+
+class PassResult(Contract):
+    """One complete read of every eligible trace, and what it changed.
+
+    The unit the stopping rule is defined over. A pass is only complete when
+    every eligible trace appeared in it — not when a sample of them did — so
+    that "reviewed twice" is a checkable property of the artifact rather than a
+    hoped-for consequence of running a few more chunks.
+    """
+
+    pass_index: int = Field(ge=0)
+    seed: int
+    """The shuffle this pass used. Recorded per pass because each is reshuffled,
+    and a pass whose order cannot be reproduced cannot be rerun."""
+
+    trace_ids: tuple[str, ...]
+    """Every trace this pass read, in the order it read them."""
+
+    chunk_indices: tuple[int, ...] = ()
+    operations: tuple[TaxonomyOperation, ...] = ()
+    contracts_before: tuple[str, ...] = ()
+    contracts_after: tuple[str, ...] = ()
+    reassigned_trace_ids: tuple[str, ...] = ()
+    """Traces this pass placed differently than the previous pass had.
+
+    The number a reviewer actually reads at the pause: it says how much the
+    taxonomy moved under a second look, which no count of operations does.
+    """
+
+    complete: bool = True
+    """False when a budget guard fired mid-pass, so the pass read only part of
+    the corpus and must not be counted toward the schedule."""
+
+    @model_validator(mode="after")
+    def a_pass_reads_each_trace_once(self) -> PassResult:
+        if self.complete and not self.trace_ids:
+            # An empty *complete* pass is a contradiction. An empty incomplete
+            # one is not: a pass whose first chunk failed read nothing, and that
+            # attempt is still worth recording rather than vanishing.
+            raise ValueError(f"pass {self.pass_index} is complete but recorded no traces")
+        if len(set(self.trace_ids)) != len(self.trace_ids):
+            raise ValueError(
+                f"pass {self.pass_index} read the same trace twice; a pass is one "
+                "read of each eligible trace"
+            )
+        return self
+
+    @property
+    def mutated(self) -> bool:
+        return any(op.mutating for op in self.operations)
+
+    @property
+    def churn(self) -> float:
+        """Fraction of what this pass read that it placed differently."""
+        return len(self.reassigned_trace_ids) / max(len(self.trace_ids), 1)
 
 
 class AuditFinding(Contract):
@@ -415,6 +479,48 @@ class TaxonomyAudit(Contract):
         )
 
 
+DEFAULT_PASSES = 2
+"""Complete corpus passes before pausing for review.
+
+Two, then stop. The first pass builds a taxonomy from nothing, so its early
+chunks were judged against definitions that did not exist yet; the second is the
+first time every trace is read against a taxonomy that has already seen the
+whole corpus. One pass is a draft, two is a draft that has been checked, and the
+pause after them is what keeps this from becoming a loop that runs until the
+model stops objecting to itself.
+
+A pass is complete only when every eligible trace appeared in it. Two clean
+chunks are not two passes, and the difference is the whole stopping rule.
+
+Continuing after the pause is a separate, human-initiated operation —
+:class:`ResumeScope` — which resumes the same workspace rather than starting
+over, and can target only what is actually unresolved.
+"""
+
+
+class ResumeScope(str, Enum):
+    """What a resumed session re-examines. Chosen by a person, never inferred.
+
+    Rereading all 160 traces to settle eleven ambiguous ones is mostly waste,
+    and the waste is not only money: every reread is another chance for the
+    model to reword a definition that was already fine, which shows up as churn
+    and makes the run look less stable than it was.
+    """
+
+    FULL = "full"
+    """Every eligible trace again, against the taxonomy as it now stands."""
+
+    UNRESOLVED = "unresolved"
+    """Ambiguous and uncovered traces only."""
+
+    AFFECTED = "affected"
+    """Unresolved traces, plus members of contracts that changed late in the
+    previous pass — the ones judged against wording that has since moved."""
+
+    FLAGGED = "flagged"
+    """Only the contracts a reviewer named."""
+
+
 class Budget(Contract):
     """Hard ceilings on one mining run.
 
@@ -424,7 +530,23 @@ class Budget(Contract):
     because the money ran out is not a taxonomy that stopped changing.
     """
 
-    max_iterations: int = Field(default=20, ge=1)
+    passes: int = Field(default=DEFAULT_PASSES, ge=1)
+    """Complete corpus passes to run before pausing. The schedule, not a guard.
+
+    Distinct from every other field here: the limits below are emergencies that
+    produce a partial artifact, while this is the plan the run is expected to
+    finish. A run that stops because it completed its passes did what it was
+    asked; a run that stops on any other field did not.
+    """
+
+    max_iterations: int = Field(default=200, ge=1)
+    """Emergency guard on chunk count, not the stopping rule.
+
+    Raised well above what a two-pass schedule needs: it used to double as the
+    stopping rule, and a ceiling low enough to end a run is a ceiling that ends
+    it mid-pass.
+    """
+
     max_llm_calls: int = Field(default=400, ge=1)
     max_seconds: float = Field(default=3600.0, gt=0)
     max_usd: float | None = Field(default=None, gt=0)
@@ -432,8 +554,15 @@ class Budget(Contract):
 
 
 class StopReason(str, Enum):
-    CONVERGED = "converged"
-    """Two consecutive clean sweeps. The only reason that yields a complete run."""
+    PASSES_COMPLETE = "passes_complete"
+    """Every requested pass read every eligible trace. Pauses for human review.
+
+    Deliberately not called convergence. The loop stopping is a fact about the
+    schedule that was run, not evidence that the taxonomy stopped moving, and
+    the previous name invited exactly that inference. What this earns is a
+    checkpoint and a diff between passes for a person to read — never an
+    automatic promotion to a finished taxonomy.
+    """
 
     MAX_ITERATIONS = "max_iterations"
     MAX_LLM_CALLS = "max_llm_calls"
@@ -442,11 +571,13 @@ class StopReason(str, Enum):
     ERROR = "error"
 
 
-COMPLETE_STOP_REASONS = frozenset({StopReason.CONVERGED})
-"""The stop reasons that permit a taxonomy to be called finished.
+COMPLETE_STOP_REASONS = frozenset({StopReason.PASSES_COMPLETE})
+"""The stop reasons under which the requested schedule actually finished.
 
 A frozenset of one, written as a set so the asymmetry is stated rather than
-implied by an ``== CONVERGED`` scattered through the codebase.
+implied by an equality check scattered through the codebase. "Complete" here
+means the passes that were asked for were run to the end — nothing more. Every
+other reason is an emergency guard firing, which leaves a partial artifact.
 """
 
 
@@ -464,6 +595,31 @@ class TaxonomyDraft(Contract):
     seed: int
     contracts: tuple[FamilyContract, ...] = ()
     chunks: tuple[ChunkResult, ...] = ()
+    passes: tuple[PassResult, ...] = ()
+    """Each complete read of the corpus, in order.
+
+    The auditable record behind the stopping rule: a reader can check that every
+    eligible trace appears in every completed pass, rather than taking the run's
+    word that it swept.
+    """
+
+    completed_passes: int = Field(default=0, ge=0)
+    """Passes that read every eligible trace. Never incremented by a partial one."""
+
+    requested_passes: int = Field(default=DEFAULT_PASSES, ge=1)
+    assignments: dict[str, str] = Field(default_factory=dict)
+    """The taxonomy's final placement of every trace it could place.
+
+    Stored so a resumed session starts from the workspace the pause left, rather
+    than replaying every chunk to reconstruct it.
+    """
+
+    resumed_from: str | None = None
+    """The draft this session continued, when it continued one."""
+
+    resume_scope: ResumeScope | None = None
+    """What a resumed session re-examined. None on a first run."""
+
     ambiguous_trace_ids: tuple[str, ...] = ()
     uncovered_trace_ids: tuple[str, ...] = ()
     unreadable_trace_ids: tuple[str, ...] = ()
@@ -482,8 +638,49 @@ class TaxonomyDraft(Contract):
 
     @property
     def complete(self) -> bool:
-        """Whether this converged rather than running out of budget."""
-        return self.stop_reason in COMPLETE_STOP_REASONS
+        """Whether the requested passes all finished.
+
+        Not convergence, and deliberately not named for it. This says the
+        schedule ran to the end and every eligible trace was read the requested
+        number of times — it says nothing about whether the taxonomy had
+        stopped moving, which is a judgement the pause exists to hand a person.
+        """
+        return (
+            self.stop_reason in COMPLETE_STOP_REASONS
+            and self.completed_passes >= self.requested_passes
+        )
+
+    @property
+    def awaiting_review(self) -> bool:
+        """Whether this is a checkpoint a person is expected to act on."""
+        return self.complete
+
+    def pass_diff(self) -> tuple[str, ...]:
+        """What changed between the last two passes, for the pause summary.
+
+        The question a reviewer actually has at a checkpoint — did the second
+        look agree with the first — which no total over the whole run answers.
+        """
+        if len(self.passes) < 2:
+            return ()
+        previous, latest = self.passes[-2], self.passes[-1]
+        created = set(latest.contracts_after) - set(latest.contracts_before)
+        removed = set(latest.contracts_before) - set(latest.contracts_after)
+        lines = [
+            f"pass {latest.pass_index}: {len(latest.operations)} operation(s), "
+            f"{len(latest.reassigned_trace_ids)} trace(s) placed differently "
+            f"({latest.churn:.1%} of what it read)"
+        ]
+        if created:
+            lines.append(f"contracts created: {', '.join(sorted(created))}")
+        if removed:
+            lines.append(f"contracts retired: {', '.join(sorted(removed))}")
+        if not latest.mutated and not previous.mutated:
+            lines.append(
+                "neither of the last two passes changed the taxonomy, which is "
+                "evidence for stability but is not itself a convergence test"
+            )
+        return tuple(lines)
 
     def contract_by_id(self) -> dict[str, FamilyContract]:
         return {c.contract_id: c for c in self.contracts}

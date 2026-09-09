@@ -246,7 +246,7 @@ _RAW_CONTRACT = {
 }
 
 
-def test_discovery_converges_and_marks_the_draft_complete() -> None:
+def test_discovery_runs_every_requested_pass_then_pauses() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund my order") for i in range(6))))
     predict = _ScriptedMiner(
         [
@@ -259,9 +259,120 @@ def test_discovery_converges_and_marks_the_draft_complete() -> None:
         ]
     )
     draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
-    assert draft.stop_reason is StopReason.CONVERGED
+    assert draft.stop_reason is StopReason.PASSES_COMPLETE
     assert draft.complete
+    assert draft.awaiting_review
+    assert draft.completed_passes == 2
     assert [c.contract_id for c in draft.contracts] == ["c1"]
+
+
+def test_every_eligible_trace_is_read_once_in_every_pass() -> None:
+    """The bug this replaced: two quiet chunks could end a run having re-read
+    a fraction of the corpus while reporting convergence."""
+    seen: dict[str, int] = {}
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        import json
+
+        rows = json.loads(chunk)
+        for row in rows:
+            seen[row["trace_id"]] = seen.get(row["trace_id"], 0) + 1
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    assert draft.completed_passes == 2
+    assert set(seen) == {f"t{i}" for i in range(40)}
+    assert all(count == 2 for count in seen.values()), seen
+    for result in draft.passes:
+        assert result.complete
+        assert len(result.trace_ids) == 40
+
+
+def test_each_pass_reshuffles_under_its_own_recorded_seed() -> None:
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=5,
+        seed=7,
+    )
+    assert [p.seed for p in draft.passes] == [7, 8]
+    assert draft.passes[0].trace_ids != draft.passes[1].trace_ids
+
+
+def test_a_partial_pass_never_counts_toward_the_schedule() -> None:
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=10,
+        budget=Budget(max_iterations=2),
+    )
+    assert draft.completed_passes == 0
+    assert not draft.complete
+    assert not draft.passes[0].complete
+
+
+def test_a_failed_chunk_does_not_shrink_a_pass_coverage() -> None:
+    """A provider blip must not silently cost a pass part of the corpus."""
+    calls = {"n": 0}
+    seen: dict[str, int] = {}
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        import json
+
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("transient outage")
+        rows = json.loads(chunk)
+        for row in rows:
+            seen[row["trace_id"]] = seen.get(row["trace_id"], 0) + 1
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(30))))
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    assert draft.completed_passes == 2
+    assert all(count == 2 for count in seen.values())
+
+
+def test_pass_diff_reports_what_the_second_look_changed() -> None:
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=2,
+    )
+    diff = draft.pass_diff()
+    assert diff
+    assert any("placed differently" in line for line in diff)
+    assert any("not itself a convergence test" in line for line in diff)
+
+
+def test_a_complete_run_still_refuses_to_call_itself_converged() -> None:
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=2,
+    )
+    assert any("not a convergence test" in limit for limit in draft.limitations)
 
 
 def test_a_run_that_never_settles_stops_on_budget_and_is_incomplete() -> None:
@@ -281,24 +392,21 @@ def test_a_run_that_never_settles_stops_on_budget_and_is_incomplete() -> None:
     )
     assert draft.stop_reason is StopReason.MAX_ITERATIONS
     assert not draft.complete
-    assert any("rather than converging" in limit for limit in draft.limitations)
+    assert any("before completing its" in limit for limit in draft.limitations)
 
 
-def test_one_clean_sweep_is_not_enough_to_freeze() -> None:
-    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    predict = _ScriptedMiner(
-        [
-            {
-                "contracts": [_RAW_CONTRACT],
-                "contract_id": "c1",
-                "operations": [{"operation": "CREATE", "rationale": "new"}],
-            },
-            {"contract_id": "c1"},
-        ]
+def test_two_chunks_are_not_two_passes() -> None:
+    """The precise defect: chunk cleanliness must not substitute for coverage."""
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=5,
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    # One chunk to create, then two quiet sweeps before freezing.
-    assert len(draft.chunks) >= 3
+    # Four chunks per pass, two passes: never fewer, however quiet they were.
+    assert len(draft.chunks) == 8
+    assert draft.completed_passes == 2
 
 
 def test_contracts_with_no_outcome_shape_are_dropped_and_reported() -> None:
@@ -400,7 +508,9 @@ def _draft(**overrides):
         view=TraceView.USER_MESSAGES,
         seed=42,
         contracts=(_contract("c1"),),
-        stop_reason=StopReason.CONVERGED,
+        stop_reason=StopReason.PASSES_COMPLETE,
+        completed_passes=2,
+        requested_passes=2,
         budget=Budget(),
         model="test-model",
         prompt_digest="digest",
@@ -1431,3 +1541,150 @@ def test_leakage_audit_still_catches_a_real_score_beside_an_identifier() -> None
     )
     corpus = ReadOnlyCorpus(corpus_obj, view=TraceView.FULL_TRAJECTORY)
     assert corpus.leakage_report(analyze_corpus(corpus_obj))
+
+
+# --- resumable sessions and incremental logging ------------------------------
+
+
+def _recorder(tmp_path, session_id: str = "sess-1"):
+    from bandits.analyze.rlm_session import SessionRecorder, SessionStore
+
+    store = SessionStore(tmp_path)
+    return store, SessionRecorder(
+        store,
+        session_id=session_id,
+        analysis_id="analysis-1",
+        view=TraceView.USER_MESSAGES,
+        model="test-model",
+    )
+
+
+def test_state_is_written_after_every_chunk_not_every_pass(tmp_path) -> None:
+    """A watcher must never be more than one model call behind."""
+    store, recorder = _recorder(tmp_path)
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
+    mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=5,
+        session=recorder,
+    )
+    events = [e for e in store.read_events("sess-1") if e["event"] == "chunk_complete"]
+    assert len(events) == 8
+    # Progress within a half-finished pass is visible, not just at boundaries.
+    first_pass = [e for e in events if e["pass"] == 0]
+    assert [e["seen_this_pass"] for e in first_pass] == [5, 10, 15, 20]
+    assert all(e["of"] == 20 for e in events)
+
+
+def test_a_mid_pass_crash_leaves_resumable_state_on_disk(tmp_path) -> None:
+    store, recorder = _recorder(tmp_path, "sess-crash")
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        import json
+
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise RuntimeError("provider down for good")
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(30))))
+    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10, session=recorder)
+
+    state = store.read("sess-crash")
+    # The work that succeeded survived, and the pass order is pinned so a resume
+    # reads what is left rather than reshuffling and rereading.
+    assert len(state.assignments) == 20
+    assert len(state.seen_this_pass) == 20
+    assert len(state.pass_order) == 30
+    assert state.contracts
+    assert "provider down" in state.last_error
+
+
+def test_progress_line_reads_without_parsing_anything(tmp_path) -> None:
+    store, recorder = _recorder(tmp_path, "sess-p")
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(10))))
+    mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
+        chunk_size=5,
+        session=recorder,
+    )
+    progress = store.read("sess-p").progress
+    assert "pass 2/2" in progress
+    assert "10/10 traces" in progress
+    assert "1 contracts" in progress
+
+
+def test_a_failed_session_is_not_readable_as_idle(tmp_path) -> None:
+    store, recorder = _recorder(tmp_path, "sess-f")
+    recorder.begin(traces_total=5, requested_passes=2, seed=1)
+    recorder.fail("the run died")
+    state = store.read("sess-f")
+    assert state.status == "failed"
+    assert state.last_error == "the run died"
+    assert [e["event"] for e in store.read_events("sess-f")][-1] == "session_failed"
+
+
+def test_a_finished_session_is_marked_awaiting_review(tmp_path) -> None:
+    store, recorder = _recorder(tmp_path, "sess-done")
+    recorder.begin(traces_total=5, requested_passes=2, seed=1)
+    recorder.finish(status="awaiting_review", stop_reason="passes_complete", draft_id="d1")
+    assert store.read("sess-done").status == "awaiting_review"
+
+
+def test_sessions_are_listed_newest_first(tmp_path) -> None:
+    from bandits.analyze.rlm_session import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("a", "b"):
+        _, recorder = _recorder(tmp_path, f"sess-{name}")
+        recorder.begin(traces_total=1, requested_passes=1, seed=1)
+    assert {s.session_id for s in store.list()} == {"sess-a", "sess-b"}
+
+
+def test_session_state_survives_a_round_trip(tmp_path) -> None:
+    store, recorder = _recorder(tmp_path, "sess-rt")
+    recorder.begin(traces_total=3, requested_passes=2, seed=5)
+    reloaded = store.read("sess-rt")
+    assert reloaded.seed == 5
+    assert reloaded.requested_passes == 2
+    assert reloaded.view is TraceView.USER_MESSAGES
+
+
+def test_a_finished_session_reports_the_runs_own_pass_count(tmp_path) -> None:
+    """The last checkpoint is written before the final pass increments."""
+    store, recorder = _recorder(tmp_path, "sess-count")
+    recorder.begin(traces_total=4, requested_passes=2, seed=1)
+    recorder.finish(status="awaiting_review", stop_reason="passes_complete", completed_passes=2)
+    assert store.read("sess-count").completed_passes == 2
+
+
+def test_each_family_names_the_view_it_was_mined_from() -> None:
+    """A Path F family saying "user messages alone" misstates its own evidence."""
+    taxonomy = _taxonomy().replace(view=TraceView.FULL_TRAJECTORY)
+    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]}).replace(
+        view=TraceView.FULL_TRAJECTORY
+    )
+    family = materialize_task_set(run, taxonomy, corpus_id="corpus-1").families[0]
+    assert any("full-trajectory view" in limit for limit in family.limitations)
+    assert not any("user messages alone" in limit for limit in family.limitations)
+    assert any("execution behaviour" in limit for limit in family.limitations)
+
+
+def test_a_path_u_family_makes_no_behaviour_caveat() -> None:
+    taxonomy = _taxonomy()
+    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]})
+    family = materialize_task_set(run, taxonomy, corpus_id="corpus-1").families[0]
+    assert any("user-messages view" in limit for limit in family.limitations)
+    assert not any("execution behaviour" in limit for limit in family.limitations)
