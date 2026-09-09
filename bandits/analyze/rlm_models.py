@@ -27,7 +27,7 @@ import json
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from bandits.traces import Contract
 
@@ -243,6 +243,55 @@ class FamilyContract(Contract):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+class ProposedContract(Contract):
+    """One contract exactly as the model must return it.
+
+    Typed rather than ``dict`` so the backend's own decoder enforces the fields.
+    An untyped ``list[dict]`` accepted ``{"name": ..., "description": ...}`` as a
+    valid answer: SUBMIT succeeded, and the parser then discarded every one of
+    them for having no stated outcome. The model was never told, by any channel
+    it could not ignore, that the outcome was required.
+
+    ``model_config`` allows extra keys rather than forbidding them: a model that
+    adds a field it was not asked for has still answered the question, and
+    rejecting the whole contract over a stray key would reintroduce the failure
+    this type exists to prevent.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="allow")
+
+    contract_id: str = ""
+    """Blank is allowed; the miner derives one from the definition."""
+
+    name: str
+    definition: str
+    required_outcome_shape: list[str]
+    """What a verifier must establish. The field that makes this a family
+    rather than a topic, and the reason this model is typed at all."""
+
+    inclusion_rules: list[str] = Field(default_factory=list)
+    exclusion_rules: list[str] = Field(default_factory=list)
+    supporting_trace_ids: list[str] = Field(default_factory=list)
+    counterexample_trace_ids: list[str] = Field(default_factory=list)
+
+
+class ProposedOperation(Contract):
+    """One taxonomy operation exactly as the model must return it.
+
+    Typed for a second reason beyond field enforcement: an untyped operation let
+    the model write ``KEEP`` meaning "the user wants to keep their reservation".
+    Naming ``contract_ids`` in the schema makes the subject of the verb the
+    taxonomy rather than the user's request.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="allow")
+
+    operation: str
+    contract_ids: list[str] = Field(default_factory=list)
+    trace_ids: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class Operation(str, Enum):
     """What one discovery step did to the taxonomy.
 
@@ -432,7 +481,7 @@ class AuditFinding(Contract):
     """
 
     contract_id: str
-    recommendation: Literal["keep", "revise", "split", "uncertain"]
+    recommendation: Literal["keep", "revise", "split", "merge", "uncertain"]
     least_compatible_pair: tuple[str, str] | None = None
     """The two members whose requested work differs most, so a reviewer knows
     where the family is weakest without rereading all of it."""
@@ -440,6 +489,13 @@ class AuditFinding(Contract):
     strongest_outsider_trace_id: str | None = None
     """The best apparent member currently outside. A contract that cannot
     exclude it is either too narrow or wrongly bounded."""
+
+    merge_with_contract_id: str | None = None
+    """The sibling contract this one should merge with, when recommended.
+
+    A merge is advisory: the audit records the suspected over-split boundary,
+    while discovery or a reviewer decides whether and how to rewrite it.
+    """
 
     topical_only: bool = False
     """Whether members share a subject while needing different verifiers.
@@ -465,6 +521,17 @@ class AuditFinding(Contract):
     def finding_is_argued_and_resolutions_say_how(self) -> AuditFinding:
         if not self.rationale.strip():
             raise ValueError(f"audit finding for {self.contract_id} carries no rationale")
+        if self.recommendation == "merge" and not self.merge_with_contract_id:
+            raise ValueError("a merge recommendation must name a sibling contract")
+        if self.recommendation != "merge" and self.merge_with_contract_id:
+            # A target on a keep or a split is a contradiction, and a reviewer
+            # reading the field would act on a merge nobody recommended.
+            raise ValueError(
+                f"finding for {self.contract_id} names a merge target without "
+                "recommending a merge"
+            )
+        if self.merge_with_contract_id == self.contract_id:
+            raise ValueError(f"contract {self.contract_id} cannot merge with itself")
         if self.resolved and not self.resolution.strip():
             raise ValueError(
                 f"audit finding for {self.contract_id} is marked resolved with no account "
@@ -475,7 +542,7 @@ class AuditFinding(Contract):
     @property
     def demands_action(self) -> bool:
         """Whether discovery must answer this before the taxonomy may freeze."""
-        return self.recommendation in ("revise", "split")
+        return self.recommendation in ("revise", "split", "merge")
 
 
 class TaxonomyAudit(Contract):

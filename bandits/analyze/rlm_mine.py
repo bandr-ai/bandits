@@ -44,6 +44,8 @@ from bandits.analyze.rlm_models import (
     FamilyContract,
     Operation,
     PassResult,
+    ProposedContract,
+    ProposedOperation,
     StopReason,
     TaxonomyDraft,
     TaxonomyOperation,
@@ -56,7 +58,7 @@ DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -64,6 +66,17 @@ CLEAN_SWEEPS_TO_FREEZE = 2
 Two rather than one: a single quiet sweep is as easily explained by an
 unrepresentative chunk as by convergence, and the cost of one more pass is far
 below the cost of freezing a taxonomy that was still moving.
+"""
+
+MAX_CONTRACT_REPAIRS = 1
+"""How many times one chunk may be asked to fix contracts it got wrong.
+
+Capped at one rather than looped. Returning the validation error to the model is
+the standard repair for structured extraction, and it is right here: a contract
+silently dropped costs the whole chunk's work, while a contract corrected costs
+one call. But a model that fails validation once will often fail it the same way
+again, and an uncapped loop would spend a chunk's entire call budget arguing
+with itself. One retry, then the drop is recorded with its evidence.
 """
 
 MAX_ASSIGNMENT_CHURN = 0.02
@@ -90,6 +103,14 @@ families when checking success would require materially different work — even 
 if the domain, the wording, and the verb are the same. Sharing a topic is not \
 sharing a family.
 
+Decision examples (the examples illustrate the test, not domain categories):
+- "Reset my password" and "I forgot my password" belong together: both can be \
+verified by establishing that the requested account has a usable new password.
+- "Reset my password" and "Change my account email" do not belong together: \
+both concern an account, but their required outcomes are different.
+- "Summarize this report in three bullets" and "Summarize this report in one \
+paragraph" may share one contract parameterized by requested output format.
+
 For every contract you propose or keep, state:
 - name: a short imperative task-family name.
 - definition: what user-requested work belongs here.
@@ -104,12 +125,34 @@ MARK_AMBIGUOUS, MARK_UNCOVERED. Mark a trace ambiguous when several contracts \
 fit it equally and uncovered when none does. Never force a trace into a family \
 to avoid leaving it unplaced; an unplaced trace is a finding about the taxonomy.
 
+For example, retaining contract c1 unchanged uses {{"operation": "KEEP", \
+"contract_ids": ["c1"], "trace_ids": ["t1"], "rationale": "..."}}. Merging \
+c1 and c2 into c3 uses contract_ids ["c1", "c2", "c3"], with the produced \
+contract last.
+
 Assign every trace in this chunk, including ones you have seen before: re-reading \
 an old trace against changed definitions is the point of the loop."""
 
 
 def instruction_for(view: TraceView) -> str:
-    """The mining prompt as this arm's miner actually receives it."""
+    """The mining prompt as this arm's miner actually receives it.
+
+    Passed as the signature's instructions rather than as an input field. The
+    two are not interchangeable: an input field becomes a REPL variable, and
+    ``REPLVariable.from_value`` shows the root model a 1000-character peek —
+    the first 500 characters and the last 500 — of any value larger than that.
+    This prompt is 2.8k characters, so a third of it was visible and the
+    schema, the outcome requirement and the worked examples all sat in the
+    elided middle. The model could have printed the variable to read the rest;
+    across 42 recorded calls it referenced it seven times and printed it in
+    full none.
+
+    Signature instructions are interpolated straight into the action prompt and
+    never wrapped in a variable, so there is nothing to elide and nothing the
+    model has to think to retrieve. In the RLM's own terms this is the query,
+    which belongs in the token window, while the traces are the context, which
+    belongs in the REPL.
+    """
     return _INSTRUCTION_HEAD.format(view=VIEW_PREAMBLES[view])
 
 
@@ -141,6 +184,7 @@ def build_predictor(
     *,
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
+    view: TraceView = TraceView.USER_MESSAGES,
     max_iterations: int = 25,
     max_llm_calls: int = 60,
 ) -> _Predictor:
@@ -175,21 +219,34 @@ def build_predictor(
         temperature=0.0,
     )
 
-    signature = (
-        "chunk: str, taxonomy: str, question: str -> contracts: list[dict], "
-        "operations: list[dict], assignments: dict[str, str], "
-        "ambiguous_trace_ids: list[str], uncovered_trace_ids: list[str]"
-    )
+    # Typed rather than list[dict]: the decoder then enforces the fields, and a
+    # topic object cannot be submitted as a valid contract in the first place.
+    # Built from real classes rather than a signature string, because DSPy
+    # resolves names in a string against its own namespace and cannot see these.
+    class _Mine(dspy.Signature):
+        chunk: str = dspy.InputField(desc="the traces to read this round")
+        taxonomy: str = dspy.InputField(desc="contracts built so far, possibly empty")
+        contracts: list[ProposedContract] = dspy.OutputField()
+        operations: list[ProposedOperation] = dspy.OutputField()
+        assignments: dict[str, str] = dspy.OutputField()
+        ambiguous_trace_ids: list[str] = dspy.OutputField()
+        uncovered_trace_ids: list[str] = dspy.OutputField()
+
+    # The query, in the RLM's sense: it belongs in the token window, not in a
+    # REPL variable the model has to remember to print.
+    _Mine.__doc__ = instruction_for(view)
     rlm = dspy.RLM(
-        signature,
+        _Mine,
         max_iters=max_iterations,
         max_llm_calls=max_llm_calls,
         sub_lm=language_model,
     )
 
-    def predict(*, chunk: str, taxonomy: str, question: str) -> Any:
+    def predict(*, chunk: str, taxonomy: str, question: str = "") -> Any:
+        # ``question`` is accepted and ignored so the injected predictors the
+        # tests use keep one shape across every stage.
         with dspy.context(lm=language_model):
-            return rlm(chunk=chunk, taxonomy=taxonomy, question=question)
+            return rlm(chunk=chunk, taxonomy=taxonomy)
 
     return with_cost(scoped_to_history(predict, language_model))
 
@@ -1039,6 +1096,7 @@ def _run_chunk(
     predict: _Predictor,
     limitations: list[str],
     session_id: str = "",
+    repairs_left: int = MAX_CONTRACT_REPAIRS,
 ) -> ChunkResult:
     """One call over one chunk, with its output cleaned at the boundary."""
     chunk_json = _chunk_payload(corpus, trace_ids, statuses)
@@ -1085,6 +1143,24 @@ def _run_chunk(
             dropped_contracts.append(json.dumps(raw, default=str))
         else:
             contracts.append(parsed)
+    if dropped_contracts and repairs_left > 0:
+        # Hand the model its own invalid output and the reason, rather than
+        # discarding work it already paid to produce.
+        repaired = _repair_contracts(
+            dropped_contracts,
+            chunk_json=chunk_json,
+            taxonomy_json=taxonomy_json,
+            corpus=corpus,
+            predict=predict,
+            known=known,
+        )
+        if repaired:
+            contracts.extend(repaired)
+            dropped_contracts = dropped_contracts[len(repaired) :]
+            limitations.append(
+                f"chunk {index} returned {len(repaired)} contract(s) that failed "
+                "validation and were corrected on a second attempt"
+            )
     if dropped_contracts:
         limitations.append(
             f"chunk {index} proposed {len(dropped_contracts)} contract(s) the parser "
@@ -1147,6 +1223,47 @@ def _run_chunk(
         raw_reply=_raw_reply(prediction),
         dropped_contracts=tuple(dropped_contracts),
     )
+
+
+_REPAIR_INSTRUCTION = """Some contracts you returned were rejected because they \
+were missing a required field. Every contract MUST carry a non-empty `definition` \
+and a non-empty `required_outcome_shape` — a list of statements a verifier could \
+check once the work is done. A contract with only a name and a description names \
+a topic, and a topic cannot be verified.
+
+Return corrected versions of the rejected contracts below. Keep what was right \
+about them and add what was missing. Return nothing for any that genuinely cannot \
+be given a checkable outcome."""
+
+
+def _repair_contracts(
+    rejected: list[str],
+    *,
+    chunk_json: str,
+    taxonomy_json: str,
+    corpus: ReadOnlyCorpus,
+    predict: _Predictor,
+    known: set[str],
+) -> list[FamilyContract]:
+    """Ask the model to fix contracts that failed validation.
+
+    Best effort by design: a repair that fails costs one call and the originals
+    are still recorded verbatim, so nothing is lost that was not already lost.
+    """
+    try:
+        prediction = predict(
+            chunk=chunk_json,
+            taxonomy=taxonomy_json,
+            question=_REPAIR_INSTRUCTION + "\n\nRejected contracts:\n" + "\n".join(rejected),
+        )
+    except Exception:  # noqa: BLE001 - a failed repair must not lose the chunk
+        return []
+    repaired = []
+    for raw in _rows(getattr(prediction, "contracts", ())):
+        parsed = _parse_contract(raw, known_traces=known)
+        if parsed is not None:
+            repaired.append(parsed)
+    return repaired
 
 
 def compute_draft_id(draft: TaxonomyDraft) -> str:
