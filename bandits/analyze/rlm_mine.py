@@ -43,6 +43,7 @@ from bandits.analyze.rlm_models import (
     ChunkResult,
     FamilyContract,
     Operation,
+    PassResult,
     StopReason,
     TaxonomyDraft,
     TaxonomyOperation,
@@ -473,43 +474,50 @@ def _compose_chunk(
     *,
     unseen: list[str],
     chunk_size: int,
-    rng: random.Random,
+    seen_this_pass: set[str],
 ) -> tuple[tuple[str, ...], dict[str, str]]:
-    """Pick the next chunk, mixing the five categories the plan requires.
+    """Pick the next chunk from what this pass has not yet read.
 
-    Unseen traces come first and take at least half the chunk while any remain,
-    so a corpus is actually covered rather than endlessly re-litigated. The rest
-    is filled with unresolved cases, traces the last operations touched, and a
-    random sample of settled ones — the last being the only way a definition
-    that drifted is caught against a trace nobody was worried about.
+    Every trace comes from ``unseen``, which is what remains of *this pass*, so
+    a pass is guaranteed to terminate having read each eligible trace exactly
+    once. That is the property the stopping rule rests on, and mixing in
+    already-read traces to make the chunk more interesting would quietly break
+    it — a chunk that re-read ten settled traces would leave ten of this pass's
+    traces for a later chunk that may never come.
+
+    The mixing the plan asks for still happens, but between passes rather than
+    within one: each pass reshuffles, so a trace's neighbours differ every time,
+    and the status label tells the model which traces it has seen before and
+    what became of them.
     """
     statuses: dict[str, str] = {}
     picked: list[str] = []
 
-    def take(candidates: Sequence[str], status: str, room: int) -> None:
-        for trace_id in candidates:
-            if room <= 0:
-                return
-            if trace_id in statuses:
-                continue
-            statuses[trace_id] = status
-            picked.append(trace_id)
-            room -= 1
+    def status_of(trace_id: str) -> str:
+        if trace_id in state.ambiguous:
+            return "ambiguous"
+        if trace_id in state.uncovered:
+            return "uncovered"
+        if trace_id in state.recently_affected:
+            return "affected"
+        if trace_id in state.assignments:
+            return "assigned"
+        return "unseen"
 
-    if unseen:
-        take(unseen[: max(1, chunk_size // 2)], "unseen", chunk_size)
+    # Unresolved and recently-affected traces first, so a chunk that can settle
+    # something does. They are still drawn only from this pass's remainder.
+    def priority(trace_id: str) -> int:
+        return {"ambiguous": 0, "uncovered": 0, "affected": 1, "assigned": 2, "unseen": 2}[
+            status_of(trace_id)
+        ]
 
-    take(sorted(state.ambiguous), "ambiguous", chunk_size - len(picked))
-    take(sorted(state.uncovered), "uncovered", chunk_size - len(picked))
-    take(sorted(state.recently_affected), "affected", chunk_size - len(picked))
-
-    # Any remaining room goes back to unseen traces before it goes to review, so
-    # a corpus with many unresolved cases still finishes its first pass.
-    take(unseen, "unseen", chunk_size - len(picked))
-
-    settled = sorted(set(state.assignments) - set(statuses))
-    rng.shuffle(settled)
-    take(settled, "assigned", chunk_size - len(picked))
+    for trace_id in sorted(unseen, key=lambda t: (priority(t), unseen.index(t))):
+        if len(picked) >= chunk_size:
+            break
+        if trace_id in seen_this_pass:
+            continue
+        statuses[trace_id] = status_of(trace_id)
+        picked.append(trace_id)
     return tuple(picked), statuses
 
 
@@ -570,101 +578,202 @@ def mine_taxonomy(
     seed: int = DEFAULT_SEED,
     budget: Budget | None = None,
     on_chunk: Callable[[ChunkResult], None] | None = None,
+    session: Any = None,
 ) -> TaxonomyDraft:
-    """Run the discovery loop until it converges or a budget stops it.
+    """Read the corpus through complete passes, then pause for review.
 
-    Returns a draft either way. A draft is never a taxonomy and never a task
-    set: it records how it stopped, and only a run that went two full sweeps
-    without changing anything is marked complete.
+    Each pass reads every eligible trace exactly once, in its own shuffled
+    order. A pass counts toward the schedule only when it finished; a pass cut
+    short by a budget guard counts for nothing, however much of the corpus it
+    got through.
+
+    Nothing here decides the taxonomy has converged, because nothing here can.
+    The run stops when it has done the passes it was asked for, and hands back a
+    draft plus the diff between those passes for a person to judge. ``session``,
+    when given, is checkpointed after every chunk so a run that dies mid-pass is
+    resumable and a run in flight is observable.
     """
     budget = budget or Budget()
-    rng = random.Random(seed)
     state = _TaxonomyState()
 
-    readable = list(corpus.readable_trace_ids())
+    eligible = list(corpus.readable_trace_ids())
     unreadable = corpus.unreadable_trace_ids()
-    if not readable:
+    if not eligible:
         raise MiningError(
             "no trace in this corpus has readable user messages; there is nothing to mine"
         )
-    # Shuffled with the recorded seed so chunk composition is reproducible from
-    # the draft alone, and so corpus order cannot become family structure.
-    rng.shuffle(readable)
 
     chunks: list[ChunkResult] = []
+    passes: list[PassResult] = []
     limitations: list[str] = []
-    clean_sweeps = 0
     calls = 0
     usd = 0.0
     cost_reported = False
-    """Whether any chunk's backend reported a price at all.
-
-    Tracked because an unreported cost and a zero cost are different facts, and
-    only one of them means ``--max-usd`` was actually enforced.
-    """
     started = time.monotonic()
     stop_reason: StopReason | None = None
+    completed_passes = 0
 
-    while True:
-        stop_reason = _budget_stop(
-            budget, iterations=len(chunks), calls=calls, started=started, usd=usd
+    if session is not None:
+        session.begin(
+            traces_total=len(eligible), requested_passes=budget.passes, seed=seed
         )
-        if stop_reason is not None:
-            break
 
-        unseen = [trace_id for trace_id in readable if trace_id not in state.seen]
-        if not unseen and clean_sweeps >= CLEAN_SWEEPS_TO_FREEZE:
-            stop_reason = StopReason.CONVERGED
-            break
+    for pass_index in range(budget.passes):
+        # Reshuffled per pass with a seed derived from the run's, so each pass
+        # reads the corpus in a different order — chunk composition cannot
+        # become family structure — while staying reproducible from the draft.
+        pass_seed = seed + pass_index
+        order = list(eligible)
+        random.Random(pass_seed).shuffle(order)
 
-        trace_ids, statuses = _compose_chunk(state, unseen=unseen, chunk_size=chunk_size, rng=rng)
-        if not trace_ids:
-            # Nothing left to look at and convergence not yet earned: the sweep
-            # requirement cannot be met, so this is a limit, not a success.
-            stop_reason = StopReason.CONVERGED if not unseen else StopReason.ERROR
-            break
+        previous_placement = dict(state.assignments)
+        contracts_before = tuple(sorted(state.contracts))
+        pass_operations: list[TaxonomyOperation] = []
+        pass_chunk_indices: list[int] = []
+        # The pass's own progress, reset here. This is the fix: the old loop
+        # tracked traces seen across the whole run, so once every trace had been
+        # read once the "have we swept" test was permanently true and two quiet
+        # chunks could end the run.
+        seen_this_pass: set[str] = set()
+        pass_complete = True
 
-        result = _run_chunk(
-            corpus,
-            state,
-            trace_ids=trace_ids,
-            statuses=statuses,
-            index=len(chunks),
-            predict=predict,
-            limitations=limitations,
-        )
-        chunks.append(result)
-        if on_chunk is not None:
-            on_chunk(result)
+        failed_this_pass: set[str] = set()
+        retried = False
+        while True:
+            remaining = [tid for tid in order if tid not in seen_this_pass]
+            if not remaining:
+                break
+            if remaining and set(remaining) == failed_this_pass:
+                # Everything left has already failed once. Retry the batch a
+                # single time, then stop: a provider that is down stays down,
+                # and looping would burn the budget without reading anything.
+                if retried:
+                    pass_complete = False
+                    limitations.append(
+                        f"pass {pass_index} could not read {len(failed_this_pass)} trace(s) "
+                        "after a retry, so it did not cover the corpus and does not count "
+                        "toward the requested passes"
+                    )
+                    break
+                retried = True
+                failed_this_pass.clear()
 
-        if result.cost_usd is not None:
-            usd += result.cost_usd
-            cost_reported = True
+            stop_reason = _budget_stop(
+                budget, iterations=len(chunks), calls=calls, started=started, usd=usd
+            )
+            if stop_reason is not None:
+                # A guard fired mid-pass. The pass is partial and must not count
+                # toward the schedule, however many traces it happened to read.
+                pass_complete = False
+                break
 
-        if result.status == "error":
-            # A failed chunk is recorded and the loop continues: one bad call
-            # must not lose a taxonomy that is otherwise progressing. It cannot
-            # count toward convergence, since nothing was read. Its spend still
-            # counts: a failed call was billed like any other.
-            clean_sweeps = 0
+            trace_ids, statuses = _compose_chunk(
+                state, unseen=remaining, chunk_size=chunk_size, seen_this_pass=seen_this_pass
+            )
+            if not trace_ids:  # pragma: no cover - remaining is non-empty here
+                pass_complete = False
+                break
+
+            result = _run_chunk(
+                corpus,
+                state,
+                trace_ids=trace_ids,
+                statuses=statuses,
+                index=len(chunks),
+                pass_index=pass_index,
+                predict=predict,
+                limitations=limitations,
+            )
+            chunks.append(result)
+            pass_chunk_indices.append(result.index)
+            if result.status == "error":
+                # Nothing was read, so these traces are still owed to this pass.
+                # Counting them would let a provider outage silently shrink a
+                # pass's coverage while the run still called the pass complete.
+                failed_this_pass.update(trace_ids)
+            else:
+                seen_this_pass.update(trace_ids)
             calls += result.llm_calls or 0
-            continue
+            if result.cost_usd is not None:
+                usd += result.cost_usd
+                cost_reported = True
 
-        contracts = [state.contracts[cid] for cid in result.assignments.values()]
-        moved = state.apply(result, contracts)
-        calls += result.llm_calls or 0
+            if result.status != "error":
+                contracts = [state.contracts[cid] for cid in result.assignments.values()]
+                state.apply(result, contracts)
+                pass_operations.extend(result.operations)
 
-        swept = not [tid for tid in readable if tid not in state.seen]
-        churn = moved / max(len(state.assignments), 1)
-        if swept and not result.mutated and churn < MAX_ASSIGNMENT_CHURN:
-            clean_sweeps += 1
+            if on_chunk is not None:
+                on_chunk(result)
+            # Written after every chunk, not every pass: a run that dies at
+            # chunk three of pass two must be resumable from chunk three, and a
+            # person watching must never be more than one model call behind.
+            if session is not None:
+                session.checkpoint(
+                    state,
+                    pass_index=pass_index,
+                    completed_passes=completed_passes,
+                    chunk=result,
+                    chunks=chunks,
+                    passes=passes,
+                    seen_this_pass=seen_this_pass,
+                    pass_order=tuple(order),
+                    calls=calls,
+                    usd=usd,
+                    elapsed=time.monotonic() - started,
+                )
+
+        reassigned = tuple(
+            sorted(
+                trace_id
+                for trace_id, contract_id in state.assignments.items()
+                if trace_id in previous_placement
+                and previous_placement[trace_id] != contract_id
+            )
+        )
+        passes.append(
+            PassResult(
+                pass_index=pass_index,
+                seed=pass_seed,
+                trace_ids=tuple(order if pass_complete else sorted(seen_this_pass)),
+                chunk_indices=tuple(pass_chunk_indices),
+                operations=tuple(pass_operations),
+                contracts_before=contracts_before,
+                contracts_after=tuple(sorted(state.contracts)),
+                reassigned_trace_ids=reassigned,
+                complete=pass_complete,
+            )
+        )
+        if pass_complete:
+            # The only place this increments, and only after every eligible
+            # trace has appeared in this pass. Two clean chunks are not a pass.
+            completed_passes += 1
         else:
-            clean_sweeps = 0
+            break
 
-    if stop_reason is not StopReason.CONVERGED:
+    if stop_reason is None:
+        # The schedule finished only if every requested pass actually completed.
+        # A pass cut short by repeated chunk failures leaves the run short of
+        # what it was asked for, and must not report the same stop reason as a
+        # run that read the whole corpus the requested number of times.
+        stop_reason = (
+            StopReason.PASSES_COMPLETE
+            if completed_passes >= budget.passes
+            else StopReason.ERROR
+        )
+
+    if stop_reason is not StopReason.PASSES_COMPLETE:
         limitations.append(
-            f"discovery stopped on {stop_reason.value} rather than converging; this "
-            "taxonomy was still changing when the run ended and must not be read as final"
+            f"discovery stopped on {stop_reason.value} before completing its "
+            f"{budget.passes} requested pass(es); {completed_passes} pass(es) read every "
+            "eligible trace, so the rest of the corpus was seen fewer times than planned"
+        )
+    else:
+        # Said on every complete run, because the previous stop reason was named
+        # "converged" and invited exactly the inference this denies.
+        limitations.append(
+            f"{completed_passes} complete pass(es) were run and the session paused for "
+            "review; this is not a convergence test and the taxonomy is not final"
         )
     if state.ambiguous:
         limitations.append(
@@ -736,6 +845,10 @@ def mine_taxonomy(
         seed=seed,
         contracts=tuple(sorted(state.contracts.values(), key=lambda c: c.contract_id)),
         chunks=tuple(chunks),
+        passes=tuple(passes),
+        completed_passes=completed_passes,
+        requested_passes=budget.passes,
+        assignments=dict(state.assignments),
         ambiguous_trace_ids=tuple(sorted(state.ambiguous)),
         uncovered_trace_ids=tuple(sorted(state.uncovered)),
         unreadable_trace_ids=tuple(sorted(unreadable)),
@@ -754,6 +867,7 @@ def _run_chunk(
     trace_ids: tuple[str, ...],
     statuses: dict[str, str],
     index: int,
+    pass_index: int,
     predict: _Predictor,
     limitations: list[str],
 ) -> ChunkResult:
@@ -772,6 +886,7 @@ def _run_chunk(
         calls, tokens = _spend_of(predict)
         return ChunkResult(
             index=index,
+            pass_index=pass_index,
             trace_ids=trace_ids,
             llm_calls=calls,
             tokens=tokens,
@@ -841,6 +956,7 @@ def _run_chunk(
     state.contracts.update({c.contract_id: c for c in contracts})
     return ChunkResult(
         index=index,
+        pass_index=pass_index,
         trace_ids=trace_ids,
         operations=tuple(operations),
         assignments=assignments,

@@ -103,10 +103,14 @@ from bandits.analyze.rlm_mine import (
     build_predictor as build_rlm_predictor,
 )
 from bandits.analyze.rlm_models import (
+    DEFAULT_PASSES as RLM_PASSES,
+)
+from bandits.analyze.rlm_models import (
     AssignmentStatus,
     Budget,
     TraceView,
 )
+from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_stability import compare_runs, save_stability_report
 from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.export import (
@@ -2106,7 +2110,14 @@ def mine_rlm_command(
         ),
     ),
     chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
-    max_iterations: int = typer.Option(20, "--max-iterations"),
+    passes: int = typer.Option(
+        RLM_PASSES,
+        "--passes",
+        help="Complete corpus passes before pausing for review. Each reads every trace once.",
+    ),
+    max_iterations: int = typer.Option(
+        200, "--max-iterations", help="Emergency guard on chunk count, not the stopping rule."
+    ),
     max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
     max_seconds: float = typer.Option(3600.0, "--max-seconds"),
     max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
@@ -2123,6 +2134,7 @@ def mine_rlm_command(
 
     analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value)
     budget = Budget(
+        passes=passes,
         max_iterations=max_iterations,
         max_llm_calls=max_llm_calls,
         max_seconds=max_seconds,
@@ -2133,6 +2145,17 @@ def mine_rlm_command(
     except MiningError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    session_store = SessionStore(project / ".bandits")
+    recorder = SessionRecorder(
+        session_store,
+        session_id=new_session_id(analysis_id, trace_view, seed),
+        analysis_id=analysis_id,
+        view=trace_view,
+        model=model,
+    )
+    console.print(f"session:     {recorder.session_id}")
+    console.print(f"[dim]watch: bandits rlm-session {recorder.session_id}[/dim]\n")
 
     with ledger.stage("rlm_mining_run", analysis_id=analysis_id, view=trace_view.value, seed=seed):
         try:
@@ -2145,16 +2168,29 @@ def mine_rlm_command(
                 chunk_size=chunk_size,
                 seed=seed,
                 budget=budget,
+                session=recorder,
                 on_chunk=lambda c: console.print(
-                    f"[dim]chunk {c.index}: {len(c.trace_ids)} trace(s), "
-                    f"{len(c.operations)} operation(s)"
-                    f"{' [failed]' if c.status == 'error' else ''}[/dim]"
+                    f"[dim]pass {c.pass_index + 1} chunk {c.index}: "
+                    f"{len(c.trace_ids)} trace(s), {len(c.operations)} operation(s)"
+                    f"{' [failed: ' + c.error[:40] + ']' if c.status == 'error' else ''}[/dim]"
                 ),
             )
         except MiningError as exc:
+            recorder.fail(str(exc))
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc
+        except Exception as exc:
+            # The session file is the only record of a run that died partway,
+            # so it must say so rather than being left reading as still running.
+            recorder.fail(str(exc))
+            raise
         envelope = save_draft(draft, store)
+        recorder.finish(
+            status="awaiting_review" if draft.complete else "incomplete",
+            stop_reason=draft.stop_reason.value,
+            draft_id=envelope.artifact_id,
+            completed_passes=draft.completed_passes,
+        )
         ledger.record(
             {
                 "event_type": "stage_complete",
@@ -2170,17 +2206,25 @@ def mine_rlm_command(
     console.print(f"view:        {draft.view.value} (seed {draft.seed})")
     console.print(f"contracts:   {len(draft.contracts)}")
     console.print(f"chunks:      {len(draft.chunks)}")
-    # The distinction the whole artifact turns on: a run that hit a budget did
-    # not converge, and must never be read as a finished taxonomy.
+    console.print(f"passes:      {draft.completed_passes}/{draft.requested_passes} complete")
+    # The distinction the whole artifact turns on: finishing the schedule is not
+    # convergence, and a run that hit a guard did not even finish the schedule.
     if draft.complete:
-        console.print("[green]converged[/green]   two consecutive clean sweeps")
+        console.print(
+            "[green]awaiting review[/green]  every requested pass read every trace; "
+            "this is a checkpoint, not a converged taxonomy"
+        )
     else:
         console.print(
-            f"[yellow]incomplete:[/yellow]  stopped on {draft.stop_reason.value}, "
-            "not on convergence"
+            f"[yellow]incomplete:[/yellow]  stopped on {draft.stop_reason.value} "
+            "before finishing its passes"
         )
     for contract in draft.contracts:
         console.print(f"  {contract.contract_id}  {contract.name}")
+    # What the second look changed. The question a reviewer has at a pause, and
+    # one no total over the whole run answers.
+    for line in draft.pass_diff():
+        console.print(f"[dim]{line}[/dim]")
     _report_unresolved(
         len(draft.ambiguous_trace_ids),
         len(draft.uncovered_trace_ids),
@@ -2407,3 +2451,65 @@ def materialize_rlm_taskset_command(
         "[dim]families here were proposed by a model reading user requests; no "
         "embedding distance was computed, so none carries a coherence figure[/dim]"
     )
+
+
+@app.command(name="rlm-session")
+def rlm_session_command(
+    session_id: str = typer.Argument(None, help="Omit to list every session."),
+    events: int = typer.Option(0, "--events", help="Show the last N progress events."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Inspect a mining session, including one still running."""
+    store = SessionStore(project / ".bandits")
+    if session_id is None:
+        sessions = store.list()
+        if not sessions:
+            console.print("[dim]no mining sessions[/dim]")
+            return
+        table = Table("session", "status", "progress", "updated")
+        for state in sessions:
+            colour = {"running": "cyan", "awaiting_review": "green", "failed": "red"}.get(
+                state.status, "yellow"
+            )
+            table.add_row(
+                state.session_id,
+                f"[{colour}]{state.status}[/{colour}]",
+                state.progress,
+                state.updated_at[:19],
+            )
+        console.print(table)
+        return
+
+    try:
+        state = store.read(session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no session {session_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"session:     {state.session_id}")
+    console.print(f"status:      {state.status}")
+    console.print(f"view:        {state.view.value} (seed {state.seed})")
+    console.print(f"progress:    {state.progress}")
+    console.print(
+        f"passes:      {state.completed_passes}/{state.requested_passes} complete, "
+        f"pass {state.pass_index + 1} in flight"
+    )
+    console.print(f"assigned:    {len(state.assignments)}")
+    _report_unresolved(
+        len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0
+    )
+    for contract in state.contracts:
+        console.print(f"  {contract.contract_id}  {contract.name}")
+    if state.last_error:
+        console.print(f"[red]last error:[/red] {state.last_error}")
+
+    if events:
+        console.print("")
+        for event in store.read_events(session_id, limit=events):
+            name = event.get("event", "?")
+            detail = " ".join(
+                f"{k}={v}"
+                for k, v in event.items()
+                if k not in ("at", "event") and v not in ("", [], None)
+            )
+            console.print(f"[dim]{event.get('at', '')[:19]}  {name}  {detail}[/dim]")

@@ -104,9 +104,17 @@ def materialize_task_set(
                 proposed_by="model",
                 coherence=None,
                 limitations=(
-                    "mined by an RLM from user messages alone; no embedding distance was "
-                    "computed, so this family has no measured coherence and its medoid is "
-                    "the lexically first member rather than a central one",
+                    f"mined by an RLM from the {run.view.value} view; no embedding "
+                    "distance was computed, so this family has no measured coherence and "
+                    "its medoid is the lexically first member rather than a central one",
+                )
+                + (
+                    (
+                        "the miner could see what the agent did, so this family may group "
+                        "episodes by execution behaviour rather than by requested work",
+                    )
+                    if run.view.reads_agent_behavior
+                    else ()
                 ),
             )
         )
