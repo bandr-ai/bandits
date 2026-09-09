@@ -124,6 +124,12 @@ def main() -> int:
         "--lineages", type=int, default=3, help="Task lineages to sample (all trials of each)."
     )
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--passes",
+        type=int,
+        default=1,
+        help="Complete corpus passes. One is enough to see whether this works at all.",
+    )
     parser.add_argument("--view", default=TraceView.USER_MESSAGES.value)
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-usd", type=float, default=2.0)
@@ -189,7 +195,7 @@ def main() -> int:
         session=recorder,
         chunk_size=3,
         budget=Budget(
-            passes=2, max_iterations=40, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
+            passes=args.passes, max_iterations=40, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
         ),
         on_chunk=lambda c: print(
             f"  chunk {c.index}: {len(c.trace_ids)} traces, {len(c.operations)} ops, "
