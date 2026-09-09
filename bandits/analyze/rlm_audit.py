@@ -167,6 +167,25 @@ def _rows(corpus: ReadOnlyCorpus, trace_ids: tuple[str, ...]) -> str:
     )
 
 
+def _raw_reply(prediction: Any) -> str:
+    """Everything the auditor returned, serialized and never truncated."""
+    fields = (
+        "recommendation",
+        "least_compatible_pair",
+        "strongest_outsider_trace_id",
+        "topical_only",
+        "rationale",
+    )
+    try:
+        return json.dumps(
+            {name: getattr(prediction, name, None) for name in fields},
+            indent=2,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return str(prediction)
+
+
 def _clean_pair(raw: Any, members: set[str]) -> tuple[str, str] | None:
     """Keep a pair only if it names two distinct real members."""
     if not isinstance(raw, (list, tuple)) or len(raw) != 2:
@@ -200,6 +219,7 @@ def audit_contract(
         # gate, which is the one outcome an audit must never produce by accident.
         raw_recommendation = "uncertain"
 
+    raw_reply = _raw_reply(prediction)
     outsider = str(getattr(prediction, "strongest_outsider_trace_id", "") or "").strip()
     rationale = str(getattr(prediction, "rationale", "") or "").strip()
     return AuditFinding(
@@ -211,6 +231,7 @@ def audit_contract(
         strongest_outsider_trace_id=outsider if outsider in set(outsiders) else None,
         topical_only=bool(getattr(prediction, "topical_only", False)),
         rationale=rationale or "the auditor returned no rationale",
+        raw_reply=raw_reply,
     )
 
 

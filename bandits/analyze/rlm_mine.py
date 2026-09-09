@@ -309,9 +309,13 @@ def _rows(value: Any) -> list[Any]:
 def _raw_reply(prediction: Any) -> str:
     """Everything the backend returned, serialized for a human to read.
 
-    Best effort and truncated: this exists to make a failed run diagnosable
-    without paying for another one, so an unserializable reply costs the record
-    rather than the chunk.
+    Never truncated. It was capped at twenty thousand characters, which is
+    smaller than a reply proposing a dozen contracts over long requests — so the
+    one case this exists for, a big chunk that came back unusable, was the case
+    it silently cut in half. A run costs money and a disk does not.
+
+    Best effort in the other direction only: an unserializable reply costs the
+    record, never the chunk.
     """
     fields = (
         "contracts",
@@ -325,9 +329,9 @@ def _raw_reply(prediction: Any) -> str:
             {name: getattr(prediction, name, None) for name in fields},
             indent=2,
             default=str,
-        )[:20000]
+        )
     except (TypeError, ValueError):
-        return str(prediction)[:20000]
+        return str(prediction)
 
 
 def _text(value: Any) -> str:
@@ -846,6 +850,7 @@ def mine_taxonomy(
                 pass_index=pass_index,
                 predict=predict,
                 limitations=limitations,
+                session_id=getattr(session, "session_id", "") if session else "",
             )
             chunks.append(result)
             pass_chunk_indices.append(result.index)
@@ -1033,13 +1038,20 @@ def _run_chunk(
     pass_index: int,
     predict: _Predictor,
     limitations: list[str],
+    session_id: str = "",
 ) -> ChunkResult:
     """One call over one chunk, with its output cleaned at the boundary."""
     chunk_json = _chunk_payload(corpus, trace_ids, statuses)
     taxonomy_json = _taxonomy_payload(state)
     started = time.monotonic()
     try:
-        with ledger.stage("rlm_chunk", chunk_index=index, traces=len(trace_ids)):
+        with ledger.stage(
+            "rlm_chunk",
+            chunk_index=index,
+            pass_index=pass_index,
+            session_id=session_id,
+            traces=len(trace_ids),
+        ):
             prediction = predict(
                 chunk=chunk_json,
                 taxonomy=taxonomy_json,
@@ -1070,7 +1082,7 @@ def _run_chunk(
         parsed = _parse_contract(raw, known_traces=known)
         if parsed is None:
             # Kept verbatim, because a count cannot say what was wrong with it.
-            dropped_contracts.append(json.dumps(raw, default=str)[:2000])
+            dropped_contracts.append(json.dumps(raw, default=str))
         else:
             contracts.append(parsed)
     if dropped_contracts:

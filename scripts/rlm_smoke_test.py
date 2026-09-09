@@ -25,16 +25,19 @@ Exits non-zero when a check fails, so it can gate the real run.
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 from pathlib import Path
 
-from bandits.analyze.rlm_assign import assign_traces
+from bandits.analyze.rlm_assign import assign_traces, save_assignment_run
 from bandits.analyze.rlm_assign import build_predictor as build_assigner
 from bandits.analyze.rlm_audit import (
     audit_taxonomy,
     compute_taxonomy_id,
     freeze_taxonomy,
+    save_audit,
+    save_taxonomy,
 )
 from bandits.analyze.rlm_audit import (
     build_predictor as build_auditor,
@@ -80,7 +83,7 @@ def _load_corpus(project: Path, corpus_id: str | None, lineages: int, seed: int)
     return corpus.replace(traces=traces), corpus_id, sorted(chosen)
 
 
-def _finalize(draft, args, recorder, derived_store) -> None:
+def _finalize(draft, args, recorder, derived_store) -> str:
     """Persist the draft, close the session, and report spend and limitations.
 
     Called before any early exit. A run that cost money and left nothing on disk
@@ -109,6 +112,7 @@ def _finalize(draft, args, recorder, derived_store) -> None:
     # proposals were rejected for missing a definition or an outcome shape.
     for limitation in draft.limitations:
         print(f"  limitation: {limitation}")
+    return envelope.artifact_id
 
 
 def main() -> int:
@@ -135,6 +139,16 @@ def main() -> int:
     parser.add_argument("--max-usd", type=float, default=2.0)
     parser.add_argument("--max-llm-calls", type=int, default=400)
     args = parser.parse_args()
+
+    # Every physical model call, with its prompt, reply, tokens and the
+    # provider's own cost, appended as it happens. On by default here rather
+    # than opt-in: this script exists to diagnose runs, and the one artifact
+    # that survives a process dying mid-chunk is the one written per call.
+    if not os.environ.get("BANDITS_LEDGER"):
+        ledger_path = args.project / ".bandits" / "rlm-ledger.jsonl"
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["BANDITS_LEDGER"] = str(ledger_path)
+    print(f"  ledger: {os.environ['BANDITS_LEDGER']}")
 
     view = TraceView(args.view)
     from bandits.analyze.analysis import analyze_corpus
@@ -227,25 +241,38 @@ def main() -> int:
     # that run used to return before saving anything: no draft to re-read, a
     # session still marked running, and the limitations that would say *why* it
     # came back empty never printed. A failed run is the one most worth keeping.
-    _finalize(draft, args, recorder, derived_store)
+    draft_id = _finalize(draft, args, recorder, derived_store)
 
     if not draft.contracts:
         print("\nno contracts: the stages below need a taxonomy and were skipped")
         return 1
 
     print("\n== adversarial audit ==")
-    audit = audit_taxonomy(draft, "smoke-draft", corpus, predict=build_auditor(**kwargs))
+    audit = audit_taxonomy(
+        draft, draft_id, corpus, predict=build_auditor(**kwargs)
+    )
+    # Saved, like everything else this run produces. Each finding carries the
+    # auditor's raw reply, which is the only record of why a contract was told
+    # to keep or split.
+    audit_envelope = save_audit(audit, derived_store)
+    print(f"  audit saved: {audit_envelope.artifact_id}")
     check("every contract was challenged", len(audit.findings) == len(draft.contracts))
     for finding in audit.findings:
         print(f"  {finding.contract_id}: {finding.recommendation} — {finding.rationale[:90]}")
 
-    taxonomy = freeze_taxonomy(draft, "smoke-draft", audit=audit, audit_id="smoke-audit", force=True)
-    taxonomy_id = compute_taxonomy_id(taxonomy)
+    taxonomy = freeze_taxonomy(
+        draft, draft_id, audit=audit, audit_id=audit_envelope.artifact_id, force=True
+    )
+    taxonomy_id = save_taxonomy(taxonomy, derived_store).artifact_id
+    assert taxonomy_id == compute_taxonomy_id(taxonomy)
+    print(f"  taxonomy saved: {taxonomy_id}")
 
     print("\n== fresh assignment ==")
     run = assign_traces(
         taxonomy, taxonomy_id, corpus, predict=build_assigner(**kwargs), batch_size=6
     )
+    run_envelope = save_assignment_run(run, derived_store)
+    print(f"  assignment saved: {run_envelope.artifact_id}")
     assigned = run.by_status(AssignmentStatus.ASSIGNED)
     check("something was assigned", bool(assigned))
     check(
