@@ -136,7 +136,11 @@ def build_predictor(
     from bandits.verify.judge import resolve_api_key
 
     key = api_key or resolve_api_key()
-    language_model = dspy.LM(f"fireworks_ai/{model}", api_key=key, temperature=0.0)
+    language_model = dspy.LM(
+        f"fireworks_ai/{model}",
+        api_key=key,
+        temperature=0.0,
+    )
     # Instructions on the signature, not in an input field: an input field
     # becomes a REPL variable and is shown as a 1000-character peek, which is
     # how the mining prompt's schema went unread. See rlm_mine.instruction_for.
