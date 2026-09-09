@@ -58,7 +58,7 @@ DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 2
+PROMPT_VERSION = 4
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -97,38 +97,78 @@ episode as you may read it, in order), and status (one of "unseen", "ambiguous",
 "uncovered", "assigned", "affected"). The variable `taxonomy` is the list of \
 family contracts you have built so far, possibly empty.
 
-Two traces belong to the SAME family when one parameterized verifier contract \
-could correctly evaluate what both users requested. They belong to DIFFERENT \
-families when checking success would require materially different work — even \
-if the domain, the wording, and the verb are the same. Sharing a topic is not \
-sharing a family.
+A family is defined by its invariant, verifiable outcome — not by the particular \
+values in one request. Two traces belong to the same family when ONE verifier \
+template, parameterized with each trace's requested values, could evaluate both.
 
-Decision examples (the examples illustrate the test, not domain categories):
-- "Reset my password" and "I forgot my password" belong together: both can be \
-verified by establishing that the requested account has a usable new password.
-- "Reset my password" and "Change my account email" do not belong together: \
-both concern an account, but their required outcomes are different.
-- "Summarize this report in three bullets" and "Summarize this report in one \
-paragraph" may share one contract parameterized by requested output format.
+Treat these as parameters unless they materially change how success is checked: \
+route, date, time, cabin, passenger count, baggage, price or charge limit, \
+payment instrument, account, person, product, and other request-specific values.
+
+Examples:
+- "Book NYC to Seattle on May 20" and "Book Boston to Chicago next Friday" \
+belong to "Book a flight". Route and date are parameters.
+- "Move my flight earlier" and "Change my flight to nonstop" belong to "Modify \
+an existing reservation". Earlier and nonstop are requested constraints checked \
+by the same verifier template.
+- "Compensate me for a delay" and "Change my reservation" are different \
+families, because their required outcomes differ.
+- Checking balances and then using those balances to rebook may be one compound \
+workflow when both outcomes are required by every member. Do not create a \
+compound family merely because two requests happened in one conversation.
+
+Before creating a contract:
+1. Check whether an existing contract already fits after substituting parameters.
+2. If its core outcome is correct but its wording is too narrow, REVISE it.
+3. CREATE only when success requires materially different verification.
+4. Mark uncovered only when neither reuse nor safe revision works.
+
+REVISE rules:
+- Preserve the existing contract_id exactly.
+- Increase revision by exactly one.
+- Broaden only enough to cover the old members and the new evidence.
+- Do not create a differently named sibling for a parameter variation.
+- Do not remove an old required outcome merely to admit an incompatible trace.
+
+Naming rules:
+- Use a short human-readable imperative phrase with spaces.
+- Good: "Book a flight", "Modify an existing reservation".
+- Bad: "book_flight_nyc_to_sea_may20".
+- Never include trace ids, people, routes, dates, amounts, card details, or \
+other request-specific values in the name.
+
+Contract wording:
+- Definitions describe reusable work using parameter language such as \
+"requested route", "requested cabin", "stated spending limit".
+- required_outcome_shape states invariant checks that refer to the trace's \
+requested values.
+- Do not copy concrete values from a supporting trace unless that value \
+fundamentally changes the kind of work.
 
 For every contract you propose or keep, state:
-- name: a short imperative task-family name.
-- definition: what user-requested work belongs here.
+- name: a short imperative task-family name, in prose.
+- definition: what user-requested work belongs here, in parameter language.
 - inclusion_rules / exclusion_rules: what admits and excludes a member.
-- required_outcome_shape: what a verifier must establish for EVERY member. A \
-contract with no stated outcome shape is a topic, not a family; do not propose one.
-- supporting_trace_ids / counterexample_trace_ids: evidence from what you have read.
+- required_outcome_shape: what a verifier must establish for EVERY member.
+- supporting_trace_ids / counterexample_trace_ids: evidence from what you read.
 
-Record every change as an operation with a rationale and the trace_ids that \
-motivated it. Valid operations: KEEP, CREATE, REVISE, SPLIT, MERGE, \
-MARK_AMBIGUOUS, MARK_UNCOVERED. Mark a trace ambiguous when several contracts \
-fit it equally and uncovered when none does. Never force a trace into a family \
-to avoid leaving it unplaced; an unplaced trace is a finding about the taxonomy.
+Operation rules. Valid operations: KEEP, CREATE, REVISE, SPLIT, MERGE, \
+MARK_AMBIGUOUS, MARK_UNCOVERED.
+- Emit operations only for contracts actually created, revised, split, merged, \
+or reconsidered because of the current chunk.
+- Do not emit KEEP for unrelated contracts; omitted contracts remain unchanged.
+- KEEP means the taxonomy contract remains unchanged. It never means the user \
+wants to keep a reservation or object unchanged.
+- Every operation must name the affected contract_ids and motivating trace_ids.
 
 For example, retaining contract c1 unchanged uses {{"operation": "KEEP", \
-"contract_ids": ["c1"], "trace_ids": ["t1"], "rationale": "..."}}. Merging \
-c1 and c2 into c3 uses contract_ids ["c1", "c2", "c3"], with the produced \
-contract last.
+"contract_ids": ["c1"], "trace_ids": ["t1"], "rationale": "..."}}. Merging c1 \
+and c2 into c3 uses contract_ids ["c1", "c2", "c3"], with the produced contract \
+last.
+
+For every trace in the chunk, assign one matching contract or explicitly mark it \
+ambiguous or uncovered. After creating or revising a contract, reconsider any \
+trace from this chunk that you previously left unplaced.
 
 Assign every trace in this chunk, including ones you have seen before: re-reading \
 an old trace against changed definitions is the point of the loop."""
@@ -297,6 +337,29 @@ def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
         return spend()
     except Exception:  # noqa: BLE001 - a bookkeeping failure must not lose the chunk
         return None, {}
+
+
+def _added_spend(
+    calls: int | None,
+    tokens: dict[str, int],
+    cost: float | None,
+    more_calls: int | None,
+    more_tokens: dict[str, int],
+    more_cost: float | None,
+) -> tuple[int | None, dict[str, int], float | None]:
+    """Sum two spend readings taken from the same predictor at different times.
+
+    ``scoped_to_history`` reports only the calls made since the wrapper was
+    last invoked, so a repair's reading replaces rather than extends the
+    original attempt's — summing here is what makes the two attempts add up
+    to what the chunk actually spent.
+    """
+    total_calls = None if calls is None and more_calls is None else (calls or 0) + (more_calls or 0)
+    total_tokens = dict(tokens)
+    for field, value in more_tokens.items():
+        total_tokens[field] = total_tokens.get(field, 0) + value
+    total_cost = None if cost is None and more_cost is None else (cost or 0.0) + (more_cost or 0.0)
+    return total_calls, total_tokens, total_cost
 
 
 def _cost_of(predict: Any) -> float | None:
@@ -603,6 +666,68 @@ class _TaxonomyState:
         self.uncovered: set[str] = set()
         self.seen: set[str] = set()
         self.recently_affected: set[str] = set()
+        self.revision_aliases = {}
+
+    revision_aliases: dict[str, str]
+    """Ids the model invented on a REVISE, mapped to the contract they belong to."""
+
+    def enforce_revisions(
+        self, operations: Sequence[TaxonomyOperation], contracts: list[FamilyContract]
+    ) -> list[str]:
+        """Make a REVISE keep the contract it revises.
+
+        The model reasons about this correctly and still gets it wrong. In a
+        recorded run it decided to "revise to remove the earlier-date
+        constraint", then wrote the broadened wording under a *new*
+        ``contract_id`` derived from that wording. The original was never
+        retired, so one lineage ended up split across two contracts that said
+        almost the same thing.
+
+        A REVISE that names a live contract therefore rewrites that contract in
+        place: the id it named wins, the revision counter advances, and the
+        model's invented id is discarded. Nothing about the semantics is
+        guessed at — the operation says which contract it is revising, and this
+        only enforces that the returned body lands on it.
+        """
+        notes: list[str] = []
+        self.revision_aliases: dict[str, str] = {}
+        proposed = {c.contract_id: c for c in contracts}
+        for op in operations:
+            if op.operation is not Operation.REVISE or not op.contract_ids:
+                continue
+            target = op.contract_ids[0]
+            existing = self.contracts.get(target)
+            if existing is None:
+                continue
+            # The body it returned, whatever it chose to call it. A revision
+            # that reused the right id needs no repair.
+            body = proposed.get(target)
+            if body is None:
+                strays = [c for c in contracts if c.contract_id not in self.contracts]
+                if len(strays) != 1:
+                    continue
+                body = strays[0]
+                # Assignments in this chunk still point at the invented id, so
+                # the rename has to be remembered for them too.
+                self.revision_aliases[body.contract_id] = target
+                notes.append(
+                    f"a REVISE of {target} returned its new wording under "
+                    f"{body.contract_id!r}; the wording was applied to {target} and the "
+                    "invented id discarded"
+                )
+                contracts.remove(body)
+            contracts.append(
+                body.replace(
+                    contract_id=target,
+                    revision=max(existing.revision + 1, body.revision),
+                    # Evidence accumulates across a revision: the traces that
+                    # motivated the original still support the broadened form.
+                    supporting_trace_ids=tuple(
+                        dict.fromkeys(existing.supporting_trace_ids + body.supporting_trace_ids)
+                    ),
+                )
+            )
+        return notes
 
     def apply_operations(
         self, operations: Sequence[TaxonomyOperation], contracts: Sequence[FamilyContract]
@@ -981,6 +1106,46 @@ def mine_taxonomy(
                     elapsed=time.monotonic() - started,
                 )
 
+        # One last look at whatever this pass could not place. A trace read
+        # before the family that fits it existed is not uncovered — it is a
+        # trace that arrived early, and in a single-pass run nothing would ever
+        # revisit it. Two of sixteen traces were lost this way in a recorded
+        # run, both to families created one chunk later.
+        unplaced = sorted(state.ambiguous | state.uncovered)
+        if pass_complete and unplaced and state.contracts:
+            reconciled = _run_chunk(
+                corpus,
+                state,
+                trace_ids=tuple(unplaced[:chunk_size]),
+                statuses={t: "unresolved" for t in unplaced[:chunk_size]},
+                index=len(chunks),
+                pass_index=pass_index,
+                predict=predict,
+                limitations=limitations,
+                session_id=getattr(session, "session_id", "") if session else "",
+            )
+            chunks.append(reconciled)
+            pass_chunk_indices.append(reconciled.index)
+            calls += reconciled.llm_calls or 0
+            if reconciled.cost_usd is not None:
+                usd += reconciled.cost_usd
+                cost_reported = True
+            if reconciled.status != "error":
+                state.apply(
+                    reconciled,
+                    [state.contracts[cid] for cid in reconciled.assignments.values()],
+                )
+                pass_operations.extend(reconciled.operations)
+                recovered = len(unplaced) - len(state.ambiguous | state.uncovered)
+                if recovered > 0:
+                    limitations.append(
+                        f"pass {pass_index} placed {recovered} trace(s) that an earlier "
+                        "chunk left unresolved, on a reconciliation sweep against the "
+                        "finished taxonomy"
+                    )
+            if on_chunk is not None:
+                on_chunk(reconciled)
+
         reassigned = tuple(
             sorted(
                 trace_id
@@ -1161,7 +1326,6 @@ def _run_chunk(
             status="error",
             error=str(exc),
         )
-    duration = time.monotonic() - started
     calls, tokens = _spend_of(predict)
     cost = _cost_of(predict)
 
@@ -1198,10 +1362,12 @@ def _run_chunk(
                 f"validation; {len(repaired)} were recovered on a second attempt and every "
                 "original is kept in dropped_contracts"
             )
-        # Re-read after the repair: the counters were snapshotted before it, so
-        # a repair's calls and cost went unbilled against the chunk and the run.
-        calls, tokens = _spend_of(predict)
-        cost = _cost_of(predict)
+        # Added to, not re-read from: scoped_to_history reports only the calls
+        # made since it was last invoked, so the repair's own reading replaces
+        # rather than includes the original attempt's unless summed here.
+        repair_calls, repair_tokens = _spend_of(predict)
+        repair_cost = _cost_of(predict)
+        calls, tokens, cost = _added_spend(calls, tokens, cost, repair_calls, repair_tokens, repair_cost)
     if dropped_contracts:
         limitations.append(
             f"chunk {index} proposed {len(dropped_contracts)} contract(s) the parser "
@@ -1210,13 +1376,19 @@ def _run_chunk(
 
     # Merged with what already exists so an assignment may name a contract from
     # an earlier chunk that this one did not restate.
-    available = {**state.contracts, **{c.contract_id: c for c in contracts}}
     raw_operations = _rows(getattr(prediction, "operations", ()))
     operations = [
         op
         for op in (_parse_operation(raw, known_traces=known) for raw in raw_operations)
         if op is not None
     ]
+
+    # Before the assignment ids are checked: a REVISE that renamed its contract
+    # leaves this chunk's assignments pointing at an id that is about to be
+    # discarded, and validating them first would drop every one of them.
+    limitations.extend(state.enforce_revisions(operations, contracts))
+
+    available = {**state.contracts, **{c.contract_id: c for c in contracts}}
     chunk_ids = set(trace_ids)
     assignments = _parse_assignments(
         _decoded(getattr(prediction, "assignments", None)),
@@ -1235,6 +1407,15 @@ def _run_chunk(
     unplaced = set(ambiguous) | set(uncovered)
     assignments = {t: c for t, c in assignments.items() if t not in unplaced}
 
+    # Before anything is folded in: a REVISE that renamed the contract it was
+    # revising would otherwise land as a second, near-identical family.
+    limitations.extend(state.enforce_revisions(operations, contracts))
+    if state.revision_aliases:
+        assignments = {
+            trace_id: state.revision_aliases.get(contract_id, contract_id)
+            for trace_id, contract_id in assignments.items()
+        }
+
     # An operation naming a contract nobody proposed and nobody already holds is
     # a claim the model did not carry out. Recorded rather than executed: it
     # would otherwise count toward convergence while changing nothing.
@@ -1249,6 +1430,7 @@ def _run_chunk(
             )
 
     state.contracts.update({c.contract_id: c for c in contracts})
+    duration = time.monotonic() - started
     return ChunkResult(
         index=index,
         pass_index=pass_index,

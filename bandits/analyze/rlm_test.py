@@ -2397,10 +2397,16 @@ def test_the_whole_prompt_reaches_the_model() -> None:
 
     text = instruction_for(TraceView.USER_MESSAGES)
     assert len(text) > 1000, "the regression only bites above the peek limit"
-    for required in ("required_outcome_shape", "Reset my password", "KEEP"):
+    for required in (
+        "required_outcome_shape",
+        "Preserve the existing contract_id",
+        "Book a flight",
+        "Do not emit KEEP",
+    ):
         assert required in text
-        # Everything load-bearing used to live past the first 500 characters.
-        assert required not in text[:500] or required == "KEEP"
+        # Everything load-bearing used to live past the first 500 characters,
+        # which is exactly the half a peek would have shown.
+        assert required not in text[:500]
 
 
 def test_a_topic_cannot_be_submitted_as_a_typed_contract() -> None:
@@ -2741,13 +2747,19 @@ def test_the_correction_never_corrupts_the_taxonomy_variable() -> None:
 
 
 def test_a_repair_is_billed_to_the_chunk() -> None:
-    """Counters were snapshotted before the repair, so its spend vanished."""
+    """Counters were snapshotted before the repair, so its spend vanished.
+
+    ``spend()`` reports only what happened since it was last read, matching
+    ``scoped_to_history``'s real per-call reset -- so the repair's own reading
+    (6 calls, $0.04) never includes the original attempt's (3 calls, $0.01),
+    and only summing the two gets the chunk's true total.
+    """
     spend = {"calls": 3, "cost": 0.01}
 
     def predict(*, chunk: str, taxonomy: str, question: str = ""):
         if "was rejected" in question:
-            spend["calls"] = 9
-            spend["cost"] = 0.05
+            spend["calls"] = 6
+            spend["cost"] = 0.04
             return SimpleNamespace(
                 contracts=[_RAW_CONTRACT],
                 operations=[],
@@ -2771,7 +2783,7 @@ def test_a_repair_is_billed_to_the_chunk() -> None:
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
     assert draft.chunks[0].llm_calls == 9
-    assert draft.chunks[0].cost_usd == 0.05
+    assert draft.chunks[0].cost_usd == pytest.approx(0.05)
 
 
 def test_every_rejected_contract_is_kept_even_when_some_are_repaired() -> None:
@@ -2860,3 +2872,158 @@ def test_the_real_signatures_carry_the_instructions_and_no_question_field() -> N
             assert "question" not in signature.input_fields, module
     finally:
         monkey.undo()
+
+
+# --- revision identity and reconciliation ------------------------------------
+
+
+def test_a_revise_that_renames_still_lands_on_the_contract_it_revised() -> None:
+    """The recorded failure: one lineage split across two near-identical families.
+
+    The model said "revise to remove the earlier-date constraint" and then wrote
+    the broadened wording under a new contract_id. The original was never
+    retired, so half the lineage stayed on it.
+    """
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        import json
+
+        calls["n"] += 1
+        rows = json.loads(chunk)
+        if calls["n"] == 1:
+            return SimpleNamespace(
+                contracts=[
+                    {
+                        "contract_id": "change_earlier_nonstop",
+                        "name": "Change to an earlier nonstop",
+                        "definition": "change a reservation to an earlier nonstop",
+                        "required_outcome_shape": ["the reservation is changed"],
+                    }
+                ],
+                operations=[
+                    {
+                        "operation": "CREATE",
+                        "contract_ids": ["change_earlier_nonstop"],
+                        "rationale": "first of its kind",
+                    }
+                ],
+                assignments={rows[0]["trace_id"]: "change_earlier_nonstop"},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+        # The bug: a REVISE whose body carries a brand-new id.
+        return SimpleNamespace(
+            contracts=[
+                {
+                    "contract_id": "change_nonstop",
+                    "name": "Modify an existing reservation",
+                    "definition": "change a reservation to a requested flight",
+                    "required_outcome_shape": ["the reservation is changed"],
+                }
+            ],
+            operations=[
+                {
+                    "operation": "REVISE",
+                    "contract_ids": ["change_earlier_nonstop"],
+                    "rationale": "the earlier-date constraint was too narrow",
+                }
+            ],
+            assignments={rows[0]["trace_id"]: "change_nonstop"},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "change my flight") for i in range(2))))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=1, budget=Budget(passes=1)
+    )
+    # One family, not two, and it keeps the id the REVISE named.
+    assert [c.contract_id for c in draft.contracts] == ["change_earlier_nonstop"]
+    survivor = draft.contracts[0]
+    assert survivor.name == "Modify an existing reservation"
+    assert survivor.revision == 2
+    assert any("invented id discarded" in limit for limit in draft.limitations)
+
+
+def test_a_revision_keeps_the_evidence_that_motivated_the_original() -> None:
+    from bandits.analyze.rlm_mine import _TaxonomyState
+    from bandits.analyze.rlm_models import TaxonomyOperation
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1").replace(supporting_trace_ids=("t1",))}
+    contracts = [_contract("c2", "a broader definition").replace(supporting_trace_ids=("t2",))]
+    state.enforce_revisions(
+        [
+            TaxonomyOperation(
+                operation=Operation.REVISE, contract_ids=("c1",), rationale="too narrow"
+            )
+        ],
+        contracts,
+    )
+    revised = next(c for c in contracts if c.contract_id == "c1")
+    assert set(revised.supporting_trace_ids) == {"t1", "t2"}
+
+
+def test_a_trace_seen_before_its_family_existed_is_reconsidered() -> None:
+    """Two of sixteen traces were lost this way: read early, never revisited."""
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        import json
+
+        calls["n"] += 1
+        rows = json.loads(chunk)
+        ids = [row["trace_id"] for row in rows]
+        if calls["n"] == 1:
+            # Nothing fits yet, so it is left unplaced.
+            return SimpleNamespace(
+                contracts=[],
+                operations=[],
+                assignments={},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=ids,
+            )
+        # The family that would have fitted it arrives one chunk later.
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[
+                {"operation": "CREATE", "contract_ids": ["c1"], "rationale": "new family"}
+            ],
+            assignments={trace_id: "c1" for trace_id in ids},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=1, budget=Budget(passes=1)
+    )
+    assert draft.uncovered_trace_ids == ()
+    assert len(draft.assignments) == 2
+    assert any("reconciliation sweep" in limit for limit in draft.limitations)
+
+
+def test_the_sweep_does_not_run_when_nothing_is_unresolved() -> None:
+    """It costs a model call, so it fires only when there is something to place."""
+    calls = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        import json
+
+        calls["n"] += 1
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={row["trace_id"]: "c1" for row in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    assert len(draft.chunks) == 1
+    assert calls["n"] == 1

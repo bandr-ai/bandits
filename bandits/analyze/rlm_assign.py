@@ -120,7 +120,11 @@ def build_predictor(
     from bandits.verify.judge import resolve_api_key
 
     key = api_key or resolve_api_key()
-    language_model = dspy.LM(f"fireworks_ai/{model}", api_key=key, temperature=0.0)
+    language_model = dspy.LM(
+        f"fireworks_ai/{model}",
+        api_key=key,
+        temperature=0.0,
+    )
     # Instructions on the signature rather than in an input field, so the whole
     # prompt reaches the root model. See rlm_mine.instruction_for for why.
     class _Assign(dspy.Signature):
