@@ -44,11 +44,14 @@ from bandits.analyze.rlm_models import (
     AssignmentRun,
     AssignmentStatus,
     Budget,
+    ChunkResult,
     FamilyContract,
     FrozenTaxonomy,
     Operation,
     StopReason,
     TaxonomyAudit,
+    TaxonomyDraft,
+    TaxonomyOperation,
     TraceAssignment,
     TraceView,
 )
@@ -1826,3 +1829,189 @@ def test_pass_history_marks_a_partial_pass() -> None:
     console = Console(width=100, record=True, file=open("/dev/null", "w"))
     print_pass_history(draft, console)
     assert "partial" in console.export_text()
+
+
+# --- resumption --------------------------------------------------------------
+
+
+def _crash_after(chunks: int, seen: dict[str, int]):
+    """A predictor that works for N chunks then dies, recording what it read."""
+    state = {"n": 0}
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        import json
+
+        state["n"] += 1
+        if chunks and state["n"] > chunks:
+            raise KeyboardInterrupt("the run was killed")
+        rows = json.loads(chunk)
+        for row in rows:
+            seen[row["trace_id"]] = seen.get(row["trace_id"], 0) + 1
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={r["trace_id"]: "c1" for r in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    return predict
+
+
+def test_a_resumed_run_finishes_the_pass_it_died_in(tmp_path) -> None:
+    """Without this the session was inspectable but restarting began again."""
+    from bandits.analyze.rlm_session import SessionRecorder
+
+    store, recorder = _recorder(tmp_path, "sess-r")
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
+    seen: dict[str, int] = {}
+
+    with pytest.raises(KeyboardInterrupt):
+        mine_taxonomy(
+            corpus, "analysis-1", predict=_crash_after(5, seen), chunk_size=10, session=recorder
+        )
+    crashed = store.read("sess-r")
+    assert crashed.pass_index == 1
+    assert crashed.traces_seen_this_pass == 10
+
+    resumed = SessionRecorder(
+        store,
+        session_id="sess-r",
+        analysis_id="analysis-1",
+        view=TraceView.USER_MESSAGES,
+        model="test-model",
+        resumed_from="sess-r",
+    )
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_crash_after(0, seen),
+        chunk_size=10,
+        session=resumed,
+        resume=crashed,
+    )
+    assert draft.completed_passes == 2
+    assert draft.stop_reason is StopReason.PASSES_COMPLETE
+    # The point of resuming: no trace is read a third time, and none is skipped.
+    assert all(count == 2 for count in seen.values()), seen
+    assert sum(seen.values()) == 80
+
+
+def test_a_resume_restores_the_taxonomy_rather_than_rebuilding_it(tmp_path) -> None:
+    from bandits.analyze.rlm_session import SessionRecorder
+
+    store, recorder = _recorder(tmp_path, "sess-t")
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
+    seen: dict[str, int] = {}
+    with pytest.raises(KeyboardInterrupt):
+        mine_taxonomy(
+            corpus, "analysis-1", predict=_crash_after(1, seen), chunk_size=10, session=recorder
+        )
+    crashed = store.read("sess-t")
+    assert crashed.contracts and crashed.assignments
+
+    def refuse(**_):
+        raise AssertionError("a resumed run must not need the model to restore state")
+
+    # Nothing is asked of the model before the first new chunk, so the restored
+    # contracts and placements came from the checkpoint alone.
+    resumed = SessionRecorder(
+        store,
+        session_id="sess-t",
+        analysis_id="analysis-1",
+        view=TraceView.USER_MESSAGES,
+        model="test-model",
+    )
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_crash_after(0, seen),
+        chunk_size=10,
+        session=resumed,
+        resume=crashed,
+    )
+    assert [c.contract_id for c in draft.contracts] == ["c1"]
+
+
+def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
+    """Reshuffling on resume would reread some traces and skip others."""
+    from bandits.analyze.rlm_session import SessionRecorder
+
+    store, recorder = _recorder(tmp_path, "sess-o")
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(30))))
+    seen: dict[str, int] = {}
+    with pytest.raises(KeyboardInterrupt):
+        mine_taxonomy(
+            corpus, "analysis-1", predict=_crash_after(1, seen), chunk_size=10, session=recorder
+        )
+    crashed = store.read("sess-o")
+    resumed = SessionRecorder(
+        store,
+        session_id="sess-o",
+        analysis_id="analysis-1",
+        view=TraceView.USER_MESSAGES,
+        model="test-model",
+    )
+    draft = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_crash_after(0, seen),
+        chunk_size=10,
+        session=resumed,
+        resume=crashed,
+    )
+    assert draft.passes[0].trace_ids == crashed.pass_order
+    assert all(count == 2 for count in seen.values())
+
+
+# --- membership after a merge ------------------------------------------------
+
+
+def _merged_draft() -> TaxonomyDraft:
+    return TaxonomyDraft(
+        analysis_id="analysis-1",
+        view=TraceView.USER_MESSAGES,
+        seed=1,
+        contracts=(_contract("c1"),),
+        chunks=(
+            ChunkResult(
+                index=0,
+                pass_index=0,
+                trace_ids=("t0", "t1"),
+                assignments={"t0": "c2", "t1": "c2"},
+            ),
+            ChunkResult(
+                index=1,
+                pass_index=0,
+                trace_ids=("t2",),
+                assignments={"t2": "c1"},
+                operations=(
+                    TaxonomyOperation(
+                        operation=Operation.MERGE,
+                        contract_ids=("c2", "c1"),
+                        rationale="one verifier covers both",
+                    ),
+                ),
+            ),
+        ),
+        assignments={"t0": "c1", "t1": "c1", "t2": "c1"},
+        stop_reason=StopReason.PASSES_COMPLETE,
+        completed_passes=2,
+        budget=Budget(),
+        model="m",
+        prompt_digest="d",
+    )
+
+
+def test_a_merged_family_shows_the_members_it_absorbed() -> None:
+    """Replaying chunk assignments strands them under the consumed contract."""
+    from bandits.analyze.rlm_audit import _draft_members
+
+    assert _draft_members(_merged_draft()) == {"c1": ("t0", "t1", "t2")}
+
+
+def test_a_consumed_contract_is_not_rendered_as_a_family() -> None:
+    """A ghost family is something a reviewer could try to act on."""
+    from bandits.analyze.rlm_audit import _draft_members
+
+    assert "c2" not in _draft_members(_merged_draft())

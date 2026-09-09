@@ -2133,6 +2133,11 @@ def mine_rlm_command(
     max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
     seed: int = typer.Option(RLM_SEED, "--seed"),
     model: str = typer.Option(RLM_MODEL, "--model"),
+    resume: str = typer.Option(
+        None,
+        "--resume",
+        help="Continue a session that stopped, from the chunk it reached.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Discover task families from raw user requests with an iterative RLM loop."""
@@ -2157,12 +2162,45 @@ def mine_rlm_command(
         raise typer.Exit(code=1) from exc
 
     session_store = SessionStore(project / ".bandits")
+    resumed_state = None
+    if resume:
+        try:
+            resumed_state = session_store.read(resume)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no session {resume!r}")
+            raise typer.Exit(code=1) from exc
+        if resumed_state.analysis_id != analysis_id:
+            # Resuming onto a different corpus would carry a taxonomy built from
+            # one set of requests onto another and call the result one run.
+            console.print(
+                f"[red]error:[/red] session {resume!r} was mining "
+                f"{resumed_state.analysis_id!r}, not {analysis_id!r}"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.view is not trace_view:
+            console.print(
+                f"[red]error:[/red] session {resume!r} used the "
+                f"{resumed_state.view.value} view; the two arms are different experiments"
+            )
+            raise typer.Exit(code=1)
+        # The same seed, or the reshuffle of a later pass would differ from what
+        # the interrupted run would have done.
+        seed = resumed_state.seed
+        console.print(
+            f"resuming:    {resume} at pass {resumed_state.pass_index + 1}, "
+            f"{resumed_state.traces_seen_this_pass}/{resumed_state.traces_total} read, "
+            f"{len(resumed_state.contracts)} contract(s) restored"
+        )
+
     recorder = SessionRecorder(
         session_store,
-        session_id=new_session_id(analysis_id, trace_view, seed),
+        # A resume continues writing to the same session, so one interrupted run
+        # stays one row in the listing rather than fragmenting across restarts.
+        session_id=resume or new_session_id(analysis_id, trace_view, seed),
         analysis_id=analysis_id,
         view=trace_view,
         model=model,
+        resumed_from=resume,
     )
     console.print(f"session:     {recorder.session_id}")
     console.print(f"[dim]watch: bandits rlm-session {recorder.session_id}[/dim]\n")
@@ -2179,6 +2217,7 @@ def mine_rlm_command(
                 seed=seed,
                 budget=budget,
                 session=recorder,
+                resume=resumed_state,
                 on_chunk=lambda c: console.print(
                     f"[dim]pass {c.pass_index + 1} chunk {c.index}: "
                     f"{len(c.trace_ids)} trace(s), {len(c.operations)} operation(s)"

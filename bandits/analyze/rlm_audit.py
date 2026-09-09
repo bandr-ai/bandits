@@ -277,21 +277,37 @@ def audit_taxonomy(
 
 
 def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
-    """The provisional membership the discovery loop last recorded.
+    """The membership the discovery loop actually ended with.
 
-    Read from the final state of the chunk assignments rather than from the
-    contracts' ``supporting_trace_ids``, which are the evidence a contract was
-    argued from and not the set of traces it ended up claiming.
+    Read from ``draft.assignments``, which is the placement the run held when it
+    stopped. The obvious alternative — replaying the chunk assignments in order —
+    is wrong, and quietly so: a MERGE moves the consumed family's members onto
+    the survivor without re-listing them in any later chunk, so a replay shows
+    them still under a contract that no longer exists. A reviewer then sees a
+    ghost family beside the real one and a survivor missing the members it
+    absorbed, which is the opposite of what the merge decided.
+
+    Falls back to the replay only for drafts written before ``assignments`` was
+    stored, where it is the sole record there is; such a draft predates merges
+    being applied at all, so the replay is accurate for it.
     """
-    placement: dict[str, str] = {}
-    for chunk in draft.chunks:
-        placement.update(chunk.assignments)
-        for trace_id in chunk.ambiguous_trace_ids + chunk.uncovered_trace_ids:
-            placement.pop(trace_id, None)
+    if draft.assignments:
+        placement = dict(draft.assignments)
+    else:  # pragma: no cover - only reachable for drafts written before this field
+        placement = {}
+        for chunk in draft.chunks:
+            placement.update(chunk.assignments)
+            for trace_id in chunk.ambiguous_trace_ids + chunk.uncovered_trace_ids:
+                placement.pop(trace_id, None)
 
+    # A contract that no longer exists cannot have members. Anything pointing at
+    # one is a bug rather than a finding, so it is dropped here instead of being
+    # rendered as a family a reviewer might try to act on.
+    live = {contract.contract_id for contract in draft.contracts}
     grouped: dict[str, list[str]] = {}
     for trace_id, contract_id in placement.items():
-        grouped.setdefault(contract_id, []).append(trace_id)
+        if contract_id in live:
+            grouped.setdefault(contract_id, []).append(trace_id)
     return {cid: tuple(sorted(traces)) for cid, traces in grouped.items()}
 
 
