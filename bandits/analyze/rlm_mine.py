@@ -226,6 +226,9 @@ def build_predictor(
     class _Mine(dspy.Signature):
         chunk: str = dspy.InputField(desc="the traces to read this round")
         taxonomy: str = dspy.InputField(desc="contracts built so far, possibly empty")
+        correction: str = dspy.InputField(
+            desc="empty on a first attempt; otherwise what was wrong with your last answer"
+        )
         contracts: list[ProposedContract] = dspy.OutputField()
         operations: list[ProposedOperation] = dspy.OutputField()
         assignments: dict[str, str] = dspy.OutputField()
@@ -244,15 +247,13 @@ def build_predictor(
 
     def predict(*, chunk: str, taxonomy: str, question: str = "") -> Any:
         # ``question`` carries a correction when one is being asked for, and is
-        # empty on an ordinary call. It is appended to the taxonomy variable
-        # rather than dropped: the standing instructions live on the signature
-        # now, so there is no input field left to put it in, and a repair
-        # request that reached nothing would silently re-send the original
-        # question and be charged for the same answer twice.
+        # empty otherwise. It gets its own input field rather than being
+        # appended to the taxonomy: concatenating it there made that variable
+        # invalid JSON, and the model's first move is to parse it. A short
+        # field is also shown in full, since the peek only elides past a
+        # thousand characters.
         with dspy.context(lm=language_model):
-            if question:
-                return rlm(chunk=chunk, taxonomy=f"{taxonomy}\n\n{question}")
-            return rlm(chunk=chunk, taxonomy=taxonomy)
+            return rlm(chunk=chunk, taxonomy=taxonomy, correction=question)
 
     return with_cost(scoped_to_history(predict, language_model))
 
@@ -1182,17 +1183,25 @@ def _run_chunk(
             dropped_contracts,
             chunk_json=chunk_json,
             taxonomy_json=taxonomy_json,
-            corpus=corpus,
             predict=predict,
             known=known,
         )
         if repaired:
             contracts.extend(repaired)
-            dropped_contracts = dropped_contracts[len(repaired) :]
+            # Which originals were fixed is not knowable from a count: the
+            # repair returns whole contracts, not a mapping back to what it
+            # was given. Every rejected record is therefore kept, and the
+            # limitation says how many were recovered. Slicing the list by the
+            # number repaired dropped an arbitrary prefix instead.
             limitations.append(
-                f"chunk {index} returned {len(repaired)} contract(s) that failed "
-                "validation and were corrected on a second attempt"
+                f"chunk {index} returned {len(dropped_contracts)} contract(s) that failed "
+                f"validation; {len(repaired)} were recovered on a second attempt and every "
+                "original is kept in dropped_contracts"
             )
+        # Re-read after the repair: the counters were snapshotted before it, so
+        # a repair's calls and cost went unbilled against the chunk and the run.
+        calls, tokens = _spend_of(predict)
+        cost = _cost_of(predict)
     if dropped_contracts:
         limitations.append(
             f"chunk {index} proposed {len(dropped_contracts)} contract(s) the parser "
@@ -1257,15 +1266,15 @@ def _run_chunk(
     )
 
 
-_REPAIR_INSTRUCTION = """Some contracts you returned were rejected because they \
-were missing a required field. Every contract MUST carry a non-empty `definition` \
-and a non-empty `required_outcome_shape` — a list of statements a verifier could \
-check once the work is done. A contract with only a name and a description names \
-a topic, and a topic cannot be verified.
+_REPAIR_INSTRUCTION = """Your last answer was rejected. Every contract MUST have a \
+non-empty `definition` and a non-empty `required_outcome_shape`: a list of \
+statements someone could check once the work is done. A name plus a description \
+is a topic, and a topic cannot be verified.
 
-Return corrected versions of the rejected contracts below. Keep what was right \
-about them and add what was missing. Return nothing for any that genuinely cannot \
-be given a checkable outcome."""
+Return corrected contracts. Keep what was right and add what was missing. Omit \
+any that genuinely cannot be given a checkable outcome. Rejected:"""
+"""Deliberately short. This rides in its own input field, and a field under a
+thousand characters is shown to the root model whole rather than as a peek."""
 
 
 def _repair_contracts(
@@ -1273,20 +1282,28 @@ def _repair_contracts(
     *,
     chunk_json: str,
     taxonomy_json: str,
-    corpus: ReadOnlyCorpus,
     predict: _Predictor,
     known: set[str],
 ) -> list[FamilyContract]:
     """Ask the model to fix contracts that failed validation.
 
-    Best effort by design: a repair that fails costs one call and the originals
-    are still recorded verbatim, so nothing is lost that was not already lost.
+    Best effort by design: a repair that fails costs one attempt and the
+    originals are still recorded verbatim, so nothing is lost that was not
+    already lost.
+
+    One *attempt*, not one model call: the repair is a whole RLM run, so it may
+    make several. Its spend is re-read into the chunk afterwards rather than
+    being left out of the budget.
     """
     try:
         prediction = predict(
             chunk=chunk_json,
             taxonomy=taxonomy_json,
-            question=_REPAIR_INSTRUCTION + "\n\nRejected contracts:\n" + "\n".join(rejected),
+            # Truncated per contract: the point is to show the model the shape
+            # it got wrong, and a long payload would push this past the peek.
+            question=_REPAIR_INSTRUCTION
+            + "\n"
+            + "\n".join(item[:300] for item in rejected[:4]),
         )
     except Exception:  # noqa: BLE001 - a failed repair must not lose the chunk
         return []

@@ -58,13 +58,17 @@ required_outcome_shape, inclusion_rules and exclusion_rules, not against its nam
 
 For every trace in the batch return one result with:
 - trace_id
-- matching_contract_ids: every contract that genuinely matches. Often exactly one. \
-Empty if none does.
+- matching_contract_ids: every contract that genuinely matches. Often exactly \
+one. Return an empty list when none does — omitting the field is not the same \
+as deciding nothing matched.
 - primary_contract_id: the single best match, ONLY when exactly one contract \
 matches. Null when zero or several match.
-- status: "assigned" (exactly one match), "ambiguous" (two or more match equally), \
-or "uncovered" (none matches).
 - reason: one or two sentences citing what in the user's request decided it.
+
+Do not return a status. The program derives it from your match list: one match \
+is assigned, two or more is ambiguous, none is uncovered. Any trace matching \
+more than one contract is ambiguous — you are not asked to judge whether the \
+matches are equally good.
 
 Do not force a trace into a family to avoid leaving it unplaced. An uncovered \
 trace is useful information about the taxonomy; a wrong assignment is not."""

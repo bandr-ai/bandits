@@ -133,6 +133,18 @@ def main() -> int:
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
+        "--discovery-only",
+        action="store_true",
+        default=True,
+        help="Stop after mining. The question is whether a contract comes out at all.",
+    )
+    parser.add_argument(
+        "--full",
+        dest="discovery_only",
+        action="store_false",
+        help="Continue into audit, freeze, assignment and materialization.",
+    )
+    parser.add_argument(
         "--passes",
         type=int,
         default=1,
@@ -270,6 +282,14 @@ def main() -> int:
     if not draft.contracts:
         print("\nno contracts: the stages below need a taxonomy and were skipped")
         return 1
+
+    if args.discovery_only:
+        # The whole question this run exists to answer is above. Audit,
+        # assignment and materialization cost money to re-answer things the
+        # discovery output already settles, so they are opt-in.
+        print("\n[discovery only] pass --full to continue into audit and assignment")
+        print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
+        return 1 if failures else 0
 
     print("\n== adversarial audit ==")
     audit = audit_taxonomy(
