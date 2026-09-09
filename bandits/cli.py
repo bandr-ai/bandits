@@ -54,6 +54,61 @@ from bandits.analyze.embed import (
     requests,
     save_cache,
 )
+from bandits.analyze.rlm_assign import (
+    DEFAULT_MODEL as RLM_ASSIGN_MODEL,
+)
+from bandits.analyze.rlm_assign import (
+    AssignmentError,
+    assign_traces,
+    load_assignment_run,
+    save_assignment_run,
+)
+from bandits.analyze.rlm_assign import (
+    build_predictor as build_assignment_predictor,
+)
+from bandits.analyze.rlm_audit import (
+    DEFAULT_MODEL as RLM_AUDIT_MODEL,
+)
+from bandits.analyze.rlm_audit import (
+    FreezeRefused,
+    TaxonomyAuditError,
+    audit_taxonomy,
+    freeze_taxonomy,
+    load_taxonomy,
+    save_taxonomy,
+)
+from bandits.analyze.rlm_audit import (
+    build_predictor as build_taxonomy_audit_predictor,
+)
+from bandits.analyze.rlm_audit import (
+    save_audit as save_rlm_audit,
+)
+from bandits.analyze.rlm_corpus import ReadOnlyCorpus
+from bandits.analyze.rlm_mine import (
+    DEFAULT_CHUNK_SIZE as RLM_CHUNK_SIZE,
+)
+from bandits.analyze.rlm_mine import (
+    DEFAULT_MODEL as RLM_MODEL,
+)
+from bandits.analyze.rlm_mine import (
+    DEFAULT_SEED as RLM_SEED,
+)
+from bandits.analyze.rlm_mine import (
+    MiningError,
+    load_draft,
+    mine_taxonomy,
+    save_draft,
+)
+from bandits.analyze.rlm_mine import (
+    build_predictor as build_rlm_predictor,
+)
+from bandits.analyze.rlm_models import (
+    AssignmentStatus,
+    Budget,
+    TraceView,
+)
+from bandits.analyze.rlm_stability import compare_runs, save_stability_report
+from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.export import (
     CompositionReport,
     Partition,
@@ -1998,3 +2053,357 @@ def interview_review_command(
 
 if __name__ == "__main__":
     app()
+
+
+# --- RLM task-family mining --------------------------------------------------
+#
+# Experimental, and kept beside the embedding miner rather than replacing it.
+# The two answer the same question by different means, and the embedding path
+# stays the baseline until this one demonstrates better semantic coherence,
+# stability, and downstream verifier transfer. Nothing here feeds `mine`.
+
+
+def _rlm_corpus(analysis_id: str, project: Path, view: str):
+    """The read-only user-message view of the corpus behind an analysis.
+
+    The miner is handed this and never the corpus, so there is no path from a
+    mining command to an assistant message, a tool call, or an outcome.
+    """
+    store = _derived(project)
+    try:
+        analysis = load_analysis(analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no analysis {analysis_id!r}")
+        raise typer.Exit(code=1) from exc
+    try:
+        corpus = ArtifactStore(project / ".bandits").read(analysis.corpus_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no corpus {analysis.corpus_id!r} behind this analysis")
+        raise typer.Exit(code=1) from exc
+    return analysis, ReadOnlyCorpus(corpus, view=TraceView(view)), store
+
+
+def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
+    """What the taxonomy could not reach. Never suppressed, never rolled into a total."""
+    for count, label, note in (
+        (ambiguous, "ambiguous", "matched several contracts and were left unplaced"),
+        (uncovered, "uncovered", "matched no contract at all"),
+        (unreadable, "unreadable", "recorded no user messages to read"),
+    ):
+        if count:
+            console.print(f"[yellow]{label}:[/yellow]   {count} trace(s) {note}")
+
+
+@app.command(name="mine-rlm")
+def mine_rlm_command(
+    analysis_id: str,
+    view: str = typer.Option(
+        TraceView.USER_MESSAGES.value,
+        "--view",
+        help=(
+            "user-messages (Path U), full-trajectory (Path F: adds assistant turns and "
+            "tool activity, rewards withheld), or first-user-message."
+        ),
+    ),
+    chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
+    max_iterations: int = typer.Option(20, "--max-iterations"),
+    max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
+    max_seconds: float = typer.Option(3600.0, "--max-seconds"),
+    max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
+    seed: int = typer.Option(RLM_SEED, "--seed"),
+    model: str = typer.Option(RLM_MODEL, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Discover task families from raw user requests with an iterative RLM loop."""
+    try:
+        trace_view = TraceView(view)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] unknown view {view!r}")
+        raise typer.Exit(code=1) from exc
+
+    analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value)
+    budget = Budget(
+        max_iterations=max_iterations,
+        max_llm_calls=max_llm_calls,
+        max_seconds=max_seconds,
+        max_usd=max_usd,
+    )
+    try:
+        predict = build_rlm_predictor(model=model)
+    except MiningError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with ledger.stage("rlm_mining_run", analysis_id=analysis_id, view=trace_view.value, seed=seed):
+        try:
+            draft = mine_taxonomy(
+                corpus,
+                analysis_id,
+                predict=predict,
+                analysis=analysis,
+                model=model,
+                chunk_size=chunk_size,
+                seed=seed,
+                budget=budget,
+                on_chunk=lambda c: console.print(
+                    f"[dim]chunk {c.index}: {len(c.trace_ids)} trace(s), "
+                    f"{len(c.operations)} operation(s)"
+                    f"{' [failed]' if c.status == 'error' else ''}[/dim]"
+                ),
+            )
+        except MiningError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        envelope = save_draft(draft, store)
+        ledger.record(
+            {
+                "event_type": "stage_complete",
+                "stage_name": "rlm_mining_run",
+                "input_artifact_id": analysis_id,
+                "output_artifact_id": envelope.artifact_id,
+                "contracts": len(draft.contracts),
+                "stop_reason": draft.stop_reason.value,
+            }
+        )
+
+    console.print(f"\ndraft_id:    {envelope.artifact_id}")
+    console.print(f"view:        {draft.view.value} (seed {draft.seed})")
+    console.print(f"contracts:   {len(draft.contracts)}")
+    console.print(f"chunks:      {len(draft.chunks)}")
+    # The distinction the whole artifact turns on: a run that hit a budget did
+    # not converge, and must never be read as a finished taxonomy.
+    if draft.complete:
+        console.print("[green]converged[/green]   two consecutive clean sweeps")
+    else:
+        console.print(
+            f"[yellow]incomplete:[/yellow]  stopped on {draft.stop_reason.value}, "
+            "not on convergence"
+        )
+    for contract in draft.contracts:
+        console.print(f"  {contract.contract_id}  {contract.name}")
+    _report_unresolved(
+        len(draft.ambiguous_trace_ids),
+        len(draft.uncovered_trace_ids),
+        len(draft.unreadable_trace_ids),
+    )
+    for limitation in draft.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="audit-rlm-taxonomy")
+def audit_rlm_taxonomy_command(
+    draft_id: str,
+    model: str = typer.Option(RLM_AUDIT_MODEL, "--model"),
+    freeze: bool = typer.Option(
+        True, "--freeze/--no-freeze", help="Freeze the taxonomy when nothing is unresolved."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Freeze despite unresolved findings, recording that it was forced."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Challenge every contract in a draft with a fresh, adversarial context."""
+    store = _derived(project)
+    try:
+        draft = load_draft(draft_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no draft {draft_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
+    try:
+        predict = build_taxonomy_audit_predictor(model=model)
+    except TaxonomyAuditError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    audit = audit_taxonomy(draft, draft_id, corpus, predict=predict, model=model)
+    audit_envelope = save_rlm_audit(audit, store)
+    console.print(f"audit_id:    {audit_envelope.artifact_id} ({audit.model})")
+
+    for finding in audit.findings:
+        colour = "yellow" if finding.demands_action else "dim"
+        topical = " [topical grouping]" if finding.topical_only else ""
+        console.print(
+            f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}"
+            f"{topical}: {finding.rationale}"
+        )
+        if finding.least_compatible_pair:
+            left, right = finding.least_compatible_pair
+            console.print(f"    [dim]least compatible: {left} vs {right}[/dim]")
+        if finding.strongest_outsider_trace_id:
+            console.print(
+                f"    [dim]strongest outsider: {finding.strongest_outsider_trace_id}[/dim]"
+            )
+
+    unresolved = audit.unresolved()
+    if unresolved:
+        console.print(
+            f"\n[yellow]{len(unresolved)} finding(s) recommend revising or splitting a "
+            "contract and are unresolved[/yellow]"
+        )
+    if not freeze:
+        return
+
+    try:
+        taxonomy = freeze_taxonomy(
+            draft, draft_id, audit=audit, audit_id=audit_envelope.artifact_id, force=force
+        )
+    except FreezeRefused as exc:
+        # Not an error in the run: the audit did its job. Re-mine to address the
+        # findings, or freeze over them deliberately with --force.
+        console.print(f"\n[yellow]not frozen:[/yellow] {exc}")
+        console.print("[dim]re-mine to address them, or pass --force to freeze anyway[/dim]")
+        return
+
+    envelope = save_taxonomy(taxonomy, store)
+    console.print(f"\ntaxonomy_id: {envelope.artifact_id}")
+    for limitation in taxonomy.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="assign-rlm-taxonomy")
+def assign_rlm_taxonomy_command(
+    taxonomy_id: str,
+    batch_size: int = typer.Option(20, "--batch-size"),
+    model: str = typer.Option(RLM_ASSIGN_MODEL, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Classify every trace against a frozen taxonomy in a fresh context."""
+    store = _derived(project)
+    try:
+        taxonomy = load_taxonomy(taxonomy_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no taxonomy {taxonomy_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    _, corpus, _ = _rlm_corpus(taxonomy.analysis_id, project, taxonomy.view.value)
+    try:
+        predict = build_assignment_predictor(model=model)
+    except AssignmentError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with ledger.stage("rlm_assignment_run", taxonomy_id=taxonomy_id, model=model):
+        run = assign_traces(
+            taxonomy,
+            taxonomy_id,
+            corpus,
+            predict=predict,
+            model=model,
+            batch_size=batch_size,
+        )
+        envelope = save_assignment_run(run, store)
+        ledger.record(
+            {
+                "event_type": "stage_complete",
+                "stage_name": "rlm_assignment_run",
+                "input_artifact_id": taxonomy_id,
+                "output_artifact_id": envelope.artifact_id,
+                "assigned": len(run.by_status(AssignmentStatus.ASSIGNED)),
+            }
+        )
+
+    console.print(f"run_id:      {envelope.artifact_id}")
+    console.print(f"assigned:    {len(run.by_status(AssignmentStatus.ASSIGNED))}")
+    for contract_id, traces in run.members().items():
+        console.print(f"  {contract_id}  {len(traces)} trace(s)")
+    _report_unresolved(
+        len(run.by_status(AssignmentStatus.AMBIGUOUS)),
+        len(run.by_status(AssignmentStatus.UNCOVERED)),
+        len(run.by_status(AssignmentStatus.UNREADABLE)),
+    )
+    for limitation in run.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="validate-rlm-mining")
+def validate_rlm_mining_command(
+    run_ids: list[str] = typer.Argument(..., help="Two or more assignment run ids."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Compare independent runs by trace co-assignment, never by family name."""
+    store = _derived(project)
+    runs = []
+    taxonomies = []
+    for run_id in run_ids:
+        try:
+            run = load_assignment_run(run_id, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no assignment run {run_id!r}")
+            raise typer.Exit(code=1) from exc
+        runs.append(run)
+        try:
+            taxonomies.append(load_taxonomy(run.taxonomy_id, store))
+        except FileNotFoundError:
+            # Recurrence is measured over whatever taxonomies are present, and
+            # the report says when it saw fewer than there are runs.
+            pass
+
+    try:
+        report = compare_runs(
+            runs,
+            run_ids,
+            analysis_id=runs[0].analysis_id,
+            taxonomies=taxonomies,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_stability_report(report, store)
+    console.print(f"report_id:   {envelope.artifact_id}")
+    console.print(f"runs:        {report.runs}")
+    console.print(f"stable:      {report.stable_assignment_fraction:.1%} of classified traces")
+    console.print(f"agreement:   {report.pairwise_agreement:.1%} mean pairwise co-assignment")
+    console.print(f"recurring:   {len(report.recurring_contracts)} contract(s) in >1 run")
+
+    if report.disagreements:
+        console.print(f"\n[yellow]{len(report.disagreements)} contested pair(s)[/yellow]")
+        for pair in report.disagreements[:10]:
+            left, right = pair.trace_ids
+            console.print(
+                f"  {left} / {right}: together in {pair.together}, apart in {pair.apart}"
+            )
+    always = [u for u in report.unplaced if u.always_unplaced]
+    if always:
+        console.print(
+            f"\n[yellow]{len(always)} trace(s) no run could place[/yellow] "
+            "[dim](a gap in the taxonomy, or a request that is not one task)[/dim]"
+        )
+    for limitation in report.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="materialize-rlm-taskset")
+def materialize_rlm_taskset_command(
+    run_id: str,
+    held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Turn confidently assigned traces into a TaskSet, with honest provenance."""
+    store = _derived(project)
+    try:
+        run = load_assignment_run(run_id, store)
+        taxonomy = load_taxonomy(run.taxonomy_id, store)
+        analysis = load_analysis(run.analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        task_set = materialize_task_set(
+            run, taxonomy, corpus_id=analysis.corpus_id, held_out=held_out
+        )
+    except MaterializationError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_task_set(task_set, store)
+    _report(task_set, envelope.artifact_id)
+    # Said plainly, because a TaskSet from this path carries no measured
+    # geometry and every reader downstream is used to one that does.
+    console.print(
+        "[dim]families here were proposed by a model reading user requests; no "
+        "embedding distance was computed, so none carries a coherence figure[/dim]"
+    )
