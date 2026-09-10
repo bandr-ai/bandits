@@ -58,7 +58,7 @@ DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 5
+PROMPT_VERSION = 8
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -232,6 +232,20 @@ def prompt_digest(model: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+DEFAULT_MAX_TOKENS = 24000
+"""Per-call ceiling for the default Nemotron + ChatAdapter path.
+
+Every recorded Nemotron completion above 12000 tokens was inspected rather
+than classified from token counts alone. The set was mixed: several were
+hallucinated multi-turn transcripts, but valid final actions and extraction
+responses also reached 13845, 19179, 20395 and 22806 tokens. A 12000 default
+would therefore cut off work known to complete successfully. 24000 leaves
+measured headroom for those calls while remaining below the confirmed 32768
+token runaway. This is still an experiment-specific default, so callers can
+lower or raise it explicitly and the ledger records the value actually used.
+"""
+
+
 def build_predictor(
     *,
     model: str = DEFAULT_MODEL,
@@ -239,6 +253,7 @@ def build_predictor(
     view: TraceView = TraceView.USER_MESSAGES,
     max_iterations: int = 25,
     max_llm_calls: int = 60,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> _Predictor:
     """A ``dspy.RLM`` over one chunk, imported only when mining actually runs.
 
@@ -269,6 +284,7 @@ def build_predictor(
         # rereads the same chunk differently for no gain a reviewer can use.
         # Run-to-run variation is measured across seeds, not sampled per call.
         temperature=0.0,
+        max_tokens=max_tokens,
     )
 
     # Typed rather than list[dict]: the decoder then enforces the fields, and a
@@ -304,6 +320,19 @@ def build_predictor(
         # invalid JSON, and the model's first move is to parse it. A short
         # field is also shown in full, since the peek only elides past a
         # thousand characters.
+        #
+        # Forcing JSONAdapter was tried and reverted. It looked promising from
+        # DeepSeek's recovery calls, but a controlled Nemotron run showed it
+        # made things worse: more calls per chunk than any ChatAdapter run,
+        # and two truncated-at-8192 responses in one chunk whose full text
+        # showed the model stuck re-litigating confusion about the JSON
+        # schema syntax itself (the $defs/$ref structure JSONAdapter puts in
+        # the prompt) rather than the actual mining task — it never got far
+        # enough into its own answer to finish the Python code block before
+        # running out of budget, twice in a row. That confusion source does
+        # not exist under ChatAdapter's plainer field-marker format, whose
+        # automatic fallback to JSONAdapter on a genuine parse failure is
+        # cheaper than asking for JSON on every call up front.
         with dspy.context(lm=language_model):
             return rlm(chunk=chunk, taxonomy=taxonomy, correction=question)
 
@@ -333,6 +362,33 @@ def with_cost(predict: Any) -> Any:
 
     predict.cost = cost  # type: ignore[attr-defined]
     return predict
+
+
+def _last_call_was_truncated(predict: Any) -> bool:
+    """Whether the call that produced this prediction was cut off mid-output.
+
+    DSPy's RLM loop returns the instant one iteration's action calls FINAL
+    successfully, so the last entry in ``predict.spend.entries`` is always the
+    exact call whose parsed code produced this prediction — never an earlier,
+    abandoned attempt. A response Fireworks or DeepSeek cut off at the
+    provider's token ceiling is not a plan that happened to finish early: two
+    real runs each produced one response that ran to its full ceiling (32768
+    and 65536 tokens) — one a hallucinated multi-turn transcript, the other a
+    repeated sentence — and neither was output a taxonomy should be built from,
+    even where DSPy's parser managed to salvage something that looked valid.
+    """
+    spend = getattr(predict, "spend", None)
+    entries = getattr(spend, "entries", None) if spend is not None else None
+    if not entries:
+        return False
+    last = entries[-1]
+    if not isinstance(last, dict):
+        return False
+    response_obj = last.get("response")
+    choices = getattr(response_obj, "choices", None)
+    if not choices:
+        return False
+    return getattr(choices[0], "finish_reason", None) == "length"
 
 
 def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
@@ -1357,6 +1413,34 @@ def _run_chunk(
             duration_seconds=time.monotonic() - started,
             status="error",
             error=str(exc),
+        )
+    if _last_call_was_truncated(predict):
+        # Discards the chunk's output when the call that actually produced it
+        # was cut off at the provider's token ceiling, however plausible the
+        # salvaged parse looks. This checks only the last history entry — the
+        # exact call whose parsed code called FINAL, since dspy.RLM.forward()
+        # returns the instant one does. It is not a guarantee that no
+        # truncated code ran anywhere in this chunk: an earlier iteration can
+        # itself have been truncated, produced malformed code, and still have
+        # been executed in the sandbox by DSPy's own loop before a later,
+        # clean iteration finished the chunk — that earlier execution already
+        # happened and this cannot undo it. What this closes is the narrower,
+        # confirmed failure: a truncated response's parse becoming the
+        # chunk's contracts and assignments. Recorded as a chunk error so the
+        # existing retry path picks its traces back up on a later chunk, the
+        # same as any other failed call.
+        calls, tokens = _spend_of(predict)
+        return ChunkResult(
+            index=index,
+            pass_index=pass_index,
+            trace_ids=trace_ids,
+            llm_calls=calls,
+            tokens=tokens,
+            cost_usd=_cost_of(predict),
+            duration_seconds=time.monotonic() - started,
+            status="error",
+            error="the call that produced this chunk's output was truncated at the "
+            "provider's token ceiling; discarded rather than parsed",
         )
     calls, tokens = _spend_of(predict)
     cost = _cost_of(predict)

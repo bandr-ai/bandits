@@ -34,6 +34,7 @@ from bandits.analyze.rlm_audit import (
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus, build_view
 from bandits.analyze.rlm_mine import (
     MiningError,
+    _last_call_was_truncated,
     _parse_contract,
     compute_draft_id,
     load_draft,
@@ -114,6 +115,54 @@ def test_first_message_arm_drops_later_turns() -> None:
     assert view.messages == ("book a flight",)
 
 
+def test_control_markers_are_untouched_by_default() -> None:
+    """No corpus is assumed to carry benchmark scaffolding: text that happens
+    to look like a control token is left exactly as the source wrote it
+    unless a caller declares it via ``control_markers``."""
+    view = build_view(
+        _trace("t1", "please transfer me to a human agent ###TRANSFER###"),
+        TraceView.USER_MESSAGES,
+    )
+    assert view.messages == ("please transfer me to a human agent ###TRANSFER###",)
+    assert view.withheld_fields == ()
+
+
+def test_a_declared_control_marker_is_stripped_from_user_messages() -> None:
+    """tau2's simulator appends ``###TRANSFER###`` to most airline episodes,
+    not only the ones that actually escalate — a miner shown it built a family
+    around that marker instead of the requested task, the exact confound this
+    view exists to prevent. The marker is a fact about that specific source,
+    declared by the caller, not assumed here for every corpus."""
+    view = build_view(
+        _trace("t1", "please transfer me to a human agent ###TRANSFER###"),
+        TraceView.USER_MESSAGES,
+        control_markers=("###TRANSFER###",),
+    )
+    assert view.messages == ("please transfer me to a human agent",)
+    assert "###TRANSFER###" in view.withheld_fields
+
+
+def test_a_message_that_is_only_a_declared_marker_is_dropped_not_emptied() -> None:
+    """A turn whose entire text is the marker must not surface as an empty
+    string standing in for a real user message."""
+    view = build_view(
+        _trace("t1", "book a flight", "###TRANSFER###"),
+        TraceView.USER_MESSAGES,
+        control_markers=("###TRANSFER###",),
+    )
+    assert view.messages == ("book a flight",)
+
+
+def test_a_declared_marker_is_also_stripped_from_the_full_trajectory_arm() -> None:
+    view = build_view(
+        _trace("t1", "please transfer me ###TRANSFER###"),
+        TraceView.FULL_TRAJECTORY,
+        control_markers=("###TRANSFER###",),
+    )
+    assert not any("###TRANSFER###" in line for line in view.messages)
+    assert "###TRANSFER###" in view.withheld_fields
+
+
 def test_trace_without_recorded_turns_is_unreadable_not_reconstructed() -> None:
     """A declared task must never be smuggled in as if it were a user message."""
     trace = _trace("t1")
@@ -138,6 +187,17 @@ def test_corpus_exposes_only_generic_operations() -> None:
     assert [v.trace_id for v in corpus.get_user_message_batch(["t2", "t1"])] == ["t2", "t1"]
     assert not hasattr(corpus, "get_spans")
     assert not hasattr(corpus, "get_outcome")
+
+
+def test_corpus_forwards_control_markers_to_every_view() -> None:
+    """The declaration lives once, at construction, and applies uniformly —
+    not per trace, and not something a caller can forget for one view but not
+    another."""
+    corpus = ReadOnlyCorpus(
+        _corpus(_trace("t1", "please transfer me ###TRANSFER###")),
+        control_markers=("###TRANSFER###",),
+    )
+    assert corpus.get_user_messages("t1").messages == ("please transfer me",)
 
 
 def test_sampling_is_reproducible_and_respects_exclusions() -> None:
@@ -468,6 +528,58 @@ def test_a_failed_chunk_is_recorded_and_the_loop_continues() -> None:
     assert len(failed) == 1
     assert "fell over" in failed[0].error
     assert len(draft.chunks) > 1
+
+
+def _entry(finish_reason: str | None) -> dict:
+    choice = SimpleNamespace(finish_reason=finish_reason)
+    response = SimpleNamespace(choices=[choice])
+    return {"response": response}
+
+
+def test_truncation_is_read_from_the_last_call_only() -> None:
+    predict = SimpleNamespace(spend=SimpleNamespace(entries=[_entry("stop"), _entry("length")]))
+    assert _last_call_was_truncated(predict) is True
+
+
+def test_an_earlier_truncated_call_does_not_taint_a_clean_final_one() -> None:
+    """A retried iteration inside the same chunk can leave an earlier
+    truncated entry in history; only the call that actually produced the
+    prediction should decide whether the chunk is discarded."""
+    predict = SimpleNamespace(spend=SimpleNamespace(entries=[_entry("length"), _entry("stop")]))
+    assert _last_call_was_truncated(predict) is False
+
+
+def test_no_spend_reporter_reads_as_not_truncated() -> None:
+    """Injected test predictors carry no .spend at all; the guard must not
+    invent truncation for a backend that cannot report it."""
+    assert _last_call_was_truncated(SimpleNamespace()) is False
+    assert _last_call_was_truncated(SimpleNamespace(spend=SimpleNamespace(entries=[]))) is False
+
+
+def test_a_truncated_final_call_fails_the_chunk_closed() -> None:
+    """Fail closed: a response cut off at the provider's token ceiling must
+    never be parsed and executed as if it were a complete answer, however
+    plausible the salvaged output looks."""
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        predict.spend = SimpleNamespace(entries=[_entry("length")])
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={"t1": "c1", "t2": "c1"},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    failed = [c for c in draft.chunks if c.status == "error"]
+    assert failed, "the truncated call must be recorded as a failed chunk"
+    assert all("truncated" in c.error for c in failed)
+    # A discarded chunk assigns nothing: its traces are never placed by a
+    # truncated call, the same as any other failed call.
+    assert all(not c.assignments for c in failed)
+    assert not draft.assignments
 
 
 def test_normal_chunk_calls_carry_no_correction() -> None:
@@ -2400,6 +2512,110 @@ def test_assignment_keeps_its_replies_and_the_rows_it_refused() -> None:
     assert run.raw_replies and "t1" in run.raw_replies[0]
     assert any("NOT_IN_BATCH" in row for row in run.dropped_results)
     assert any("could not be read" in limit for limit in run.limitations)
+
+
+def test_ledger_records_finish_reason_and_adapter_fallback(tmp_path, monkeypatch) -> None:
+    """A JSONAdapter fallback after a ChatAdapter parse failure issues its own
+    real request, which otherwise lands in the ledger indistinguishable from a
+    genuine next RLM iteration. response_format is the one kwarg only
+    JSONAdapter ever sets, so it is what marks a row as a fallback.
+
+    A response cut off at the provider's token ceiling is the other thing
+    invisible before this fix: DSPy's own truncation warning reads
+    ``choices[0].finish_reason``, and that is now the same field surfaced here.
+    """
+    import json
+
+    from bandits.analyze.audit import scoped_to_history
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+
+    def _choice(finish_reason: str) -> SimpleNamespace:
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason=finish_reason)])
+
+    # temperature and max_tokens live on the LM instance (``dspy.LM(...,
+    # max_tokens=8192)``), not re-sent per call — a real call's own kwargs
+    # dict is empty of them, exactly like this. A prior version of the
+    # ledger fix read only the per-call dict and always logged ``{}`` for a
+    # setting that was, in fact, in effect on every request.
+    language_model = SimpleNamespace(history=[], kwargs={"temperature": 0.0, "max_tokens": 8192})
+
+    def raw_predict(**inputs):
+        language_model.history.append(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "kwargs": {"api_key": "secret"},
+                "outputs": ["ok so far"],
+                "usage": {"completion_tokens": 100},
+                "cost": 0.01,
+                "model": "test-model",
+                "response": _choice("length"),
+                "uuid": "call-1",
+                "timestamp": "t1",
+            }
+        )
+        language_model.history.append(
+            {
+                "messages": [{"role": "user", "content": "retry"}],
+                "kwargs": {"response_format": {"type": "json_object"}},
+                "outputs": ["recovered"],
+                "usage": {"completion_tokens": 40},
+                "cost": 0.002,
+                "model": "test-model",
+                "response": _choice("stop"),
+                "uuid": "call-2",
+                "timestamp": "t2",
+            }
+        )
+        return SimpleNamespace(result="done")
+
+    wrapped = scoped_to_history(raw_predict, language_model)
+    wrapped()
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    calls = [r for r in rows if r.get("event_type") == "model_call"]
+    assert len(calls) == 2
+
+    truncated, recovered = calls
+    assert truncated["response"]["finish_reason"] == "length"
+    assert truncated["adapter"] == "chat"
+    assert truncated["request"]["kwargs"] == {"temperature": 0.0, "max_tokens": 8192}
+    assert "api_key" not in truncated["request"]["kwargs"]
+    assert "secret" not in json.dumps(truncated)
+
+    assert recovered["response"]["finish_reason"] == "stop"
+    assert recovered["adapter"] == "json"
+    # The instance default still applies to this call too — response_format
+    # being per-call does not mean temperature/max_tokens were unset for it.
+    assert recovered["request"]["kwargs"] == {"temperature": 0.0, "max_tokens": 8192}
+
+
+def test_a_per_call_override_wins_over_the_instance_default(tmp_path, monkeypatch) -> None:
+    """A genuine per-call override — an adapter deliberately changing
+    max_tokens for one request — must still be visible, not shadowed by the
+    instance-level default it overrides."""
+    import json
+
+    from bandits.analyze.audit import _record_history
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+
+    language_model = SimpleNamespace(kwargs={"temperature": 0.0, "max_tokens": 8192})
+    entries = [
+        {
+            "messages": [],
+            "kwargs": {"max_tokens": 16384},
+            "outputs": [],
+            "model": "test-model",
+        }
+    ]
+
+    _record_history(entries, language_model=language_model)
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert rows[0]["request"]["kwargs"] == {"temperature": 0.0, "max_tokens": 16384}
 
 
 def test_chunk_ledger_rows_name_their_pass_and_session(tmp_path, monkeypatch) -> None:

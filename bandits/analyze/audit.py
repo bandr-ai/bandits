@@ -299,7 +299,7 @@ def scoped_to_history(predict: _Predictor, language_model: Any) -> _Predictor:
             # are exactly the ones a rerun that behaved differently needs.
             history = getattr(language_model, "history", None)
             spend.entries = list(history[before:]) if isinstance(history, list) else []
-            _record_history(spend.entries)
+            _record_history(spend.entries, language_model=language_model)
 
     wrapped.spend = spend  # type: ignore[attr-defined]
     return wrapped
@@ -308,7 +308,7 @@ def scoped_to_history(predict: _Predictor, language_model: Any) -> _Predictor:
 _CODE_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
 
 
-def _record_history(entries: Sequence[Any]) -> None:
+def _record_history(entries: Sequence[Any], *, language_model: Any = None) -> None:
     """Write each RLM subcall to the ledger as the physical call it was.
 
     The audit reaches Fireworks through DSPy rather than through
@@ -320,9 +320,12 @@ def _record_history(entries: Sequence[Any]) -> None:
 
     What is still not visible here: the REPL's stdout appears only inside the
     *next* entry's prompt, as the ``repl_history`` the model is shown, so a
-    final iteration's output is unrecoverable from history alone. Retries and
-    failures inside litellm are invisible too — a call that failed and was
-    retried appears as one entry, or as none.
+    final iteration's output is unrecoverable from history alone. Retries
+    inside litellm are still invisible — a call that failed and was retried
+    below this layer appears as one entry, or as none. A ChatAdapter parse
+    failure is not one of those: DSPy's fallback to JSONAdapter issues its own
+    real request, which lands here as its own entry, indistinguishable from a
+    genuine next RLM iteration without comparing response shapes by hand.
     """
     if not ledger.enabled():
         return
@@ -335,14 +338,51 @@ def _record_history(entries: Sequence[Any]) -> None:
             first = outputs[0]
             text = first.get("text", "") if isinstance(first, dict) else str(first)
         code = _CODE_BLOCK.findall(text)
+        # entry["response"] is the raw litellm response object DSPy kept, not
+        # a ledger reconstruction — finish_reason is exactly what DSPy itself
+        # reads to decide whether a completion was truncated (lm.py's own
+        # ``_check_truncation``), just never previously surfaced past that
+        # warning log line.
+        finish_reason = None
+        response_obj = entry.get("response")
+        choices = getattr(response_obj, "choices", None)
+        if choices:
+            finish_reason = getattr(choices[0], "finish_reason", None)
+        # An allowlist, not every non-api_ kwarg: DSPy's kwargs dict is not a
+        # contract, and a field added there tomorrow should not silently start
+        # appearing in every ledger row until someone notices.
+        #
+        # temperature and max_tokens are set once on the LM instance
+        # (``dspy.LM(..., max_tokens=8192)``), not re-passed on every call, so
+        # they never appear in a single call's own kwargs — only in
+        # ``language_model.kwargs``, the LM's baked-in defaults. A prior
+        # version of this function read only the per-call dict and always
+        # logged ``{}`` for a setting that was, in fact, in effect on every
+        # request. The per-call dict is read second so a genuine per-call
+        # override — an adapter deliberately changing max_tokens for one
+        # request — still wins over the instance default.
+        call_kwargs = entry.get("kwargs") or {}
+        lm_kwargs = getattr(language_model, "kwargs", None) or {}
+        request_kwargs = {
+            key: value
+            for source in (lm_kwargs, call_kwargs)
+            for key, value in source.items()
+            if key in ("temperature", "max_tokens")
+        }
+        # ChatAdapter never sets response_format; JSONAdapter always does, on
+        # both its direct use and its fallback path after a ChatAdapter parse
+        # failure. That fallback issues its own real request, which otherwise
+        # lands here indistinguishable from a genuine next RLM iteration.
+        adapter = "json" if "response_format" in call_kwargs else "chat"
         ledger.record(
             {
                 "event_type": "model_call",
                 "provider": "dspy",
                 "model": entry.get("model"),
                 "iteration": index + 1,
-                "request": {"messages": entry.get("messages")},
-                "response": {"text": text},
+                "adapter": adapter,
+                "request": {"messages": entry.get("messages"), "kwargs": request_kwargs},
+                "response": {"text": text, "finish_reason": finish_reason},
                 # Pulled out of the reply rather than left inside it: the code
                 # is what the root model actually did, and grepping a ledger
                 # for it should not mean parsing markdown fences back out.

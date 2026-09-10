@@ -43,7 +43,7 @@ from bandits.analyze.rlm_audit import (
     build_predictor as build_auditor,
 )
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
-from bandits.analyze.rlm_mine import build_predictor, mine_taxonomy, save_draft
+from bandits.analyze.rlm_mine import DEFAULT_MODEL, build_predictor, mine_taxonomy, save_draft
 from bandits.analyze.rlm_models import AssignmentStatus, Budget, TraceView
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_taskset import materialize_task_set
@@ -154,6 +154,14 @@ def main() -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-usd", type=float, default=2.0)
     parser.add_argument("--max-llm-calls", type=int, default=400)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Per-call completion token ceiling. What counts as safe is "
+        "model-specific and measured per experiment, not a harness default — "
+        "omit to use build_predictor's own default.",
+    )
     args = parser.parse_args()
 
     # Every physical model call, with its prompt, reply, tokens and the
@@ -173,7 +181,14 @@ def main() -> int:
         args.project, args.corpus, args.lineages, args.seed
     )
     analysis = analyze_corpus(corpus_obj)
-    corpus = ReadOnlyCorpus(corpus_obj, view=view)
+    # control_markers belongs on the TraceCorpus artifact, declared once at
+    # `bandits ingest --control-marker`, and every RLM command reads it from
+    # there — this corpus predates that field, so the tau2-specific fallback
+    # stays here rather than silently mining an ungoverned view. Re-ingest
+    # with --control-marker '###TRANSFER###' to carry it on the artifact
+    # instead and drop this override.
+    control_markers = corpus_obj.control_markers or ("###TRANSFER###",)
+    corpus = ReadOnlyCorpus(corpus_obj, view=view, control_markers=control_markers)
     print(f"\ncorpus: {corpus_id}")
     print(f"  {len(corpus_obj.traces)} trace(s) from {len(lineages)} lineage(s): "
           f"{', '.join(lineages)}")
@@ -186,6 +201,8 @@ def main() -> int:
     kwargs: dict[str, object] = {"view": view}
     if args.model:
         kwargs["model"] = args.model
+    if args.max_tokens is not None:
+        kwargs["max_tokens"] = args.max_tokens
     failures: list[str] = []
 
     def check(name: str, ok: bool, detail: str = "") -> None:
@@ -226,6 +243,8 @@ def main() -> int:
         "smoke-analysis",
         predict=build_predictor(**kwargs),
         analysis=analysis,
+        model=args.model or DEFAULT_MODEL,
+        seed=args.seed,
         session=recorder,
         chunk_size=3,
         budget=Budget(
