@@ -17,20 +17,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from bandits.analyze.rlm_assign import (
-    AssignmentError,
-    _parse_result,
-    assign_traces,
-    load_assignment_run,
-    save_assignment_run,
-)
-from bandits.analyze.rlm_audit import (
-    FreezeRefused,
-    audit_clustering,
-    compute_taxonomy_id,
-    freeze_taxonomy,
-    resolve_findings,
-)
+from bandits.analyze.rlm_audit import audit_clustering
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus, build_view
 from bandits.analyze.rlm_mine import (
     MiningError,
@@ -42,21 +29,16 @@ from bandits.analyze.rlm_mine import (
     save_clustering_run,
 )
 from bandits.analyze.rlm_models import (
-    AssignmentRun,
-    AssignmentStatus,
     Budget,
     ChunkResult,
     FamilyContract,
-    FrozenTaxonomy,
     Operation,
     RLMClusteringAudit,
     RLMClusteringRun,
     StopReason,
     TaxonomyOperation,
-    TraceAssignment,
     TraceView,
 )
-from bandits.analyze.rlm_stability import compare_runs, save_stability_report
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, UserTurn
 
@@ -773,401 +755,11 @@ def test_a_failed_contract_audit_is_uncertain_not_absent() -> None:
     assert "provider down" in audit.findings[0].rationale
 
 
-def test_freeze_refuses_while_a_split_is_unresolved() -> None:
-    from bandits.analyze.rlm_models import AuditFinding
-
-    audit = RLMClusteringAudit(
-        run_id="run-1",
-        findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two tasks"),),
-        model="m",
-        prompt_digest="d",
-    )
-    with pytest.raises(FreezeRefused, match="have not been resolved"):
-        freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="audit-1")
-
-
-def test_resolved_findings_permit_the_freeze() -> None:
-    from bandits.analyze.rlm_models import AuditFinding
-
-    audit = RLMClusteringAudit(
-        run_id="run-1",
-        findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two tasks"),),
-        model="m",
-        prompt_digest="d",
-    )
-    resolved = resolve_findings(audit, {"c1": "split into c1 and c2 in the next sweep"})
-    assert not resolved.unresolved()
-    taxonomy = freeze_taxonomy(_draft(), "run-1", audit=resolved, audit_id="audit-1")
-    assert taxonomy.complete
-
-
 def test_a_resolution_must_say_how() -> None:
     from bandits.analyze.rlm_models import AuditFinding
 
     with pytest.raises(ValidationError, match="indistinguishable from ignoring it"):
         AuditFinding(contract_id="c1", recommendation="split", rationale="two", resolved=True)
-
-
-def test_forcing_a_freeze_records_that_it_was_forced() -> None:
-    from bandits.analyze.rlm_models import AuditFinding
-
-    audit = RLMClusteringAudit(
-        run_id="run-1",
-        findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two"),),
-        model="m",
-        prompt_digest="d",
-    )
-    taxonomy = freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1", force=True)
-    assert any("unresolved audit finding" in limit for limit in taxonomy.limitations)
-
-
-def test_freezing_without_an_audit_says_so() -> None:
-    taxonomy = freeze_taxonomy(_draft(), "run-1")
-    assert taxonomy.audit_id is None
-    assert any("no adversarial audit" in limit for limit in taxonomy.limitations)
-
-
-def test_an_incomplete_draft_freezes_but_never_reads_as_converged() -> None:
-    taxonomy = freeze_taxonomy(_draft(stop_reason=StopReason.MAX_SECONDS), "run-1")
-    assert not taxonomy.complete
-    assert any("never converg" in x or "rather than converging" in x for x in taxonomy.limitations)
-
-
-def test_taxonomy_id_tracks_contract_wording() -> None:
-    """An assignment naming a taxonomy id must be naming exact wording."""
-    first = freeze_taxonomy(_draft(), "run-1")
-    reworded = freeze_taxonomy(
-        _draft(contracts=(_contract("c1", "refund an order the policy allows"),)), "run-1"
-    )
-    assert compute_taxonomy_id(first) != compute_taxonomy_id(reworded)
-
-
-def test_an_empty_taxonomy_cannot_be_frozen() -> None:
-    with pytest.raises(ValidationError, match="cannot be assigned against"):
-        freeze_taxonomy(_draft(contracts=()), "run-1")
-
-
-# --- fresh assignment --------------------------------------------------------
-
-
-def _taxonomy(*contracts: FamilyContract) -> FrozenTaxonomy:
-    return FrozenTaxonomy(
-        run_id="run-1",
-        analysis_id="analysis-1",
-        view=TraceView.USER_MESSAGES,
-        contracts=contracts or (_contract("c1"),),
-        complete=True,
-    )
-
-
-def test_assignment_classifies_every_trace() -> None:
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-
-    def predict(*, taxonomy: str, batch: str, question: str):
-        import json
-
-        return SimpleNamespace(
-            results=[
-                {
-                    "trace_id": row["trace_id"],
-                    "matching_contract_ids": ["c1"],
-                    "primary_contract_id": "c1",
-                    "status": "assigned",
-                    "reason": "asks for a refund",
-                }
-                for row in json.loads(batch)
-            ]
-        )
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
-    assert len(run.assignments) == 2
-    assert run.members() == {"c1": ("t1", "t2")}
-
-
-def test_two_matches_stay_ambiguous_and_pick_no_primary() -> None:
-    """Ambiguity is preserved for review rather than broken by a tiebreak."""
-    parsed = _parse_result(
-        {
-            "trace_id": "t1",
-            "matching_contract_ids": ["c1", "c2"],
-            "primary_contract_id": "c1",
-            "status": "assigned",
-            "reason": "both fit",
-        },
-        known_contracts={"c1", "c2"},
-    )
-    assert parsed is not None
-    assert parsed.status is AssignmentStatus.AMBIGUOUS
-    assert parsed.primary_contract_id is None
-
-
-def test_no_match_is_uncovered_even_when_the_model_says_assigned() -> None:
-    parsed = _parse_result(
-        {"trace_id": "t1", "matching_contract_ids": [], "status": "assigned", "reason": "eh"},
-        known_contracts={"c1"},
-    )
-    assert parsed is not None
-    assert parsed.status is AssignmentStatus.UNCOVERED
-    assert parsed.matching_contract_ids == ()
-
-
-def test_a_match_naming_an_unknown_contract_is_dropped() -> None:
-    parsed = _parse_result(
-        {"trace_id": "t1", "matching_contract_ids": ["ghost"], "reason": "x"},
-        known_contracts={"c1"},
-    )
-    assert parsed is not None
-    assert parsed.status is AssignmentStatus.UNCOVERED
-
-
-def test_a_trace_the_model_skipped_becomes_uncovered_not_missing() -> None:
-    """A missing trace would silently shrink the coverage denominator."""
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-
-    def predict(**_):
-        return SimpleNamespace(
-            results=[
-                {
-                    "trace_id": "t1",
-                    "matching_contract_ids": ["c1"],
-                    "primary_contract_id": "c1",
-                    "reason": "refund",
-                }
-            ]
-        )
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
-    assert {a.trace_id for a in run.assignments} == {"t1", "t2"}
-    assert run.by_status(AssignmentStatus.UNCOVERED)[0].trace_id == "t2"
-    assert any("no result from the model" in limit for limit in run.limitations)
-
-
-def test_unreadable_traces_are_classified_as_unreadable() -> None:
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2")))
-
-    def predict(**_):
-        return SimpleNamespace(
-            results=[
-                {
-                    "trace_id": "t1",
-                    "matching_contract_ids": ["c1"],
-                    "primary_contract_id": "c1",
-                    "reason": "refund",
-                }
-            ]
-        )
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
-    assert run.by_status(AssignmentStatus.UNREADABLE)[0].trace_id == "t2"
-
-
-def test_a_failed_batch_does_not_lose_its_traces() -> None:
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-
-    def predict(**_):
-        raise RuntimeError("provider down")
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict, batch_size=2)
-    assert len(run.assignments) == 2
-    assert all(a.status is AssignmentStatus.UNCOVERED for a in run.assignments)
-    assert any("provider down" in limit for limit in run.limitations)
-
-
-def test_assigning_across_views_is_refused() -> None:
-    """The two arms are different experiments and must not be mixed."""
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")), view=TraceView.FIRST_USER_MESSAGE)
-    with pytest.raises(AssignmentError, match="different experiments"):
-        assign_traces(_taxonomy(), "tax-1", corpus, predict=lambda **_: None)
-
-
-def test_ambiguous_traces_are_excluded_from_members() -> None:
-    run = AssignmentRun(
-        taxonomy_id="tax-1",
-        analysis_id="analysis-1",
-        view=TraceView.USER_MESSAGES,
-        assignments=(
-            TraceAssignment(
-                trace_id="t1",
-                matching_contract_ids=("c1",),
-                primary_contract_id="c1",
-                status=AssignmentStatus.ASSIGNED,
-                reason="refund",
-            ),
-            TraceAssignment(
-                trace_id="t2",
-                matching_contract_ids=("c1", "c2"),
-                status=AssignmentStatus.AMBIGUOUS,
-                reason="both",
-            ),
-        ),
-        model="m",
-        prompt_digest="d",
-    )
-    assert run.members() == {"c1": ("t1",)}
-
-
-def test_assignment_contract_rejects_a_status_that_disagrees_with_its_matches() -> None:
-    with pytest.raises(ValidationError, match="assigned to nothing"):
-        TraceAssignment(trace_id="t1", status=AssignmentStatus.ASSIGNED, reason="x")
-    with pytest.raises(ValidationError, match="fewer than two matches"):
-        TraceAssignment(
-            trace_id="t1",
-            matching_contract_ids=("c1",),
-            status=AssignmentStatus.AMBIGUOUS,
-            reason="x",
-        )
-    with pytest.raises(ValidationError, match="still names a contract"):
-        TraceAssignment(
-            trace_id="t1",
-            matching_contract_ids=("c1",),
-            status=AssignmentStatus.UNCOVERED,
-            reason="x",
-        )
-
-
-def test_assignment_run_round_trips(tmp_path) -> None:
-    store = DerivedStore(tmp_path)
-    run = AssignmentRun(
-        taxonomy_id="tax-1",
-        analysis_id="analysis-1",
-        view=TraceView.USER_MESSAGES,
-        assignments=(
-            TraceAssignment(
-                trace_id="t1",
-                matching_contract_ids=("c1",),
-                primary_contract_id="c1",
-                status=AssignmentStatus.ASSIGNED,
-                reason="refund",
-            ),
-        ),
-        model="m",
-        prompt_digest="d",
-    )
-    envelope = save_assignment_run(run, store)
-    assert envelope.parent_artifact_id == "tax-1"
-    assert load_assignment_run(envelope.artifact_id, store) == run
-
-
-# --- stability ---------------------------------------------------------------
-
-
-def _run(taxonomy_id: str, groups: dict[str, list[str]], unplaced: dict[str, str] | None = None):
-    assignments = [
-        TraceAssignment(
-            trace_id=trace_id,
-            matching_contract_ids=(contract_id,),
-            primary_contract_id=contract_id,
-            status=AssignmentStatus.ASSIGNED,
-            reason="grouped",
-        )
-        for contract_id, traces in groups.items()
-        for trace_id in traces
-    ]
-    for trace_id, status in (unplaced or {}).items():
-        assignments.append(
-            TraceAssignment(
-                trace_id=trace_id,
-                matching_contract_ids=("c1", "c2") if status == "ambiguous" else (),
-                status=AssignmentStatus(status),
-                reason="unplaced",
-            )
-        )
-    return AssignmentRun(
-        taxonomy_id=taxonomy_id,
-        analysis_id="analysis-1",
-        view=TraceView.USER_MESSAGES,
-        assignments=tuple(assignments),
-        model="m",
-        prompt_digest="d",
-    )
-
-
-def test_identical_grouping_under_different_names_is_perfect_agreement() -> None:
-    """Names differ between runs and carry no information; partners do."""
-    left = _run("tax-1", {"c1": ["t1", "t2"], "c2": ["t3"]})
-    right = _run("tax-2", {"zzz": ["t1", "t2"], "yyy": ["t3"]})
-    report = compare_runs([left, right], ["r1", "r2"], analysis_id="analysis-1")
-    assert report.pairwise_agreement == 1.0
-    assert report.stable_assignment_fraction == 1.0
-    assert report.disagreements == ()
-
-
-def test_a_split_disagreement_is_reported_as_a_contested_pair() -> None:
-    left = _run("tax-1", {"c1": ["t1", "t2"]})
-    right = _run("tax-2", {"c1": ["t1"], "c2": ["t2"]})
-    report = compare_runs([left, right], ["r1", "r2"], analysis_id="analysis-1")
-    assert report.pairwise_agreement == 0.0
-    assert report.disagreements[0].trace_ids == ("t1", "t2")
-    assert report.disagreements[0].together == 1
-    assert report.disagreements[0].apart == 1
-
-
-def test_a_run_that_left_a_trace_unplaced_does_not_vote_it_apart() -> None:
-    """Declining to place is not the same claim as separating."""
-    left = _run("tax-1", {"c1": ["t1", "t2"]})
-    right = _run("tax-2", {"c1": ["t1"]}, unplaced={"t2": "uncovered"})
-    report = compare_runs([left, right], ["r1", "r2"], analysis_id="analysis-1")
-    assert report.disagreements == ()
-    assert report.unplaced[0].trace_id == "t2"
-
-
-def test_unplaced_traces_count_against_stability() -> None:
-    left = _run("tax-1", {"c1": ["t1", "t2"]})
-    right = _run("tax-2", {"c1": ["t1", "t2"]}, unplaced={"t3": "ambiguous"})
-    report = compare_runs([left, right], ["r1", "r2"], analysis_id="analysis-1")
-    assert report.stable_assignment_fraction < 1.0
-
-
-def test_runs_sharing_a_taxonomy_are_refused() -> None:
-    """That measures classifier repeatability, not discovery stability."""
-    left = _run("tax-1", {"c1": ["t1"]})
-    right = _run("tax-1", {"c1": ["t1"]})
-    with pytest.raises(ValueError, match="not whether independent discovery"):
-        compare_runs([left, right], ["r1", "r2"], analysis_id="analysis-1")
-
-
-def test_a_single_run_cannot_report_stability() -> None:
-    with pytest.raises(ValueError, match="at least two runs"):
-        compare_runs([_run("tax-1", {"c1": ["t1"]})], ["r1"], analysis_id="analysis-1")
-
-
-def test_recurring_contracts_are_counted_on_meaning_not_name() -> None:
-    left = _taxonomy(_contract("c1"))
-    right = _taxonomy(_contract("zz").replace(name="Money back"))
-    report = compare_runs(
-        [_run("tax-1", {"c1": ["t1"]}), _run("tax-2", {"zz": ["t1"]})],
-        ["r1", "r2"],
-        analysis_id="analysis-1",
-        taxonomies=[left, right],
-    )
-    assert report.recurring_contracts[0][1] == 2
-
-
-def test_stability_report_round_trips(tmp_path) -> None:
-    store = DerivedStore(tmp_path)
-    report = compare_runs(
-        [_run("tax-1", {"c1": ["t1", "t2"]}), _run("tax-2", {"c1": ["t1", "t2"]})],
-        ["r1", "r2"],
-        analysis_id="analysis-1",
-    )
-    envelope = save_stability_report(report, store)
-    assert envelope.parent_artifact_id == "analysis-1"
-
-
-def test_a_report_cannot_name_the_same_run_twice() -> None:
-    from bandits.analyze.rlm_stability import StabilityReport
-
-    with pytest.raises(ValidationError, match="names the same run twice"):
-        StabilityReport(
-            analysis_id="a1",
-            assignment_run_ids=("r1", "r1"),
-            runs=2,
-            stable_assignment_fraction=1.0,
-            pairwise_agreement=1.0,
-        )
-
-
-# --- materialization ---------------------------------------------------------
 
 
 def _tool_trace(trace_id: str, *, output: dict, message: str = "refund my order") -> Trace:
@@ -1352,32 +944,6 @@ def test_a_corpus_yielding_nothing_to_strip_is_reported_as_suspicious() -> None:
         chunk_size=2,
     )
     assert any("under other names" in limit for limit in run.limitations)
-
-
-def test_the_two_paths_cannot_be_cross_assigned() -> None:
-    """Comparing the arms requires that neither ever sees the other's taxonomy."""
-    taxonomy = _taxonomy().replace(view=TraceView.FULL_TRAJECTORY)
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")), view=TraceView.USER_MESSAGES)
-    with pytest.raises(AssignmentError, match="different experiments"):
-        assign_traces(taxonomy, "tax-1", corpus, predict=lambda **_: None)
-
-
-# --- review fixes: prompts, provenance, budgets, operations, coverage --------
-
-
-def test_each_arm_gets_a_prompt_describing_what_it_actually_sees() -> None:
-    """A Path F prompt claiming user-messages-only is internally inconsistent."""
-    from bandits.analyze.rlm_assign import instruction_for as assign_instruction
-    from bandits.analyze.rlm_audit import instruction_for as audit_instruction
-    from bandits.analyze.rlm_mine import instruction_for as mine_instruction
-
-    for build in (mine_instruction, audit_instruction, assign_instruction):
-        full = build(TraceView.FULL_TRAJECTORY)
-        users = build(TraceView.USER_MESSAGES)
-        assert "FULL trajectory" in full
-        assert "ONLY what the users asked for" not in full
-        assert "ONLY what the users asked for" in users
-        assert "[tool]" not in users
 
 
 def test_path_f_prompt_forbids_grouping_by_agent_behavior() -> None:
@@ -2199,30 +1765,6 @@ def test_unparseable_text_is_still_dropped_rather_than_crashing() -> None:
     assert run.contracts == ()
 
 
-def test_assignment_results_arriving_as_json_text_are_read() -> None:
-    import json
-
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-
-    def predict(*, taxonomy: str, batch: str, question: str):
-        return SimpleNamespace(
-            results=json.dumps(
-                [
-                    {
-                        "trace_id": row["trace_id"],
-                        "matching_contract_ids": ["c1"],
-                        "primary_contract_id": "c1",
-                        "reason": "refund",
-                    }
-                    for row in json.loads(batch)
-                ]
-            )
-        )
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
-    assert run.members() == {"c1": ("t1", "t2")}
-
-
 def test_a_decoded_scalar_is_not_iterated() -> None:
     """`"1"` decodes to an int, which raises; `'"txt"'` to a string, which
     iterates one character at a time and silently yields garbage."""
@@ -2257,14 +1799,6 @@ def test_a_bare_string_is_not_read_as_a_list_of_ids() -> None:
 
     assert _string_tuple("t1") == ()
     assert _string_tuple(["t1", "t2"]) == ("t1", "t2")
-
-
-def test_assignment_survives_a_scalar_reply() -> None:
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-    run = assign_traces(
-        _taxonomy(), "tax-1", corpus, predict=lambda **_: SimpleNamespace(results="1")
-    )
-    assert run.by_status(AssignmentStatus.UNCOVERED)[0].trace_id == "t1"
 
 
 def test_every_chunk_keeps_what_the_model_actually_returned() -> None:
@@ -2358,28 +1892,6 @@ def test_the_audit_keeps_what_the_auditor_said() -> None:
         ),
     )
     assert "two different outcomes" in audit.findings[0].raw_reply
-
-
-def test_assignment_keeps_its_replies_and_the_rows_it_refused() -> None:
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-
-    def predict(*, taxonomy: str, batch: str, question: str):
-        return SimpleNamespace(
-            results=[
-                {
-                    "trace_id": "t1",
-                    "matching_contract_ids": ["c1"],
-                    "primary_contract_id": "c1",
-                    "reason": "refund",
-                },
-                {"trace_id": "NOT_IN_BATCH", "matching_contract_ids": ["c1"], "reason": "x"},
-            ]
-        )
-
-    run = assign_traces(_taxonomy(), "tax-1", corpus, predict=predict)
-    assert run.raw_replies and "t1" in run.raw_replies[0]
-    assert any("NOT_IN_BATCH" in row for row in run.dropped_results)
-    assert any("could not be read" in limit for limit in run.limitations)
 
 
 def test_ledger_records_finish_reason_and_adapter_fallback(tmp_path, monkeypatch) -> None:
@@ -2733,28 +2245,6 @@ def test_a_whole_chunk_of_typed_instances_is_read() -> None:
     assert len(run.assignments) == 4
 
 
-def test_typed_assignment_results_are_read() -> None:
-    from bandits.analyze.rlm_models import ProposedAssignment
-
-    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-    run = assign_traces(
-        _taxonomy(),
-        "tax-1",
-        corpus,
-        predict=lambda **_: SimpleNamespace(
-            results=[
-                ProposedAssignment(
-                    trace_id="t1",
-                    matching_contract_ids=["c1"],
-                    primary_contract_id="c1",
-                    reason="refund",
-                )
-            ]
-        ),
-    )
-    assert run.members() == {"c1": ("t1",)}
-
-
 def test_the_repair_request_actually_reaches_the_model() -> None:
     """The predictor ignored `question`, so a repair re-sent the original ask."""
     seen: list[str] = []
@@ -2946,68 +2436,6 @@ def test_every_rejected_contract_is_kept_even_when_some_are_repaired() -> None:
     kept = " ".join(run.chunks[0].dropped_contracts)
     for name in ("first", "second", "third"):
         assert name in kept
-
-
-def test_freeze_refuses_an_unresolved_merge() -> None:
-    """The copy mentioned merges; the gate itself was untested for them."""
-    from bandits.analyze.rlm_models import AuditFinding
-
-    audit = RLMClusteringAudit(
-        run_id="run-1",
-        findings=(
-            AuditFinding(
-                contract_id="c1",
-                recommendation="merge",
-                merge_with_contract_id="c2",
-                rationale="one verifier covers both",
-            ),
-        ),
-        model="m",
-        prompt_digest="d",
-    )
-    with pytest.raises(FreezeRefused, match="merging"):
-        freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1")
-    forced = freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1", force=True)
-    assert any("merge" in limit for limit in forced.limitations)
-
-
-def test_the_real_signatures_carry_the_instructions_and_no_question_field() -> None:
-    """Asserted on the built signature, not on the instruction string.
-
-    The earlier visibility test only measured the prompt's geometry. It would
-    have passed while the production predictor still passed that prompt as an
-    input field, which is the arrangement that truncated it.
-    """
-    dspy = pytest.importorskip("dspy")
-
-    built: dict[str, object] = {}
-
-    class _Capture:
-        def __init__(self, signature, **kwargs):
-            built["signature"] = signature
-
-        def __call__(self, **kwargs):
-            built["called_with"] = set(kwargs)
-            return SimpleNamespace()
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(dspy, "RLM", _Capture)
-        monkey.setattr(dspy, "LM", lambda *a, **k: SimpleNamespace(history=[]))
-        for module in ("rlm_mine", "rlm_audit", "rlm_assign"):
-            stage = __import__(f"bandits.analyze.{module}", fromlist=["build_predictor"])
-            stage.build_predictor(api_key="test", view=TraceView.FULL_TRAJECTORY)
-            signature = built["signature"]
-            # The prompt is on the signature, where DSPy renders it whole.
-            assert "FULL trajectory" in signature.instructions, module
-            assert len(signature.instructions) > 1000, module
-            # And not an input field, where it would be shown as a peek.
-            assert "question" not in signature.input_fields, module
-    finally:
-        monkey.undo()
-
-
-# --- revision identity and reconciliation ------------------------------------
 
 
 def test_a_revise_that_renames_still_lands_on_the_contract_it_revised() -> None:
@@ -3258,16 +2686,6 @@ def test_the_audit_asks_for_uncertain_rather_than_leaning_to_split() -> None:
     assert 'answer "uncertain" rather than guessing' in text
     # And it names the failure the sixteen-trace run actually produced.
     assert "only because two contracts fixed different parameter values" in text
-
-
-def test_the_assignment_prompt_matches_its_own_schema() -> None:
-    from bandits.analyze.rlm_assign import instruction_for
-    from bandits.analyze.rlm_models import ProposedAssignment
-
-    text = instruction_for(TraceView.USER_MESSAGES)
-    assert ProposedAssignment.model_fields["primary_contract_id"].annotation is str
-    assert "do not answer null" in text
-    assert "Null when zero" not in text
 
 
 def test_mining_examples_are_not_all_one_domain() -> None:

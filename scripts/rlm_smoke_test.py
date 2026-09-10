@@ -30,14 +30,10 @@ import random
 import sys
 from pathlib import Path
 
-from bandits.analyze.rlm_assign import assign_traces, save_assignment_run
-from bandits.analyze.rlm_assign import build_predictor as build_assigner
+from bandits.analyze.analysis import save_analysis
 from bandits.analyze.rlm_audit import (
     audit_clustering,
-    compute_taxonomy_id,
-    freeze_taxonomy,
     save_audit,
-    save_taxonomy,
 )
 from bandits.analyze.rlm_audit import (
     build_predictor as build_auditor,
@@ -49,9 +45,10 @@ from bandits.analyze.rlm_mine import (
     mine_taxonomy,
     save_clustering_run,
 )
-from bandits.analyze.rlm_models import AssignmentStatus, Budget, TraceView
+from bandits.analyze.rlm_models import Budget, TraceView
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_taskset import materialize_task_set
+from bandits.analyze.tasksets import save_task_set
 from bandits.store import ArtifactStore, DerivedStore
 
 
@@ -144,7 +141,7 @@ def main() -> int:
         "--full",
         dest="discovery_only",
         action="store_false",
-        help="Continue into audit, freeze, assignment and materialization.",
+        help="Continue into the advisory audit and materialization.",
     )
     parser.add_argument(
         "--passes",
@@ -227,10 +224,17 @@ def main() -> int:
     # is a dozen model calls.
     derived_store = DerivedStore(args.project / ".bandits")
     session_store = SessionStore(args.project / ".bandits")
+    # Saved, not stamped with a made-up parent. A run written with an analysis id
+    # that was never persisted cannot be audited or materialized afterwards: every
+    # command downstream loads the analysis to reach the traces, and a fabricated
+    # parent leaves the artifact readable but permanently orphaned.
+    analysis_envelope = save_analysis(analysis, derived_store)
+    analysis_id = analysis_envelope.artifact_id
+    print(f"  analysis saved: {analysis_id}")
     recorder = SessionRecorder(
         session_store,
         session_id=new_session_id("smoke", view, args.seed),
-        analysis_id="smoke-analysis",
+        analysis_id=analysis_id,
         view=view,
         model=args.model or "default",
     )
@@ -244,7 +248,7 @@ def main() -> int:
 
     draft = mine_taxonomy(
         corpus,
-        "smoke-analysis",
+        analysis_id,
         predict=build_predictor(**kwargs),
         analysis=analysis,
         model=args.model or DEFAULT_MODEL,
@@ -310,10 +314,10 @@ def main() -> int:
         return 1
 
     if args.discovery_only:
-        # The whole question this run exists to answer is above. Audit,
-        # assignment and materialization cost money to re-answer things the
-        # discovery output already settles, so they are opt-in.
-        print("\n[discovery only] pass --full to continue into audit and assignment")
+        # The whole question this run exists to answer is above. The audit and
+        # materialization cost money to re-answer things the discovery output
+        # already settles, so they are opt-in.
+        print("\n[discovery only] pass --full to continue into audit and materialization")
         print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
         return 1 if failures else 0
 
@@ -328,34 +332,37 @@ def main() -> int:
     for finding in audit.findings:
         print(f"  {finding.contract_id}: {finding.recommendation} — {finding.rationale[:90]}")
 
-    taxonomy = freeze_taxonomy(
-        draft, draft_id, audit=audit, audit_id=audit_envelope.artifact_id, force=True
-    )
-    taxonomy_id = save_taxonomy(taxonomy, derived_store).artifact_id
-    assert taxonomy_id == compute_taxonomy_id(taxonomy)
-    print(f"  taxonomy saved: {taxonomy_id}")
+    print("\n== materialization ==")
+    # Straight from the run. Its own final assignments are the placement, so
+    # there is no freeze and no second classification pass between here and a
+    # task set.
+    task_set = materialize_task_set(draft, analysis, held_out=0.3)
+    task_set_id = save_task_set(task_set, derived_store).artifact_id
+    print(f"  task set saved: {task_set_id}")
+    for family in task_set.families:
+        print(f"  {family.family_id}: {list(family.trace_ids)}")
 
-    print("\n== fresh assignment ==")
-    run = assign_traces(
-        taxonomy, taxonomy_id, corpus, predict=build_assigner(**kwargs), batch_size=6
-    )
-    run_envelope = save_assignment_run(run, derived_store)
-    print(f"  assignment saved: {run_envelope.artifact_id}")
-    assigned = run.by_status(AssignmentStatus.ASSIGNED)
-    check("something was assigned", bool(assigned))
+    assert task_set.clustering is not None
     check(
-        "no trace was silently dropped",
-        len(run.assignments) == corpus.count_traces(),
-        f"{len(run.assignments)} of {corpus.count_traces()}",
+        "the task set names the arm that produced it",
+        task_set.clustering.backend == f"rlm-{view.value}",
+        task_set.clustering.backend,
     )
-    for contract_id, traces in run.members().items():
-        print(f"  {contract_id}: {list(traces)}")
+    check(
+        "coverage is not overstated",
+        task_set.workload_coverage <= 1.0,
+        f"{task_set.workload_coverage:.1%}",
+    )
+    check(
+        "no family claims a measured coherence",
+        all(family.coherence is None for family in task_set.families),
+    )
 
     # The substantive check, and the one worth paying for: the four trials of a
-    # single task are the same request, so a taxonomy that scatters them across
+    # single task are the same request, so a grouping that scatters them across
     # families is not finding tasks. This is the real corpus's own ground truth,
     # and it is the only labelled signal used anywhere in this script.
-    groups = [set(v) for v in run.members().values()]
+    groups = [set(family.trace_ids) for family in task_set.families]
     split_lineages = []
     for name in lineages:
         trials = {t.trace_id for t in corpus_obj.traces if (t.lineage_id or t.trace_id) == name}
@@ -368,25 +375,16 @@ def main() -> int:
         "; ".join(split_lineages),
     )
 
-    if assigned:
-        print("\n== materialization ==")
-        task_set = materialize_task_set(run, taxonomy, corpus_id=analysis.corpus_id)
-        assert task_set.clustering is not None
-        check(
-            "the task set names the arm that produced it",
-            task_set.clustering.backend == f"rlm-{view.value}",
-            task_set.clustering.backend,
-        )
-        check(
-            "coverage is not overstated",
-            task_set.workload_coverage <= 1.0
-            and task_set.workload_coverage
-            == len(assigned)
-            / max(
-                len([a for a in run.assignments if a.status is not AssignmentStatus.UNREADABLE]), 1
-            ),
-            f"{task_set.workload_coverage:.1%}",
-        )
+    # A lineage on both sides of the split makes every held-out measurement a
+    # measurement against a rerun of what the verifier was drafted from.
+    straddling = []
+    for family in task_set.families:
+        fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+        for name in lineages:
+            trials = {t.trace_id for t in corpus_obj.traces if (t.lineage_id or t.trace_id) == name}
+            if trials & fit and trials & held:
+                straddling.append(f"{name} in {family.family_id}")
+    check("no lineage straddles the split", not straddling, "; ".join(straddling))
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
     return 1 if failures else 0
