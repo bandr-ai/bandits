@@ -55,6 +55,103 @@ def test_ingest_unknown_source_exits_nonzero(tmp_path) -> None:
     assert result.exit_code == 1
 
 
+def test_ingest_records_declared_control_markers(tmp_path) -> None:
+    """A benchmark's own scaffolding, declared once at ingest, must survive
+    onto the stored corpus so every later RLM command reads it automatically
+    rather than each one needing to know the source is tau2."""
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            str(FIXTURE),
+            "--source",
+            "otlp",
+            "--project",
+            str(tmp_path),
+            "--control-marker",
+            "###TRANSFER###",
+            "--control-marker",
+            "###STOP###",
+        ],
+    )
+    assert result.exit_code == 0
+    artifact_id = next(
+        line.split("artifact_id: ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("artifact_id:")
+    )
+    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
+    assert corpus.control_markers == ("###TRANSFER###", "###STOP###")
+
+
+def test_ingest_without_control_marker_leaves_it_empty(tmp_path) -> None:
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    artifact_id = next(
+        line.split("artifact_id: ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("artifact_id:")
+    )
+    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
+    assert corpus.control_markers == ()
+
+
+def test_mine_rlm_exposes_the_per_call_token_ceiling() -> None:
+    result = runner.invoke(app, ["mine-rlm", "--help"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "--max-tokens" in result.stdout
+
+
+def test_rlm_corpus_forwards_control_markers_from_the_stored_artifact(tmp_path) -> None:
+    """Every RLM mining/audit/assignment command builds its corpus through
+    this one function — a marker declared at ingest must reach the miner
+    without each of those four commands having to know to ask for it."""
+    from datetime import UTC, datetime
+
+    from bandits.analyze import save_analysis
+    from bandits.analyze.analysis import analyze_corpus
+    from bandits.cli import _rlm_corpus
+    from bandits.store import ArtifactStore, DerivedStore
+    from bandits.traces import Span, SpanKind, Trace, TraceCorpus, UserTurn
+
+    moment = datetime(2024, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="t1",
+        source="chat-json",
+        source_digest="0" * 64,
+        task="please transfer me ###TRANSFER###",
+        user_turns=(UserTurn(text="please transfer me ###TRANSFER###"),),
+        spans=(
+            Span(
+                span_id="t1:span-0",
+                kind=SpanKind.MODEL,
+                name="model",
+                started_at=moment,
+                ended_at=moment,
+            ),
+        ),
+    )
+    corpus = TraceCorpus(
+        source="chat-json", traces=(trace,), control_markers=("###TRANSFER###",)
+    )
+    store = ArtifactStore(tmp_path / ".bandits")
+    envelope = store.write(corpus, source_path="synthetic")
+
+    analysis = analyze_corpus(corpus).replace(corpus_id=envelope.artifact_id)
+    analysis_envelope = save_analysis(analysis, DerivedStore(tmp_path / ".bandits"))
+
+    _, rlm_corpus, _ = _rlm_corpus(analysis_envelope.artifact_id, tmp_path, "user-messages")
+    view = rlm_corpus.get_user_messages(trace.trace_id)
+    assert "###TRANSFER###" not in " ".join(view.messages)
+    assert "###TRANSFER###" in view.withheld_fields
+
+
 def test_list_shows_ingested_artifact(tmp_path) -> None:
     runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
 

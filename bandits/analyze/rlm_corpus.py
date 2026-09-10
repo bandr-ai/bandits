@@ -88,6 +88,28 @@ A single tool result can be a whole file. Truncation is by length rather than by
 significance, so nothing here decides which half of a payload mattered.
 """
 
+def _strip_control_markers(text: str, markers: Sequence[str], removed: set[str]) -> str:
+    """Strip caller-declared literal tokens from one turn's own text.
+
+    Empty by default: this module makes no assumption that any corpus
+    contains benchmark scaffolding. A source that does — tau2's simulator
+    appends ``###TRANSFER###`` to a user turn's text on most episodes in the
+    airline corpus, not only the ones that actually escalate to a human
+    agent — is a fact about that source, declared by its caller at the
+    ``ReadOnlyCorpus`` boundary, not knowledge this generic view carries for
+    every corpus. A miner shown that marker treated "the trace ends in this
+    token" as a verifiable outcome and built a family around ending state
+    instead of requested task, precisely the confound ``_WITHHELD_KEYS``
+    polices for structured fields. Unlike those fields this lives inside the
+    message text itself, so it is stripped by substring rather than by key,
+    and reported through ``withheld_fields`` the same way.
+    """
+    for marker in markers:
+        if marker in text:
+            removed.add(marker)
+            text = text.replace(marker, "")
+    return text.strip()
+
 
 def _redact(payload: Any, removed: set[str], depth: int = 0) -> Any:
     """Strip outcome-bearing keys from a payload, recording what was taken.
@@ -130,7 +152,9 @@ def _render_span(span: Span, removed: set[str]) -> str:
     return f"[{role}:{span.name}] {text}".rstrip()
 
 
-def _trajectory_messages(trace: Trace) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _trajectory_messages(
+    trace: Trace, control_markers: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The whole conversation as ordered lines, plus the fields withheld from it.
 
     User turns are interleaved by the span they followed, so the request and the
@@ -138,10 +162,12 @@ def _trajectory_messages(trace: Trace) -> tuple[tuple[str, ...], tuple[str, ...]
     is missing is emitted first rather than dropped: losing a user message would
     quietly turn Path F into a strictly worse Path U.
     """
+    removed: set[str] = set()
     by_anchor: dict[str | None, list[str]] = {}
     for turn in trace.user_turns:
-        if turn.text.strip():
-            by_anchor.setdefault(turn.after_span_id, []).append(f"[user] {turn.text}")
+        text = _strip_control_markers(turn.text, control_markers, removed)
+        if text:
+            by_anchor.setdefault(turn.after_span_id, []).append(f"[user] {text}")
 
     known = {span.span_id for span in trace.spans}
     lines: list[str] = list(by_anchor.pop(None, []))
@@ -149,14 +175,15 @@ def _trajectory_messages(trace: Trace) -> tuple[tuple[str, ...], tuple[str, ...]
         if anchor not in known:
             lines.extend(by_anchor.pop(anchor))
 
-    removed: set[str] = set()
     for span in trace.spans:
         lines.append(_render_span(span, removed))
         lines.extend(by_anchor.pop(span.span_id, []))
     return tuple(lines), tuple(sorted(removed))
 
 
-def build_view(trace: Trace, view: TraceView) -> UserMessageView:
+def build_view(
+    trace: Trace, view: TraceView, *, control_markers: Sequence[str] = ()
+) -> UserMessageView:
     """Reduce one trace to the user messages the given arm may read.
 
     ``FIRST_USER_MESSAGE`` keeps only the opening request. The two user-message
@@ -170,9 +197,14 @@ def build_view(trace: Trace, view: TraceView) -> UserMessageView:
     trace has spans, because an episode with recorded work and no recorded user
     turn still shows what was done — but it is *unreadable* when the trace has
     neither, since an empty trajectory says nothing at all.
+
+    ``control_markers`` is empty by default: this function makes no assumption
+    that any corpus contains benchmark scaffolding. A source that does declares
+    its own literal tokens through ``ReadOnlyCorpus``, at the boundary where
+    that source-specific fact belongs — never baked in here for every caller.
     """
     if view is TraceView.FULL_TRAJECTORY:
-        lines, withheld = _trajectory_messages(trace)
+        lines, withheld = _trajectory_messages(trace, control_markers)
         if not lines:
             return UserMessageView(
                 trace_id=trace.trace_id,
@@ -184,7 +216,12 @@ def build_view(trace: Trace, view: TraceView) -> UserMessageView:
             )
         return UserMessageView(trace_id=trace.trace_id, messages=lines, withheld_fields=withheld)
 
-    texts = tuple(turn.text for turn in trace.user_turns if turn.text.strip())
+    removed: set[str] = set()
+    texts = tuple(
+        stripped
+        for turn in trace.user_turns
+        if (stripped := _strip_control_markers(turn.text, control_markers, removed))
+    )
     if not texts:
         return UserMessageView(
             trace_id=trace.trace_id,
@@ -198,7 +235,9 @@ def build_view(trace: Trace, view: TraceView) -> UserMessageView:
     if view is TraceView.FIRST_USER_MESSAGE:
         texts = texts[:1]
 
-    return UserMessageView(trace_id=trace.trace_id, messages=texts)
+    return UserMessageView(
+        trace_id=trace.trace_id, messages=texts, withheld_fields=tuple(sorted(removed))
+    )
 
 
 class ReadOnlyCorpus:
@@ -213,10 +252,23 @@ class ReadOnlyCorpus:
     unreadable identically everywhere it appears.
     """
 
-    def __init__(self, corpus: TraceCorpus, *, view: TraceView = TraceView.USER_MESSAGES) -> None:
+    def __init__(
+        self,
+        corpus: TraceCorpus,
+        *,
+        view: TraceView = TraceView.USER_MESSAGES,
+        control_markers: Sequence[str] = (),
+    ) -> None:
+        """``control_markers`` declares literal tokens to strip from message
+        text before the miner ever reads it — empty unless the caller knows
+        its source writes benchmark scaffolding into a turn's own text (tau2's
+        ``###TRANSFER###``, for example). That knowledge belongs to whoever
+        constructs this corpus for a specific source, not to this class.
+        """
         self._view = view
         self._views: dict[str, UserMessageView] = {
-            trace.trace_id: build_view(trace, view) for trace in corpus.traces
+            trace.trace_id: build_view(trace, view, control_markers=control_markers)
+            for trace in corpus.traces
         }
         # Source order, not sorted: the corpus order is a fact about the export,
         # and any shuffling this miner does is seeded and recorded separately.

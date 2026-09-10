@@ -92,6 +92,9 @@ from bandits.analyze.rlm_mine import (
     DEFAULT_CHUNK_SIZE as RLM_CHUNK_SIZE,
 )
 from bandits.analyze.rlm_mine import (
+    DEFAULT_MAX_TOKENS as RLM_MAX_TOKENS,
+)
+from bandits.analyze.rlm_mine import (
     DEFAULT_MODEL as RLM_MODEL,
 )
 from bandits.analyze.rlm_mine import (
@@ -214,6 +217,15 @@ def ingest(
         help="Redaction ruleset. 'secrets-only-v1' keeps email addresses, which are "
         "often the task's own identifier.",
     ),
+    control_marker: list[str] = typer.Option(
+        [],
+        "--control-marker",
+        help="Literal token this export writes into a message's own text that is "
+        "not part of the user's request (tau2's '###TRANSFER###', for one). "
+        "Repeatable. Declared once here rather than left for every downstream "
+        "RLM command to remember: every mining, audit and assignment run "
+        "reading this corpus strips it before a model ever sees it.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Load a trace export into the local artifact store."""
@@ -222,6 +234,8 @@ def ingest(
     except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    if control_marker:
+        corpus = corpus.replace(control_markers=tuple(control_marker))
 
     store = ArtifactStore(project / ".bandits")
     envelope = store.write(corpus, source_path=str(path))
@@ -2094,7 +2108,11 @@ def _rlm_corpus(analysis_id: str, project: Path, view: str):
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no corpus {analysis.corpus_id!r} behind this analysis")
         raise typer.Exit(code=1) from exc
-    return analysis, ReadOnlyCorpus(corpus, view=TraceView(view)), store
+    return (
+        analysis,
+        ReadOnlyCorpus(corpus, view=TraceView(view), control_markers=corpus.control_markers),
+        store,
+    )
 
 
 def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
@@ -2129,6 +2147,11 @@ def mine_rlm_command(
         200, "--max-iterations", help="Emergency guard on chunk count, not the stopping rule."
     ),
     max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
+    max_tokens: int = typer.Option(
+        RLM_MAX_TOKENS,
+        "--max-tokens",
+        help="Maximum completion tokens for each model call.",
+    ),
     max_seconds: float = typer.Option(3600.0, "--max-seconds"),
     max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
     seed: int = typer.Option(RLM_SEED, "--seed"),
@@ -2156,7 +2179,7 @@ def mine_rlm_command(
         max_usd=max_usd,
     )
     try:
-        predict = build_rlm_predictor(model=model, view=trace_view)
+        predict = build_rlm_predictor(model=model, view=trace_view, max_tokens=max_tokens)
     except MiningError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
