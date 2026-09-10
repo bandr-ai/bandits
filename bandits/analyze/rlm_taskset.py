@@ -63,26 +63,54 @@ def _stable_fraction(*parts: str) -> float:
 def _split_groups(analysis: CorpusAnalysis, trace_ids: tuple[str, ...]) -> dict[str, list[str]]:
     """The indivisible groups inside one family.
 
-    Two traces share a group when the analysis declares the same lineage, or
-    when their requests normalize identically. The second rule matters as much
-    as the first: a corpus that never recorded lineage still repeats requests,
-    and splitting a repeated request across the boundary measures a verifier
-    against the run it was drafted from.
+    Two traces share a group when the analysis declares the same lineage *or*
+    when their requests normalize identically, and those two relations compose:
+    a trace joined to one group by lineage and to another by an identical
+    request merges both into one. Reading the second rule as a fallback for
+    traces without lineage — which an ``elif`` here once did — leaves two runs
+    of the same request in different retry chains free to land on opposite
+    sides, which is exactly the leak this exists to close.
+
+    The second rule matters as much as the first: a corpus that never recorded
+    lineage still repeats requests, and splitting a repeated request across the
+    boundary measures a verifier against the run it was drafted from.
     """
     by_trace = {task.trace_id: task for task in analysis.tasks}
+
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        root = key
+        while parent[root] != root:
+            root = parent[root]
+        while parent[key] != root:
+            parent[key], key = root, parent[key]
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            # Toward the lexicographically smaller root, so the component's name
+            # does not depend on the order traces were read in.
+            if right_root < left_root:
+                left_root, right_root = right_root, left_root
+            parent[right_root] = left_root
+
+    for trace_id in trace_ids:
+        node = f"trace:{trace_id}"
+        find(node)
+        task = by_trace.get(trace_id)
+        if task is None:
+            continue
+        if task.lineage_id:
+            union(node, f"lineage:{task.lineage_id}")
+        if task.instruction:
+            union(node, f"request:{normalize_instruction(task.instruction)}")
+
     groups: dict[str, list[str]] = {}
     for trace_id in trace_ids:
-        task = by_trace.get(trace_id)
-        lineage = task.lineage_id if task else None
-        if lineage:
-            key = f"lineage:{lineage}"
-        elif task and task.instruction:
-            key = f"request:{normalize_instruction(task.instruction)}"
-        else:
-            # No lineage and no instruction to match on. Its own group, never
-            # merged with another, because nothing here says it is a rerun.
-            key = f"trace:{trace_id}"
-        groups.setdefault(key, []).append(trace_id)
+        groups.setdefault(find(f"trace:{trace_id}"), []).append(trace_id)
     return groups
 
 
@@ -142,6 +170,7 @@ def materialize_task_set(
     analysis: CorpusAnalysis,
     *,
     held_out: float = 0.0,
+    run_id: str | None = None,
 ) -> TaskSet:
     """Build a TaskSet from the traces the miner placed.
 
@@ -168,6 +197,24 @@ def materialize_task_set(
     if unknown:
         raise MaterializationError(
             f"the run assigns traces to contract(s) it does not define: {unknown}"
+        )
+
+    # A trace id the analysis never had is a hallucinated member, and without
+    # this it becomes a real one: it has no task to read, so the split treats it
+    # as an independent group and every count downstream includes it.
+    known_traces = {task.trace_id for task in analysis.tasks}
+    strangers = sorted(
+        (
+            set(run.assignments)
+            | set(run.ambiguous_trace_ids)
+            | set(run.uncovered_trace_ids)
+            | set(run.unreadable_trace_ids)
+        )
+        - known_traces
+    )
+    if strangers:
+        raise MaterializationError(
+            f"the run names trace(s) the analysis does not contain: {strangers}"
         )
 
     unresolved = (
@@ -275,11 +322,13 @@ def materialize_task_set(
             backend=backend_for(run.view),
             # Not thresholds. There is no similarity here, and these are the
             # neutral values the contract requires; what actually produced the
-            # grouping is the model and view recorded beside them.
+            # grouping is the model and run recorded beside them.
             similarity=0.0,
             neighbors=1,
             embedding_model=None,
             embedding_cache_id=None,
+            model=run.model,
+            source_run_id=run_id,
         ),
         total_workload_mass=classified,
         workload_coverage=(total_mass / classified) if classified else 0.0,

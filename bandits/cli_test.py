@@ -12,7 +12,6 @@ from bandits.analyze import (
     load_task_set,
     save_task_set,
 )
-from bandits.analyze.fixtures import task_set_by_first_word
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -28,6 +27,7 @@ from bandits.verify import (
 )
 from bandits.verify.models import CheckReview, InterviewDecision
 from bandits.verify.validate import Agreement, Validation, save_validation
+from tests.tasksets import task_set_by_first_word
 
 runner = CliRunner()
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"

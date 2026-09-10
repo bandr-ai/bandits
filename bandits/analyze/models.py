@@ -370,6 +370,23 @@ class ClusteringProvenance(Contract):
 
     embedding_cache_id: str | None = None
 
+    model: str | None = None
+    """The model that proposed these families, when one did.
+
+    None for a grouping computed rather than proposed. Carried structurally
+    because "which model produced this task set" is the first question asked of
+    two task sets that disagree, and prose in ``limitations`` cannot be compared
+    across artifacts.
+    """
+
+    source_run_id: str | None = None
+    """The artifact this task set was materialized from, when it came from one.
+
+    ``analysis_id`` reaches only the analysis, so without this the run that did
+    the grouping — its seed, budget, prompt digest and stop reason — can be
+    found only by searching the store for one that happens to match.
+    """
+
     duplicate_similarity: float = Field(default=1.0, ge=0, le=1)
     """Above this, two descriptors were treated as the same request and their
     lineage groups held to one side of the split. Deliberately far stricter than

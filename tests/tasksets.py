@@ -1,5 +1,10 @@
 """Deterministic task sets for tests downstream of grouping.
 
+Test infrastructure, deliberately outside the shipped package. The split rule
+below is tuned to how the fixture corpora order their episodes, which is a
+reasonable thing for a test helper to do and a misleading thing to find sitting
+in ``bandits.analyze`` beside code that makes claims about real corpora.
+
 Verifier drafting, running, validation and export all need a ``TaskSet`` to
 work on, and none of them care how the grouping was produced. Building one here
 by an obvious rule keeps those suites independent of whatever discovers families

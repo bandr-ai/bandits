@@ -17,7 +17,6 @@ from bandits.analyze import (
     compute_analysis_id,
     compute_task_set_id,
 )
-from bandits.analyze.fixtures import task_set_by_first_word
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, compute_label_set_id, make_label
 from bandits.store import DerivedStore
@@ -42,6 +41,7 @@ from bandits.verify.validate import (
     save_validation,
     validate_draft,
 )
+from tests.tasksets import task_set_by_first_word
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 SUCCEEDED = "addr-1"

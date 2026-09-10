@@ -74,7 +74,6 @@ from bandits.analyze.tasksets import (
 from bandits.analyze.text import normalize_instruction
 
 __all__ = [
-    "DEFAULT_HELD_OUT",
     "AuditFinding",
     "Budget",
     "ChunkResult",
