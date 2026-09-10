@@ -58,7 +58,7 @@ DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 4
+PROMPT_VERSION = 5
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -96,6 +96,12 @@ The variable `chunk` is a list of dicts, each with keys: trace_id, messages (the
 episode as you may read it, in order), and status (one of "unseen", "ambiguous", \
 "uncovered", "assigned", "affected"). The variable `taxonomy` is the list of \
 family contracts you have built so far, possibly empty.
+
+Parse `chunk` and `taxonomy` programmatically. Do not print either variable in \
+full. Print only trace ids, concise request summaries, contract ids, and outcome \
+shapes needed for the decision in front of you. Use a sub-LLM call for semantic \
+comparison of specific traces rather than reasoning over the whole chunk again \
+in text.
 
 A family is defined by its invariant, verifiable outcome — not by the particular \
 values in one request. Two traces belong to the same family when ONE verifier \
@@ -1337,7 +1343,7 @@ def _run_chunk(
             prediction = predict(
                 chunk=chunk_json,
                 taxonomy=taxonomy_json,
-                question=instruction_for(corpus.view),
+                question="",
             )
     except Exception as exc:  # noqa: BLE001 - a failed chunk is recorded, not fatal
         calls, tokens = _spend_of(predict)
@@ -1443,6 +1449,19 @@ def _run_chunk(
     # this stage must never do.
     unplaced = set(ambiguous) | set(uncovered)
     assignments = {t: c for t, c in assignments.items() if t not in unplaced}
+
+    # A trace this chunk read but named in none of assignments, ambiguous or
+    # uncovered did not vanish - the model omitted it, most often because a
+    # truncated or max-iterations reply left those output fields empty. Silence
+    # must not read as coverage: an omitted trace goes to uncovered instead of
+    # disappearing from every accounting the run reports.
+    omitted = [t for t in trace_ids if t not in assignments and t not in unplaced]
+    if omitted:
+        limitations.append(
+            f"chunk {index} did not report {len(omitted)} trace(s) it read "
+            f"({', '.join(omitted)}); marked uncovered rather than dropped"
+        )
+        uncovered = uncovered + tuple(omitted)
 
     # An operation naming a contract nobody proposed and nobody already holds is
     # a claim the model did not carry out. Recorded rather than executed: it
