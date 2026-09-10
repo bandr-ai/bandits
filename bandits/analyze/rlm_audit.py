@@ -140,7 +140,7 @@ def build_predictor(
             "the taxonomy audit needs the 'audit' extra: uv sync --extra audit"
         ) from exc
 
-    from bandits.analyze.audit import scoped_to_history
+    from bandits.analyze.rlm_history import scoped_to_history
     from bandits.verify.judge import resolve_api_key
 
     key = api_key or resolve_api_key()

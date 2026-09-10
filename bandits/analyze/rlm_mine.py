@@ -273,7 +273,7 @@ def build_predictor(
     except ImportError as exc:  # pragma: no cover - depends on the extra
         raise MiningError("RLM mining needs the 'audit' extra: uv sync --extra audit") from exc
 
-    from bandits.analyze.audit import scoped_to_history
+    from bandits.analyze.rlm_history import scoped_to_history
     from bandits.verify.judge import resolve_api_key
 
     key = api_key or resolve_api_key()

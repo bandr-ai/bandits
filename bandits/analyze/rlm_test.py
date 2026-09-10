@@ -2241,7 +2241,7 @@ def test_the_spend_wrapper_accepts_every_stage_signature() -> None:
     plain functions and never reach the wrapper, so it failed only against a
     live model — on the first real call of all three paths at once.
     """
-    from bandits.analyze.audit import scoped_to_history
+    from bandits.analyze.rlm_history import scoped_to_history
 
     language_model = SimpleNamespace(history=[])
     for kwargs in (
@@ -2526,7 +2526,7 @@ def test_ledger_records_finish_reason_and_adapter_fallback(tmp_path, monkeypatch
     """
     import json
 
-    from bandits.analyze.audit import scoped_to_history
+    from bandits.analyze.rlm_history import scoped_to_history
 
     path = tmp_path / "ledger.jsonl"
     monkeypatch.setenv("BANDITS_LEDGER", str(path))
@@ -2597,7 +2597,7 @@ def test_a_per_call_override_wins_over_the_instance_default(tmp_path, monkeypatc
     instance-level default it overrides."""
     import json
 
-    from bandits.analyze.audit import _record_history
+    from bandits.analyze.rlm_history import record_history
 
     path = tmp_path / "ledger.jsonl"
     monkeypatch.setenv("BANDITS_LEDGER", str(path))
@@ -2612,7 +2612,7 @@ def test_a_per_call_override_wins_over_the_instance_default(tmp_path, monkeypatc
         }
     ]
 
-    _record_history(entries, language_model=language_model)
+    record_history(entries, language_model=language_model)
 
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert rows[0]["request"]["kwargs"] == {"temperature": 0.0, "max_tokens": 16384}

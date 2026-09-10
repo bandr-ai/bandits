@@ -40,14 +40,10 @@ from bandits.analyze.families import (
     DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
     DEFAULT_NEIGHBORS,
-    compute_task_set_id,
     fingerprint,
-    load_task_set,
     merge_families,
     mine_task_set,
-    normalize_instruction,
     normalize_request,
-    save_task_set,
     split_family,
 )
 from bandits.analyze.models import (
@@ -132,6 +128,12 @@ from bandits.analyze.rlm_stability import (
 )
 from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.analyze.tasks import extract_task
+from bandits.analyze.tasksets import (
+    compute_task_set_id,
+    load_task_set,
+    save_task_set,
+)
+from bandits.analyze.text import normalize_instruction
 
 __all__ = [
     "AUDIT_MODEL",

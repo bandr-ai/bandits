@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 from collections import Counter
 from collections.abc import Callable
 from typing import Literal
@@ -32,7 +31,8 @@ from bandits.analyze.models import (
     TaskSet,
     kind_rank,
 )
-from bandits.store import DerivedEnvelope, DerivedStore
+from bandits.analyze.tasksets import compute_task_set_id, load_task_set, save_task_set
+from bandits.analyze.text import normalize_instruction
 
 DEFAULT_BUDGET = 20
 DEFAULT_HELD_OUT = 0.3
@@ -100,13 +100,6 @@ _SEMANTIC_RESERVE_LIMIT = (
     "the tail reserve is filled from structural signals only; categories that "
     "depend on what the work meant need a domain extension to select for"
 )
-
-_NON_TOKEN = re.compile(r"[^a-z0-9<>_]+")
-
-
-def normalize_instruction(instruction: str) -> str:
-    """Normalize case and separators without hiding any values."""
-    return " ".join(_NON_TOKEN.sub(" ", instruction.lower()).split())
 
 
 def normalize_request(instruction: str) -> str:
@@ -1059,24 +1052,16 @@ def _rebuild(
     )
 
 
-def compute_task_set_id(task_set: TaskSet) -> str:
-    digest = hashlib.sha256(task_set.model_dump_json().encode("utf-8")).hexdigest()
-    return f"taskset-{digest[:16]}"
-
-
-def save_task_set(task_set: TaskSet, store: DerivedStore) -> DerivedEnvelope:
-    return store.write(
-        compute_task_set_id(task_set),
-        kind="taskset",
-        parent_artifact_id=task_set.analysis_id,
-        payload=task_set.model_dump_json().encode("utf-8"),
-        summary={
-            "families": len(task_set.families),
-            "selected": len(task_set.selected),
-            "missing_slots": len(task_set.missing_slots),
-        },
-    )
-
-
-def load_task_set(task_set_id: str, store: DerivedStore) -> TaskSet:
-    return TaskSet.model_validate_json(store.read_payload(task_set_id))
+__all__ = [
+    "DEFAULT_BUDGET",
+    "DEFAULT_HELD_OUT",
+    "compute_task_set_id",
+    "fingerprint",
+    "load_task_set",
+    "merge_families",
+    "mine_task_set",
+    "normalize_instruction",
+    "normalize_request",
+    "save_task_set",
+    "split_family",
+]
