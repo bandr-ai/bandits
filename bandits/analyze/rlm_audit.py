@@ -1,4 +1,4 @@
-"""Attack a run taxonomy with a context that never watched it being built.
+"""Attack a clustering run with a context that never watched it being built.
 
 The discovery loop argues itself into a taxonomy, and the reasoning that
 produced a family is exactly the reasoning least able to see what is wrong with
@@ -13,9 +13,10 @@ this whole path exists to detect — members that share a subject while needing
 different verifiers, which is what embedding distance cannot tell apart and what
 a plausible family name actively hides.
 
-Advisory, like the family audit it parallels: nothing here edits a contract.
-What it does have is teeth at the freeze — :func:`freeze_taxonomy` refuses while
-an actionable finding is unresolved, so an audit cannot be run and ignored.
+Purely advisory, and with no gate behind it. Nothing here edits a contract,
+changes a placement, or blocks materialization; it saves findings for a person
+to read. An audit that is never run costs a task set nothing but the reading,
+which is the honest position until the findings are shown to be worth acting on.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from bandits.analyze.rlm_models import (
     VIEW_PREAMBLES,
     AuditFinding,
     FamilyContract,
-    FrozenTaxonomy,
     RLMClusteringAudit,
     RLMClusteringRun,
     TraceView,
@@ -93,16 +93,6 @@ def instruction_for(view: TraceView) -> str:
 
 class ClusteringAuditError(RuntimeError):
     """The auditor could not be built or returned nothing usable."""
-
-
-class FreezeRefused(RuntimeError):
-    """A taxonomy was asked to freeze while something was still unresolved.
-
-    Raised rather than warned about. Freezing is what lets an assignment name
-    fixed wording, and a taxonomy frozen over an open split recommendation would
-    carry that unresolved finding into every artifact derived from it, with
-    nothing downstream able to tell.
-    """
 
 
 class _Predictor(Protocol):
@@ -492,99 +482,9 @@ def _run_members(run: RLMClusteringRun) -> dict[str, tuple[str, ...]]:
     return {cid: tuple(sorted(traces)) for cid, traces in grouped.items()}
 
 
-def resolve_findings(audit: RLMClusteringAudit, resolutions: dict[str, str]) -> RLMClusteringAudit:
-    """Record how discovery answered each actionable finding.
-
-    Separate from the audit that raised them so the original verdict is never
-    overwritten: what was found and what was done about it are two facts, and a
-    resolution that quietly edited the finding would leave no way to tell an
-    addressed objection from one that was argued away.
-    """
-    updated = []
-    for finding in audit.findings:
-        resolution = resolutions.get(finding.contract_id, "").strip()
-        if resolution and finding.demands_action:
-            updated.append(finding.replace(resolved=True, resolution=resolution))
-        else:
-            updated.append(finding)
-    return audit.replace(findings=tuple(updated))
-
-
-def freeze_taxonomy(
-    run: RLMClusteringRun,
-    run_id: str,
-    *,
-    audit: RLMClusteringAudit | None = None,
-    audit_id: str | None = None,
-    force: bool = False,
-) -> FrozenTaxonomy:
-    """Freeze a run into a taxonomy an assignment can be made against.
-
-    Refuses while an actionable audit finding is unresolved. ``force`` exists
-    for the case where a reviewer has decided to freeze anyway — an incomplete
-    artifact is still worth inspecting — and it records that decision as a
-    limitation rather than hiding it.
-    """
-    if audit is not None:
-        unresolved = audit.unresolved()
-        if unresolved and not force:
-            raise FreezeRefused(
-                f"{len(unresolved)} audit finding(s) recommend revising, splitting or "
-                f"merging a contract and have not been resolved: "
-                f"{', '.join(f.contract_id for f in unresolved)}"
-            )
-
-    limitations = list(run.limitations)
-    if not run.complete:
-        limitations.append(
-            f"frozen from a run that stopped on {run.stop_reason.value} rather than "
-            "converging; its contracts were still changing"
-        )
-    if audit is None:
-        limitations.append(
-            "no adversarial audit was run against this taxonomy; its contracts have not "
-            "been challenged by an independent context"
-        )
-    elif audit.unresolved():
-        limitations.append(
-            f"frozen over {len(audit.unresolved())} unresolved audit finding(s) "
-            "recommending a revision, a split or a merge"
-        )
-
-    return FrozenTaxonomy(
-        run_id=run_id,
-        audit_id=audit_id,
-        analysis_id=run.analysis_id,
-        view=run.view,
-        contracts=run.contracts,
-        complete=run.complete,
-        limitations=tuple(dict.fromkeys(limitations)),
-    )
-
-
 def compute_audit_id(audit: RLMClusteringAudit) -> str:
     digest = hashlib.sha256(audit.model_dump_json().encode("utf-8")).hexdigest()
     return f"rlm-taxonomy-audit-{digest[:16]}"
-
-
-def compute_taxonomy_id(taxonomy: FrozenTaxonomy) -> str:
-    """Content-addressed over the contracts, so an id names exact wording.
-
-    Derived from the semantic claims rather than the whole model: an assignment
-    naming a taxonomy id must be naming the text it classified against, and the
-    run and audit ids that produced it are lineage, not content.
-    """
-    payload = json.dumps(
-        {
-            "view": taxonomy.view.value,
-            "contracts": [
-                contract.model_dump(mode="json")
-                for contract in sorted(taxonomy.contracts, key=lambda c: c.contract_id)
-            ],
-        },
-        sort_keys=True,
-    )
-    return f"rlm-taxonomy-{hashlib.sha256(payload.encode()).hexdigest()[:16]}"
 
 
 def save_audit(audit: RLMClusteringAudit, store: DerivedStore) -> DerivedEnvelope:
@@ -601,19 +501,5 @@ def save_audit(audit: RLMClusteringAudit, store: DerivedStore) -> DerivedEnvelop
     )
 
 
-def save_taxonomy(taxonomy: FrozenTaxonomy, store: DerivedStore) -> DerivedEnvelope:
-    return store.write(
-        compute_taxonomy_id(taxonomy),
-        kind="rlm_taxonomy",
-        parent_artifact_id=taxonomy.run_id,
-        payload=taxonomy.model_dump_json().encode("utf-8"),
-        summary={"contracts": len(taxonomy.contracts), "complete": int(taxonomy.complete)},
-    )
-
-
 def load_audit(audit_id: str, store: DerivedStore) -> RLMClusteringAudit:
     return RLMClusteringAudit.model_validate_json(store.read_payload(audit_id))
-
-
-def load_taxonomy(taxonomy_id: str, store: DerivedStore) -> FrozenTaxonomy:
-    return FrozenTaxonomy.model_validate_json(store.read_payload(taxonomy_id))

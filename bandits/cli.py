@@ -54,29 +54,13 @@ from bandits.analyze.embed import (
     requests,
     save_cache,
 )
-from bandits.analyze.rlm_assign import (
-    DEFAULT_MODEL as RLM_ASSIGN_MODEL,
-)
-from bandits.analyze.rlm_assign import (
-    AssignmentError,
-    assign_traces,
-    load_assignment_run,
-    save_assignment_run,
-)
-from bandits.analyze.rlm_assign import (
-    build_predictor as build_assignment_predictor,
-)
 from bandits.analyze.rlm_audit import (
     DEFAULT_MODEL as RLM_AUDIT_MODEL,
 )
 from bandits.analyze.rlm_audit import (
     ClusteringAuditError,
-    FreezeRefused,
     _run_members,
     audit_clustering,
-    freeze_taxonomy,
-    load_taxonomy,
-    save_taxonomy,
 )
 from bandits.analyze.rlm_audit import (
     build_predictor as build_taxonomy_audit_predictor,
@@ -113,12 +97,10 @@ from bandits.analyze.rlm_models import (
     DEFAULT_PASSES as RLM_PASSES,
 )
 from bandits.analyze.rlm_models import (
-    AssignmentStatus,
     Budget,
     TraceView,
 )
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
-from bandits.analyze.rlm_stability import compare_runs, save_stability_report
 from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.analyze.rlm_view import (
     family_card,
@@ -2307,34 +2289,32 @@ def mine_rlm_command(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-@app.command(name="audit-rlm-taxonomy")
-def audit_rlm_taxonomy_command(
-    draft_id: str,
+@app.command(name="audit-rlm")
+def audit_rlm_command(
+    run_id: str,
     model: str = typer.Option(RLM_AUDIT_MODEL, "--model"),
-    freeze: bool = typer.Option(
-        True, "--freeze/--no-freeze", help="Freeze the taxonomy when nothing is unresolved."
-    ),
-    force: bool = typer.Option(
-        False, "--force", help="Freeze despite unresolved findings, recording that it was forced."
-    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Challenge every contract in a draft with a fresh, adversarial context."""
+    """Challenge every contract in a clustering run with a fresh, adversarial context.
+
+    Advisory only. This saves findings and changes nothing: no placement moves,
+    and materializing the run neither requires this nor consults it.
+    """
     store = _derived(project)
     try:
-        draft = load_clustering_run(draft_id, store)
+        run = load_clustering_run(run_id, store)
     except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no draft {draft_id!r}")
+        console.print(f"[red]error:[/red] no clustering run {run_id!r}")
         raise typer.Exit(code=1) from exc
 
-    _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
+    _, corpus, _ = _rlm_corpus(run.analysis_id, project, run.view.value)
     try:
-        predict = build_taxonomy_audit_predictor(model=model, view=draft.view)
+        predict = build_taxonomy_audit_predictor(model=model, view=run.view)
     except ClusteringAuditError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    audit = audit_clustering(draft, draft_id, corpus, predict=predict, model=model)
+    audit = audit_clustering(run, run_id, corpus, predict=predict, model=model)
     audit_envelope = save_rlm_audit(audit, store)
     console.print(f"audit_id:    {audit_envelope.artifact_id} ({audit.model})")
 
@@ -2361,135 +2341,7 @@ def audit_rlm_taxonomy_command(
             f"\n[yellow]{len(unresolved)} finding(s) recommend revising, splitting, or merging a "
             "contract and are unresolved[/yellow]"
         )
-    if not freeze:
-        return
-
-    try:
-        taxonomy = freeze_taxonomy(
-            draft, draft_id, audit=audit, audit_id=audit_envelope.artifact_id, force=force
-        )
-    except FreezeRefused as exc:
-        # Not an error in the run: the audit did its job. Re-mine to address the
-        # findings, or freeze over them deliberately with --force.
-        console.print(f"\n[yellow]not frozen:[/yellow] {exc}")
-        console.print("[dim]re-mine to address them, or pass --force to freeze anyway[/dim]")
-        return
-
-    envelope = save_taxonomy(taxonomy, store)
-    console.print(f"\ntaxonomy_id: {envelope.artifact_id}")
-    for limitation in taxonomy.limitations:
-        console.print(f"[yellow]limitation:[/yellow] {limitation}")
-
-
-@app.command(name="assign-rlm-taxonomy")
-def assign_rlm_taxonomy_command(
-    taxonomy_id: str,
-    batch_size: int = typer.Option(20, "--batch-size"),
-    model: str = typer.Option(RLM_ASSIGN_MODEL, "--model"),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Classify every trace against a frozen taxonomy in a fresh context."""
-    store = _derived(project)
-    try:
-        taxonomy = load_taxonomy(taxonomy_id, store)
-    except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no taxonomy {taxonomy_id!r}")
-        raise typer.Exit(code=1) from exc
-
-    _, corpus, _ = _rlm_corpus(taxonomy.analysis_id, project, taxonomy.view.value)
-    try:
-        predict = build_assignment_predictor(model=model, view=taxonomy.view)
-    except AssignmentError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    with ledger.stage("rlm_assignment_run", taxonomy_id=taxonomy_id, model=model):
-        run = assign_traces(
-            taxonomy,
-            taxonomy_id,
-            corpus,
-            predict=predict,
-            model=model,
-            batch_size=batch_size,
-        )
-        envelope = save_assignment_run(run, store)
-        ledger.record(
-            {
-                "event_type": "stage_complete",
-                "stage_name": "rlm_assignment_run",
-                "input_artifact_id": taxonomy_id,
-                "output_artifact_id": envelope.artifact_id,
-                "assigned": len(run.by_status(AssignmentStatus.ASSIGNED)),
-            }
-        )
-
-    console.print(f"run_id:      {envelope.artifact_id}")
-    console.print(f"assigned:    {len(run.by_status(AssignmentStatus.ASSIGNED))}")
-    for contract_id, traces in run.members().items():
-        console.print(f"  {contract_id}  {len(traces)} trace(s)")
-    _report_unresolved(
-        len(run.by_status(AssignmentStatus.AMBIGUOUS)),
-        len(run.by_status(AssignmentStatus.UNCOVERED)),
-        len(run.by_status(AssignmentStatus.UNREADABLE)),
-    )
-    for limitation in run.limitations:
-        console.print(f"[yellow]limitation:[/yellow] {limitation}")
-
-
-@app.command(name="validate-rlm-mining")
-def validate_rlm_mining_command(
-    run_ids: list[str] = typer.Argument(..., help="Two or more assignment run ids."),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Compare independent runs by trace co-assignment, never by family name."""
-    store = _derived(project)
-    runs = []
-    taxonomies = []
-    for run_id in run_ids:
-        try:
-            run = load_assignment_run(run_id, store)
-        except FileNotFoundError as exc:
-            console.print(f"[red]error:[/red] no assignment run {run_id!r}")
-            raise typer.Exit(code=1) from exc
-        runs.append(run)
-        try:
-            taxonomies.append(load_taxonomy(run.taxonomy_id, store))
-        except FileNotFoundError:
-            # Recurrence is measured over whatever taxonomies are present, and
-            # the report says when it saw fewer than there are runs.
-            pass
-
-    try:
-        report = compare_runs(
-            runs,
-            run_ids,
-            analysis_id=runs[0].analysis_id,
-            taxonomies=taxonomies,
-        )
-    except ValueError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    envelope = save_stability_report(report, store)
-    console.print(f"report_id:   {envelope.artifact_id}")
-    console.print(f"runs:        {report.runs}")
-    console.print(f"stable:      {report.stable_assignment_fraction:.1%} of classified traces")
-    console.print(f"agreement:   {report.pairwise_agreement:.1%} mean pairwise co-assignment")
-    console.print(f"recurring:   {len(report.recurring_contracts)} contract(s) in >1 run")
-
-    if report.disagreements:
-        console.print(f"\n[yellow]{len(report.disagreements)} contested pair(s)[/yellow]")
-        for pair in report.disagreements[:10]:
-            left, right = pair.trace_ids
-            console.print(f"  {left} / {right}: together in {pair.together}, apart in {pair.apart}")
-    always = [u for u in report.unplaced if u.always_unplaced]
-    if always:
-        console.print(
-            f"\n[yellow]{len(always)} trace(s) no run could place[/yellow] "
-            "[dim](a gap in the taxonomy, or a request that is not one task)[/dim]"
-        )
-    for limitation in report.limitations:
-        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+        console.print("[dim]advisory: nothing here changed the run or its placements[/dim]")
 
 
 @app.command(name="materialize-rlm-taskset")
