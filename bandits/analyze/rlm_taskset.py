@@ -1,4 +1,4 @@
-"""Turn a reviewed assignment run into a TaskSet the rest of the pipeline can use.
+"""Turn a clustering run into a TaskSet the rest of the pipeline can use.
 
 The honesty problem this solves. ``TaskSet`` was designed around embedding
 geometry: a family carries a ``medoid_trace_id``, a ``FamilyCoherence`` diameter,
@@ -14,24 +14,29 @@ a centrality claim. Every family says in its limitations that it was not measure
 
 Ambiguous, uncovered and unreadable traces are never materialized. They are
 findings awaiting review, and a task set that quietly absorbed them would be
-claiming a coverage the assignment run explicitly refused to claim.
+claiming a coverage the run explicitly refused to claim.
+
+The fit/held-out split moves whole lineage groups, never individual traces. No
+distance is involved: a lineage the analysis declared is one group, a trace
+without one is its own group, and two traces of the same normalized request are
+held together so a verifier is never measured against a rerun of what it was
+drafted from.
 """
 
 from __future__ import annotations
 
+import hashlib
+
 from bandits.analyze.models import (
     ClusteringProvenance,
+    CorpusAnalysis,
     SelectedTask,
     SlotKind,
     TaskFamily,
     TaskSet,
 )
-from bandits.analyze.rlm_models import (
-    AssignmentRun,
-    AssignmentStatus,
-    FrozenTaxonomy,
-    TraceView,
-)
+from bandits.analyze.rlm_models import RLMClusteringRun, TraceView
+from bandits.analyze.text import normalize_instruction
 
 
 def backend_for(view: TraceView) -> str:
@@ -46,46 +51,147 @@ def backend_for(view: TraceView) -> str:
 
 
 class MaterializationError(RuntimeError):
-    """The assignment run cannot honestly become a task set."""
+    """The clustering run cannot honestly become a task set."""
+
+
+def _stable_fraction(*parts: str) -> float:
+    """A deterministic value in [0, 1) for one key, so splits are reproducible."""
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / float(1 << 64)
+
+
+def _split_groups(analysis: CorpusAnalysis, trace_ids: tuple[str, ...]) -> dict[str, list[str]]:
+    """The indivisible groups inside one family.
+
+    Two traces share a group when the analysis declares the same lineage, or
+    when their requests normalize identically. The second rule matters as much
+    as the first: a corpus that never recorded lineage still repeats requests,
+    and splitting a repeated request across the boundary measures a verifier
+    against the run it was drafted from.
+    """
+    by_trace = {task.trace_id: task for task in analysis.tasks}
+    groups: dict[str, list[str]] = {}
+    for trace_id in trace_ids:
+        task = by_trace.get(trace_id)
+        lineage = task.lineage_id if task else None
+        if lineage:
+            key = f"lineage:{lineage}"
+        elif task and task.instruction:
+            key = f"request:{normalize_instruction(task.instruction)}"
+        else:
+            # No lineage and no instruction to match on. Its own group, never
+            # merged with another, because nothing here says it is a rerun.
+            key = f"trace:{trace_id}"
+        groups.setdefault(key, []).append(trace_id)
+    return groups
+
+
+def _split_family(
+    analysis: CorpusAnalysis,
+    *,
+    family_id: str,
+    trace_ids: tuple[str, ...],
+    held_out: float,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Fit ids, held-out ids, and any limitations the split itself produced.
+
+    Groups are ordered by a hash of the analysis, the family and the group key,
+    so the split is reproducible from the artifact without recording a seed.
+    Whole groups move: the target fraction is approached and never met exactly,
+    because meeting it exactly means cutting a group in half.
+    """
+    groups = _split_groups(analysis, trace_ids)
+    if held_out <= 0.0 or len(groups) < 2:
+        limitation = ()
+        if held_out > 0.0:
+            limitation = (
+                f"family {family_id} holds one independent group of episodes, so no "
+                "held-out side could be taken and a verifier drafted here cannot be "
+                "validated against traces it did not see",
+            )
+        return trace_ids, (), limitation
+
+    ordered = sorted(
+        groups.items(),
+        key=lambda item: (_stable_fraction(analysis.corpus_id, family_id, item[0]), item[0]),
+    )
+    target = len(trace_ids) * held_out
+    held: list[str] = []
+    fit: list[str] = []
+    for _, members in ordered:
+        # The last group always lands in fit: a family whose every group went
+        # held-out has nothing left to draft a verifier from.
+        if len(held) + len(members) <= target and len(fit) + len(members) < len(trace_ids):
+            held.extend(members)
+        else:
+            fit.extend(members)
+    if not held:
+        return (
+            tuple(sorted(fit)),
+            (),
+            (
+                f"family {family_id} has no group small enough to hold out at the requested "
+                "fraction; every episode is on the fit side",
+            ),
+        )
+    return tuple(sorted(fit)), tuple(sorted(held)), ()
 
 
 def materialize_task_set(
-    run: AssignmentRun,
-    taxonomy: FrozenTaxonomy,
+    run: RLMClusteringRun,
+    analysis: CorpusAnalysis,
     *,
-    corpus_id: str,
     held_out: float = 0.0,
 ) -> TaskSet:
-    """Build a TaskSet from confidently assigned traces only.
+    """Build a TaskSet from the traces the miner placed.
 
-    ``held_out`` splits each family for downstream verifier measurement. The
-    split is taken over the sorted member list rather than sampled, because
-    nothing here has a seed to record and an unrecorded random split cannot be
-    reproduced from the artifact.
+    The run's own final assignments are authoritative. Nothing reclassifies
+    here, and a trace the miner left ambiguous, uncovered or unreadable stays
+    out of every family rather than being placed by this code.
     """
-    if run.taxonomy_id != _taxonomy_matches(run, taxonomy):
-        raise MaterializationError(
-            "this assignment run was made against a different taxonomy than the one given"
-        )
     if not 0.0 <= held_out < 1.0:
         raise ValueError("held_out must be a fraction below 1.0")
+    # Compared on content, not on a passed-in id: an analysis loaded from the
+    # wrong artifact would otherwise materialize families whose members were
+    # never in it, and the mismatch would only surface downstream as missing
+    # traces.
+    from bandits.analyze.analysis import compute_analysis_id
 
-    contracts = {c.contract_id: c for c in taxonomy.contracts}
-    members = run.members()
-    if not members:
+    if compute_analysis_id(analysis) != run.analysis_id:
         raise MaterializationError(
-            "no trace was confidently assigned, so there is no family to materialize"
+            f"this clustering run was made against analysis {run.analysis_id!r}, "
+            "which is not the analysis given"
         )
 
+    live = {contract.contract_id for contract in run.contracts}
+    unknown = sorted({cid for cid in run.assignments.values() if cid not in live})
+    if unknown:
+        raise MaterializationError(
+            f"the run assigns traces to contract(s) it does not define: {unknown}"
+        )
+
+    unresolved = (
+        set(run.ambiguous_trace_ids) | set(run.uncovered_trace_ids) | set(run.unreadable_trace_ids)
+    )
+    members: dict[str, list[str]] = {}
+    for trace_id, contract_id in run.assignments.items():
+        if trace_id in unresolved:
+            continue
+        members.setdefault(contract_id, []).append(trace_id)
+    if not members:
+        raise MaterializationError("no trace was placed, so there is no family to materialize")
+
+    contracts = {contract.contract_id: contract for contract in run.contracts}
     families: list[TaskFamily] = []
     selected: list[SelectedTask] = []
-    for contract_id, trace_ids in members.items():
-        contract = contracts.get(contract_id)
-        if contract is None:  # pragma: no cover - assignment validates against the taxonomy
-            continue
-        cut = int(len(trace_ids) * held_out)
-        held = trace_ids[:cut]
-        fit = trace_ids[cut:]
+    split_limitations: list[str] = []
+    for contract_id in sorted(members):
+        trace_ids = tuple(sorted(members[contract_id]))
+        contract = contracts[contract_id]
+        fit, held, limits = _split_family(
+            analysis, family_id=contract_id, trace_ids=trace_ids, held_out=held_out
+        )
+        split_limitations.extend(limits)
         families.append(
             TaskFamily(
                 family_id=contract_id,
@@ -123,36 +229,35 @@ def materialize_task_set(
         )
 
     total_mass = sum(f.workload_mass for f in families)
-    # Every trace the assignment run classified, not just the ones it placed.
-    # Coverage is the fraction of the workload these families actually stand
-    # for, and dividing placed traces by placed traces would report 100% for a
-    # run that left most of the corpus unplaced — the more traces the taxonomy
-    # failed to reach, the better it would score.
-    classified = sum(1 for a in run.assignments if a.status is not AssignmentStatus.UNREADABLE)
-    unresolved = {
-        status: len(run.by_status(status))
-        for status in (
-            AssignmentStatus.AMBIGUOUS,
-            AssignmentStatus.UNCOVERED,
-            AssignmentStatus.UNREADABLE,
-        )
-    }
+    # Every trace the miner could read, not just the ones it placed. Dividing
+    # placed traces by placed traces would report 100% for a run that left most
+    # of the corpus unplaced — the more traces the run failed to reach, the
+    # better it would score.
+    classified = len({task.trace_id for task in analysis.tasks} - set(run.unreadable_trace_ids))
 
     limitations = [
         "families here were proposed by a language model, not by a reproducible "
         "distance computation; two runs of the miner may disagree",
         f"mined from the {run.view.value} view",
-        *taxonomy.limitations,
+        "membership is the miner's own final placement; no independent pass "
+        "reclassified these traces, so a family and its members were decided in "
+        "the same context",
+        *run.limitations,
+        *split_limitations,
     ]
-    for status, count in unresolved.items():
-        if count:
+    for label, ids in (
+        ("ambiguous", run.ambiguous_trace_ids),
+        ("uncovered", run.uncovered_trace_ids),
+        ("unreadable", run.unreadable_trace_ids),
+    ):
+        if ids:
             limitations.append(
-                f"{count} trace(s) were {status.value} in the assignment run and are "
+                f"{len(ids)} trace(s) were {label} in the clustering run and are "
                 "excluded from every family here until a reviewer resolves them"
             )
-    if not taxonomy.complete:
+    if not run.complete:
         limitations.append(
-            "the taxonomy behind this task set was frozen from a run that never converged"
+            "the clustering run behind this task set never finished its requested passes"
         )
     if run.view.reads_agent_behavior:
         limitations.append(
@@ -162,7 +267,7 @@ def materialize_task_set(
         )
 
     return TaskSet(
-        corpus_id=corpus_id,
+        corpus_id=analysis.corpus_id,
         analysis_id=run.analysis_id,
         families=tuple(families),
         selected=tuple(selected),
@@ -181,14 +286,3 @@ def materialize_task_set(
         missing_slots=(),
         limitations=tuple(dict.fromkeys(limitations)),
     )
-
-
-def _taxonomy_matches(run: AssignmentRun, taxonomy: FrozenTaxonomy) -> str:
-    """The run's taxonomy id if the taxonomy given is really the one it used.
-
-    Compared on contract text rather than on the id alone, so a taxonomy loaded
-    from the wrong artifact cannot pass by carrying a matching id.
-    """
-    from bandits.analyze.rlm_audit import compute_taxonomy_id
-
-    return compute_taxonomy_id(taxonomy) if compute_taxonomy_id(taxonomy) == run.taxonomy_id else ""

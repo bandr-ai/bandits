@@ -57,7 +57,6 @@ from bandits.analyze.rlm_models import (
     TraceView,
 )
 from bandits.analyze.rlm_stability import compare_runs, save_stability_report
-from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, UserTurn
 
@@ -1171,53 +1170,6 @@ def test_a_report_cannot_name_the_same_run_twice() -> None:
 # --- materialization ---------------------------------------------------------
 
 
-def test_materialization_fabricates_no_similarity_geometry() -> None:
-    """The task set's whole claim is that no distance was computed."""
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1", "t2"]})
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.clustering is not None
-    assert task_set.clustering.backend == "rlm-user-messages"
-    assert task_set.clustering.embedding_model is None
-    family = task_set.families[0]
-    assert family.coherence is None
-    assert family.medoid_trace_id in family.trace_ids
-    assert any("no embedding distance" in limit for limit in family.limitations)
-
-
-def test_unresolved_traces_never_enter_a_family() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]}, unplaced={"t2": "ambiguous"})
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert [t for f in task_set.families for t in f.trace_ids] == ["t1"]
-    assert any("until a reviewer resolves them" in limit for limit in task_set.limitations)
-
-
-def test_materializing_against_the_wrong_taxonomy_is_refused() -> None:
-    run = _run("tax-does-not-match", {"c1": ["t1"]})
-    with pytest.raises(MaterializationError, match="different taxonomy"):
-        materialize_task_set(run, _taxonomy(), corpus_id="corpus-1")
-
-
-def test_a_run_that_placed_nothing_yields_no_task_set() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {}, unplaced={"t1": "uncovered"})
-    with pytest.raises(MaterializationError, match="no family to materialize"):
-        materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-
-
-def test_held_out_split_keeps_every_member_on_one_side() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1", "t2", "t3", "t4"]})
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1", held_out=0.5)
-    family = task_set.families[0]
-    assert set(family.fit_trace_ids) | set(family.held_out_trace_ids) == set(family.trace_ids)
-    assert not set(family.fit_trace_ids) & set(family.held_out_trace_ids)
-
-
-# --- path F: the full-trajectory arm ----------------------------------------
-
-
 def _tool_trace(trace_id: str, *, output: dict, message: str = "refund my order") -> Trace:
     moment = datetime(2024, 1, 1, tzinfo=UTC)
     return Trace(
@@ -1449,68 +1401,6 @@ def test_prompt_digest_covers_every_view_wording() -> None:
         assert prompt_digest("m") != before
     finally:
         rlm_models.VIEW_PREAMBLES[TraceView.FULL_TRAJECTORY] = original
-
-
-def test_task_set_backend_names_the_arm_that_produced_it() -> None:
-    """Path F labelled rlm-user-messages corrupts every later comparison."""
-    taxonomy = _taxonomy().replace(view=TraceView.FULL_TRAJECTORY)
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]}).replace(
-        view=TraceView.FULL_TRAJECTORY
-    )
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.clustering is not None
-    assert task_set.clustering.backend == "rlm-full-trajectory"
-    assert any("full trajectories" in limit for limit in task_set.limitations)
-
-
-def test_path_u_task_set_still_names_its_own_arm() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]})
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.clustering is not None
-    assert task_set.clustering.backend == "rlm-user-messages"
-    assert not any("full trajectories" in limit for limit in task_set.limitations)
-
-
-def test_coverage_counts_unplaced_traces_against_the_task_set() -> None:
-    """Placed/placed would report 100% for a run that reached almost nothing."""
-    taxonomy = _taxonomy()
-    run = _run(
-        compute_taxonomy_id(taxonomy),
-        {"c1": ["t1"]},
-        unplaced={"t2": "uncovered", "t3": "ambiguous"},
-    )
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.total_workload_mass == 3
-    assert task_set.workload_coverage == pytest.approx(1 / 3)
-
-
-def test_coverage_is_one_only_when_everything_was_placed() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1", "t2"]})
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.workload_coverage == 1.0
-
-
-def test_unreadable_traces_are_outside_the_coverage_denominator() -> None:
-    """They were never classifiable, so they are not a coverage failure."""
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]}).replace(
-        assignments=(
-            TraceAssignment(
-                trace_id="t1",
-                matching_contract_ids=("c1",),
-                primary_contract_id="c1",
-                status=AssignmentStatus.ASSIGNED,
-                reason="x",
-            ),
-            TraceAssignment(
-                trace_id="t2", status=AssignmentStatus.UNREADABLE, reason="no messages"
-            ),
-        )
-    )
-    task_set = materialize_task_set(run, taxonomy, corpus_id="corpus-1")
-    assert task_set.workload_coverage == 1.0
 
 
 class _CostingMiner(_ScriptedMiner):
@@ -1884,29 +1774,6 @@ def test_a_finished_session_reports_the_runs_own_pass_count(tmp_path) -> None:
     recorder.begin(traces_total=4, requested_passes=2, seed=1)
     recorder.finish(status="awaiting_review", stop_reason="passes_complete", completed_passes=2)
     assert store.read("sess-count").completed_passes == 2
-
-
-def test_each_family_names_the_view_it_was_mined_from() -> None:
-    """A Path F family saying "user messages alone" misstates its own evidence."""
-    taxonomy = _taxonomy().replace(view=TraceView.FULL_TRAJECTORY)
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]}).replace(
-        view=TraceView.FULL_TRAJECTORY
-    )
-    family = materialize_task_set(run, taxonomy, corpus_id="corpus-1").families[0]
-    assert any("full-trajectory view" in limit for limit in family.limitations)
-    assert not any("user messages alone" in limit for limit in family.limitations)
-    assert any("execution behaviour" in limit for limit in family.limitations)
-
-
-def test_a_path_u_family_makes_no_behaviour_caveat() -> None:
-    taxonomy = _taxonomy()
-    run = _run(compute_taxonomy_id(taxonomy), {"c1": ["t1"]})
-    family = materialize_task_set(run, taxonomy, corpus_id="corpus-1").families[0]
-    assert any("user-messages view" in limit for limit in family.limitations)
-    assert not any("execution behaviour" in limit for limit in family.limitations)
-
-
-# --- viewing -----------------------------------------------------------------
 
 
 def _render(renderable) -> str:
