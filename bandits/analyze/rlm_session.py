@@ -1,6 +1,6 @@
 """A resumable mining session, written to disk as it goes.
 
-Why this is not just the draft artifact. A draft is content-addressed and
+Why this is not just the run artifact. A run is content-addressed and
 immutable: it exists only once the run finishes, which is exactly when it stops
 being useful for answering "what is this doing right now" and "what did it get
 through before it died". A run over 160 traces makes dozens of model calls over
@@ -16,7 +16,7 @@ can be resumed from the last chunk that completed rather than from the start.
 
 The session is deliberately *not* evidence. It is a scratchpad that gets
 overwritten, and nothing downstream may cite it. When a run reaches its pause,
-the immutable ``TaxonomyDraft`` is written from it in the ordinary way, and that
+the immutable ``RLMClusteringRun`` is written from it in the ordinary way, and that
 is what an audit, an assignment or a task set is ever parented to.
 """
 
@@ -291,9 +291,7 @@ class SessionRecorder:
             completed_passes=completed_passes,
             chunk_index=len(tuple(chunks)),
             traces_seen_this_pass=len(seen_this_pass),
-            contracts=tuple(
-                sorted(state.contracts.values(), key=lambda c: c.contract_id)
-            ),
+            contracts=tuple(sorted(state.contracts.values(), key=lambda c: c.contract_id)),
             assignments=dict(state.assignments),
             ambiguous_trace_ids=tuple(sorted(state.ambiguous)),
             uncovered_trace_ids=tuple(sorted(state.uncovered)),
@@ -331,7 +329,7 @@ class SessionRecorder:
         *,
         status: str,
         stop_reason: str,
-        draft_id: str = "",
+        run_id: str = "",
         completed_passes: int | None = None,
     ) -> None:
         """Close the session with the run's own final counts.
@@ -339,7 +337,7 @@ class SessionRecorder:
         ``completed_passes`` is passed in rather than read from the last
         checkpoint: a pass increments only after its final chunk, so the state
         written during that chunk is always one behind, and a session closed on
-        it would report fewer passes than the draft beside it.
+        it would report fewer passes than the run beside it.
         """
         self._state = self._state.replace(
             status=status,
@@ -355,7 +353,7 @@ class SessionRecorder:
                 "event": "session_finished",
                 "status": status,
                 "stop_reason": stop_reason,
-                "draft_id": draft_id,
+                "run_id": run_id,
                 "completed_passes": self._state.completed_passes,
                 "contracts": len(self._state.contracts),
             },

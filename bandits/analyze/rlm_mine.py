@@ -14,7 +14,7 @@ materially, and move under 2% of assignments — and every other way of stopping
 is a budget limit that yields an explicitly *incomplete* artifact. A taxonomy
 that stopped because the money ran out must never read as one that stopped
 changing, so :class:`~bandits.analyze.rlm_models.StopReason` travels with the
-draft for the rest of its life.
+run for the rest of its life.
 
 Chunk boundaries are never family boundaries. Each chunk deliberately mixes
 unseen traces with ambiguous ones, traces touched by recent changes, and random
@@ -46,8 +46,8 @@ from bandits.analyze.rlm_models import (
     PassResult,
     ProposedContract,
     ProposedOperation,
+    RLMClusteringRun,
     StopReason,
-    TaxonomyDraft,
     TaxonomyOperation,
     TraceView,
 )
@@ -219,7 +219,7 @@ class _Predictor(Protocol):
 
 
 def prompt_digest(model: str) -> str:
-    """Pins wording, model and version onto every draft they produced."""
+    """Pins wording, model and version onto every run they produced."""
     payload = json.dumps(
         {
             "instruction": _INSTRUCTION_HEAD,
@@ -1011,7 +1011,7 @@ def mine_taxonomy(
     on_chunk: Callable[[ChunkResult], None] | None = None,
     session: Any = None,
     resume: Any = None,
-) -> TaxonomyDraft:
+) -> RLMClusteringRun:
     """Read the corpus through complete passes, then pause for review.
 
     Each pass reads every eligible trace exactly once, in its own shuffled
@@ -1021,7 +1021,7 @@ def mine_taxonomy(
 
     Nothing here decides the taxonomy has converged, because nothing here can.
     The run stops when it has done the passes it was asked for, and hands back a
-    draft plus the diff between those passes for a person to judge. ``session``,
+    run plus the diff between those passes for a person to judge. ``session``,
     when given, is checkpointed after every chunk so a run that dies mid-pass is
     resumable and a run in flight is observable.
     """
@@ -1064,14 +1064,12 @@ def mine_taxonomy(
     completed_passes = resume.completed_passes if resume is not None else 0
 
     if session is not None:
-        session.begin(
-            traces_total=len(eligible), requested_passes=budget.passes, seed=seed
-        )
+        session.begin(traces_total=len(eligible), requested_passes=budget.passes, seed=seed)
 
     for pass_index in range(resume_pass, budget.passes):
         # Reshuffled per pass with a seed derived from the run's, so each pass
         # reads the corpus in a different order — chunk composition cannot
-        # become family structure — while staying reproducible from the draft.
+        # become family structure — while staying reproducible from the run.
         pass_seed = seed + pass_index
         if pass_index == resume_pass and resume_order:
             # The order the interrupted pass was working through, so what it had
@@ -1223,8 +1221,7 @@ def mine_taxonomy(
             sorted(
                 trace_id
                 for trace_id, contract_id in state.assignments.items()
-                if trace_id in previous_placement
-                and previous_placement[trace_id] != contract_id
+                if trace_id in previous_placement and previous_placement[trace_id] != contract_id
             )
         )
         passes.append(
@@ -1253,9 +1250,7 @@ def mine_taxonomy(
         # what it was asked for, and must not report the same stop reason as a
         # run that read the whole corpus the requested number of times.
         stop_reason = (
-            StopReason.PASSES_COMPLETE
-            if completed_passes >= budget.passes
-            else StopReason.ERROR
+            StopReason.PASSES_COMPLETE if completed_passes >= budget.passes else StopReason.ERROR
         )
 
     if stop_reason is not StopReason.PASSES_COMPLETE:
@@ -1350,7 +1345,7 @@ def mine_taxonomy(
         for contract in sorted(state.contracts.values(), key=lambda c: c.contract_id)
     )
 
-    return TaxonomyDraft(
+    return RLMClusteringRun(
         analysis_id=analysis_id,
         view=corpus.view,
         seed=seed,
@@ -1483,7 +1478,9 @@ def _run_chunk(
         # rather than includes the original attempt's unless summed here.
         repair_calls, repair_tokens = _spend_of(predict)
         repair_cost = _cost_of(predict)
-        calls, tokens, cost = _added_spend(calls, tokens, cost, repair_calls, repair_tokens, repair_cost)
+        calls, tokens, cost = _added_spend(
+            calls, tokens, cost, repair_calls, repair_tokens, repair_cost
+        )
     if dropped_contracts:
         limitations.append(
             f"chunk {index} proposed {len(dropped_contracts)} contract(s) the parser "
@@ -1617,9 +1614,7 @@ def _repair_contracts(
             taxonomy=taxonomy_json,
             # Truncated per contract: the point is to show the model the shape
             # it got wrong, and a long payload would push this past the peek.
-            question=_REPAIR_INSTRUCTION
-            + "\n"
-            + "\n".join(item[:300] for item in rejected[:4]),
+            question=_REPAIR_INSTRUCTION + "\n" + "\n".join(item[:300] for item in rejected[:4]),
         )
     except Exception:  # noqa: BLE001 - a failed repair must not lose the chunk
         return []
@@ -1631,27 +1626,27 @@ def _repair_contracts(
     return repaired
 
 
-def compute_draft_id(draft: TaxonomyDraft) -> str:
-    digest = hashlib.sha256(draft.model_dump_json().encode("utf-8")).hexdigest()
-    return f"rlm-taxonomy-draft-{digest[:16]}"
+def compute_run_id(run: RLMClusteringRun) -> str:
+    digest = hashlib.sha256(run.model_dump_json().encode("utf-8")).hexdigest()
+    return f"rlm-clustering-run-{digest[:16]}"
 
 
-def save_draft(draft: TaxonomyDraft, store: DerivedStore) -> DerivedEnvelope:
+def save_clustering_run(run: RLMClusteringRun, store: DerivedStore) -> DerivedEnvelope:
     """Persist beside the analysis it was mined from, never onto it."""
     return store.write(
-        compute_draft_id(draft),
-        kind="rlm_taxonomy_draft",
-        parent_artifact_id=draft.analysis_id,
-        payload=draft.model_dump_json().encode("utf-8"),
+        compute_run_id(run),
+        kind="rlm_clustering_run",
+        parent_artifact_id=run.analysis_id,
+        payload=run.model_dump_json().encode("utf-8"),
         summary={
-            "contracts": len(draft.contracts),
-            "chunks": len(draft.chunks),
-            "ambiguous": len(draft.ambiguous_trace_ids),
-            "uncovered": len(draft.uncovered_trace_ids),
-            "complete": int(draft.complete),
+            "contracts": len(run.contracts),
+            "chunks": len(run.chunks),
+            "ambiguous": len(run.ambiguous_trace_ids),
+            "uncovered": len(run.uncovered_trace_ids),
+            "complete": int(run.complete),
         },
     )
 
 
-def load_draft(draft_id: str, store: DerivedStore) -> TaxonomyDraft:
-    return TaxonomyDraft.model_validate_json(store.read_payload(draft_id))
+def load_clustering_run(run_id: str, store: DerivedStore) -> RLMClusteringRun:
+    return RLMClusteringRun.model_validate_json(store.read_payload(run_id))

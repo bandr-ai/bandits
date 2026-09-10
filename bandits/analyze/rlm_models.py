@@ -317,9 +317,7 @@ class ProposedOperation(Contract):
         """
         needs_contract = {"KEEP", "CREATE", "REVISE", "SPLIT", "MERGE"}
         if self.operation in needs_contract and not self.contract_ids:
-            raise ValueError(
-                f"a {self.operation} operation must name the contract_ids it acts on"
-            )
+            raise ValueError(f"a {self.operation} operation must name the contract_ids it acts on")
         if self.operation == "MERGE" and len(self.contract_ids) < 2:
             raise ValueError("a MERGE names the contracts it consumes and the one it produces")
         return self
@@ -586,8 +584,7 @@ class AuditFinding(Contract):
             # A target on a keep or a split is a contradiction, and a reviewer
             # reading the field would act on a merge nobody recommended.
             raise ValueError(
-                f"finding for {self.contract_id} names a merge target without "
-                "recommending a merge"
+                f"finding for {self.contract_id} names a merge target without recommending a merge"
             )
         if self.merge_with_contract_id == self.contract_id:
             raise ValueError(f"contract {self.contract_id} cannot merge with itself")
@@ -604,8 +601,8 @@ class AuditFinding(Contract):
         return self.recommendation in ("revise", "split", "merge")
 
 
-class TaxonomyAudit(Contract):
-    """One adversarial pass over a draft taxonomy. Its own artifact.
+class RLMClusteringAudit(Contract):
+    """One adversarial pass over a run taxonomy. Its own artifact.
 
     Advisory in the same sense the family audit is: it never edits contracts.
     Discovery must explicitly resolve or preserve each finding, and the stop
@@ -613,14 +610,14 @@ class TaxonomyAudit(Contract):
     """
 
     schema_version: int = 1
-    draft_id: str
+    run_id: str
     findings: tuple[AuditFinding, ...] = ()
     model: str
     prompt_digest: str
     limitations: tuple[str, ...] = ()
 
     @model_validator(mode="after")
-    def one_finding_per_contract(self) -> TaxonomyAudit:
+    def one_finding_per_contract(self) -> RLMClusteringAudit:
         seen = [f.contract_id for f in self.findings]
         if len(seen) != len(set(seen)):
             raise ValueError("audit reports the same contract twice")
@@ -642,7 +639,7 @@ DEFAULT_PASSES = 2
 Two, then stop. The first pass builds a taxonomy from nothing, so its early
 chunks were judged against definitions that did not exist yet; the second is the
 first time every trace is read against a taxonomy that has already seen the
-whole corpus. One pass is a draft, two is a draft that has been checked, and the
+whole corpus. One pass is a run, two is a run that has been checked, and the
 pause after them is what keeps this from becoming a loop that runs until the
 model stops objecting to itself.
 
@@ -738,11 +735,11 @@ other reason is an emergency guard firing, which leaves a partial artifact.
 """
 
 
-class TaxonomyDraft(Contract):
+class RLMClusteringRun(Contract):
     """The provisional output of one discovery loop, before freezing.
 
-    Never a TaskSet, and never silently promoted into one. A draft records how
-    it stopped, and a draft that stopped because a budget ran out carries that
+    Never a TaskSet, and never silently promoted into one. A run records how
+    it stopped, and a run that stopped because a budget ran out carries that
     for the rest of its life.
     """
 
@@ -772,7 +769,7 @@ class TaxonomyDraft(Contract):
     """
 
     resumed_from: str | None = None
-    """The draft this session continued, when it continued one."""
+    """The run this session continued, when it continued one."""
 
     resume_scope: ResumeScope | None = None
     """What a resumed session re-examined. None on a first run."""
@@ -787,10 +784,10 @@ class TaxonomyDraft(Contract):
     limitations: tuple[str, ...] = ()
 
     @model_validator(mode="after")
-    def contracts_are_distinct(self) -> TaxonomyDraft:
+    def contracts_are_distinct(self) -> RLMClusteringRun:
         ids = [c.contract_id for c in self.contracts]
         if len(ids) != len(set(ids)):
-            raise ValueError("draft contains duplicate contract ids")
+            raise ValueError("run contains duplicate contract ids")
         return self
 
     @property
@@ -844,7 +841,7 @@ class TaxonomyDraft(Contract):
 
 
 class FrozenTaxonomy(Contract):
-    """A draft, frozen and content-addressed, ready to be assigned against.
+    """A run, frozen and content-addressed, ready to be assigned against.
 
     Freezing is the point at which contracts stop moving, so an assignment can
     name what it was made against. The taxonomy id is derived from the contract
@@ -852,7 +849,7 @@ class FrozenTaxonomy(Contract):
     """
 
     schema_version: int = 1
-    draft_id: str
+    run_id: str
     audit_id: str | None = None
     """The adversarial pass this was frozen after. None means none ran, which is
     recorded because an unaudited taxonomy is a weaker claim, not a clean one."""
@@ -861,8 +858,8 @@ class FrozenTaxonomy(Contract):
     view: TraceView
     contracts: tuple[FamilyContract, ...]
     complete: bool
-    """Carried forward from the draft. A taxonomy frozen from an incomplete
-    draft is still assignable — that is how a budget-limited run is inspected —
+    """Carried forward from the run. A taxonomy frozen from an incomplete
+    run is still assignable — that is how a budget-limited run is inspected —
     but it must never read as converged."""
 
     limitations: tuple[str, ...] = ()

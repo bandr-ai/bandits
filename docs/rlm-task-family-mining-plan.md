@@ -207,7 +207,7 @@ If needed, reconcile the independent taxonomies into a consensus taxonomy, then 
 Keep stages separate and content-addressed:
 
     rlm-mining-run
-    rlm-taxonomy-draft
+    rlm-clustering-run
     rlm-taxonomy-audit
     rlm-taxonomy
     rlm-assignment-run

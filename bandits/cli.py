@@ -70,10 +70,10 @@ from bandits.analyze.rlm_audit import (
     DEFAULT_MODEL as RLM_AUDIT_MODEL,
 )
 from bandits.analyze.rlm_audit import (
+    ClusteringAuditError,
     FreezeRefused,
-    TaxonomyAuditError,
-    _draft_members,
-    audit_taxonomy,
+    _run_members,
+    audit_clustering,
     freeze_taxonomy,
     load_taxonomy,
     save_taxonomy,
@@ -102,9 +102,9 @@ from bandits.analyze.rlm_mine import (
 )
 from bandits.analyze.rlm_mine import (
     MiningError,
-    load_draft,
+    load_clustering_run,
     mine_taxonomy,
-    save_draft,
+    save_clustering_run,
 )
 from bandits.analyze.rlm_mine import (
     build_predictor as build_rlm_predictor,
@@ -2256,7 +2256,7 @@ def mine_rlm_command(
             # so it must say so rather than being left reading as still running.
             recorder.fail(str(exc))
             raise
-        envelope = save_draft(draft, store)
+        envelope = save_clustering_run(draft, store)
         recorder.finish(
             status="awaiting_review" if draft.complete else "incomplete",
             stop_reason=draft.stop_reason.value,
@@ -2292,14 +2292,12 @@ def mine_rlm_command(
             "before finishing its passes"
         )
     console.print("")
-    console.print(taxonomy_overview(draft.contracts, members=_draft_members(draft)))
+    console.print(taxonomy_overview(draft.contracts, members=_run_members(draft)))
     # What the second look changed. The question a reviewer has at a pause, and
     # one no total over the whole run answers.
     console.print("")
     print_pass_history(draft, console)
-    console.print(
-        f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}[/dim]"
-    )
+    console.print(f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}[/dim]")
     _report_unresolved(
         len(draft.ambiguous_trace_ids),
         len(draft.uncovered_trace_ids),
@@ -2324,7 +2322,7 @@ def audit_rlm_taxonomy_command(
     """Challenge every contract in a draft with a fresh, adversarial context."""
     store = _derived(project)
     try:
-        draft = load_draft(draft_id, store)
+        draft = load_clustering_run(draft_id, store)
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no draft {draft_id!r}")
         raise typer.Exit(code=1) from exc
@@ -2332,11 +2330,11 @@ def audit_rlm_taxonomy_command(
     _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
     try:
         predict = build_taxonomy_audit_predictor(model=model, view=draft.view)
-    except TaxonomyAuditError as exc:
+    except ClusteringAuditError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    audit = audit_taxonomy(draft, draft_id, corpus, predict=predict, model=model)
+    audit = audit_clustering(draft, draft_id, corpus, predict=predict, model=model)
     audit_envelope = save_rlm_audit(audit, store)
     console.print(f"audit_id:    {audit_envelope.artifact_id} ({audit.model})")
 
@@ -2483,9 +2481,7 @@ def validate_rlm_mining_command(
         console.print(f"\n[yellow]{len(report.disagreements)} contested pair(s)[/yellow]")
         for pair in report.disagreements[:10]:
             left, right = pair.trace_ids
-            console.print(
-                f"  {left} / {right}: together in {pair.together}, apart in {pair.apart}"
-            )
+            console.print(f"  {left} / {right}: together in {pair.together}, apart in {pair.apart}")
     always = [u for u in report.unplaced if u.always_unplaced]
     if always:
         console.print(
@@ -2587,9 +2583,7 @@ def rlm_session_command(
         f"pass {state.pass_index + 1} in flight"
     )
     console.print(f"assigned:    {len(state.assignments)}")
-    _report_unresolved(
-        len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0
-    )
+    _report_unresolved(len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0)
     for contract in state.contracts:
         console.print(f"  {contract.contract_id}  {contract.name}")
     if state.last_error:
@@ -2656,7 +2650,7 @@ def rlm_families_command(
     """Read a mined taxonomy as reviewable family cards, not id lists."""
     store = _derived(project)
     try:
-        draft = load_draft(draft_id, store)
+        draft = load_clustering_run(draft_id, store)
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no draft {draft_id!r}")
         raise typer.Exit(code=1) from exc
@@ -2677,7 +2671,7 @@ def rlm_families_command(
     except typer.Exit:
         console.print("[dim]corpus unavailable; showing ids without requests[/dim]")
 
-    members = _draft_members(draft)
+    members = _run_members(draft)
     contracts = draft.contracts
     if family is not None:
         contracts = tuple(c for c in contracts if c.contract_id == family)
