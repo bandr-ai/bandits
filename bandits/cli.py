@@ -2498,20 +2498,17 @@ def materialize_rlm_taskset_command(
     held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Turn confidently assigned traces into a TaskSet, with honest provenance."""
+    """Turn the traces a clustering run placed into a TaskSet, with honest provenance."""
     store = _derived(project)
     try:
-        run = load_assignment_run(run_id, store)
-        taxonomy = load_taxonomy(run.taxonomy_id, store)
+        run = load_clustering_run(run_id, store)
         analysis = load_analysis(run.analysis_id, store)
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
-        task_set = materialize_task_set(
-            run, taxonomy, corpus_id=analysis.corpus_id, held_out=held_out
-        )
+        task_set = materialize_task_set(run, analysis, held_out=held_out)
     except MaterializationError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -2522,7 +2519,8 @@ def materialize_rlm_taskset_command(
     # geometry and every reader downstream is used to one that does.
     console.print(
         "[dim]families here were proposed by a model reading user requests; no "
-        "embedding distance was computed, so none carries a coherence figure[/dim]"
+        "embedding distance was computed, so none carries a coherence figure, and "
+        "membership is the miner's own placement rather than an independent pass[/dim]"
     )
 
 
