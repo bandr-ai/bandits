@@ -90,16 +90,63 @@ sibling-consensus proxy label.
   builtins, and a 2s per-trace alarm. Still: read `discovered_signals.py` before
   reuse.
 
-## Next
+## Second corpus: AppWorld (`scripts/rederive_signal.py`)
 
-1. Get a second labelled corpus with repeated rollouts (any eval harness that
-   records pass/fail per attempt) and re-run — confirm consensus AUC holds off
-   τ².
-2. Wire sibling consensus into `bandits/export/` as a first-class per-trajectory
-   signal artifact, precision-first, quarantining non-consensus runs rather than
-   dropping them. Keep it separate from `ReviewedVerifier`; SFT export should not
-   depend on the verifier lifecycle.
-3. For single-shot production traces, consensus is unavailable — the open
-   question there is whether next-user-turn sentiment and post-session git state
-   (neither present in these two corpora) carry the signal. Needs a corpus that
-   records them.
+To check whether the wall was a τ² artefact, the same question was run on
+**AppWorld** — 30 sealed-truth runs from `Exgentic/agent-llm-traces-v2`, 7-67
+steps each, real multi-app tasks (pay a debt list over Venmo/Splitwise, archive
+songs across every Spotify playlist), and the tool responses in the trace *do*
+show what came back, errors included. 10 success / 20 failure, baseline 66.7%.
+
+New signal tried here, the "solve it yourself and diff" idea: a **grounded
+decomposed judge**. A model first breaks the request into atomic sub-goals, then
+for each one is shown the agent's calls and results and asked whether the
+evidence shows it was done. Score is the fraction of sub-goals with positive
+evidence. Also a **reverse reconstruction**: infer the task from only the
+state-changing calls, then rate how well that matches the real request.
+
+| signal | AUC | vs baseline 66.7% |
+| --- | --- | --- |
+| reverse_reconstruction | 0.66 | ties baseline; 10% coverage at its precision point |
+| made_mutations | 0.58 | no |
+| no_error_results | 0.54 | no |
+| **grounded decomposed judge** | **0.49** | worse than a coin flip |
+| final_claims_complete | 0.48 | no |
+| not_errored | 0.45 | no |
+
+The decomposed judge scored seven benchmark-failed runs at 0.9-1.0 ("every
+sub-goal done") and three benchmark-passed runs at 0.2-0.33. It sees a
+plausible-looking `create_expense` call return OK and calls the sub-goal done; it
+cannot see that the expense had the wrong amount or the wrong person. Same wall
+as τ², now on long trajectories with full tool output.
+
+## The conclusion
+
+Across two corpora that share almost nothing — short vs long, retail vs
+multi-app, stripped vs full tool output — **every method that reads only the
+trajectory lands at chance.** Structural signals, a holistic judge, a grounded
+decomposed judge, reverse reconstruction, model-synthesized features: all AUC
+0.45-0.62.
+
+The reason is the same both times: success is defined by a per-task checker
+against a hidden goal state, and the trajectory does not contain the goal state.
+You cannot re-derive a grade you were never shown the answer key for. The
+verifier pipeline's central bet — that a success check can be induced from traces
+— does not hold for benchmark data of this kind.
+
+The one thing that beat chance, sibling consensus at AUC 0.82, works by not
+judging a trajectory at all: it compares repeated rollouts of one task to each
+other. It needs k > 1 attempts per task.
+
+## What follows
+
+1. **Labelled benchmark and eval-harness data already carries the outcome.** Use
+   it directly for SFT. Exgentic ships `success` per run; τ² ships it. The blind
+   export was a choice for the verifier dogfood, not a constraint.
+2. **For unlabelled production traces the signal must come from outside the
+   trajectory** — the user's next message, whether the diff was kept or reverted,
+   whether a follow-up session was needed. Not from re-reading the transcript,
+   which these experiments show carries almost nothing.
+3. **Sibling consensus** is worth wiring into `bandits/export/` as a
+   precision-first per-trajectory signal for any corpus with repeated rollouts,
+   kept separate from `ReviewedVerifier`.
