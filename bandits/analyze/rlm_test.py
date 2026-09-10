@@ -2400,7 +2400,7 @@ def test_the_whole_prompt_reaches_the_model() -> None:
     for required in (
         "required_outcome_shape",
         "Preserve the existing contract_id",
-        "Book a flight",
+        "Refund an eligible order",
         "Do not emit KEEP",
     ):
         assert required in text
@@ -2944,6 +2944,11 @@ def test_a_revise_that_renames_still_lands_on_the_contract_it_revised() -> None:
     assert survivor.name == "Modify an existing reservation"
     assert survivor.revision == 2
     assert any("invented id discarded" in limit for limit in draft.limitations)
+    # The trace the revision was made for must still be assigned, under the id
+    # that survived. Checking only the contract let a renamed REVISE pass while
+    # its assignment was validated against ids the rename had already removed
+    # and silently dropped, leaving the family with wording but no members.
+    assert set(draft.assignments.values()) == {"change_earlier_nonstop"}
 
 
 def test_a_revision_keeps_the_evidence_that_motivated_the_original() -> None:
@@ -3027,3 +3032,119 @@ def test_the_sweep_does_not_run_when_nothing_is_unresolved() -> None:
     )
     assert len(draft.chunks) == 1
     assert calls["n"] == 1
+
+
+# --- evidence, revision hygiene, and the prompt/schema contract ---------------
+
+
+def test_contract_evidence_is_rebuilt_from_final_assignments() -> None:
+    """A family holding three traces cited one, because the model writes
+    supporting_trace_ids as it goes and never revisits them."""
+
+    def predict(*, chunk: str, taxonomy: str, question: str = ""):
+        import json
+
+        rows = json.loads(chunk)
+        return SimpleNamespace(
+            # Claims only the first trace it ever saw, every time.
+            contracts=[{**_RAW_CONTRACT, "supporting_trace_ids": ["t0"]}],
+            operations=[],
+            assignments={row["trace_id"]: "c1" for row in rows},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    draft = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
+    )
+    assert draft.contracts[0].supporting_trace_ids == ("t0", "t1", "t2", "t3")
+
+
+def test_evidence_drops_a_trace_that_moved_away() -> None:
+    """Stale in the other direction: a member reassigned elsewhere."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1").replace(supporting_trace_ids=("t1", "t2"))}
+    state.assignments = {"t1": "c1"}
+    members: dict[str, list[str]] = {}
+    for trace_id, contract_id in state.assignments.items():
+        members.setdefault(contract_id, []).append(trace_id)
+    rebuilt = state.contracts["c1"].replace(
+        supporting_trace_ids=tuple(sorted(members.get("c1", ())))
+    )
+    assert rebuilt.supporting_trace_ids == ("t1",)
+
+
+def test_a_revise_reusing_the_right_id_does_not_duplicate_it() -> None:
+    """The good case still had to be removed from the list before re-appending."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+    from bandits.analyze.rlm_models import TaxonomyOperation
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1")}
+    contracts = [_contract("c1", "a broader definition")]
+    state.enforce_revisions(
+        [
+            TaxonomyOperation(
+                operation=Operation.REVISE, contract_ids=("c1",), rationale="too narrow"
+            )
+        ],
+        contracts,
+    )
+    assert [c.contract_id for c in contracts] == ["c1"]
+    assert contracts[0].revision == 2
+
+
+def test_the_audit_signature_and_prompt_agree_on_empty_values() -> None:
+    """The prompt asked for null on fields the DSPy signature types as str/list.
+
+    Only the output signature was ever wrong; the persisted AuditFinding has
+    always been optional. A model answering null exactly as instructed could
+    fail structured decoding.
+    """
+    from bandits.analyze.rlm_audit import instruction_for
+
+    text = instruction_for(TraceView.USER_MESSAGES)
+    assert "Empty list only if" in text
+    assert "Empty string if none is close" in text
+    assert "otherwise an empty string" in text
+    assert "Null" not in text
+
+
+def test_the_audit_asks_for_uncertain_rather_than_leaning_to_split() -> None:
+    from bandits.analyze.rlm_audit import instruction_for
+
+    text = instruction_for(TraceView.USER_MESSAGES)
+    assert "Prefer split over keep" not in text
+    assert 'answer "uncertain" rather than guessing' in text
+    # And it names the failure the sixteen-trace run actually produced.
+    assert "only because two contracts fixed different parameter values" in text
+
+
+def test_the_assignment_prompt_matches_its_own_schema() -> None:
+    from bandits.analyze.rlm_assign import instruction_for
+    from bandits.analyze.rlm_models import ProposedAssignment
+
+    text = instruction_for(TraceView.USER_MESSAGES)
+    assert ProposedAssignment.model_fields["primary_contract_id"].annotation is str
+    assert "do not answer null" in text
+    assert "Null when zero" not in text
+
+
+def test_mining_examples_are_not_all_one_domain() -> None:
+    """Four flight examples would specialize the miner while appearing to help."""
+    from bandits.analyze.rlm_mine import instruction_for
+
+    text = instruction_for(TraceView.USER_MESSAGES)
+    block = text[text.index("Examples, drawn") : text.index("Before creating")]
+    assert "order" in block and "password" in block, "examples span more than one domain"
+
+
+def test_the_repair_instruction_scopes_itself_to_contracts() -> None:
+    from bandits.analyze.rlm_mine import _REPAIR_INSTRUCTION
+
+    assert "Do not reconsider" in _REPAIR_INSTRUCTION
+    # Still short enough to be shown whole rather than as a peek.
+    assert len(_REPAIR_INSTRUCTION) < 900

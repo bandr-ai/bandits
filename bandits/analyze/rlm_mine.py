@@ -105,14 +105,20 @@ Treat these as parameters unless they materially change how success is checked: 
 route, date, time, cabin, passenger count, baggage, price or charge limit, \
 payment instrument, account, person, product, and other request-specific values.
 
-Examples:
-- "Book NYC to Seattle on May 20" and "Book Boston to Chicago next Friday" \
-belong to "Book a flight". Route and date are parameters.
-- "Move my flight earlier" and "Change my flight to nonstop" belong to "Modify \
-an existing reservation". Earlier and nonstop are requested constraints checked \
-by the same verifier template.
-- "Compensate me for a delay" and "Change my reservation" are different \
-families, because their required outcomes differ.
+Examples, drawn from unrelated domains on purpose — the rule is about required \
+outcomes, not about any one subject:
+- "Refund order 88123" and "Give me my money back for the blue chair" belong to \
+one family. Order id and product are parameters; both require the same check, \
+that the named order reached a refunded state for the stated amount.
+- "Move my flight earlier" and "Change my flight to nonstop" belong to one \
+family. Earlier and nonstop are requested constraints the same verifier \
+template checks against each trace's stated preference.
+- "Compensate me for the delay" and "Change my reservation" are different \
+families: one must establish that a credit of a policy-determined amount was \
+issued, the other that an itinerary changed. Neither check can stand in for the \
+other.
+- "Reset my password" and "Update my email address" are different families \
+despite both being account changes — the verifiable outcomes share no field.
 - Checking balances and then using those balances to rebook may be one compound \
 workflow when both outcomes are required by every member. Do not create a \
 compound family merely because two requests happened in one conversation.
@@ -132,8 +138,8 @@ REVISE rules:
 
 Naming rules:
 - Use a short human-readable imperative phrase with spaces.
-- Good: "Book a flight", "Modify an existing reservation".
-- Bad: "book_flight_nyc_to_sea_may20".
+- Good: "Refund an eligible order", "Modify an existing reservation".
+- Bad: "refund_order_88123", "book_flight_nyc_to_sea_may20".
 - Never include trace ids, people, routes, dates, amounts, card details, or \
 other request-specific values in the name.
 
@@ -702,7 +708,12 @@ class _TaxonomyState:
             # The body it returned, whatever it chose to call it. A revision
             # that reused the right id needs no repair.
             body = proposed.get(target)
-            if body is None:
+            if body is not None:
+                # Reusing the right id is the good case, and it still has to be
+                # taken out of the list: the revised copy is appended below, and
+                # leaving the original in place put the same contract in twice.
+                contracts.remove(body)
+            else:
                 strays = [c for c in contracts if c.contract_id not in self.contracts]
                 if len(strays) != 1:
                     continue
@@ -1262,11 +1273,26 @@ def mine_taxonomy(
                 "if this corpus records rewards under other names they reached the miner"
             )
 
+    # Evidence rebuilt from where traces actually ended up. The model writes
+    # supporting_trace_ids as it goes, so a contract records the traces that
+    # motivated it and never the ones assigned to it afterwards: in a recorded
+    # run a family holding three traces cited one. The assignments are the
+    # authority on membership, so they are the authority on evidence too.
+    members_by_contract: dict[str, list[str]] = {}
+    for trace_id, contract_id in state.assignments.items():
+        members_by_contract.setdefault(contract_id, []).append(trace_id)
+    final_contracts = tuple(
+        contract.replace(
+            supporting_trace_ids=tuple(sorted(members_by_contract.get(contract.contract_id, ())))
+        )
+        for contract in sorted(state.contracts.values(), key=lambda c: c.contract_id)
+    )
+
     return TaxonomyDraft(
         analysis_id=analysis_id,
         view=corpus.view,
         seed=seed,
-        contracts=tuple(sorted(state.contracts.values(), key=lambda c: c.contract_id)),
+        contracts=final_contracts,
         chunks=tuple(chunks),
         passes=tuple(passes),
         completed_passes=completed_passes,
@@ -1453,8 +1479,11 @@ non-empty `definition` and a non-empty `required_outcome_shape`: a list of \
 statements someone could check once the work is done. A name plus a description \
 is a topic, and a topic cannot be verified.
 
-Return corrected contracts. Keep what was right and add what was missing. Omit \
-any that genuinely cannot be given a checkable outcome. Rejected:"""
+Return corrected contracts only. Do not reconsider the taxonomy operations or \
+the trace assignments from your last answer; those were accepted and anything \
+you return for them is discarded. Keep what was right about each contract and \
+add what was missing. Omit any that genuinely cannot be given a checkable \
+outcome. Rejected:"""
 """Deliberately short. This rides in its own input field, and a field under a
 thousand characters is shown to the root model whole rather than as a peek."""
 
