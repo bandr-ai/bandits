@@ -92,7 +92,7 @@ def test_model_judge_keeps_structured_rationale_and_fails_closed() -> None:
         '{"verdict":"failure","confidence":0.91,"rationale":"wrong action"}'
     )
     assert verdict is Verdict.FAILURE
-    assert rationale.startswith("auto-label-v2:")
+    assert rationale.startswith("auto-label-v3:")
     assert "wrong action" in rationale
 
     verdict, rationale = _parse_model_label("not json")

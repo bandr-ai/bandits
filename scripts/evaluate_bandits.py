@@ -41,7 +41,10 @@ from bandits.verify import (
     start_review,
     validate_draft,
 )
-from bandits.verify.judge import DEFAULT_MODEL, fireworks_completion, render_transcript
+from bandits.verify.judge import fireworks_completion, render_transcript
+
+MODEL_LABEL_MODEL = "accounts/fireworks/models/gpt-oss-120b"
+MODEL_LABEL_VERSION = "auto-label-v3"
 
 
 @dataclass
@@ -280,13 +283,13 @@ Return ONLY one JSON object:
 def _parse_model_label(reply: str) -> tuple[Verdict, str]:
     start, end = reply.find("{"), reply.rfind("}")
     if start < 0 or end < start:
-        return Verdict.UNCLEAR, f"auto-label-v2: unparseable response: {reply[:500]}"
+        return Verdict.UNCLEAR, f"{MODEL_LABEL_VERSION}: unparseable response: {reply[:500]}"
     try:
         parsed = json.loads(reply[start : end + 1])
         verdict = Verdict(str(parsed.get("verdict", "unclear")).lower())
     except (json.JSONDecodeError, ValueError, AttributeError):
-        return Verdict.UNCLEAR, f"auto-label-v2: unparseable response: {reply[:500]}"
-    return verdict, "auto-label-v2: " + json.dumps(parsed, sort_keys=True)
+        return Verdict.UNCLEAR, f"{MODEL_LABEL_VERSION}: unparseable response: {reply[:500]}"
+    return verdict, f"{MODEL_LABEL_VERSION}: " + json.dumps(parsed, sort_keys=True)
 
 
 def model_label_family(project: Path, taskset_id: str, family_id: str):
@@ -297,7 +300,9 @@ def model_label_family(project: Path, taskset_id: str, family_id: str):
     if cached is not None:
         label_set = load_label_set(cached.artifact_id, store)
         if label_set.labels and all(
-            label.source == "model" and label.rationale.startswith("auto-label-v2:")
+            label.source == "model"
+            and label.labeler == MODEL_LABEL_MODEL
+            and label.rationale.startswith(f"{MODEL_LABEL_VERSION}:")
             for label in label_set.labels
         ):
             return label_set, cached.artifact_id, True
@@ -308,7 +313,7 @@ def model_label_family(project: Path, taskset_id: str, family_id: str):
 
     def label_trace(trace_id: str) -> tuple[Verdict, str]:
         prompt = _model_label_prompt(traces[trace_id])
-        reply = fireworks_completion(DEFAULT_MODEL, prompt, 0.2)
+        reply = fireworks_completion(MODEL_LABEL_MODEL, prompt, 0.0)
         return _parse_model_label(reply)
 
     decisions = {trace_id: label_trace(trace_id) for trace_id in family.trace_ids}
@@ -317,10 +322,10 @@ def model_label_family(project: Path, taskset_id: str, family_id: str):
             trace_id=trace_id,
             family_id=family_id,
             verdict=decision[0],
-            labeler=DEFAULT_MODEL,
+            labeler=MODEL_LABEL_MODEL,
             source="model",
             rationale=decision[1],
-            prompted_by="auto-label-v2",
+            prompted_by=MODEL_LABEL_VERSION,
         )
         for trace_id, decision in decisions.items()
     )
@@ -461,7 +466,7 @@ def review_app(project: Path, labeler: str) -> None:
             label = label_by_trace.get(trace_id)
             if label is None:
                 return "No model judgment recorded."
-            raw = label.rationale.removeprefix("auto-label-v2: ")
+            raw = label.rationale.removeprefix(f"{MODEL_LABEL_VERSION}: ")
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
