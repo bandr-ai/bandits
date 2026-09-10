@@ -69,8 +69,10 @@ Use this when success needs to be explainable, measured, and tied to an owner de
 # 1. Extract candidate tasks and outcome evidence.
 uv run bandits analyze <corpus-id> --tasks
 
-# 2. Group related work and create lineage-safe fit/held-out splits.
-uv run bandits mine <analysis-id> --budget 20
+# 2. Discover task families by reading requests, then materialize them
+#    into a task set with lineage-safe fit/held-out splits.
+uv run bandits mine-rlm <analysis-id>
+uv run bandits materialize-rlm-taskset <clustering-run-id>
 uv run bandits families <task-set-id>
 
 # 3. Draft checks for one family and run them over historical fit traces.
@@ -121,15 +123,17 @@ uv run bandits export <task-set-id> --format sft \
 
 The fit/held-out split moves whole lineage groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so two runs of the same request from different sessions arrive as independent groups — and a source that declares no lineage at all leaves every trace its own.
 
-Before splitting, lineage groups are unioned by duplicate evidence: identical requests, and — where a backend can measure it — requests above a much stricter similarity than the one used for grouping. Normalization changes case and separators only; it preserves identifiers and every other value, so `refund order 7741` and `refund order 8802` remain distinct inputs to both grouping and duplicate detection.
+Two traces of the same normalized request are held together as well, so a corpus that declares no lineage still cannot put one request on both sides. Normalization changes case and separators only; it preserves identifiers and every other value, so `refund order 7741` and `refund order 8802` remain distinct.
 
-The joins are recorded on the family as auditable edges rather than applied silently, and survive a reviewer's correction: `merge-families` reads the analysis so it can find lineages the two families disagreed about, moves any that end up on both sides whole to one side, and says it did. Without them, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
+Without this, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
+
+Whole groups move, so the realized held-out share is whatever complete groups come nearest the requested fraction. A family with only one independent group reports that it has no held-out side rather than taking one, because a verifier there can be drafted but never validated.
 
 ### What produced a grouping
 
-A task set records the clustering that formed its families: the distance backend, the resolved similarity threshold and neighbor count, and — where vectors were compared — the embedding model and the cache artifact holding them. Resolved values, not the flags that were passed, so an omitted flag records the default that actually applied.
+A task set records the arm that produced it — the trace view the miner read — along with the model and the clustering run behind it. Families carry no coherence figure and no similarity threshold: nothing measured a distance, and a plausible number in those fields would be fabricated geometry in an artifact whose whole claim is that it used none. Each family's representative is its lexically first member, which is a real trace chosen by a rule that cannot be mistaken for a centrality claim.
 
-Mining the same analysis twice under different settings produces two task sets that differ in content, and therefore in id. This is what explains why. It is also what an embedding grouping needs in order to be reproducible at all: `EmbeddingCache` refuses to mix vectors from two models because they are not comparable, and a task set grouped by those vectors inherits the constraint.
+A materialized task set also records what this path cannot claim: the miner named a family and placed its members in one context, so membership was never checked by an independent pass.
 ### Ranking drafted checks against outcomes
 
 Drafting proposes checks from values observed across a family's fit traces, and measures every candidate over those traces by executing it. The draft carries the results: success support, failure rejection, false positives, scorable coverage, and unknown count.
@@ -217,10 +221,11 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `ingest` | Normalize, redact, and store a trace export |
 | `list` / `show` | Browse corpora, traces, spans, and ingest issues |
 | `analyze` | Extract task candidates and outcome evidence |
-| `mine` / `families` | Group tasks, split lineages without separating duplicates, and select representative runs, recording the clustering that produced them |
-| `merge-families` / `split-family` | Record human corrections to proposed groupings |
+| `mine-rlm` | Discover task families by reading raw user requests, with no embedding geometry |
+| `audit-rlm` | Advisory: challenge each discovered family in a fresh adversarial context. Changes nothing |
+| `materialize-rlm-taskset` / `families` | Turn a clustering run into a task set with lineage-safe fit/held-out splits, and read it back |
+| `rlm-session` / `rlm-families` | Watch a running mining session; read its families as reviewable cards |
 | `draft-verifier` | Propose deterministic checks, rank them against labeled outcomes, and replay them on history |
-| `audit-families` | Advisory model read of family coherence; proposes splits only |
 | `interview-verifier` | Refine a draft through a bounded owner interview |
 | `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
 | `label` | Label disagreements and the remaining family runs |
@@ -270,7 +275,7 @@ The test suite exercises ingestion fidelity, redaction, content-addressed storag
 ```text
 bandits/
 ├── ingest/      # OTLP, chat JSON, and Claude Code adapters
-├── analyze/     # task extraction, evidence, embeddings, and families
+├── analyze/     # task extraction, evidence, and RLM family discovery
 ├── verify/      # draft, execute, interview, validate, review, and judge
 ├── export/      # verifier-gated SFT and portable eval JSONL
 ├── traces.py    # immutable canonical trace contracts

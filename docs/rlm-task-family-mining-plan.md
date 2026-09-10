@@ -1,12 +1,19 @@
 # RLM Task-Family Mining Plan
 
+> **Status.** Built and shipped, with the lifecycle around it cut back. Freezing,
+> fresh assignment and cross-run stability were designed here and then removed
+> before merge: none had been run against a real corpus, and each existed to
+> support the next. The miner's own final assignments are now authoritative and
+> materialize straight into a TaskSet. Sections below marked *not built* record
+> what was planned and why it was dropped, rather than describing the code.
+
 ## Goal
 
 Add an experimental RLM miner that discovers reusable task families from raw agent traces without embedding geometry, predefined domains, task categories, or action schemas.
 
 Two traces belong to one family when the same parameterized verifier contract could correctly evaluate what their users requested.
 
-Keep the existing mutual-kNN miner as a baseline until the RLM path demonstrates better semantic coherence, stability, and downstream verifier transfer.
+The embedding mutual-kNN miner was kept as a baseline during development and has since been removed: nothing called it, and a second grouping backend no command reaches is weight without evidence behind it.
 
 ## Input boundary
 
@@ -61,15 +68,16 @@ Path F wins only if it improves semantic family coherence and verifier transfer 
 
     Raw trajectories
       -> user-message views
-      -> iterative RLM taxonomy discovery
-      -> adversarial contract audit
-      -> frozen family contracts
-      -> fresh RLM assignment of every trace
-      -> ambiguity and coverage review
-      -> repeated-run stability analysis
-      -> optional TaskSet materialization
+      -> iterative RLM family discovery
+      -> optional advisory audit
+      -> TaskSet materialization
 
-Embeddings and kNN are excluded from the initial experiment so the semantic hypothesis is tested cleanly.
+Embeddings and kNN are excluded so the semantic hypothesis is tested cleanly.
+
+What this flow no longer contains, and what that costs: a family and the traces
+in it are decided by one context, so nothing independent checks the placement.
+Materialized task sets say so in their limitations rather than leaving a reader
+to assume otherwise.
 
 ## Read-only corpus interface
 
@@ -154,6 +162,10 @@ The discovery RLM must explicitly resolve or preserve every audit finding.
 
 ## Stop conditions
 
+*Not built as a freeze gate.* A run stops on its requested passes or a budget, and
+the conditions below became the reviewer's checklist rather than a promotion
+rule. The original text follows.
+
 Freeze the taxonomy only after two consecutive complete sweeps:
 
 - create no family;
@@ -168,6 +180,13 @@ Freeze the taxonomy only after two consecutive complete sweeps:
 Enforce hard iteration, model-call, elapsed-time, and monetary budgets. Hitting a limit produces an incomplete artifact, never a successful taxonomy.
 
 ## Fresh assignment
+
+*Not built.* Removed before merge. The argument for it stands — a definition that
+changed mid-loop makes the placements that preceded it provisional, and a cold
+classifier cannot inherit the reasoning that produced a family — but it was never
+run against a real corpus, and keeping it meant keeping the freeze it depended on.
+What it would have bought is now recorded as a limitation on every task set. The
+original text follows.
 
 Discovery assignments are provisional because their definitions changed during the loop. After freezing:
 
@@ -190,6 +209,11 @@ Never force a match. Preserve multiple matches and uncertainty for reconciliatio
 
 ## Stability
 
+*Not built.* Removed with the assignment runs it compared. Worth rebuilding
+against two clustering runs' own assignments when there is a reason to spend the
+runs: co-assignment agreement is still the right measurement, and generated
+family names are still worthless for it. The original text follows.
+
 Repeat the complete discovery and assignment process at least five times with different recorded input orders or seeds. Runs must not share taxonomies.
 
 Compare runs by trace co-assignment rather than generated family names. Report:
@@ -206,15 +230,11 @@ If needed, reconcile the independent taxonomies into a consensus taxonomy, then 
 
 Keep stages separate and content-addressed:
 
-    rlm-mining-run
     rlm-clustering-run
-    rlm-taxonomy-audit
-    rlm-taxonomy
-    rlm-assignment-run
-    rlm-stability-report
-    rlm-taskset
+    rlm-clustering-audit    (optional, advisory)
+    taskset
 
-Each artifact records parent IDs, model, prompt digest, sampling seed, budgets, timestamps, and limitations. A draft must never silently become an accepted TaskSet.
+Each artifact records parent IDs, model, prompt digest, sampling seed, budgets, timestamps, and limitations.
 
 Ambiguous, uncovered, and unreadable traces remain visible and are excluded from automatic verifier drafting until reviewed.
 
@@ -229,25 +249,22 @@ Ambiguous, uncovered, and unreadable traces remain visible and are excluded from
 
 Follow-up stages:
 
-    bandits audit-rlm-taxonomy TAXONOMY_DRAFT_ID --project PROJECT
-    bandits assign-rlm-taxonomy TAXONOMY_ID ANALYSIS_ID --project PROJECT
-    bandits validate-rlm-mining ASSIGNMENT_RUN_ID --project PROJECT
-    bandits materialize-rlm-taskset ASSIGNMENT_RUN_ID --project PROJECT
+    bandits audit-rlm RUN_ID --project PROJECT            (optional, advisory)
+    bandits materialize-rlm-taskset RUN_ID --project PROJECT
 
-Discovery, assignment, validation, and materialization remain separate operations.
+The audit is advisory: it saves findings, moves no trace, and materialization
+neither requires it nor reads it.
 
 ## Evaluation
 
 Compare:
 
-1. Current embedding mutual-kNN mining.
-2. One-shot LLM clustering.
-3. Iterative RLM over user messages plus fresh assignment.
-4. Iterative RLM over full trajectories plus fresh assignment.
-5. Iterative RLM over user messages with adversarial audit.
-6. Iterative RLM over full trajectories with adversarial audit.
+1. One-shot LLM clustering.
+2. Iterative RLM over user messages.
+3. Iterative RLM over full trajectories.
 
-Do not use embedding-mined families as ground truth. Measure:
+Arms 3-6 of the original list paired each with fresh assignment, which no longer
+exists. Measure:
 
 - blind human acceptance of family coherence;
 - over-merging and fragmentation;
@@ -265,7 +282,7 @@ The decisive test is whether a verifier drafted from some family members correct
 - Add user-message trace views.
 - Add discovery, contract, iteration, and assignment models.
 - Implement the read-only corpus interface.
-- Implement iterative discovery and fresh assignment.
+- Implement iterative discovery. *(Fresh assignment dropped: see Fresh assignment.)*
 - Run on the 160-trace corpus without embeddings.
 
 ### Phase B: Reliability
@@ -273,20 +290,22 @@ The decisive test is whether a verifier drafted from some family members correct
 - Add structured response validation.
 - Add resumable checkpoints and budgets.
 - Add adversarial audits and formal stop conditions.
-- Add five-run stability measurement.
+- Add five-run stability measurement. *(Dropped: see Stability.)*
 
 ### Phase C: Bandits integration
 
 - Add honest RLM provenance to TaskSet without fabricated similarity fields.
 - Preserve unresolved traces.
-- Connect reviewed families to selection and verifier drafting.
-- Add reviewer actions for accept, revise, split, and merge.
+- Connect discovered families to selection and verifier drafting.
+- Add reviewer actions for accept, revise, split, and merge. *(Not built: an
+  exact-instruction split would undo the parameterization the miner exists to
+  find. Re-mine instead, until there is a contract-aware correction to write.)*
 
 ### Phase D: Enterprise scaling
 
 - Shard corpora mechanically.
 - Recursively reconcile shard-level contract proposals.
-- Reassign traces against frozen global contracts.
+- Reassign traces against stable global contracts.
 - Process novel and ambiguous traffic during incremental updates.
 - Introduce embedding retrieval only after pure-RLM semantic quality is established.
 
@@ -306,4 +325,11 @@ If it only creates better names for incoherent groups, the experiment failed. If
 
 The governing principle is:
 
-> The RLM maintains a falsifiable taxonomy, repeatedly tests it against raw user requests, freezes it, and sends every membership decision through an independent pass.
+> The RLM maintains a falsifiable taxonomy and repeatedly tests it against raw
+> user requests.
+>
+> The clause that followed — "freezes it, and sends every membership decision
+> through an independent pass" — describes the half that was cut. Restoring it is
+> what would make a family's membership evidence rather than assertion, and it is
+> the first thing to rebuild if these families are ever used for more than
+> drafting.
