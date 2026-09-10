@@ -1409,15 +1409,26 @@ def _run_chunk(
         if op is not None
     ]
 
-    # Before the assignment ids are checked: a REVISE that renamed its contract
-    # leaves this chunk's assignments pointing at an id that is about to be
-    # discarded, and validating them first would drop every one of them.
+    # Enforced once, and before the assignment ids are validated. A REVISE that
+    # renamed its contract leaves this chunk's assignments pointing at an id
+    # that enforcement is about to discard, so the raw ids are rewritten through
+    # the alias map first. Validating them beforehand dropped every row naming
+    # the invented id — the contract survived and the traces that motivated the
+    # revision silently did not.
     limitations.extend(state.enforce_revisions(operations, contracts))
 
     available = {**state.contracts, **{c.contract_id: c for c in contracts}}
     chunk_ids = set(trace_ids)
+    raw_assignments = _decoded(getattr(prediction, "assignments", None))
+    if state.revision_aliases and isinstance(raw_assignments, dict):
+        raw_assignments = {
+            trace_id: state.revision_aliases.get(contract_id, contract_id)
+            if isinstance(contract_id, str)
+            else contract_id
+            for trace_id, contract_id in raw_assignments.items()
+        }
     assignments = _parse_assignments(
-        _decoded(getattr(prediction, "assignments", None)),
+        raw_assignments,
         chunk_ids=chunk_ids,
         contract_ids=set(available),
     )
@@ -1432,15 +1443,6 @@ def _run_chunk(
     # this stage must never do.
     unplaced = set(ambiguous) | set(uncovered)
     assignments = {t: c for t, c in assignments.items() if t not in unplaced}
-
-    # Before anything is folded in: a REVISE that renamed the contract it was
-    # revising would otherwise land as a second, near-identical family.
-    limitations.extend(state.enforce_revisions(operations, contracts))
-    if state.revision_aliases:
-        assignments = {
-            trace_id: state.revision_aliases.get(contract_id, contract_id)
-            for trace_id, contract_id in assignments.items()
-        }
 
     # An operation naming a contract nobody proposed and nobody already holds is
     # a claim the model did not carry out. Recorded rather than executed: it

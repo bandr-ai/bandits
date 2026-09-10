@@ -2944,6 +2944,12 @@ def test_a_revise_that_renames_still_lands_on_the_contract_it_revised() -> None:
     assert survivor.name == "Modify an existing reservation"
     assert survivor.revision == 2
     assert any("invented id discarded" in limit for limit in draft.limitations)
+    # The load-bearing assertion. Checking only which contracts survive passes
+    # even when the trace that motivated the revision was silently dropped,
+    # because its assignment named the id enforcement had just discarded.
+    assert len(draft.assignments) == 2
+    assert set(draft.assignments.values()) == {"change_earlier_nonstop"}
+    assert survivor.supporting_trace_ids == ("t0", "t1")
     # The trace the revision was made for must still be assigned, under the id
     # that survived. Checking only the contract let a renamed REVISE pass while
     # its assignment was validated against ids the rename had already removed
