@@ -20,7 +20,6 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from bandits.analyze.analysis import compute_analysis_id
-from bandits.analyze.families import compute_task_set_id
 from bandits.analyze.models import (
     CorpusAnalysis,
     Evidence,
@@ -28,6 +27,7 @@ from bandits.analyze.models import (
     TaskSet,
     Visibility,
 )
+from bandits.analyze.tasksets import compute_task_set_id
 from bandits.labels import LabelSet, Verdict, compute_label_set_id
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
