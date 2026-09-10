@@ -57,19 +57,27 @@ not enough.
 
 Report:
 - least_compatible_pair: the two member trace_ids whose requested work differs \
-most, and say how their required outcomes differ. Null only if there are under \
-two members.
+most, and say how their required outcomes differ. Empty list only if there are \
+under two members.
 - strongest_outsider_trace_id: the outsider that most looks like it belongs. \
-Null if none is close.
+Empty string if none is close.
 - topical_only: true if the members share a subject but would need materially \
 different verifiers. This is the failure you are most looking for.
 - recommendation: "keep", "revise", "split", "merge", or "uncertain".
 - merge_with_contract_id: for "merge", the sibling contract_id whose requested \
-work and required outcome can use the same parameterized verifier; otherwise null.
+work and required outcome can use the same parameterized verifier; otherwise an \
+empty string.
 - rationale: two or three sentences on what decided it.
 
-Prefer split over keep when in doubt. Recommend merge only when the two contracts \
-can genuinely share one verifier contract, not merely because their topics overlap. \
+When the evidence does not settle it, answer "uncertain" rather than guessing at \
+split or keep. Split when you can name the outcome check that would have to \
+differ; keep when every member answers to the same one.
+
+Check the sibling contracts for a boundary that exists only because two \
+contracts fixed different parameter values — a different route, amount, product \
+or account — while requiring the same outcome check. That is a merge, and it is \
+the failure most easily missed. Recommend merge only when the two contracts can \
+genuinely share one verifier contract, not merely because their topics overlap. \
 Recommendations are advisory; never rewrite or combine contracts yourself."""
 
 

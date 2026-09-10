@@ -62,8 +62,13 @@ For every trace in the batch return one result with:
 one. Return an empty list when none does — omitting the field is not the same \
 as deciding nothing matched.
 - primary_contract_id: the single best match, ONLY when exactly one contract \
-matches. Null when zero or several match.
+matches. An empty string when zero or several match — the field is a string, so \
+do not answer null.
 - reason: one or two sentences citing what in the user's request decided it.
+
+Naming more than one contract is a real answer, not a failure: two contracts \
+that both genuinely match one request is evidence the taxonomy overlaps, and \
+that is worth recording. Do not narrow to one to avoid it.
 
 Do not return a status. The program derives it from your match list: one match \
 is assigned, two or more is ambiguous, none is uncovered. Any trace matching \
