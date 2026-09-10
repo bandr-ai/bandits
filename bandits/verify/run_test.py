@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from bandits.analyze import analyze_corpus, compute_analysis_id
-from bandits.analyze.fixtures import task_set_by_first_word
 from bandits.analyze.models import EvidenceKind
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
@@ -30,6 +29,7 @@ from bandits.verify.models import (
     VerifierSpec,
     VerifierStatus,
 )
+from tests.tasksets import task_set_by_first_word
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 

@@ -283,3 +283,78 @@ def test_the_provenance_names_the_arm_rather_than_a_threshold() -> None:
     assert task_set.clustering.backend == "rlm-full-trajectory"
     assert task_set.clustering.embedding_model is None
     assert any("behaviour groups" in limit for limit in task_set.limitations)
+
+
+def test_one_request_in_two_lineages_stays_on_one_side() -> None:
+    """The two grouping rules compose; the second is not a fallback for the first.
+
+    Two runs of the same request from different sessions arrive as different
+    lineages. Reading the request rule only when lineage is absent leaves them
+    free to land on opposite sides, which is the leak the rule exists to close.
+    """
+    analysis = _analysis(
+        ("t1", "L1", "Refund order 123"),
+        ("t2", "L2", "refund order 123"),
+        ("t3", "L3", "Cancel the flight"),
+        ("t4", "L4", "Change my seat"),
+        ("t5", "L5", "Add a bag"),
+        ("t6", "L6", "Upgrade the cabin"),
+    )
+    run = _run(analysis, {f"t{i}": "c1" for i in range(1, 7)})
+
+    family = materialize_task_set(run, analysis, held_out=0.4).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert not ({"t1", "t2"} & fit and {"t1", "t2"} & held), (
+        "one request in two lineages was split across the boundary"
+    )
+
+
+def test_a_lineage_chain_and_a_shared_request_merge_into_one_group() -> None:
+    """Transitivity: t1-t2 by lineage, t2-t3 by request, so all three move together."""
+    analysis = _analysis(
+        ("t1", "L1", "Refund order 123"),
+        ("t2", "L1", "Cancel the flight"),
+        ("t3", "L2", "cancel the flight"),
+        ("t4", "L3", "Change my seat"),
+        ("t5", "L4", "Add a bag"),
+        ("t6", "L5", "Upgrade the cabin"),
+    )
+    run = _run(analysis, {f"t{i}": "c1" for i in range(1, 7)})
+
+    family = materialize_task_set(run, analysis, held_out=0.5).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    chain = {"t1", "t2", "t3"}
+    assert not (chain & fit and chain & held), "a transitively joined component was split"
+
+
+def test_a_trace_the_analysis_never_had_is_refused() -> None:
+    """Without this it becomes a real family member: it has no task to read, so
+    the split treats it as its own group and every count downstream includes it."""
+    analysis = _analysis(("t1", None, "refund"))
+    run = _run(analysis, {"t1": "c1"}, contract_ids=["c1"])
+    run = run.model_copy(update={"assignments": {"t1": "c1", "hallucinated": "c1"}})
+
+    with pytest.raises(MaterializationError, match="does not contain"):
+        materialize_task_set(run, analysis)
+
+
+def test_an_unresolved_trace_the_analysis_never_had_is_refused() -> None:
+    analysis = _analysis(("t1", None, "refund"))
+    run = _run(analysis, {"t1": "c1"}, ambiguous_trace_ids=("ghost",))
+
+    with pytest.raises(MaterializationError, match="does not contain"):
+        materialize_task_set(run, analysis)
+
+
+def test_the_task_set_records_the_model_and_run_that_produced_it() -> None:
+    """"Which model produced this" is the first question asked of two task sets
+    that disagree, and prose in limitations cannot be compared across artifacts."""
+    analysis = _analysis(("t1", None, "refund"))
+    run = _run(analysis, {"t1": "c1"})
+
+    task_set = materialize_task_set(run, analysis, run_id="rlm-clustering-run-abc")
+
+    assert task_set.clustering.model == "test-model"
+    assert task_set.clustering.source_run_id == "rlm-clustering-run-abc"

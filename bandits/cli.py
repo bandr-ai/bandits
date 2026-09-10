@@ -1957,7 +1957,7 @@ def materialize_rlm_taskset_command(
         raise typer.Exit(code=1) from exc
 
     try:
-        task_set = materialize_task_set(run, analysis, held_out=held_out)
+        task_set = materialize_task_set(run, analysis, held_out=held_out, run_id=run_id)
     except MaterializationError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc

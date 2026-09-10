@@ -224,10 +224,15 @@ def main() -> int:
     # is a dozen model calls.
     derived_store = DerivedStore(args.project / ".bandits")
     session_store = SessionStore(args.project / ".bandits")
-    # Saved, not stamped with a made-up parent. A run written with an analysis id
-    # that was never persisted cannot be audited or materialized afterwards: every
-    # command downstream loads the analysis to reach the traces, and a fabricated
-    # parent leaves the artifact readable but permanently orphaned.
+    # The sampled corpus first, then its analysis. Sampling builds a new corpus
+    # whose id is the hash of the traces it kept, and analyzing it stamps that id
+    # onto the analysis. Saving only the analysis leaves a chain whose second
+    # link points at a corpus that was never written, so `audit-rlm` follows
+    # analysis.corpus_id into the store and finds nothing — the same orphaning as
+    # the fabricated "smoke-analysis" parent, one level deeper.
+    artifact_store = ArtifactStore(args.project / ".bandits")
+    sampled = artifact_store.write(corpus_obj, source_path=f"smoke-sample-of-{corpus_id}")
+    print(f"  sampled corpus saved: {sampled.artifact_id}")
     analysis_envelope = save_analysis(analysis, derived_store)
     analysis_id = analysis_envelope.artifact_id
     print(f"  analysis saved: {analysis_id}")
@@ -336,7 +341,7 @@ def main() -> int:
     # Straight from the run. Its own final assignments are the placement, so
     # there is no freeze and no second classification pass between here and a
     # task set.
-    task_set = materialize_task_set(draft, analysis, held_out=0.3)
+    task_set = materialize_task_set(draft, analysis, held_out=0.3, run_id=draft_id)
     task_set_id = save_task_set(task_set, derived_store).artifact_id
     print(f"  task set saved: {task_set_id}")
     for family in task_set.families:

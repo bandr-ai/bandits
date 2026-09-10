@@ -131,7 +131,7 @@ Whole groups move, so the realized held-out share is whatever complete groups co
 
 ### What produced a grouping
 
-A task set records the arm that produced it — the trace view the miner read — along with the model and the clustering run behind it. Families carry no coherence figure and no similarity threshold: nothing measured a distance, and a plausible number in those fields would be fabricated geometry in an artifact whose whole claim is that it used none. Each family's representative is its lexically first member, which is a real trace chosen by a rule that cannot be mistaken for a centrality claim.
+A task set records the arm that produced it — the trace view the miner read — along with the model that proposed the families and the id of the clustering run it was materialized from. Families carry no coherence figure and no similarity threshold: nothing measured a distance, and a plausible number in those fields would be fabricated geometry in an artifact whose whole claim is that it used none. Each family's representative is its lexically first member, which is a real trace chosen by a rule that cannot be mistaken for a centrality claim.
 
 A materialized task set also records what this path cannot claim: the miner named a family and placed its members in one context, so membership was never checked by an independent pass.
 ### Ranking drafted checks against outcomes
