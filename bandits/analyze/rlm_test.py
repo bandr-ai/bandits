@@ -26,7 +26,7 @@ from bandits.analyze.rlm_assign import (
 )
 from bandits.analyze.rlm_audit import (
     FreezeRefused,
-    audit_taxonomy,
+    audit_clustering,
     compute_taxonomy_id,
     freeze_taxonomy,
     resolve_findings,
@@ -36,10 +36,10 @@ from bandits.analyze.rlm_mine import (
     MiningError,
     _last_call_was_truncated,
     _parse_contract,
-    compute_draft_id,
-    load_draft,
+    compute_run_id,
+    load_clustering_run,
     mine_taxonomy,
-    save_draft,
+    save_clustering_run,
 )
 from bandits.analyze.rlm_models import (
     AssignmentRun,
@@ -49,9 +49,9 @@ from bandits.analyze.rlm_models import (
     FamilyContract,
     FrozenTaxonomy,
     Operation,
+    RLMClusteringAudit,
+    RLMClusteringRun,
     StopReason,
-    TaxonomyAudit,
-    TaxonomyDraft,
     TaxonomyOperation,
     TraceAssignment,
     TraceView,
@@ -323,12 +323,12 @@ def test_discovery_runs_every_requested_pass_then_pauses() -> None:
             {"contract_id": "c1"},
         ]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
-    assert draft.stop_reason is StopReason.PASSES_COMPLETE
-    assert draft.complete
-    assert draft.awaiting_review
-    assert draft.completed_passes == 2
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    assert run.stop_reason is StopReason.PASSES_COMPLETE
+    assert run.complete
+    assert run.awaiting_review
+    assert run.completed_passes == 2
+    assert [c.contract_id for c in run.contracts] == ["c1"]
 
 
 def test_every_eligible_trace_is_read_once_in_every_pass() -> None:
@@ -351,40 +351,40 @@ def test_every_eligible_trace_is_read_once_in_every_pass() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
-    assert draft.completed_passes == 2
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    assert run.completed_passes == 2
     assert set(seen) == {f"t{i}" for i in range(40)}
     assert all(count == 2 for count in seen.values()), seen
-    for result in draft.passes:
+    for result in run.passes:
         assert result.complete
         assert len(result.trace_ids) == 40
 
 
 def test_each_pass_reshuffles_under_its_own_recorded_seed() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
         seed=7,
     )
-    assert [p.seed for p in draft.passes] == [7, 8]
-    assert draft.passes[0].trace_ids != draft.passes[1].trace_ids
+    assert [p.seed for p in run.passes] == [7, 8]
+    assert run.passes[0].trace_ids != run.passes[1].trace_ids
 
 
 def test_a_partial_pass_never_counts_toward_the_schedule() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=10,
         budget=Budget(max_iterations=2),
     )
-    assert draft.completed_passes == 0
-    assert not draft.complete
-    assert not draft.passes[0].complete
+    assert run.completed_passes == 0
+    assert not run.complete
+    assert not run.passes[0].complete
 
 
 def test_a_failed_chunk_does_not_shrink_a_pass_coverage() -> None:
@@ -410,20 +410,20 @@ def test_a_failed_chunk_does_not_shrink_a_pass_coverage() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(30))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
-    assert draft.completed_passes == 2
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    assert run.completed_passes == 2
     assert all(count == 2 for count in seen.values())
 
 
 def test_pass_diff_reports_what_the_second_look_changed() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    diff = draft.pass_diff()
+    diff = run.pass_diff()
     assert diff
     assert any("placed differently" in line for line in diff)
     assert any("not itself a convergence test" in line for line in diff)
@@ -431,13 +431,13 @@ def test_pass_diff_reports_what_the_second_look_changed() -> None:
 
 def test_a_complete_run_still_refuses_to_call_itself_converged() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    assert any("not a convergence test" in limit for limit in draft.limitations)
+    assert any("not a convergence test" in limit for limit in run.limitations)
 
 
 def test_a_run_that_never_settles_stops_on_budget_and_is_incomplete() -> None:
@@ -452,26 +452,26 @@ def test_a_run_that_never_settles_stops_on_budget_and_is_incomplete() -> None:
             }
         ]
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(max_iterations=3)
     )
-    assert draft.stop_reason is StopReason.MAX_ITERATIONS
-    assert not draft.complete
-    assert any("before completing its" in limit for limit in draft.limitations)
+    assert run.stop_reason is StopReason.MAX_ITERATIONS
+    assert not run.complete
+    assert any("before completing its" in limit for limit in run.limitations)
 
 
 def test_two_chunks_are_not_two_passes() -> None:
     """The precise defect: chunk cleanliness must not substitute for coverage."""
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
     )
     # Four chunks per pass, two passes: never fewer, however quiet they were.
-    assert len(draft.chunks) == 8
-    assert draft.completed_passes == 2
+    assert len(run.chunks) == 8
+    assert run.completed_passes == 2
 
 
 def test_contracts_with_no_outcome_shape_are_dropped_and_reported() -> None:
@@ -479,12 +479,12 @@ def test_contracts_with_no_outcome_shape_are_dropped_and_reported() -> None:
     predict = _ScriptedMiner(
         [{"contracts": [{"contract_id": "c1", "name": "Stuff", "definition": "things"}]}]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert draft.contracts == ()
-    assert any("the parser refused" in limit for limit in draft.limitations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert run.contracts == ()
+    assert any("the parser refused" in limit for limit in run.limitations)
     # The rejected contract is kept verbatim, so a failed run can be diagnosed
     # without paying for another one.
-    assert any(chunk.dropped_contracts for chunk in draft.chunks)
+    assert any(chunk.dropped_contracts for chunk in run.chunks)
 
 
 def test_hallucinated_trace_ids_are_dropped_rather_than_losing_the_chunk() -> None:
@@ -502,9 +502,9 @@ def test_a_trace_marked_unplaced_is_never_also_assigned() -> None:
     predict = _ScriptedMiner(
         [{"contracts": [_RAW_CONTRACT], "contract_id": "c1", "uncovered": ["t2"]}]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert "t2" in draft.uncovered_trace_ids
-    assert all("t2" not in chunk.assignments for chunk in draft.chunks)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert "t2" in run.uncovered_trace_ids
+    assert all("t2" not in chunk.assignments for chunk in run.chunks)
 
 
 def test_a_failed_chunk_is_recorded_and_the_loop_continues() -> None:
@@ -523,11 +523,11 @@ def test_a_failed_chunk_is_recorded_and_the_loop_continues() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    failed = [c for c in draft.chunks if c.status == "error"]
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    failed = [c for c in run.chunks if c.status == "error"]
     assert len(failed) == 1
     assert "fell over" in failed[0].error
-    assert len(draft.chunks) > 1
+    assert len(run.chunks) > 1
 
 
 def _entry(finish_reason: str | None) -> dict:
@@ -572,14 +572,14 @@ def test_a_truncated_final_call_fails_the_chunk_closed() -> None:
             uncovered_trace_ids=[],
         )
 
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    failed = [c for c in draft.chunks if c.status == "error"]
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    failed = [c for c in run.chunks if c.status == "error"]
     assert failed, "the truncated call must be recorded as a failed chunk"
     assert all("truncated" in c.error for c in failed)
     # A discarded chunk assigns nothing: its traces are never placed by a
     # truncated call, the same as any other failed call.
     assert all(not c.assignments for c in failed)
-    assert not draft.assignments
+    assert not run.assignments
 
 
 def test_normal_chunk_calls_carry_no_correction() -> None:
@@ -605,9 +605,9 @@ def test_a_trace_the_chunk_read_but_never_reported_becomes_uncovered() -> None:
             uncovered_trace_ids=[],
         )
 
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert "t2" in draft.uncovered_trace_ids
-    assert any("t2" in limitation for limitation in draft.limitations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert "t2" in run.uncovered_trace_ids
+    assert any("t2" in limitation for limitation in run.limitations)
 
 
 def test_every_readable_trace_is_accounted_for_somewhere() -> None:
@@ -622,12 +622,12 @@ def test_every_readable_trace_is_accounted_for_somewhere() -> None:
             {"contract_id": "c1"},
         ]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
     accounted = (
-        set(draft.assignments)
-        | set(draft.ambiguous_trace_ids)
-        | set(draft.uncovered_trace_ids)
-        | set(draft.unreadable_trace_ids)
+        set(run.assignments)
+        | set(run.ambiguous_trace_ids)
+        | set(run.uncovered_trace_ids)
+        | set(run.unreadable_trace_ids)
     )
     assert accounted == set(corpus.list_trace_ids())
 
@@ -655,23 +655,23 @@ def test_chunks_mix_unseen_traces_with_review() -> None:
 def test_draft_round_trips_through_the_store(tmp_path) -> None:
     store = DerivedStore(tmp_path)
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    envelope = save_draft(draft, store)
+    envelope = save_clustering_run(run, store)
     assert envelope.parent_artifact_id == "analysis-1"
-    assert load_draft(envelope.artifact_id, store) == draft
-    assert compute_draft_id(draft) == envelope.artifact_id
+    assert load_clustering_run(envelope.artifact_id, store) == run
+    assert compute_run_id(run) == envelope.artifact_id
 
 
 # --- adversarial audit and freezing -----------------------------------------
 
 
 def _draft(**overrides):
-    from bandits.analyze.rlm_models import TaxonomyDraft
+    from bandits.analyze.rlm_models import RLMClusteringRun
 
     base = dict(
         analysis_id="analysis-1",
@@ -685,7 +685,7 @@ def _draft(**overrides):
         model="test-model",
         prompt_digest="digest",
     )
-    return TaxonomyDraft(**{**base, **overrides})
+    return RLMClusteringRun(**{**base, **overrides})
 
 
 def test_audit_challenges_every_contract() -> None:
@@ -702,7 +702,7 @@ def test_audit_challenges_every_contract() -> None:
             rationale="these share a topic and need different verifiers",
         )
 
-    audit = audit_taxonomy(_draft(), "draft-1", corpus, predict=predict)
+    audit = audit_clustering(_draft(), "run-1", corpus, predict=predict)
     assert len(audit.findings) == 1
     assert audit.findings[0].topical_only
     assert audit.unresolved()
@@ -710,7 +710,7 @@ def test_audit_challenges_every_contract() -> None:
 
 def test_audit_can_recommend_a_merge_only_with_a_real_sibling() -> None:
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "return")))
-    draft = _draft(contracts=(_contract("c1"), _contract("c2")))
+    run = _draft(contracts=(_contract("c1"), _contract("c2")))
 
     def predict(**kwargs):
         import json
@@ -723,7 +723,7 @@ def test_audit_can_recommend_a_merge_only_with_a_real_sibling() -> None:
             rationale="both contracts require the same parameterized outcome",
         )
 
-    audit = audit_taxonomy(draft, "draft-1", corpus, predict=predict)
+    audit = audit_clustering(run, "run-1", corpus, predict=predict)
     # Both contracts nominate each other, which is one proposal about the pair.
     # Recorded once, on the lexically first, so accepting it cannot leave the
     # taxonomy blocked by the same merge's mirror image.
@@ -738,9 +738,9 @@ def test_audit_can_recommend_a_merge_only_with_a_real_sibling() -> None:
 
 def test_merge_recommendation_with_unknown_sibling_becomes_uncertain() -> None:
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-    audit = audit_taxonomy(
+    audit = audit_clustering(
         _draft(),
-        "draft-1",
+        "run-1",
         corpus,
         predict=lambda **_: SimpleNamespace(
             recommendation="merge",
@@ -759,7 +759,7 @@ def test_an_unparseable_recommendation_becomes_uncertain_never_keep() -> None:
     def predict(**_):
         return SimpleNamespace(recommendation="looks fine to me!", rationale="ok")
 
-    audit = audit_taxonomy(_draft(), "draft-1", corpus, predict=predict)
+    audit = audit_clustering(_draft(), "run-1", corpus, predict=predict)
     assert audit.findings[0].recommendation == "uncertain"
 
 
@@ -769,7 +769,7 @@ def test_a_failed_contract_audit_is_uncertain_not_absent() -> None:
     def predict(**_):
         raise RuntimeError("provider down")
 
-    audit = audit_taxonomy(_draft(), "draft-1", corpus, predict=predict)
+    audit = audit_clustering(_draft(), "run-1", corpus, predict=predict)
     assert audit.findings[0].recommendation == "uncertain"
     assert "provider down" in audit.findings[0].rationale
 
@@ -777,28 +777,28 @@ def test_a_failed_contract_audit_is_uncertain_not_absent() -> None:
 def test_freeze_refuses_while_a_split_is_unresolved() -> None:
     from bandits.analyze.rlm_models import AuditFinding
 
-    audit = TaxonomyAudit(
-        draft_id="draft-1",
+    audit = RLMClusteringAudit(
+        run_id="run-1",
         findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two tasks"),),
         model="m",
         prompt_digest="d",
     )
     with pytest.raises(FreezeRefused, match="have not been resolved"):
-        freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="audit-1")
+        freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="audit-1")
 
 
 def test_resolved_findings_permit_the_freeze() -> None:
     from bandits.analyze.rlm_models import AuditFinding
 
-    audit = TaxonomyAudit(
-        draft_id="draft-1",
+    audit = RLMClusteringAudit(
+        run_id="run-1",
         findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two tasks"),),
         model="m",
         prompt_digest="d",
     )
     resolved = resolve_findings(audit, {"c1": "split into c1 and c2 in the next sweep"})
     assert not resolved.unresolved()
-    taxonomy = freeze_taxonomy(_draft(), "draft-1", audit=resolved, audit_id="audit-1")
+    taxonomy = freeze_taxonomy(_draft(), "run-1", audit=resolved, audit_id="audit-1")
     assert taxonomy.complete
 
 
@@ -812,40 +812,40 @@ def test_a_resolution_must_say_how() -> None:
 def test_forcing_a_freeze_records_that_it_was_forced() -> None:
     from bandits.analyze.rlm_models import AuditFinding
 
-    audit = TaxonomyAudit(
-        draft_id="draft-1",
+    audit = RLMClusteringAudit(
+        run_id="run-1",
         findings=(AuditFinding(contract_id="c1", recommendation="split", rationale="two"),),
         model="m",
         prompt_digest="d",
     )
-    taxonomy = freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="a1", force=True)
+    taxonomy = freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1", force=True)
     assert any("unresolved audit finding" in limit for limit in taxonomy.limitations)
 
 
 def test_freezing_without_an_audit_says_so() -> None:
-    taxonomy = freeze_taxonomy(_draft(), "draft-1")
+    taxonomy = freeze_taxonomy(_draft(), "run-1")
     assert taxonomy.audit_id is None
     assert any("no adversarial audit" in limit for limit in taxonomy.limitations)
 
 
 def test_an_incomplete_draft_freezes_but_never_reads_as_converged() -> None:
-    taxonomy = freeze_taxonomy(_draft(stop_reason=StopReason.MAX_SECONDS), "draft-1")
+    taxonomy = freeze_taxonomy(_draft(stop_reason=StopReason.MAX_SECONDS), "run-1")
     assert not taxonomy.complete
     assert any("never converg" in x or "rather than converging" in x for x in taxonomy.limitations)
 
 
 def test_taxonomy_id_tracks_contract_wording() -> None:
     """An assignment naming a taxonomy id must be naming exact wording."""
-    first = freeze_taxonomy(_draft(), "draft-1")
+    first = freeze_taxonomy(_draft(), "run-1")
     reworded = freeze_taxonomy(
-        _draft(contracts=(_contract("c1", "refund an order the policy allows"),)), "draft-1"
+        _draft(contracts=(_contract("c1", "refund an order the policy allows"),)), "run-1"
     )
     assert compute_taxonomy_id(first) != compute_taxonomy_id(reworded)
 
 
 def test_an_empty_taxonomy_cannot_be_frozen() -> None:
     with pytest.raises(ValidationError, match="cannot be assigned against"):
-        freeze_taxonomy(_draft(contracts=()), "draft-1")
+        freeze_taxonomy(_draft(contracts=()), "run-1")
 
 
 # --- fresh assignment --------------------------------------------------------
@@ -853,7 +853,7 @@ def test_an_empty_taxonomy_cannot_be_frozen() -> None:
 
 def _taxonomy(*contracts: FamilyContract) -> FrozenTaxonomy:
     return FrozenTaxonomy(
-        draft_id="draft-1",
+        run_id="run-1",
         analysis_id="analysis-1",
         view=TraceView.USER_MESSAGES,
         contracts=contracts or (_contract("c1"),),
@@ -1364,26 +1364,26 @@ def test_path_f_mining_warns_that_families_may_be_behavior() -> None:
         _corpus(*(_tool_trace(f"t{i}", output={"ok": True, "score": 1}) for i in range(4))),
         view=TraceView.FULL_TRAJECTORY,
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    assert draft.view is TraceView.FULL_TRAJECTORY
-    assert any("what the agent did" in limit for limit in draft.limitations)
-    assert any("score" in limit for limit in draft.limitations)
+    assert run.view is TraceView.FULL_TRAJECTORY
+    assert any("what the agent did" in limit for limit in run.limitations)
+    assert any("score" in limit for limit in run.limitations)
 
 
 def test_path_u_mining_carries_no_behavior_warning() -> None:
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    assert not any("what the agent did" in limit for limit in draft.limitations)
+    assert not any("what the agent did" in limit for limit in run.limitations)
     assert corpus.withheld_fields() == ()
 
 
@@ -1393,13 +1393,13 @@ def test_a_corpus_yielding_nothing_to_strip_is_reported_as_suspicious() -> None:
         _corpus(*(_tool_trace(f"t{i}", output={"ok": True}) for i in range(2))),
         view=TraceView.FULL_TRAJECTORY,
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    assert any("under other names" in limit for limit in draft.limitations)
+    assert any("under other names" in limit for limit in run.limitations)
 
 
 def test_the_two_paths_cannot_be_cross_assigned() -> None:
@@ -1535,29 +1535,29 @@ def test_max_usd_actually_stops_the_run() -> None:
         ],
         price=1.0,
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=predict,
         chunk_size=2,
         budget=Budget(max_usd=3.0, max_iterations=50),
     )
-    assert draft.stop_reason is StopReason.MAX_USD
-    assert not draft.complete
-    assert sum(c.cost_usd or 0 for c in draft.chunks) >= 3.0
+    assert run.stop_reason is StopReason.MAX_USD
+    assert not run.complete
+    assert sum(c.cost_usd or 0 for c in run.chunks) >= 3.0
 
 
 def test_a_requested_ceiling_nothing_priced_is_reported_not_ignored() -> None:
     """Silently disabling --max-usd is how a run overspends unnoticed."""
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
         budget=Budget(max_usd=5.0),
     )
-    assert any("no backend reported a cost" in limit for limit in draft.limitations)
+    assert any("no backend reported a cost" in limit for limit in run.limitations)
 
 
 def test_a_failed_chunk_still_counts_against_the_budget() -> None:
@@ -1568,14 +1568,14 @@ def test_a_failed_chunk_still_counts_against_the_budget() -> None:
         def __call__(self, **kw):
             raise RuntimeError("provider down")
 
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_Failing([{}], price=2.0),
         chunk_size=2,
         budget=Budget(max_usd=3.0, max_iterations=50),
     )
-    assert draft.stop_reason is StopReason.MAX_USD
+    assert run.stop_reason is StopReason.MAX_USD
 
 
 def test_a_merge_actually_removes_the_contracts_it_consumed() -> None:
@@ -1599,8 +1599,8 @@ def test_a_merge_actually_removes_the_contracts_it_consumed() -> None:
             {"contract_id": "c1"},
         ]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in run.contracts] == ["c1"]
 
 
 def test_a_merge_moves_members_of_the_consumed_contract() -> None:
@@ -1674,8 +1674,8 @@ def test_an_operation_naming_a_contract_nobody_holds_is_reported() -> None:
             }
         ]
     )
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert any("could not be applied" in limit for limit in draft.limitations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert any("could not be applied" in limit for limit in run.limitations)
 
 
 def test_leakage_audit_catches_a_reward_under_an_unforeseen_key() -> None:
@@ -1716,14 +1716,14 @@ def test_mining_reports_leakage_as_a_limitation() -> None:
         *(_tool_trace(f"t{i}", output={"quality_metric": 0.87654321}) for i in range(4))
     )
     corpus = ReadOnlyCorpus(corpus_obj, view=TraceView.FULL_TRAJECTORY)
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
         analysis=analyze_corpus(corpus_obj),
     )
-    assert any("OUTCOME LEAKAGE" in limit for limit in draft.limitations)
+    assert any("OUTCOME LEAKAGE" in limit for limit in run.limitations)
 
 
 def test_mining_without_an_analysis_says_the_check_was_skipped() -> None:
@@ -1731,13 +1731,13 @@ def test_mining_without_an_analysis_says_the_check_was_skipped() -> None:
         _corpus(*(_tool_trace(f"t{i}", output={"ok": True}) for i in range(2))),
         view=TraceView.FULL_TRAJECTORY,
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
     )
-    assert any("never checked for outcome values" in limit for limit in draft.limitations)
+    assert any("never checked for outcome values" in limit for limit in run.limitations)
 
 
 def test_leakage_audit_ignores_identifiers_echoing_the_trace_id() -> None:
@@ -1855,7 +1855,7 @@ def test_a_failed_session_is_not_readable_as_idle(tmp_path) -> None:
 def test_a_finished_session_is_marked_awaiting_review(tmp_path) -> None:
     store, recorder = _recorder(tmp_path, "sess-done")
     recorder.begin(traces_total=5, requested_passes=2, seed=1)
-    recorder.finish(status="awaiting_review", stop_reason="passes_complete", draft_id="d1")
+    recorder.finish(status="awaiting_review", stop_reason="passes_complete", run_id="d1")
     assert store.read("sess-done").status == "awaiting_review"
 
 
@@ -1951,8 +1951,8 @@ def test_a_card_surfaces_an_audit_verdict_and_topical_flag() -> None:
     from bandits.analyze.rlm_models import AuditFinding
     from bandits.analyze.rlm_view import family_card
 
-    audit = TaxonomyAudit(
-        draft_id="d1",
+    audit = RLMClusteringAudit(
+        run_id="d1",
         findings=(
             AuditFinding(
                 contract_id="c1",
@@ -2032,7 +2032,7 @@ def test_pass_history_marks_a_partial_pass() -> None:
     from bandits.analyze.rlm_view import print_pass_history
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(20))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
@@ -2040,7 +2040,7 @@ def test_pass_history_marks_a_partial_pass() -> None:
         budget=Budget(max_iterations=2),
     )
     console = Console(width=100, record=True, file=open("/dev/null", "w"))
-    print_pass_history(draft, console)
+    print_pass_history(run, console)
     assert "partial" in console.export_text()
 
 
@@ -2095,7 +2095,7 @@ def test_a_resumed_run_finishes_the_pass_it_died_in(tmp_path) -> None:
         model="test-model",
         resumed_from="sess-r",
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_crash_after(0, seen),
@@ -2103,8 +2103,8 @@ def test_a_resumed_run_finishes_the_pass_it_died_in(tmp_path) -> None:
         session=resumed,
         resume=crashed,
     )
-    assert draft.completed_passes == 2
-    assert draft.stop_reason is StopReason.PASSES_COMPLETE
+    assert run.completed_passes == 2
+    assert run.stop_reason is StopReason.PASSES_COMPLETE
     # The point of resuming: no trace is read a third time, and none is skipped.
     assert all(count == 2 for count in seen.values()), seen
     assert sum(seen.values()) == 80
@@ -2135,7 +2135,7 @@ def test_a_resume_restores_the_taxonomy_rather_than_rebuilding_it(tmp_path) -> N
         view=TraceView.USER_MESSAGES,
         model="test-model",
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_crash_after(0, seen),
@@ -2143,7 +2143,7 @@ def test_a_resume_restores_the_taxonomy_rather_than_rebuilding_it(tmp_path) -> N
         session=resumed,
         resume=crashed,
     )
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    assert [c.contract_id for c in run.contracts] == ["c1"]
 
 
 def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
@@ -2165,7 +2165,7 @@ def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
         view=TraceView.USER_MESSAGES,
         model="test-model",
     )
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_crash_after(0, seen),
@@ -2173,15 +2173,15 @@ def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
         session=resumed,
         resume=crashed,
     )
-    assert draft.passes[0].trace_ids == crashed.pass_order
+    assert run.passes[0].trace_ids == crashed.pass_order
     assert all(count == 2 for count in seen.values())
 
 
 # --- membership after a merge ------------------------------------------------
 
 
-def _merged_draft() -> TaxonomyDraft:
-    return TaxonomyDraft(
+def _merged_draft() -> RLMClusteringRun:
+    return RLMClusteringRun(
         analysis_id="analysis-1",
         view=TraceView.USER_MESSAGES,
         seed=1,
@@ -2218,16 +2218,16 @@ def _merged_draft() -> TaxonomyDraft:
 
 def test_a_merged_family_shows_the_members_it_absorbed() -> None:
     """Replaying chunk assignments strands them under the consumed contract."""
-    from bandits.analyze.rlm_audit import _draft_members
+    from bandits.analyze.rlm_audit import _run_members
 
-    assert _draft_members(_merged_draft()) == {"c1": ("t0", "t1", "t2")}
+    assert _run_members(_merged_draft()) == {"c1": ("t0", "t1", "t2")}
 
 
 def test_a_consumed_contract_is_not_rendered_as_a_family() -> None:
     """A ghost family is something a reviewer could try to act on."""
-    from bandits.analyze.rlm_audit import _draft_members
+    from bandits.analyze.rlm_audit import _run_members
 
-    assert "c2" not in _draft_members(_merged_draft())
+    assert "c2" not in _run_members(_merged_draft())
 
 
 # --- the live-model boundary -------------------------------------------------
@@ -2283,10 +2283,10 @@ def test_a_reply_arriving_as_json_text_is_not_thrown_away() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(6))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
-    assert len(draft.assignments) == 6
-    assert any(op.operation is Operation.CREATE for p in draft.passes for op in p.operations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    assert [c.contract_id for c in run.contracts] == ["c1"]
+    assert len(run.assignments) == 6
+    assert any(op.operation is Operation.CREATE for p in run.passes for op in p.operations)
 
 
 def test_a_fenced_json_reply_is_decoded() -> None:
@@ -2311,8 +2311,8 @@ def test_a_single_contract_returned_bare_is_still_read() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in run.contracts] == ["c1"]
 
 
 def test_unparseable_text_is_still_dropped_rather_than_crashing() -> None:
@@ -2328,8 +2328,8 @@ def test_unparseable_text_is_still_dropped_rather_than_crashing() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert draft.contracts == ()
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert run.contracts == ()
 
 
 def test_assignment_results_arriving_as_json_text_are_read() -> None:
@@ -2379,10 +2379,10 @@ def test_a_scalar_reply_does_not_crash_a_chunk() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert draft.contracts == ()
-    assert all(chunk.status == "success" for chunk in draft.chunks)
-    assert any("no contracts at all" in limit for limit in draft.limitations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert run.contracts == ()
+    assert all(chunk.status == "success" for chunk in run.chunks)
+    assert any("no contracts at all" in limit for limit in run.limitations)
 
 
 def test_a_bare_string_is_not_read_as_a_list_of_ids() -> None:
@@ -2403,13 +2403,13 @@ def test_assignment_survives_a_scalar_reply() -> None:
 def test_every_chunk_keeps_what_the_model_actually_returned() -> None:
     """Two paid runs were lost guessing at why contracts were rejected."""
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus,
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [{"name": "Topic only"}]}]),
         chunk_size=2,
     )
-    chunk = draft.chunks[0]
+    chunk = run.chunks[0]
     assert "Topic only" in chunk.raw_reply
     assert chunk.dropped_contracts
     assert "Topic only" in chunk.dropped_contracts[0]
@@ -2435,9 +2435,10 @@ def test_a_contract_with_nothing_to_verify_is_still_refused() -> None:
     from bandits.analyze.rlm_mine import _parse_contract
 
     assert _parse_contract({"name": "Refunds"}, known_traces=set()) is None
-    assert _parse_contract(
-        {"name": "Refunds", "definition": "refund things"}, known_traces=set()
-    ) is None
+    assert (
+        _parse_contract({"name": "Refunds", "definition": "refund things"}, known_traces=set())
+        is None
+    )
 
 
 # --- durable logging ---------------------------------------------------------
@@ -2457,8 +2458,8 @@ def test_raw_replies_are_not_truncated() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert len(draft.chunks[0].raw_reply) > 50_000
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert len(run.chunks[0].raw_reply) > 50_000
 
 
 def test_a_rejected_contract_is_kept_whole() -> None:
@@ -2474,16 +2475,16 @@ def test_a_rejected_contract_is_kept_whole() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert len(draft.chunks[0].dropped_contracts[0]) > 4_000
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert len(run.chunks[0].dropped_contracts[0]) > 4_000
 
 
 def test_the_audit_keeps_what_the_auditor_said() -> None:
     """A verdict that gates the freeze must be traceable to a reply."""
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-    audit = audit_taxonomy(
+    audit = audit_clustering(
         _draft(),
-        "draft-1",
+        "run-1",
         corpus,
         predict=lambda **_: SimpleNamespace(
             recommendation="split", rationale="two different outcomes"
@@ -2642,9 +2643,7 @@ def test_chunk_ledger_rows_name_their_pass_and_session(tmp_path, monkeypatch) ->
             uncovered_trace_ids=[],
         )
 
-    mine_taxonomy(
-        corpus, "analysis-1", predict=predict, chunk_size=2, session=recorder
-    )
+    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2, session=recorder)
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     calls = [r for r in rows if r.get("event_type") == "model_call"]
     assert calls
@@ -2722,9 +2721,9 @@ def test_rejected_contracts_are_repaired_rather_than_dropped() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
-    assert any("recovered on a second attempt" in limit for limit in draft.limitations)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in run.contracts] == ["c1"]
+    assert any("recovered on a second attempt" in limit for limit in run.limitations)
 
 
 def test_repair_is_attempted_at_most_once_per_chunk() -> None:
@@ -2742,15 +2741,15 @@ def test_repair_is_attempted_at_most_once_per_chunk() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    assert draft.contracts == ()
+    assert run.contracts == ()
     # One chunk: the original call plus a single repair, and never a third
     # however many times the model repeats the same invalid answer.
-    assert len(draft.chunks) == 1
+    assert len(run.chunks) == 1
     assert calls["n"] == 2
-    assert any("the parser refused" in limit for limit in draft.limitations)
+    assert any("the parser refused" in limit for limit in run.limitations)
 
 
 def test_a_failing_repair_keeps_the_original_evidence() -> None:
@@ -2766,8 +2765,8 @@ def test_a_failing_repair_keeps_the_original_evidence() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert any(chunk.dropped_contracts for chunk in draft.chunks)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert any(chunk.dropped_contracts for chunk in run.chunks)
 
 
 def test_a_non_merge_finding_may_not_name_a_merge_target() -> None:
@@ -2793,9 +2792,7 @@ def test_sibling_contracts_stay_inside_the_peek_limit() -> None:
     """Past 1000 characters the model sees a peek and can name an id it never saw."""
     from bandits.analyze.rlm_audit import _compact_siblings
 
-    siblings = tuple(
-        _contract(f"c{i}", f"definition number {i} " + "x" * 60) for i in range(6)
-    )
+    siblings = tuple(_contract(f"c{i}", f"definition number {i} " + "x" * 60) for i in range(6))
     compact = _compact_siblings(siblings)
     assert len(compact) < 1000, len(compact)
     for i in range(6):
@@ -2864,9 +2861,9 @@ def test_a_whole_chunk_of_typed_instances_is_read() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
-    assert len(draft.assignments) == 4
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert [c.contract_id for c in run.contracts] == ["c1"]
+    assert len(run.assignments) == 4
 
 
 def test_typed_assignment_results_are_read() -> None:
@@ -2914,20 +2911,20 @@ def test_the_repair_request_actually_reaches_the_model() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
     assert any("was rejected" in q for q in seen)
     assert any("required_outcome_shape" in q for q in seen)
-    assert [c.contract_id for c in draft.contracts] == ["c1"]
+    assert [c.contract_id for c in run.contracts] == ["c1"]
 
 
 def test_a_non_merge_reply_carrying_a_target_does_not_lose_the_finding() -> None:
     """Model validation would reject it, costing the whole audit call."""
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
-    audit = audit_taxonomy(
+    audit = audit_clustering(
         _draft(),
-        "draft-1",
+        "run-1",
         corpus,
         predict=lambda **_: SimpleNamespace(
             recommendation="keep",
@@ -2967,9 +2964,10 @@ def test_an_operation_must_name_a_verb_and_a_contract() -> None:
         ProposedOperation(operation="CREATE", contract_ids=["c1"], rationale="")
     with pytest.raises(ValidationError, match="consumes and the one it produces"):
         ProposedOperation(operation="MERGE", contract_ids=["c1"], rationale="r")
-    assert ProposedOperation(
-        operation="KEEP", contract_ids=["c1"], rationale="unchanged"
-    ).operation == "KEEP"
+    assert (
+        ProposedOperation(operation="KEEP", contract_ids=["c1"], rationale="unchanged").operation
+        == "KEEP"
+    )
 
 
 def test_an_assignment_must_decide_rather_than_omit() -> None:
@@ -3047,11 +3045,11 @@ def test_a_repair_is_billed_to_the_chunk() -> None:
     predict.cost = lambda: spend["cost"]
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    assert draft.chunks[0].llm_calls == 9
-    assert draft.chunks[0].cost_usd == pytest.approx(0.05)
+    assert run.chunks[0].llm_calls == 9
+    assert run.chunks[0].cost_usd == pytest.approx(0.05)
 
 
 def test_every_rejected_contract_is_kept_even_when_some_are_repaired() -> None:
@@ -3075,10 +3073,10 @@ def test_every_rejected_contract_is_kept_even_when_some_are_repaired() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    kept = " ".join(draft.chunks[0].dropped_contracts)
+    kept = " ".join(run.chunks[0].dropped_contracts)
     for name in ("first", "second", "third"):
         assert name in kept
 
@@ -3087,8 +3085,8 @@ def test_freeze_refuses_an_unresolved_merge() -> None:
     """The copy mentioned merges; the gate itself was untested for them."""
     from bandits.analyze.rlm_models import AuditFinding
 
-    audit = TaxonomyAudit(
-        draft_id="draft-1",
+    audit = RLMClusteringAudit(
+        run_id="run-1",
         findings=(
             AuditFinding(
                 contract_id="c1",
@@ -3101,8 +3099,8 @@ def test_freeze_refuses_an_unresolved_merge() -> None:
         prompt_digest="d",
     )
     with pytest.raises(FreezeRefused, match="merging"):
-        freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="a1")
-    forced = freeze_taxonomy(_draft(), "draft-1", audit=audit, audit_id="a1", force=True)
+        freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1")
+    forced = freeze_taxonomy(_draft(), "run-1", audit=audit, audit_id="a1", force=True)
     assert any("merge" in limit for limit in forced.limitations)
 
 
@@ -3203,26 +3201,26 @@ def test_a_revise_that_renames_still_lands_on_the_contract_it_revised() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "change my flight") for i in range(2))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=1, budget=Budget(passes=1)
     )
     # One family, not two, and it keeps the id the REVISE named.
-    assert [c.contract_id for c in draft.contracts] == ["change_earlier_nonstop"]
-    survivor = draft.contracts[0]
+    assert [c.contract_id for c in run.contracts] == ["change_earlier_nonstop"]
+    survivor = run.contracts[0]
     assert survivor.name == "Modify an existing reservation"
     assert survivor.revision == 2
-    assert any("invented id discarded" in limit for limit in draft.limitations)
+    assert any("invented id discarded" in limit for limit in run.limitations)
     # The load-bearing assertion. Checking only which contracts survive passes
     # even when the trace that motivated the revision was silently dropped,
     # because its assignment named the id enforcement had just discarded.
-    assert len(draft.assignments) == 2
-    assert set(draft.assignments.values()) == {"change_earlier_nonstop"}
+    assert len(run.assignments) == 2
+    assert set(run.assignments.values()) == {"change_earlier_nonstop"}
     assert survivor.supporting_trace_ids == ("t0", "t1")
     # The trace the revision was made for must still be assigned, under the id
     # that survived. Checking only the contract let a renamed REVISE pass while
     # its assignment was validated against ids the rename had already removed
     # and silently dropped, leaving the family with wording but no members.
-    assert set(draft.assignments.values()) == {"change_earlier_nonstop"}
+    assert set(run.assignments.values()) == {"change_earlier_nonstop"}
 
 
 def test_a_revision_keeps_the_evidence_that_motivated_the_original() -> None:
@@ -3266,21 +3264,19 @@ def test_a_trace_seen_before_its_family_existed_is_reconsidered() -> None:
         # The family that would have fitted it arrives one chunk later.
         return SimpleNamespace(
             contracts=[_RAW_CONTRACT],
-            operations=[
-                {"operation": "CREATE", "contract_ids": ["c1"], "rationale": "new family"}
-            ],
+            operations=[{"operation": "CREATE", "contract_ids": ["c1"], "rationale": "new family"}],
             assignments={trace_id: "c1" for trace_id in ids},
             ambiguous_trace_ids=[],
             uncovered_trace_ids=[],
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=1, budget=Budget(passes=1)
     )
-    assert draft.uncovered_trace_ids == ()
-    assert len(draft.assignments) == 2
-    assert any("reconciliation sweep" in limit for limit in draft.limitations)
+    assert run.uncovered_trace_ids == ()
+    assert len(run.assignments) == 2
+    assert any("reconciliation sweep" in limit for limit in run.limitations)
 
 
 def test_the_sweep_does_not_run_when_nothing_is_unresolved() -> None:
@@ -3301,10 +3297,10 @@ def test_the_sweep_does_not_run_when_nothing_is_unresolved() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(2))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    assert len(draft.chunks) == 1
+    assert len(run.chunks) == 1
     assert calls["n"] == 1
 
 
@@ -3329,10 +3325,10 @@ def test_contract_evidence_is_rebuilt_from_final_assignments() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
-    draft = mine_taxonomy(
+    run = mine_taxonomy(
         corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(passes=1)
     )
-    assert draft.contracts[0].supporting_trace_ids == ("t0", "t1", "t2", "t3")
+    assert run.contracts[0].supporting_trace_ids == ("t0", "t1", "t2", "t3")
 
 
 def test_evidence_drops_a_trace_that_moved_away() -> None:

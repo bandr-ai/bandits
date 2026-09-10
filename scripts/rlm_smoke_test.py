@@ -33,7 +33,7 @@ from pathlib import Path
 from bandits.analyze.rlm_assign import assign_traces, save_assignment_run
 from bandits.analyze.rlm_assign import build_predictor as build_assigner
 from bandits.analyze.rlm_audit import (
-    audit_taxonomy,
+    audit_clustering,
     compute_taxonomy_id,
     freeze_taxonomy,
     save_audit,
@@ -43,7 +43,12 @@ from bandits.analyze.rlm_audit import (
     build_predictor as build_auditor,
 )
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
-from bandits.analyze.rlm_mine import DEFAULT_MODEL, build_predictor, mine_taxonomy, save_draft
+from bandits.analyze.rlm_mine import (
+    DEFAULT_MODEL,
+    build_predictor,
+    mine_taxonomy,
+    save_clustering_run,
+)
 from bandits.analyze.rlm_models import AssignmentStatus, Budget, TraceView
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_taskset import materialize_task_set
@@ -91,12 +96,9 @@ def _finalize(draft, args, recorder, derived_store) -> str:
     session left marked ``running`` reads as a run still in flight.
     """
 
-    envelope = save_draft(draft, derived_store)
+    envelope = save_clustering_run(draft, derived_store)
     print(f"\n  draft saved: {envelope.artifact_id}")
-    print(
-        f"  read it: uv run bandits rlm-families {envelope.artifact_id} "
-        f"--project {args.project}"
-    )
+    print(f"  read it: uv run bandits rlm-families {envelope.artifact_id} --project {args.project}")
     recorder.finish(
         status="awaiting_review" if draft.complete else "incomplete",
         stop_reason=draft.stop_reason.value,
@@ -190,8 +192,10 @@ def main() -> int:
     control_markers = corpus_obj.control_markers or ("###TRANSFER###",)
     corpus = ReadOnlyCorpus(corpus_obj, view=view, control_markers=control_markers)
     print(f"\ncorpus: {corpus_id}")
-    print(f"  {len(corpus_obj.traces)} trace(s) from {len(lineages)} lineage(s): "
-          f"{', '.join(lineages)}")
+    print(
+        f"  {len(corpus_obj.traces)} trace(s) from {len(lineages)} lineage(s): "
+        f"{', '.join(lineages)}"
+    )
     for trace in corpus_obj.traces[:3]:
         first = trace.user_turns[0].text if trace.user_turns else ""
         print(f"  {trace.trace_id}: {' '.join(first.split())[:88]}")
@@ -248,7 +252,10 @@ def main() -> int:
         session=recorder,
         chunk_size=3,
         budget=Budget(
-            passes=args.passes, max_iterations=40, max_llm_calls=args.max_llm_calls, max_usd=args.max_usd
+            passes=args.passes,
+            max_iterations=40,
+            max_llm_calls=args.max_llm_calls,
+            max_usd=args.max_usd,
         ),
         on_chunk=lambda c: print(
             f"  chunk {c.index}: {len(c.trace_ids)} traces, {len(c.operations)} ops, "
@@ -311,9 +318,7 @@ def main() -> int:
         return 1 if failures else 0
 
     print("\n== adversarial audit ==")
-    audit = audit_taxonomy(
-        draft, draft_id, corpus, predict=build_auditor(**kwargs)
-    )
+    audit = audit_clustering(draft, draft_id, corpus, predict=build_auditor(**kwargs))
     # Saved, like everything else this run produces. Each finding carries the
     # auditor's raw reply, which is the only record of why a contract was told
     # to keep or split.
@@ -376,8 +381,10 @@ def main() -> int:
             "coverage is not overstated",
             task_set.workload_coverage <= 1.0
             and task_set.workload_coverage
-            == len(assigned) / max(len([a for a in run.assignments
-                                        if a.status is not AssignmentStatus.UNREADABLE]), 1),
+            == len(assigned)
+            / max(
+                len([a for a in run.assignments if a.status is not AssignmentStatus.UNREADABLE]), 1
+            ),
             f"{task_set.workload_coverage:.1%}",
         )
 

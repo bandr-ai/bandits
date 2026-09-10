@@ -152,7 +152,7 @@ def materialize_task_set(
             )
     if not taxonomy.complete:
         limitations.append(
-            "the taxonomy behind this task set was frozen from a draft that never converged"
+            "the taxonomy behind this task set was frozen from a run that never converged"
         )
     if run.view.reads_agent_behavior:
         limitations.append(

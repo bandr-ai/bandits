@@ -130,6 +130,7 @@ def build_predictor(
         api_key=key,
         temperature=0.0,
     )
+
     # Instructions on the signature rather than in an input field, so the whole
     # prompt reaches the root model. See rlm_mine.instruction_for for why.
     class _Assign(dspy.Signature):
@@ -165,9 +166,7 @@ def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
 def _raw_reply(prediction: Any) -> str:
     """Everything the classifier returned for one batch, never truncated."""
     try:
-        return json.dumps(
-            {"results": getattr(prediction, "results", None)}, indent=2, default=str
-        )
+        return json.dumps({"results": getattr(prediction, "results", None)}, indent=2, default=str)
     except (TypeError, ValueError):
         return str(prediction)
 

@@ -88,6 +88,7 @@ A single tool result can be a whole file. Truncation is by length rather than by
 significance, so nothing here decides which half of a payload mattered.
 """
 
+
 def _strip_control_markers(text: str, markers: Sequence[str], removed: set[str]) -> str:
     """Strip caller-declared literal tokens from one turn's own text.
 

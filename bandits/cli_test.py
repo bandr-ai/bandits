@@ -137,9 +137,7 @@ def test_rlm_corpus_forwards_control_markers_from_the_stored_artifact(tmp_path) 
             ),
         ),
     )
-    corpus = TraceCorpus(
-        source="chat-json", traces=(trace,), control_markers=("###TRANSFER###",)
-    )
+    corpus = TraceCorpus(source="chat-json", traces=(trace,), control_markers=("###TRANSFER###",))
     store = ArtifactStore(tmp_path / ".bandits")
     envelope = store.write(corpus, source_path="synthetic")
 

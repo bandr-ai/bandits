@@ -1,4 +1,4 @@
-"""Attack a draft taxonomy with a context that never watched it being built.
+"""Attack a run taxonomy with a context that never watched it being built.
 
 The discovery loop argues itself into a taxonomy, and the reasoning that
 produced a family is exactly the reasoning least able to see what is wrong with
@@ -31,8 +31,8 @@ from bandits.analyze.rlm_models import (
     AuditFinding,
     FamilyContract,
     FrozenTaxonomy,
-    TaxonomyAudit,
-    TaxonomyDraft,
+    RLMClusteringAudit,
+    RLMClusteringRun,
     TraceView,
 )
 from bandits.store import DerivedEnvelope, DerivedStore
@@ -91,7 +91,7 @@ def instruction_for(view: TraceView) -> str:
     return _INSTRUCTION_HEAD.format(view=VIEW_PREAMBLES[view])
 
 
-class TaxonomyAuditError(RuntimeError):
+class ClusteringAuditError(RuntimeError):
     """The auditor could not be built or returned nothing usable."""
 
 
@@ -136,7 +136,7 @@ def build_predictor(
     try:
         import dspy
     except ImportError as exc:  # pragma: no cover - depends on the extra
-        raise TaxonomyAuditError(
+        raise ClusteringAuditError(
             "the taxonomy audit needs the 'audit' extra: uv sync --extra audit"
         ) from exc
 
@@ -149,6 +149,7 @@ def build_predictor(
         api_key=key,
         temperature=0.0,
     )
+
     # Instructions on the signature, not in an input field: an input field
     # becomes a REPL variable and is shown as a 1000-character peek, which is
     # how the mining prompt's schema went unread. See rlm_mine.instruction_for.
@@ -193,7 +194,7 @@ _OUTSIDER_SAMPLE = 12
 
 Bounded because "the strongest apparent member currently outside" is a search
 over the whole corpus, and handing a whole corpus to every contract's audit
-costs more than the question is worth. Drawn deterministically from the draft
+costs more than the question is worth. Drawn deterministically from the run
 seed so the sample is reproducible from the artifact.
 """
 
@@ -234,6 +235,7 @@ def _raw_reply(prediction: Any) -> str:
 _PEEK_LIMIT = 1000
 """What ``REPLVariable.from_value`` shows of a variable before eliding its middle."""
 
+
 def _compact_siblings(contracts: tuple[FamilyContract, ...]) -> str:
     """Sibling contracts, trimmed to what a merge judgement actually needs.
 
@@ -267,7 +269,9 @@ def _compact_siblings(contracts: tuple[FamilyContract, ...]) -> str:
                     "contract_id": item.contract_id,
                     "name": clip(item.name),
                     "definition": clip(item.definition),
-                    "required_outcome_shape": [clip(line) for line in item.required_outcome_shape[:1]],
+                    "required_outcome_shape": [
+                        clip(line) for line in item.required_outcome_shape[:1]
+                    ],
                 }
                 for item in contracts
             ],
@@ -349,30 +353,30 @@ def audit_contract(
     )
 
 
-def audit_taxonomy(
-    draft: TaxonomyDraft,
-    draft_id: str,
+def audit_clustering(
+    run: RLMClusteringRun,
+    run_id: str,
     corpus: ReadOnlyCorpus,
     *,
     predict: _Predictor,
     model: str = DEFAULT_MODEL,
-) -> TaxonomyAudit:
-    """Challenge every contract in a draft, one pass each.
+) -> RLMClusteringAudit:
+    """Challenge every contract in a run, one pass each.
 
     A contract whose audit fails is recorded as ``uncertain`` rather than
     skipped: an absent finding reads as a contract nobody objected to, and the
     freeze gate would then pass on the strength of a call that never happened.
     """
-    assigned = _draft_members(draft)
+    assigned = _run_members(run)
     all_readable = set(corpus.readable_trace_ids())
     findings: list[AuditFinding] = []
     limitations: list[str] = []
 
-    for contract in draft.contracts:
+    for contract in run.contracts:
         members = assigned.get(contract.contract_id, ())
         pool = sorted(all_readable - set(members))
         outsiders = (
-            corpus.sample_trace_ids(_OUTSIDER_SAMPLE, seed=draft.seed, exclude=tuple(members))
+            corpus.sample_trace_ids(_OUTSIDER_SAMPLE, seed=run.seed, exclude=tuple(members))
             if pool
             else ()
         )
@@ -386,7 +390,7 @@ def audit_taxonomy(
                         outsiders=outsiders,
                         sibling_contracts=tuple(
                             sibling
-                            for sibling in draft.contracts
+                            for sibling in run.contracts
                             if sibling.contract_id != contract.contract_id
                         ),
                         predict=predict,
@@ -408,8 +412,8 @@ def audit_taxonomy(
             "audit output is advisory and uncalibrated: it never edits a contract, and "
             "it has not been measured against labelled same-family pairs"
         )
-    return TaxonomyAudit(
-        draft_id=draft_id,
+    return RLMClusteringAudit(
+        run_id=run_id,
         findings=tuple(findings),
         model=model,
         prompt_digest=prompt_digest(model),
@@ -435,9 +439,7 @@ def _normalize_reciprocal_merges(findings: list[AuditFinding]) -> list[AuditFind
         if f.recommendation == "merge" and f.merge_with_contract_id
     }
     superseded = {
-        other
-        for one, other in proposals.items()
-        if proposals.get(other) == one and other > one
+        other for one, other in proposals.items() if proposals.get(other) == one and other > one
     }
     if not superseded:
         return findings
@@ -446,8 +448,7 @@ def _normalize_reciprocal_merges(findings: list[AuditFinding]) -> list[AuditFind
             recommendation="keep",
             merge_with_contract_id=None,
             rationale=(
-                f"{f.rationale} (this merge is recorded once, on "
-                f"{f.merge_with_contract_id})"
+                f"{f.rationale} (this merge is recorded once, on {f.merge_with_contract_id})"
             ),
         )
         if f.contract_id in superseded
@@ -456,10 +457,10 @@ def _normalize_reciprocal_merges(findings: list[AuditFinding]) -> list[AuditFind
     ]
 
 
-def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
+def _run_members(run: RLMClusteringRun) -> dict[str, tuple[str, ...]]:
     """The membership the discovery loop actually ended with.
 
-    Read from ``draft.assignments``, which is the placement the run held when it
+    Read from ``run.assignments``, which is the placement the run held when it
     stopped. The obvious alternative — replaying the chunk assignments in order —
     is wrong, and quietly so: a MERGE moves the consumed family's members onto
     the survivor without re-listing them in any later chunk, so a replay shows
@@ -468,14 +469,14 @@ def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
     absorbed, which is the opposite of what the merge decided.
 
     Falls back to the replay only for drafts written before ``assignments`` was
-    stored, where it is the sole record there is; such a draft predates merges
+    stored, where it is the sole record there is; such a run predates merges
     being applied at all, so the replay is accurate for it.
     """
-    if draft.assignments:
-        placement = dict(draft.assignments)
+    if run.assignments:
+        placement = dict(run.assignments)
     else:  # pragma: no cover - only reachable for drafts written before this field
         placement = {}
-        for chunk in draft.chunks:
+        for chunk in run.chunks:
             placement.update(chunk.assignments)
             for trace_id in chunk.ambiguous_trace_ids + chunk.uncovered_trace_ids:
                 placement.pop(trace_id, None)
@@ -483,7 +484,7 @@ def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
     # A contract that no longer exists cannot have members. Anything pointing at
     # one is a bug rather than a finding, so it is dropped here instead of being
     # rendered as a family a reviewer might try to act on.
-    live = {contract.contract_id for contract in draft.contracts}
+    live = {contract.contract_id for contract in run.contracts}
     grouped: dict[str, list[str]] = {}
     for trace_id, contract_id in placement.items():
         if contract_id in live:
@@ -491,7 +492,7 @@ def _draft_members(draft: TaxonomyDraft) -> dict[str, tuple[str, ...]]:
     return {cid: tuple(sorted(traces)) for cid, traces in grouped.items()}
 
 
-def resolve_findings(audit: TaxonomyAudit, resolutions: dict[str, str]) -> TaxonomyAudit:
+def resolve_findings(audit: RLMClusteringAudit, resolutions: dict[str, str]) -> RLMClusteringAudit:
     """Record how discovery answered each actionable finding.
 
     Separate from the audit that raised them so the original verdict is never
@@ -510,14 +511,14 @@ def resolve_findings(audit: TaxonomyAudit, resolutions: dict[str, str]) -> Taxon
 
 
 def freeze_taxonomy(
-    draft: TaxonomyDraft,
-    draft_id: str,
+    run: RLMClusteringRun,
+    run_id: str,
     *,
-    audit: TaxonomyAudit | None = None,
+    audit: RLMClusteringAudit | None = None,
     audit_id: str | None = None,
     force: bool = False,
 ) -> FrozenTaxonomy:
-    """Freeze a draft into a taxonomy an assignment can be made against.
+    """Freeze a run into a taxonomy an assignment can be made against.
 
     Refuses while an actionable audit finding is unresolved. ``force`` exists
     for the case where a reviewer has decided to freeze anyway — an incomplete
@@ -533,10 +534,10 @@ def freeze_taxonomy(
                 f"{', '.join(f.contract_id for f in unresolved)}"
             )
 
-    limitations = list(draft.limitations)
-    if not draft.complete:
+    limitations = list(run.limitations)
+    if not run.complete:
         limitations.append(
-            f"frozen from a draft that stopped on {draft.stop_reason.value} rather than "
+            f"frozen from a run that stopped on {run.stop_reason.value} rather than "
             "converging; its contracts were still changing"
         )
     if audit is None:
@@ -551,17 +552,17 @@ def freeze_taxonomy(
         )
 
     return FrozenTaxonomy(
-        draft_id=draft_id,
+        run_id=run_id,
         audit_id=audit_id,
-        analysis_id=draft.analysis_id,
-        view=draft.view,
-        contracts=draft.contracts,
-        complete=draft.complete,
+        analysis_id=run.analysis_id,
+        view=run.view,
+        contracts=run.contracts,
+        complete=run.complete,
         limitations=tuple(dict.fromkeys(limitations)),
     )
 
 
-def compute_audit_id(audit: TaxonomyAudit) -> str:
+def compute_audit_id(audit: RLMClusteringAudit) -> str:
     digest = hashlib.sha256(audit.model_dump_json().encode("utf-8")).hexdigest()
     return f"rlm-taxonomy-audit-{digest[:16]}"
 
@@ -571,7 +572,7 @@ def compute_taxonomy_id(taxonomy: FrozenTaxonomy) -> str:
 
     Derived from the semantic claims rather than the whole model: an assignment
     naming a taxonomy id must be naming the text it classified against, and the
-    draft and audit ids that produced it are lineage, not content.
+    run and audit ids that produced it are lineage, not content.
     """
     payload = json.dumps(
         {
@@ -586,11 +587,11 @@ def compute_taxonomy_id(taxonomy: FrozenTaxonomy) -> str:
     return f"rlm-taxonomy-{hashlib.sha256(payload.encode()).hexdigest()[:16]}"
 
 
-def save_audit(audit: TaxonomyAudit, store: DerivedStore) -> DerivedEnvelope:
+def save_audit(audit: RLMClusteringAudit, store: DerivedStore) -> DerivedEnvelope:
     return store.write(
         compute_audit_id(audit),
-        kind="rlm_taxonomy_audit",
-        parent_artifact_id=audit.draft_id,
+        kind="rlm_clustering_audit",
+        parent_artifact_id=audit.run_id,
         payload=audit.model_dump_json().encode("utf-8"),
         summary={
             "findings": len(audit.findings),
@@ -604,14 +605,14 @@ def save_taxonomy(taxonomy: FrozenTaxonomy, store: DerivedStore) -> DerivedEnvel
     return store.write(
         compute_taxonomy_id(taxonomy),
         kind="rlm_taxonomy",
-        parent_artifact_id=taxonomy.draft_id,
+        parent_artifact_id=taxonomy.run_id,
         payload=taxonomy.model_dump_json().encode("utf-8"),
         summary={"contracts": len(taxonomy.contracts), "complete": int(taxonomy.complete)},
     )
 
 
-def load_audit(audit_id: str, store: DerivedStore) -> TaxonomyAudit:
-    return TaxonomyAudit.model_validate_json(store.read_payload(audit_id))
+def load_audit(audit_id: str, store: DerivedStore) -> RLMClusteringAudit:
+    return RLMClusteringAudit.model_validate_json(store.read_payload(audit_id))
 
 
 def load_taxonomy(taxonomy_id: str, store: DerivedStore) -> FrozenTaxonomy:

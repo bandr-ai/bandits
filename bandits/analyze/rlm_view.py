@@ -26,7 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
-from bandits.analyze.rlm_models import FamilyContract, TaxonomyAudit, TaxonomyDraft
+from bandits.analyze.rlm_models import FamilyContract, RLMClusteringAudit, RLMClusteringRun
 from bandits.analyze.rlm_session import SessionState
 
 _EXCERPT = 100
@@ -67,7 +67,7 @@ def family_card(
     *,
     members: Sequence[str] = (),
     corpus: ReadOnlyCorpus | None = None,
-    audit: TaxonomyAudit | None = None,
+    audit: RLMClusteringAudit | None = None,
     max_examples: int = 4,
 ) -> Panel:
     """One family, rendered as something a reviewer can accept or reject.
@@ -117,9 +117,7 @@ def family_card(
     border = "cyan"
     finding = None
     if audit is not None:
-        finding = next(
-            (f for f in audit.findings if f.contract_id == contract.contract_id), None
-        )
+        finding = next((f for f in audit.findings if f.contract_id == contract.contract_id), None)
     if finding is not None:
         status = f"audit: {finding.recommendation}"
         border = {"keep": "green", "revise": "yellow", "split": "red"}.get(
@@ -151,7 +149,7 @@ def taxonomy_overview(
     contracts: Sequence[FamilyContract],
     *,
     members: dict[str, tuple[str, ...]] | None = None,
-    audit: TaxonomyAudit | None = None,
+    audit: RLMClusteringAudit | None = None,
 ) -> Table:
     """Every family at a glance, biggest first, with what the audit said."""
     table = Table("family", "name", "members", "outcome", "audit")
@@ -201,16 +199,14 @@ def live_panel(state: SessionState, *, recent: Sequence[dict] = ()) -> Panel:
     header.add_row("status", f"[{status_colour}]{state.status}[/{status_colour}]")
     header.add_row(
         "pass",
-        f"{state.pass_index + 1} of {state.requested_passes} "
-        f"({state.completed_passes} complete)",
+        f"{state.pass_index + 1} of {state.requested_passes} ({state.completed_passes} complete)",
     )
     header.add_row("traces", _bar(state.traces_seen_this_pass, state.traces_total))
     header.add_row("chunks", str(state.chunk_index))
     header.add_row("assigned", str(len(state.assignments)))
     header.add_row(
         "unresolved",
-        f"{len(state.ambiguous_trace_ids)} ambiguous, "
-        f"{len(state.uncovered_trace_ids)} uncovered",
+        f"{len(state.ambiguous_trace_ids)} ambiguous, {len(state.uncovered_trace_ids)} uncovered",
     )
     header.add_row("spend", f"{state.llm_calls} calls · ${state.cost_usd:.4f}")
 
@@ -222,9 +218,7 @@ def live_panel(state: SessionState, *, recent: Sequence[dict] = ()) -> Panel:
         counts: dict[str, int] = {}
         for contract_id in state.assignments.values():
             counts[contract_id] = counts.get(contract_id, 0) + 1
-        for contract in sorted(
-            state.contracts, key=lambda c: -counts.get(c.contract_id, 0)
-        ):
+        for contract in sorted(state.contracts, key=lambda c: -counts.get(c.contract_id, 0)):
             table.add_row(
                 contract.contract_id,
                 _excerpt(contract.name, 34),
@@ -264,7 +258,11 @@ def _event_line(event: dict) -> str:
         return (
             f"pass {event.get('pass', 0) + 1} chunk {event.get('chunk')}: "
             f"{event.get('traces')} traces, {operations}"
-            + (f" [failed: {event.get('error', '')[:40]}]" if event.get("status") == "error" else "")
+            + (
+                f" [failed: {event.get('error', '')[:40]}]"
+                if event.get("status") == "error"
+                else ""
+            )
         )
     if name == "session_finished":
         return f"finished: {event.get('stop_reason')} ({event.get('completed_passes')} passes)"
@@ -275,17 +273,17 @@ def _event_line(event: dict) -> str:
     return name
 
 
-def print_pass_history(draft: TaxonomyDraft, console: Console) -> None:
+def print_pass_history(run: RLMClusteringRun, console: Console) -> None:
     """What each pass changed, so a reviewer can see the taxonomy settling.
 
     The question at a pause is whether the second look agreed with the first,
     and that is a per-pass fact: a run whose second pass moved a third of its
     traces has not settled, however tidy the final list of families looks.
     """
-    if not draft.passes:
+    if not run.passes:
         return
     table = Table("pass", "traces", "operations", "moved", "families after")
-    for result in draft.passes:
+    for result in run.passes:
         table.add_row(
             str(result.pass_index + 1) + ("" if result.complete else " [yellow](partial)[/yellow]"),
             str(len(result.trace_ids)),
