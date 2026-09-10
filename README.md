@@ -121,9 +121,9 @@ uv run bandits export <task-set-id> --format sft \
 
 ### Duplicates and the held-out split
 
-The fit/held-out split moves whole lineage groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so two runs of the same request from different sessions arrive as independent groups — and a source that declares no lineage at all leaves every trace its own.
+The fit/held-out split moves whole groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so a source that declares no lineage at all leaves every trace its own.
 
-Two traces of the same normalized request are held together as well, so a corpus that declares no lineage still cannot put one request on both sides. Normalization changes case and separators only; it preserves identifiers and every other value, so `refund order 7741` and `refund order 8802` remain distinct.
+Two traces of the same normalized request are joined as well, and the two rules compose rather than one falling back to the other: two runs of one request from different sessions are held together despite carrying different lineage ids, and a group joined by lineage on one edge and by an identical request on another moves whole. Normalization changes case and separators only; it preserves identifiers and every other value, so `refund order 7741` and `refund order 8802` remain distinct.
 
 Without this, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
 
