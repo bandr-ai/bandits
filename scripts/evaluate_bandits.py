@@ -488,13 +488,15 @@ def review_app(project: Path, labeler: str) -> None:
             }
             for trace_id in representative_ids[:3]
         ]
-        # One proposal keeps human work proportional to families, not trajectories.
+        # Generate alternatives before measuring them. The reviewer still sees
+        # one proposal, but it is the strongest measured candidate rather than
+        # whichever frequency hypothesis happened to be drafted first.
         draft = draft_verifiers(
             taskset,
             taskset_env.artifact_id,
             analysis,
             family_id,
-            limit=1,
+            limit=8,
             labels=label_set,
         )
         draft_env = save_verifier_draft(draft, store)
@@ -515,7 +517,29 @@ def review_app(project: Path, labeler: str) -> None:
             validation_id=validation_env.artifact_id,
         )
         checks = []
-        for spec in draft.verifiers:
+
+        def candidate_rank(spec) -> tuple[float, ...]:
+            held = validation.held_out(spec.verifier_id)
+            assessment = next(
+                (
+                    item
+                    for item in validation.gameability_assessments
+                    if item.verifier_id == spec.verifier_id
+                ),
+                None,
+            )
+            if held is None:
+                return (0, 0, 0, 0, 0)
+            return (
+                float(held.scored > 0),
+                float((held.false_positives or 0) == 0),
+                float(not assessment.attack_succeeded) if assessment else 0,
+                held.agreement if held.agreement is not None else -1,
+                held.coverage if held.coverage is not None else -1,
+            )
+
+        best_specs = sorted(draft.verifiers, key=candidate_rank, reverse=True)[:1]
+        for spec in best_specs:
             held = validation.held_out(spec.verifier_id)
             assessment = next(
                 (
@@ -547,6 +571,24 @@ def review_app(project: Path, labeler: str) -> None:
                             "model_reason": label_reason(item.trace_id),
                         }
                     )
+            successes = sum(label.verdict is Verdict.SUCCESS for label in labels)
+            failures = sum(label.verdict is Verdict.FAILURE for label in labels)
+            reasons = []
+            if not successes or not failures:
+                reasons.append("The model labels do not include both successes and failures.")
+            if held is None or held.scored < 2:
+                reasons.append("Fewer than two held-out examples were scorable.")
+            if held and held.coverage is not None and held.coverage < 0.5:
+                reasons.append("It covers less than half of labeled held-out examples.")
+            if held and (held.false_positives or 0) > 0:
+                reasons.append(f"It accepts {held.false_positives} labeled failure(s).")
+            if held and (held.agreement is None or held.agreement < 0.8):
+                reasons.append("Agreement with the model judgments is below 80%.")
+            if assessment is None or assessment.coverage != "complete":
+                reasons.append("The gaming probe did not cover the complete verifier.")
+            elif assessment.attack_succeeded:
+                reasons.append("A synthetic run passed without performing the requested task.")
+            recommendation = "reject" if reasons else "accept"
             for check in spec.checks:
                 checks.append(
                     {
@@ -567,6 +609,9 @@ def review_app(project: Path, labeler: str) -> None:
                         "attacks": attacks,
                         "counterexamples": counterexamples,
                         "blind_spots": list(spec.blind_spots),
+                        "recommendation": recommendation,
+                        "recommendation_reasons": reasons,
+                        "candidates_tested": len(draft.verifiers),
                     }
                 )
         state.update(
@@ -741,7 +786,7 @@ function render(){if(state.phase==='select')select();else if(state.phase==='work
 function select(){app.innerHTML=`<div class=panel><h2>Select eval families</h2><p class=muted>Nothing is preselected. The LLM will label their trajectories; you will review one proposed verifier per family.</p>${state.families.map((f,i)=>`<label class=row><input type=checkbox value="${f.id}"><span style="flex:1"><b>${esc(f.descriptor)}</b></span><span class=pill>${f.fit} fit · ${f.held} held</span></label>`).join('')}<div class=actions><button id=all>Select all</button><button class=primary id=start>Generate verifiers</button></div></div>`;document.querySelector('#all').onclick=()=>document.querySelectorAll('input[type=checkbox]').forEach(x=>x.checked=true);document.querySelector('#start').onclick=()=>{const b=document.querySelector('#start');b.disabled=true;b.textContent='LLM labeling…';api('/api/select',{families:[...document.querySelectorAll('input:checked')].map(x=>x.value)}).catch(showError)}}
 function label(){const c=state.cards[cardIndex],pct=100*cardIndex/state.cards.length;app.innerHTML=`<div class=bar><i style="width:${pct}%"></i></div><p class=muted>Family ${state.index+1}/${state.selected.length} · trajectory ${cardIndex+1}/${state.cards.length}</p><div class=panel><h3>Request</h3><div class=request>${esc(c.instruction)}</div><h3>What changed</h3>${c.states.map(x=>`<div class=fact><b>${esc(x.tool)}</b> · ${esc(x.key)} = ${esc(JSON.stringify(x.value))}</div>`).join('')||'<div class=fact>No structured result</div>'}<h3>Agent final response</h3><div class=final>${esc(c.final)}</div><textarea id=why placeholder="Optional rationale"></textarea><div class=actions><button class=success onclick="pick('success')">Success (S)</button><button class=failure onclick="pick('failure')">Failure (F)</button><button class=unclear onclick="pick('unclear')">Unclear (U)</button></div></div>`}
 function pick(verdict){labelDecisions[state.cards[cardIndex].trace_id]={verdict,rationale:document.querySelector('#why').value};cardIndex++;if(cardIndex===state.cards.length){const d=labelDecisions;labelDecisions={};cardIndex=0;api('/api/labels',d).catch(showError)}else label()}
-function checks(){const m=state.model_labels,reps=(state.representatives||[]).map(x=>`<div class=fact><b>${esc(x.model_verdict)}</b> · ${esc(x.request)}<div class=muted>${esc(x.model_reason)}</div></div>`).join('');app.innerHTML=`<div class=panel><h2>Review proposed verifier</h2><p class=muted>Your question is narrow: <b>would this recorded field necessarily prove that these requests succeeded?</b> The model labels are hypotheses, not ground truth.</p><h3>What this family asks for</h3>${reps}<p class=muted>${m.model} labeled all traces: ${m.success} success, ${m.failure} failure, ${m.unclear} unclear.</p>${state.checks.map(c=>`<div class=row style="display:block"><h2>${esc(c.description)}</h2><div><span class=metric>model agreement ${c.agreement==null?'n/a':Math.round(c.agreement*100)+'%'}</span><span class=metric>scorable ${c.scored}/${c.labeled}</span><span class=metric>FP ${c.false_positives??'n/a'}</span><span class=metric>FN ${c.false_negatives??'n/a'}</span></div><h3>Where verifier and model disagree</h3>${c.counterexamples.length?c.counterexamples.map(x=>`<div class=fact><b>${esc(x.kind)}</b> · model=${esc(x.model_verdict)}<br>${esc(x.request)}<div class=muted>${esc(x.model_reason)}</div></div>`).join(''):'<p class=muted>No disagreement among scorable held-out examples. This does not prove correctness.</p>'}<h3>Gaming test</h3>${c.attacks.length?c.attacks.map(a=>`<div class=fact>${a.passed?'⚠ Attack succeeded':'Attack resisted'}: ${esc(a.hypothesis)} (${a.forged_facts} forged fact${a.forged_facts===1?'':'s'})</div>`).join(''):'<p class=muted>No applicable attack template; safety was not established.</p>'}${c.blind_spots.length?`<h3>Known blind spots</h3><p>${c.blind_spots.map(esc).join('<br>')}</p>`:''}<h3>Your decision</h3><p>Does this check necessarily demonstrate successful completion—not merely that one tool emitted this value?</p><textarea data-note="${c.check_id}" placeholder="State why this field is or is not sufficient evidence."></textarea><div class=actions><label><input type=radio name="${c.check_id}" value=accept> Accept as sufficient</label><label><input type=radio name="${c.check_id}" value=reject checked> Reject as insufficient</label></div></div>`).join('')||'<p>No executable verifier could be proposed for this family.</p>'}<button class=primary id=submit>Save decision and continue</button></div>`;document.querySelector('#submit').onclick=()=>{const d={};state.checks.forEach(c=>d[c.check_id]={decision:document.querySelector(`input[name="${c.check_id}"]:checked`).value,rationale:document.querySelector(`[data-note="${c.check_id}"]`).value});api('/api/reviews',d).catch(showError)}}
+function checks(){const m=state.model_labels,reps=(state.representatives||[]).map(x=>`<div class=fact><b>${esc(x.model_verdict)}</b> · ${esc(x.request)}<div class=muted>${esc(x.model_reason)}</div></div>`).join('');app.innerHTML=`<div class=panel><h2>Review the strongest of ${state.checks[0]?.candidates_tested??0} candidates</h2><p class=muted>The system measured several candidates first. You only confirm or override its recommendation.</p><h3>What this family asks for</h3>${reps}<p class=muted>${m.model} labeled all traces: ${m.success} success, ${m.failure} failure, ${m.unclear} unclear.</p>${state.checks.map(c=>`<div class=row style="display:block"><h2>${esc(c.description)}</h2><div class=fact><b>System recommendation: ${c.recommendation.toUpperCase()}</b>${c.recommendation_reasons.length?`<div>${c.recommendation_reasons.map(x=>'• '+esc(x)).join('<br>')}</div>`:'<div>No automatic rejection condition was found. Human confirmation is still required.</div>'}</div><div><span class=metric>agreement ${c.agreement==null?'not measurable':Math.round(c.agreement*100)+'%'}</span><span class=metric>tested on ${c.scored}/${c.labeled}</span><span class=metric>accepted failures ${c.false_positives??'unknown'}</span><span class=metric>missed successes ${c.false_negatives??'unknown'}</span></div><h3>Examples it gets wrong</h3>${c.counterexamples.length?c.counterexamples.map(x=>`<div class=fact><b>${esc(x.kind)}</b><br>${esc(x.request)}<div class=muted>${esc(x.model_reason)}</div></div>`).join(''):'<p class=muted>No measured disagreement. Small or one-sided samples can still make this inconclusive.</p>'}<h3>Can it be faked?</h3>${c.attacks.length?c.attacks.map(a=>`<div class=fact>${a.passed?'⚠ Yes':'Not by this test'}: ${esc(a.hypothesis)}</div>`).join(''):'<p class=muted>Not tested—this is unknown, not safe.</p>'}<h3>Your call</h3><p>Confirm the recommendation unless domain knowledge tells you this field alone proves the whole request succeeded.</p><textarea data-note="${c.check_id}" placeholder="Optional: explain an override or note missing evidence."></textarea><div class=actions><label><input type=radio name="${c.check_id}" value="${c.recommendation}" checked> Confirm ${c.recommendation}</label><label><input type=radio name="${c.check_id}" value="${c.recommendation==='accept'?'reject':'accept'}"> Override to ${c.recommendation==='accept'?'reject':'accept'}</label></div></div>`).join('')||'<p>No executable verifier could be proposed for this family.</p>'}<button class=primary id=submit>Save and continue</button></div>`;document.querySelector('#submit').onclick=()=>{const d={};state.checks.forEach(c=>d[c.check_id]={decision:document.querySelector(`input[name="${c.check_id}"]:checked`).value,rationale:document.querySelector(`[data-note="${c.check_id}"]`).value});api('/api/reviews',d).catch(showError)}}
 function done(){app.innerHTML=`<div class=panel><h2>Review complete</h2><p>${state.exports.length} eval export(s) created.</p><p class=muted>Now—and only now—provide the sealed τ2 truth file.</p><input id=truth type=text value="work/tau2-run/tau2.labels.json"><div class=actions><button class=primary id=score>Reveal truth and score</button></div></div>`;document.querySelector('#score').onclick=()=>api('/api/score',{truth:document.querySelector('#truth').value}).catch(showError)}
 function report(){const r=state.report,s=r.scores,w=r.workflow,h=r.held_out;app.innerHTML=`<div class=panel><h2>Final result</h2><div class=request>Trust score: ${s.trust_score==null?'n/a':Math.round(s.trust_score*100)+'%'}</div><p>Precision ${s.success_precision==null?'n/a':Math.round(s.success_precision*100)+'%'} · Coverage ${s.coverage==null?'n/a':Math.round(s.coverage*100)+'%'} · Failure recall ${s.failure_recall==null?'n/a':Math.round(s.failure_recall*100)+'%'}</p><p>${w.reviewed_families} reviewed families · ${w.exported_rows} exported rows · ${h.scored}/${h.labeled} held-out scored · ${s.leaked_task_groups} leaked task groups</p><p class=muted>Saved to the project report.json.</p></div>`}
 function showError(e){statusEl.innerHTML=`<span class=error>${esc(e.message)}</span>`}addEventListener('keydown',e=>{if(state?.phase!=='label'||e.target.tagName==='TEXTAREA')return;if(e.key.toLowerCase()==='s')pick('success');if(e.key.toLowerCase()==='f')pick('failure');if(e.key.toLowerCase()==='u')pick('unclear')});load();
