@@ -224,9 +224,11 @@ class _ScriptedMiner:
         self.script = script
         self.calls = 0
         self.seen_chunks: list[str] = []
+        self.seen_questions: list[str] = []
 
     def __call__(self, *, chunk: str, taxonomy: str, question: str):
         self.seen_chunks.append(chunk)
+        self.seen_questions.append(question)
         step = self.script[min(self.calls, len(self.script) - 1)]
         self.calls += 1
         import json
@@ -466,6 +468,56 @@ def test_a_failed_chunk_is_recorded_and_the_loop_continues() -> None:
     assert len(failed) == 1
     assert "fell over" in failed[0].error
     assert len(draft.chunks) > 1
+
+
+def test_normal_chunk_calls_carry_no_correction() -> None:
+    """The full mining instruction already lives in the Signature doc; a
+    normal call must not also pay to repeat it through ``correction``."""
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+    predict = _ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}])
+    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert predict.seen_questions == [""] * len(predict.seen_questions)
+
+
+def test_a_trace_the_chunk_read_but_never_reported_becomes_uncovered() -> None:
+    """A max-iterations or truncated reply can leave assignments, ambiguous
+    and uncovered all empty. The trace must not simply disappear."""
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
+
+    def predict(*, chunk: str, taxonomy: str, question: str):
+        return SimpleNamespace(
+            contracts=[_RAW_CONTRACT],
+            operations=[],
+            assignments={"t1": "c1"},
+            ambiguous_trace_ids=[],
+            uncovered_trace_ids=[],
+        )
+
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert "t2" in draft.uncovered_trace_ids
+    assert any("t2" in limitation for limitation in draft.limitations)
+
+
+def test_every_readable_trace_is_accounted_for_somewhere() -> None:
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(6))))
+    predict = _ScriptedMiner(
+        [
+            {
+                "contracts": [_RAW_CONTRACT],
+                "contract_id": "c1",
+                "operations": [{"operation": "CREATE", "rationale": "these are all refunds"}],
+            },
+            {"contract_id": "c1"},
+        ]
+    )
+    draft = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    accounted = (
+        set(draft.assignments)
+        | set(draft.ambiguous_trace_ids)
+        | set(draft.uncovered_trace_ids)
+        | set(draft.unreadable_trace_ids)
+    )
+    assert accounted == set(corpus.list_trace_ids())
 
 
 def test_mining_an_unreadable_corpus_refuses_rather_than_inventing() -> None:
