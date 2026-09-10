@@ -15,44 +15,12 @@ from rich.text import Text
 
 from bandits import ledger
 from bandits.analyze import (
-    DEFAULT_BUDGET,
-    DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
-    DEFAULT_NEIGHBORS,
     analyze_corpus,
     load_analysis,
     load_task_set,
-    merge_families,
-    mine_task_set,
     save_analysis,
     save_task_set,
-    split_family,
-)
-from bandits.analyze.audit import (
-    DEFAULT_MODEL as AUDIT_MODEL,
-)
-from bandits.analyze.audit import (
-    AuditError,
-    audit_task_set,
-    build_predictor,
-    load_audit_run,
-    save_audit_run,
-)
-from bandits.analyze.embed import (
-    DEFAULT_MODEL as EMBEDDING_MODEL,
-)
-from bandits.analyze.embed import (
-    DEFAULT_SIMILARITY as EMBEDDING_SIMILARITY,
-)
-from bandits.analyze.embed import (
-    EmbeddingCache,
-    EmbeddingError,
-    build_cache,
-    descriptors,
-    embedding_distance,
-    load_cache,
-    requests,
-    save_cache,
 )
 from bandits.analyze.rlm_audit import (
     DEFAULT_MODEL as RLM_AUDIT_MODEL,
@@ -337,33 +305,6 @@ def analyze(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[EmbeddingCache, str]:
-    """Vectors for every descriptor this analysis will be grouped on.
-
-    Reuses a saved cache when one covers the corpus, and embeds only what it is
-    missing, so re-mining the same analysis at a different threshold costs
-    nothing. Vectors from two models are never mixed — a cache pinned to another
-    model is passed over rather than extended.
-    """
-    # Both halves of what mining compares. Values remain visible in descriptors
-    # and requests, so task-defining identifiers reach both distance backends. Building
-    # only the first leaves every duplicate comparison reading maximally far.
-    wanted = descriptors(analysis) + requests(analysis)
-    existing: EmbeddingCache | None = None
-    reused_id = ""
-    for envelope in store.list(kind="embeddings"):
-        if envelope.parent_artifact_id != analysis.corpus_id:
-            continue
-        candidate = load_cache(envelope.artifact_id, store)
-        if candidate.model == model:
-            existing, reused_id = candidate, envelope.artifact_id
-            break
-
-    cache = build_cache(wanted, model=model, existing=existing)
-    if existing is not None and cache.vectors == existing.vectors:
-        return cache, reused_id
-    return cache, save_cache(cache, store, analysis.corpus_id).artifact_id
-
 
 def _derived(project: Path) -> DerivedStore:
     return DerivedStore(project / ".bandits")
@@ -605,114 +546,6 @@ def _report_audit(run, run_id: str, task_set) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-def _run_audit(task_set, task_set_id: str, analysis, store, *, model: str, family_ids=None):
-    """Audit a task set and persist the result beside it. Never rewrites it."""
-    predict = build_predictor(model=model)
-    with ledger.stage("audit_run", task_set_id=task_set_id, model=model):
-        run = audit_task_set(
-            task_set,
-            task_set_id,
-            analysis,
-            predict=predict,
-            model=model,
-            family_ids=family_ids,
-            on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
-        )
-        envelope = save_audit_run(run, store)
-        # Lineage rather than contents: the run is already an immutable
-        # artifact, so the ledger records which one this pass produced and lets
-        # the store hold what is in it.
-        ledger.record(
-            {
-                "event_type": "stage_complete",
-                "stage_name": "audit_run",
-                "input_artifact_id": task_set_id,
-                "output_artifact_id": envelope.artifact_id,
-                "audited": len(run.concluded()),
-                "failed": len(run.failed()),
-                "skipped": len(run.skipped),
-            }
-        )
-    _report_audit(run, envelope.artifact_id, task_set)
-    return run
-
-
-@app.command()
-def mine(
-    analysis_id: str,
-    budget: int = typer.Option(DEFAULT_BUDGET, "--budget", help="How many tasks to select."),
-    held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
-    similarity: float = typer.Option(
-        EMBEDDING_SIMILARITY,
-        "--similarity",
-        help="Higher groups more conservatively. Tuned for cosine similarity.",
-    ),
-    neighbors: int = typer.Option(
-        DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
-    ),
-    duplicate_similarity: float = typer.Option(
-        DEFAULT_DUPLICATE_SIMILARITY,
-        "--duplicate-similarity",
-        help="Above this two requests are the same one, and never straddle the split.",
-    ),
-    embedding_model: str = typer.Option(
-        EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
-    ),
-    audit: bool = typer.Option(
-        True,
-        "--audit/--no-audit",
-        help="Run the advisory family coherence audit. Never changes grouping.",
-    ),
-    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Group an analysis into task families and select a representative set."""
-    store = _derived(project)
-    try:
-        analysis = load_analysis(analysis_id, store)
-    except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no analysis {analysis_id!r}")
-        raise typer.Exit(code=1) from exc
-
-    try:
-        cache, cache_id = _embedding_cache(analysis, store, embedding_model)
-    except EmbeddingError as exc:
-        # Embedding failures must stop the run rather than produce a task set
-        # whose requested clustering operation never completed.
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    task_set = mine_task_set(
-        analysis,
-        analysis_id,
-        budget=budget,
-        held_out=held_out,
-        similarity=similarity,
-        neighbors=neighbors,
-        distance=embedding_distance(cache),
-        duplicate_distance=embedding_distance(cache),
-        duplicate_similarity=duplicate_similarity,
-        backend="embedding",
-        embedding_model=embedding_model,
-        embedding_cache_id=cache_id,
-        proposed_by="model",
-    )
-    envelope = save_task_set(task_set, store)
-    _report(task_set, envelope.artifact_id)
-    console.print(f"embeddings:  {cache_id} ({len(cache.vectors)} vectors, {embedding_model})")
-
-    if not audit:
-        return
-    try:
-        # Written as its own artifact parented to the task set just saved. The
-        # task set is already persisted and is not touched again, so mining is
-        # byte-identical whether or not this pass runs.
-        _run_audit(task_set, envelope.artifact_id, analysis, store, model=audit_model)
-    except AuditError as exc:
-        # The grouping above is complete and saved. An audit that could not run
-        # is a missing second opinion, not a failed mine.
-        console.print(f"[yellow]audit skipped:[/yellow] {exc}")
-
 
 @app.command()
 def families(
@@ -749,104 +582,7 @@ def families(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-@app.command(name="audit-families")
-def audit_families_command(
-    task_set_id: str,
-    family: list[str] = typer.Option(
-        None, "--family", help="Audit only these families. Repeatable."
-    ),
-    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
-    show: str = typer.Option(
-        None, "--show", help="Print a saved audit by id instead of running a new one."
-    ),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Read each family with a model and report whether it holds together.
 
-    Advisory only: proposes splits for a reviewer to apply and never changes
-    grouping, merges families, or touches clustering parameters.
-    """
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-
-    if show is not None:
-        try:
-            run = load_audit_run(show, store)
-        except FileNotFoundError as exc:
-            console.print(f"[red]error:[/red] no audit {show!r}")
-            raise typer.Exit(code=1) from exc
-        if run.task_set_id != task_set_id:
-            # The two are read independently, and nothing downstream notices the
-            # mismatch: geometric coherence is looked up by family id, so a
-            # family this task set never had reads as "not measured" rather than
-            # as wrong, and the `split-family` line would name the audit's task
-            # set beside a family judged against another one.
-            console.print(
-                f"[red]error:[/red] audit {show} is for task set {run.task_set_id}, "
-                f"not {task_set_id}"
-            )
-            raise typer.Exit(code=1)
-        _report_audit(run, show, task_set)
-        return
-
-    try:
-        analysis = load_analysis(task_set.analysis_id, store)
-    except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no analysis {task_set.analysis_id!r}")
-        raise typer.Exit(code=1) from exc
-
-    try:
-        _run_audit(
-            task_set,
-            task_set_id,
-            analysis,
-            store,
-            model=audit_model,
-            family_ids=tuple(family) if family else None,
-        )
-    except (AuditError, ValueError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-
-@app.command(name="merge-families")
-def merge_families_command(
-    task_set_id: str,
-    family_ids: list[str] = typer.Argument(..., help="Two or more families that are one task."),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Record a reviewer's decision that several families are the same task."""
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-    try:
-        corrected = merge_families(
-            task_set, tuple(family_ids), load_analysis(task_set.analysis_id, store)
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    envelope = save_task_set(corrected, store)
-    _report(corrected, envelope.artifact_id)
-
-
-@app.command(name="split-family")
-def split_family_command(
-    task_set_id: str,
-    family_id: str,
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Split a family back into its exact-instruction groups."""
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-    try:
-        corrected = split_family(task_set, family_id, load_analysis(task_set.analysis_id, store))
-    except ValueError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    envelope = save_task_set(corrected, store)
-    _report(corrected, envelope.artifact_id)
 
 
 @app.command(name="draft-verifier")

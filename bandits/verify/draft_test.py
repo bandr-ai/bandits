@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
+from bandits.analyze import analyze_corpus, compute_analysis_id
+from bandits.analyze.fixtures import task_set_by_first_word
 from bandits.analyze.models import EvidenceKind
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, make_label
@@ -24,19 +25,13 @@ from bandits.verify.execute import execute_verifier
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
-def _test_distance(left: str, right: str) -> float:
-    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
-
 
 def _task_set(path: Path):
     analysis = analyze_corpus(load_corpus(path, "otlp"))
     analysis_id = compute_analysis_id(analysis)
-    return analysis, mine_task_set(
+    return analysis, task_set_by_first_word(
         analysis,
         analysis_id,
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
 
@@ -113,12 +108,9 @@ def test_exact_output_is_proposed_only_when_the_instruction_requires_exact_text(
         ),
     )
     analysis = analyze_corpus(corpus)
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=1,
     )
 
@@ -143,12 +135,9 @@ def test_a_recorded_evaluator_score_becomes_a_check(tmp_path) -> None:
         + "\n"
     )
     analysis = analyze_corpus(load_corpus(source, "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=5,
     )
     family = task_set.families[0]
@@ -175,12 +164,9 @@ def test_stronger_evidence_survives_the_draft_limit(tmp_path) -> None:
         ' "gen_ai.tool.call.arguments": {}, "gen_ai.tool.call.result": {"exit_code": 0}}}\n'
     )
     analysis = analyze_corpus(load_corpus(source, "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=5,
     )
 
@@ -217,12 +203,9 @@ def _varying_amounts(tmp_path) -> Path:
 
 def _drafted(path, limit: int = 8):
     analysis = analyze_corpus(load_corpus(path, "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=5,
     )
     return draft_verifiers(task_set, "ts-1", analysis, task_set.families[0].family_id, limit=limit)
@@ -289,12 +272,9 @@ def test_two_tools_reporting_one_key_are_drafted_as_different_checks() -> None:
     """`status` from a lookup and `status` from an override are not one field."""
     fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
     analysis = analyze_corpus(load_corpus(fixtures / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
     address = next(f for f in task_set.families if "address" in f.descriptor)
@@ -426,12 +406,9 @@ def _skewed_corpus(
 def _skewed(**corpus_options):
     corpus = _skewed_corpus(**corpus_options)
     analysis = analyze_corpus(corpus)
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -566,12 +543,9 @@ def _two_condition_corpus() -> TraceCorpus:
 def test_a_two_condition_success_produces_a_justified_composite() -> None:
     """Status alone accepts a run that moved no money; the amount alone accepts a pending one."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -656,12 +630,9 @@ def test_labels_from_another_family_are_refused() -> None:
 def test_a_contradictory_conjunction_is_never_proposed() -> None:
     """Two equality checks on one field would score zero forever and read as strict."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -684,12 +655,9 @@ def test_a_contradictory_conjunction_is_never_proposed() -> None:
 def test_an_invariant_is_not_retired_by_the_failures_it_exists_to_catch() -> None:
     """Unlabeled, one counterexample retires it; labeled, only a success can."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -742,12 +710,9 @@ def test_a_stale_label_set_is_refused_rather_than_read_as_uncalibrated() -> None
 def test_a_composite_never_appears_without_the_checks_it_was_built_from(limit: int) -> None:
     """Validation exists to compare the conjunction against its sources."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -766,12 +731,9 @@ def test_a_composite_never_appears_without_the_checks_it_was_built_from(limit: i
 def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() -> None:
     """A derived candidate does not consume a slot a caller was choosing between."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]
@@ -788,12 +750,9 @@ def test_the_limit_bounds_independent_checks_not_the_conjunctions_over_them() ->
 def test_labels_covering_only_the_held_out_side_do_not_claim_calibration() -> None:
     """Drafting reads the fit side, so a label elsewhere measures nothing here."""
     analysis = analyze_corpus(_two_condition_corpus())
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=lambda left, right: 0.0,
-        backend="first-word",
-        similarity=0.5,
         budget=10,
     )
     family = task_set.families[0]

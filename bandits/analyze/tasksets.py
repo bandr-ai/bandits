@@ -12,6 +12,12 @@ import hashlib
 from bandits.analyze.models import TaskSet
 from bandits.store import DerivedEnvelope, DerivedStore
 
+DEFAULT_HELD_OUT = 0.3
+"""Share of each family's episodes reserved for measuring a verifier.
+
+Whole lineage groups move, so the realized share is whatever complete groups
+come nearest this without crossing it."""
+
 
 def compute_task_set_id(task_set: TaskSet) -> str:
     digest = hashlib.sha256(task_set.model_dump_json().encode("utf-8")).hexdigest()

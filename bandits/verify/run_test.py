@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from bandits.analyze import analyze_corpus, compute_analysis_id, mine_task_set
+from bandits.analyze import analyze_corpus, compute_analysis_id
+from bandits.analyze.fixtures import task_set_by_first_word
 from bandits.analyze.models import EvidenceKind
 from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
@@ -33,20 +34,14 @@ from bandits.verify.models import (
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
-def _test_distance(left: str, right: str) -> float:
-    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
-
 
 @pytest.fixture
 def context():
     corpus = load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp")
     analysis = analyze_corpus(corpus)
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
     family = max(task_set.families, key=lambda f: f.workload_mass)
