@@ -10,8 +10,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from bandits.analyze.families import normalize_instruction
 from bandits.analyze.models import CorpusAnalysis, TaskSet
+from bandits.analyze.text import normalize_instruction
 from bandits.export.eval import (
     _check_lineage,
     _partition_warnings,
