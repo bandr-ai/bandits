@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import time
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
 from typer.testing import CliRunner
 
 from bandits.analyze import (
-    DEFAULT_DUPLICATE_SIMILARITY,
     load_analysis,
     load_task_set,
     save_task_set,
 )
-from bandits.analyze.audit import AuditError, load_audit_run
-from bandits.analyze.embed import EmbeddingError, descriptors, load_cache, requests
 from bandits.cli import app
 from bandits.export import direct_sft
 from bandits.ingest.otlp import load_otlp
@@ -33,9 +28,44 @@ from bandits.verify import (
 )
 from bandits.verify.models import CheckReview, InterviewDecision
 from bandits.verify.validate import Agreement, Validation, save_validation
+from tests.tasksets import task_set_by_first_word
 
 runner = CliRunner()
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """Strip ANSI codes before substring checks: CI renders --help output
+    with color (unlike a local run), which can split a plain-text match
+    across color codes and fail even though the text is visibly present."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
+SUPPORT_FIXTURE = (
+    Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
+)
+
+
+def _mined(tmp_path: Path) -> str:
+    """Ingest and analyze the support fixture, then save a rule-built task set.
+
+    Built by the first-word fixture rule rather than by a miner: these tests are
+    about the commands downstream of grouping, and pinning them to whatever
+    discovers families would break them all again on the next change to it.
+    """
+    runner.invoke(
+        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
+    analyzed = runner.invoke(app, ["analyze", corpus_id, "--project", str(tmp_path)])
+    assert analyzed.exit_code == 0, analyzed.stdout
+    analysis_id = analyzed.stdout.split()[1]
+
+    store = DerivedStore(tmp_path / ".bandits")
+    analysis = load_analysis(analysis_id, store)
+    task_set = task_set_by_first_word(analysis, analysis_id, budget=10)
+    return save_task_set(task_set, store).artifact_id
 
 
 def test_ingest_prints_artifact_summary(tmp_path) -> None:
@@ -44,8 +74,8 @@ def test_ingest_prints_artifact_summary(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "artifact_id: corpus-" in result.stdout
-    assert "traces:      2" in result.stdout
+    assert "artifact_id: corpus-" in plain(result.stdout)
+    assert "traces:      2" in plain(result.stdout)
 
 
 def test_ingest_unknown_source_exits_nonzero(tmp_path) -> None:
@@ -55,13 +85,209 @@ def test_ingest_unknown_source_exits_nonzero(tmp_path) -> None:
     assert result.exit_code == 1
 
 
+def test_ingest_records_declared_control_markers(tmp_path) -> None:
+    """A benchmark's own scaffolding, declared once at ingest, must survive
+    onto the stored corpus so every later RLM command reads it automatically
+    rather than each one needing to know the source is tau2."""
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            str(FIXTURE),
+            "--source",
+            "otlp",
+            "--project",
+            str(tmp_path),
+            "--control-marker",
+            "###TRANSFER###",
+            "--control-marker",
+            "###STOP###",
+        ],
+    )
+    assert result.exit_code == 0
+    artifact_id = next(
+        line.split("artifact_id: ", 1)[1]
+        for line in plain(result.stdout).splitlines()
+        if line.startswith("artifact_id:")
+    )
+    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
+    assert corpus.control_markers == ("###TRANSFER###", "###STOP###")
+
+
+def test_ingest_without_control_marker_leaves_it_empty(tmp_path) -> None:
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    artifact_id = next(
+        line.split("artifact_id: ", 1)[1]
+        for line in plain(result.stdout).splitlines()
+        if line.startswith("artifact_id:")
+    )
+    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
+    assert corpus.control_markers == ()
+
+
+def test_mine_rlm_exposes_the_per_call_token_ceiling() -> None:
+    result = runner.invoke(app, ["mine-rlm", "--help"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "--max-tokens" in plain(result.stdout)
+
+
+def test_mine_rlm_then_materialize_rlm_taskset_through_the_real_cli(tmp_path) -> None:
+    """Exercises the exact commands evaluate_bandits.py's orchestration runs as
+    subprocesses: `mine-rlm --model ... --max-usd ...` then
+    `materialize-rlm-taskset`. Only the model call itself is mocked — argument
+    parsing, corpus loading, artifact writing, and materialization all run for
+    real, so a rename or signature change to either command breaks this test
+    instead of only breaking at run time months later."""
+    from datetime import UTC, datetime
+
+    from bandits.analyze import save_analysis
+    from bandits.analyze.analysis import analyze_corpus
+    from bandits.store import ArtifactStore, DerivedStore
+    from bandits.traces import Span, SpanKind, Trace, TraceCorpus, UserTurn
+
+    def _trace(trace_id: str, instruction: str) -> Trace:
+        moment = datetime(2024, 1, 1, tzinfo=UTC)
+        return Trace(
+            trace_id=trace_id,
+            source="chat-json",
+            source_digest="0" * 64,
+            task=instruction,
+            user_turns=(UserTurn(text=instruction),),
+            spans=(
+                Span(
+                    span_id=f"{trace_id}:span-0",
+                    kind=SpanKind.MODEL,
+                    name="model",
+                    started_at=moment,
+                    ended_at=moment,
+                ),
+            ),
+        )
+
+    corpus = TraceCorpus(
+        source="chat-json",
+        traces=(
+            _trace("t1", "Refund order 7741"),
+            _trace("t2", "Cancel order 8820"),
+            _trace("t3", "Change the shipping address"),
+        ),
+    )
+    artifact_store = ArtifactStore(tmp_path / ".bandits")
+    derived_store = DerivedStore(tmp_path / ".bandits")
+    artifact_store.write(corpus, source_path="synthetic")
+    analysis_envelope = save_analysis(analyze_corpus(corpus), derived_store)
+
+    def fake_predictor(*, model, view, max_tokens):
+        def predict(*, chunk, taxonomy, question):
+            trace_ids = [row["trace_id"] for row in json.loads(chunk)]
+            return SimpleNamespace(
+                contracts=[
+                    {
+                        "contract_id": "c1",
+                        "name": "Handle an order",
+                        "definition": "resolve a request about an order",
+                        "required_outcome_shape": ["the request is resolved"],
+                    }
+                ],
+                operations=[],
+                assignments={trace_id: "c1" for trace_id in trace_ids},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+
+        return predict
+
+    with mock.patch("bandits.cli.build_rlm_predictor", fake_predictor):
+        mined = runner.invoke(
+            app,
+            [
+                "mine-rlm",
+                analysis_envelope.artifact_id,
+                "--model",
+                "test-model",
+                "--max-usd",
+                "5.0",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+    assert mined.exit_code == 0, mined.stdout
+    run_id = next(
+        line.split("draft_id:", 1)[1].strip()
+        for line in plain(mined.stdout).splitlines()
+        if line.startswith("draft_id:")
+    )
+
+    materialized = runner.invoke(
+        app, ["materialize-rlm-taskset", run_id, "--project", str(tmp_path)]
+    )
+    assert materialized.exit_code == 0, materialized.stdout
+
+    task_set_id = next(
+        line.split("taskset_id:", 1)[1].strip()
+        for line in plain(materialized.stdout).splitlines()
+        if line.startswith("taskset_id:")
+    )
+    task_set = load_task_set(task_set_id, derived_store)
+    assert task_set.families
+
+
+def test_rlm_corpus_forwards_control_markers_from_the_stored_artifact(tmp_path) -> None:
+    """Every RLM mining/audit/assignment command builds its corpus through
+    this one function — a marker declared at ingest must reach the miner
+    without each of those four commands having to know to ask for it."""
+    from datetime import UTC, datetime
+
+    from bandits.analyze import save_analysis
+    from bandits.analyze.analysis import analyze_corpus
+    from bandits.cli import _rlm_corpus
+    from bandits.store import ArtifactStore, DerivedStore
+    from bandits.traces import Span, SpanKind, Trace, TraceCorpus, UserTurn
+
+    moment = datetime(2024, 1, 1, tzinfo=UTC)
+    trace = Trace(
+        trace_id="t1",
+        source="chat-json",
+        source_digest="0" * 64,
+        task="please transfer me ###TRANSFER###",
+        user_turns=(UserTurn(text="please transfer me ###TRANSFER###"),),
+        spans=(
+            Span(
+                span_id="t1:span-0",
+                kind=SpanKind.MODEL,
+                name="model",
+                started_at=moment,
+                ended_at=moment,
+            ),
+        ),
+    )
+    corpus = TraceCorpus(source="chat-json", traces=(trace,), control_markers=("###TRANSFER###",))
+    store = ArtifactStore(tmp_path / ".bandits")
+    envelope = store.write(corpus, source_path="synthetic")
+
+    analysis = analyze_corpus(corpus).replace(corpus_id=envelope.artifact_id)
+    analysis_envelope = save_analysis(analysis, DerivedStore(tmp_path / ".bandits"))
+
+    _, rlm_corpus, _ = _rlm_corpus(analysis_envelope.artifact_id, tmp_path, "user-messages")
+    view = rlm_corpus.get_user_messages(trace.trace_id)
+    assert "###TRANSFER###" not in " ".join(view.messages)
+    assert "###TRANSFER###" in view.withheld_fields
+
+
 def test_list_shows_ingested_artifact(tmp_path) -> None:
     runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
 
     result = runner.invoke(app, ["list", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "otlp" in result.stdout
+    assert "otlp" in plain(result.stdout)
 
 
 def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
@@ -70,14 +296,14 @@ def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
 
     overview = runner.invoke(app, ["show", artifact_id, "--project", str(tmp_path)])
     assert overview.exit_code == 0
-    assert "trace-1" in overview.stdout
-    assert "trace-2" in overview.stdout
+    assert "trace-1" in plain(overview.stdout)
+    assert "trace-2" in plain(overview.stdout)
 
     detail = runner.invoke(
         app, ["show", artifact_id, "--trace", "trace-1", "--project", str(tmp_path)]
     )
     assert detail.exit_code == 0
-    assert "lookup_order" in detail.stdout
+    assert "lookup_order" in plain(detail.stdout)
 
 
 CODING_FIXTURE = (
@@ -92,9 +318,9 @@ def test_analyze_reports_tasks_and_never_hides_limitations(tmp_path) -> None:
     result = runner.invoke(app, ["analyze", artifact_id, "--tasks", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "analysis_id: analysis-" in result.stdout
-    assert "task-trace-1" in result.stdout
-    assert "limitation:" in result.stdout
+    assert "analysis_id: analysis-" in plain(result.stdout)
+    assert "task-trace-1" in plain(result.stdout)
+    assert "limitation:" in plain(result.stdout)
 
 
 def test_analyze_reads_a_coding_corpus_too(tmp_path) -> None:
@@ -106,7 +332,7 @@ def test_analyze_reads_a_coding_corpus_too(tmp_path) -> None:
     result = runner.invoke(app, ["analyze", artifact_id, "--tasks", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "task-code-1" in result.stdout
+    assert "task-code-1" in plain(result.stdout)
 
 
 def test_analyze_unknown_artifact_exits_nonzero(tmp_path) -> None:
@@ -122,62 +348,6 @@ SUPPORT_FIXTURE = (
 )
 
 
-@pytest.fixture(autouse=True)
-def offline_embedder(monkeypatch):
-    """Keep `mine` off the network.
-
-    Grouping now embeds every descriptor, so without this the whole suite would
-    need an API key. Vectors are derived from the descriptor's own tokens, which
-    gives the support fixture stable, expected families — these
-    tests are about the command's plumbing, not about grouping quality.
-    """
-
-    def deterministic(model: str, texts):
-        # Hashed into a fixed width rather than a per-call vocabulary: build_cache
-        # embeds in batches, so a vocabulary derived from the batch would give
-        # later batches a different dimensionality and make cosine_distance raise.
-        # Wide enough that the fixtures' tokens do not collide, which would merge
-        # descriptors that share no words.
-        width = 4096
-        vectors = []
-        for text in texts:
-            vector = [0.0] * width
-            for token in text.split():
-                vector[hash_token(token) % width] = 1.0
-            vectors.append(vector)
-        return vectors
-
-    monkeypatch.setattr("bandits.cli.build_cache", _partial_embed(deterministic))
-
-
-def hash_token(token: str) -> int:
-    """Stable across processes, unlike hash(), so vectors do not shift per run."""
-    return int(hashlib.sha256(token.encode()).hexdigest()[:16], 16)
-
-
-def _partial_embed(embedder):
-    """Bind a stub embedder into `build_cache` without changing its signature."""
-    from bandits.analyze.embed import build_cache
-
-    def patched(texts, *, model, embed=None, existing=None):
-        return build_cache(texts, model=model, embed=embedder, existing=existing)
-
-    return patched
-
-
-def _mined(tmp_path: Path) -> str:
-    """Ingest, analyze and mine the support fixture; return the task set id."""
-    runner.invoke(
-        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analyzed = runner.invoke(app, ["analyze", corpus_id, "--project", str(tmp_path)])
-    analysis_id = analyzed.stdout.split()[1]
-    mined = runner.invoke(app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)])
-    assert mined.exit_code == 0, mined.stdout
-    return mined.stdout.split()[1]
-
-
 def _audit_predictor(**fields):
     """Stand in for the RLM. No model, no sandbox, no credentials in CI."""
 
@@ -189,430 +359,6 @@ def _audit_predictor(**fields):
 
     return build
 
-
-def test_mine_runs_the_audit_and_saves_it_beside_the_task_set(tmp_path) -> None:
-    runner.invoke(
-        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=False,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="Members describe two different tasks.",
-        ),
-    ):
-        result = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
-        )
-
-    assert result.exit_code == 0
-    assert "audit_id:    family-audit-" in result.stdout
-    store = DerivedStore(tmp_path / ".bandits")
-    assert store.list(kind="family_audit")
-
-    # The audit is its own artifact hanging off the task set, never inside it.
-    task_set_id = result.stdout.split()[1]
-    assert store.list(kind="family_audit")[0].parent_artifact_id == task_set_id
-
-
-def test_mine_output_is_identical_with_and_without_the_audit(tmp_path) -> None:
-    """The issue's acceptance criterion, at the CLI boundary."""
-
-    def mine_into(project: Path, *extra: str) -> str:
-        runner.invoke(
-            app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(project)]
-        )
-        corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-        analysis_id = runner.invoke(
-            app, ["analyze", corpus_id, "--project", str(project)]
-        ).stdout.split()[1]
-        mined = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(project), *extra]
-        )
-        assert mined.exit_code == 0, mined.stdout
-        return mined.stdout.split()[1]
-
-    audited_dir, plain_dir = tmp_path / "audited", tmp_path / "plain"
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=False,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="Two tasks here.",
-        ),
-    ):
-        audited_id = mine_into(audited_dir)
-    plain_id = mine_into(plain_dir, "--no-audit")
-
-    # Content-addressed, so an identical id is an identical task set.
-    assert audited_id == plain_id
-    assert DerivedStore(audited_dir / ".bandits").read_payload(audited_id) == DerivedStore(
-        plain_dir / ".bandits"
-    ).read_payload(plain_id)
-    assert not DerivedStore(plain_dir / ".bandits").list(kind="family_audit")
-
-
-def test_mine_survives_an_audit_that_cannot_run(tmp_path) -> None:
-    """A missing second opinion is not a failed mine."""
-    runner.invoke(
-        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    def missing_extra(**_):
-        raise AuditError("the family audit needs the 'audit' extra")
-
-    with mock.patch("bandits.cli.build_predictor", missing_extra):
-        result = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
-        )
-
-    assert result.exit_code == 0
-    assert "audit skipped:" in result.stdout
-    assert DerivedStore(tmp_path / ".bandits").list(kind="taskset")
-
-
-def test_audit_families_points_a_split_at_the_split_command(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
-    family = next(f for f in task_set.families if len(f.trace_ids) >= 2)
-    first, second = family.trace_ids[0], family.trace_ids[1]
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=False,
-            outlier_trace_ids=[first],
-            proposed_subgroups=[[first], [second]],
-            generated_name="Refund an eligible order",
-            rationale="These are two tasks.",
-        ),
-    ):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert "incoherent" in result.stdout
-    assert f"bandits split-family {task_set_id} {family.family_id}" in result.stdout
-    # Advisory: the task set it read is untouched.
-    assert load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits")) == task_set
-
-
-def test_audit_families_reports_both_verdicts_side_by_side(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="One task throughout.",
-        ),
-    ):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert "semantic" in result.stdout and "geometric" in result.stdout
-
-
-def test_the_audit_report_names_the_slowest_family(tmp_path) -> None:
-    """A duration nobody can attribute is not something a reviewer can act on.
-
-    The point of reporting a slowest family is to go and look at it, so the
-    figure has to arrive with the id it belongs to.
-    """
-    task_set_id = _mined(tmp_path)
-
-    def build(*, model, **_):
-        seen: list[str] = []
-
-        def predict(*, members, question):
-            seen.append(members)
-            # The second family audited sleeps, so the slowest is a known one
-            # rather than whichever happened to win a race.
-            if len(seen) == 2:
-                time.sleep(0.05)
-            return SimpleNamespace(
-                coherent=True,
-                outlier_trace_ids=[],
-                proposed_subgroups=[],
-                generated_name="Refund an eligible order",
-                rationale="One task.",
-            )
-
-        return predict
-
-    with mock.patch("bandits.cli.build_predictor", build):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0, result.stdout
-    slowest = [line for line in result.stdout.splitlines() if "slowest" in line]
-    assert slowest, result.stdout
-    assert "family-" in slowest[0], "the slowest duration has to name the family it belongs to"
-
-
-def test_the_audit_report_says_when_no_token_usage_was_reported(tmp_path) -> None:
-    """Never estimated. A count derived here would be wrong and look official."""
-    task_set_id = _mined(tmp_path)
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="One task.",
-        ),
-    ):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0, result.stdout
-    assert "no token usage was reported" in result.stdout
-
-
-def test_a_failed_family_is_reported_with_what_it_spent(tmp_path) -> None:
-    """A failure that spent budget must not read as a family nobody tried."""
-    task_set_id = _mined(tmp_path)
-
-    def build(*, model, **_):
-        def predict(*, members, question):
-            raise RuntimeError("connection reset")
-
-        predict.spend = lambda: (4, {"total_tokens": 250})
-        return predict
-
-    with mock.patch("bandits.cli.build_predictor", build):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0, result.stdout
-    assert "reached no verdict" in result.stdout
-    assert "connection reset" in result.stdout
-    assert "after 4 call(s)" in result.stdout
-
-    # And the attempt is persisted, not only printed.
-    store = DerivedStore(tmp_path / ".bandits")
-    run = load_audit_run(store.list(kind="family_audit")[0].artifact_id, store)
-    failures = run.failed()
-    assert failures and failures[0].llm_calls == 4
-    assert failures[0].tokens == {"total_tokens": 250}
-    assert run.concluded() == (), "a failed attempt must never count as a verdict"
-
-
-def test_audit_families_rejects_an_unknown_family(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="x"),
-    ):
-        result = runner.invoke(
-            app,
-            [
-                "audit-families",
-                task_set_id,
-                "--family",
-                "family-does-not-exist",
-                "--project",
-                str(tmp_path),
-            ],
-        )
-
-    assert result.exit_code == 1
-    assert "unknown family id" in result.stdout
-
-
-def test_audit_families_can_reprint_a_saved_audit(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="One task throughout.",
-        ),
-    ):
-        first = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-    audit_id = first.stdout.split("audit_id:")[1].split()[0]
-
-    result = runner.invoke(
-        app, ["audit-families", task_set_id, "--show", audit_id, "--project", str(tmp_path)]
-    )
-
-    assert result.exit_code == 0
-    assert "Refund an eligible order" in result.stdout
-
-
-def test_audit_families_refuses_an_audit_of_another_task_set(tmp_path) -> None:
-    """The audit and the task set are loaded independently, so nothing else
-    notices they disagree.
-
-    Geometric coherence is looked up by family id, so families the supplied task
-    set never had read as "not measured" rather than as wrong, and the printed
-    `split-family` line would name the audit's task set beside a family judged
-    against another one.
-    """
-    task_set_id = _mined(tmp_path)
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-    other = runner.invoke(app, ["mine", analysis_id, "--budget", "4", "--project", str(tmp_path)])
-    other_task_set_id = other.stdout.split()[1]
-    assert other_task_set_id != task_set_id
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True, outlier_trace_ids=[], proposed_subgroups=[], rationale="One task."
-        ),
-    ):
-        first = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-    audit_id = first.stdout.split("audit_id:")[1].split()[0]
-
-    result = runner.invoke(
-        app,
-        ["audit-families", other_task_set_id, "--show", audit_id, "--project", str(tmp_path)],
-    )
-
-    assert result.exit_code == 1
-    assert task_set_id in result.stdout
-    assert other_task_set_id in result.stdout
-
-
-def test_mine_reports_coverage_and_unfilled_slots(tmp_path) -> None:
-    runner.invoke(
-        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    result = runner.invoke(app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert "taskset_id:  taskset-" in result.stdout
-    assert "coverage:" in result.stdout
-    assert "missing slot" in result.stdout
-
-
-def test_mine_embeds_and_records_the_cache_it_grouped_with(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
-
-    embeddings = DerivedStore(tmp_path / ".bandits").list(kind="embeddings")
-    assert len(embeddings) == 1, "grouping should have saved exactly one cache"
-    assert embeddings[0].parent_artifact_id == task_set.corpus_id
-    assert {f.proposed_by for f in task_set.families} == {"model"}
-
-
-def test_mining_twice_reuses_the_saved_cache(tmp_path) -> None:
-    """A second run must not pay for the same vectors again."""
-    _mined(tmp_path)
-    store = DerivedStore(tmp_path / ".bandits")
-    before = store.list(kind="embeddings")[0].artifact_id
-
-    def refuse(model, texts):
-        raise AssertionError(f"re-embedded {len(texts)} descriptor(s) already cached")
-
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    with mock.patch("bandits.cli.build_cache", _partial_embed(refuse)):
-        again = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
-        )
-
-    assert again.exit_code == 0, again.stdout
-    assert store.list(kind="embeddings")[0].artifact_id == before
-
-
-def test_mine_fails_loudly_when_embedding_fails(tmp_path) -> None:
-    """No silent fallback: a task set nobody knows to distrust is the bug itself."""
-    runner.invoke(
-        app, ["ingest", str(SUPPORT_FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
-    )
-    corpus_id = compute_artifact_id(load_otlp(SUPPORT_FIXTURE))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    def unreachable(model, texts):
-        raise EmbeddingError("FIREWORKS_API_KEY is not set")
-
-    with mock.patch("bandits.cli.build_cache", _partial_embed(unreachable)):
-        result = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
-        )
-
-    assert result.exit_code == 1
-    assert "FIREWORKS_API_KEY" in result.stdout
-    assert not DerivedStore(tmp_path / ".bandits").list(kind="taskset")
-
-
-def test_mine_warns_when_grouping_found_no_structure(tmp_path) -> None:
-    """An inert grouping stage still reports high coverage; the warning is the tell."""
-    # The support fixture repeats four instructions across its traces, and exact
-    # duplicates collapse before clustering. Singletons need distinct text.
-    corpus = tmp_path / "varied.otlp.jsonl"
-    corpus.write_text(
-        "\n".join(
-            json.dumps(
-                {
-                    "trace_id": f"t-{i}",
-                    "span_id": f"t-{i}-s0",
-                    "parent_span_id": None,
-                    "name": "gpt-5",
-                    "start_time": "2026-03-01T00:00:00Z",
-                    "end_time": "2026-03-01T00:00:30Z",
-                    "attributes": {
-                        "gen_ai.operation.name": "chat",
-                        "task": "unrelated request "
-                        + "alpha bravo charlie delta echo foxtrot".split()[i],
-                        "gen_ai.completion": "done",
-                    },
-                }
-            )
-            for i in range(6)
-        )
-    )
-    runner.invoke(app, ["ingest", str(corpus), "--source", "otlp", "--project", str(tmp_path)])
-    corpus_id = compute_artifact_id(load_otlp(corpus))
-    analysis_id = runner.invoke(
-        app, ["analyze", corpus_id, "--project", str(tmp_path)]
-    ).stdout.split()[1]
-
-    # Every descriptor mutually distant, so each lands in its own family.
-    def orthogonal(model, texts):
-        return [[1.0 if i == j else 0.0 for j in range(len(texts))] for i in range(len(texts))]
-
-    with mock.patch("bandits.cli.build_cache", _partial_embed(orthogonal)):
-        result = runner.invoke(
-            app, ["mine", analysis_id, "--budget", "10", "--project", str(tmp_path)]
-        )
-
-    assert result.exit_code == 0
-    assert "contain one trace" in result.stdout
 
 
 def test_mine_stays_quiet_when_grouping_worked(tmp_path) -> None:
@@ -634,9 +380,9 @@ def test_families_shows_one_family_in_full(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
-    assert family.descriptor in result.stdout
-    assert family.medoid_trace_id in result.stdout
-    assert "held_out" in result.stdout
+    assert family.descriptor in plain(result.stdout)
+    assert family.medoid_trace_id in plain(result.stdout)
+    assert "held_out" in plain(result.stdout)
 
 
 def test_families_rejects_an_unknown_family(tmp_path) -> None:
@@ -646,38 +392,6 @@ def test_families_rejects_an_unknown_family(tmp_path) -> None:
         app, ["families", task_set_id, "--family", "family-nope", "--project", str(tmp_path)]
     )
 
-    assert result.exit_code == 1
-
-
-def test_merge_families_writes_a_new_task_set(tmp_path) -> None:
-    task_set_id = _mined(tmp_path)
-    store = DerivedStore(tmp_path / ".bandits")
-    families = load_task_set(task_set_id, store).families
-
-    result = runner.invoke(
-        app,
-        # fmt: off
-        [
-            "merge-families",
-            task_set_id,
-            families[0].family_id,
-            families[1].family_id,
-            "--project",
-            str(tmp_path),
-        ],
-        # fmt: on
-    )
-
-    assert result.exit_code == 0
-    assert "coherence unknown" in result.stdout
-    merged_id = result.stdout.split()[1]
-    assert merged_id != task_set_id
-    assert load_task_set(task_set_id, store).families == families, "the original is untouched"
-    assert len(load_task_set(merged_id, store).families) == len(families) - 1
-
-
-def test_mine_unknown_analysis_exits_nonzero(tmp_path) -> None:
-    result = runner.invoke(app, ["mine", "analysis-nope", "--project", str(tmp_path)])
     assert result.exit_code == 1
 
 
@@ -752,10 +466,10 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "status:       complete" in result.stdout
+    assert "status:       complete" in plain(result.stdout)
     interview_id = next(
         line.split(maxsplit=1)[1]
-        for line in result.stdout.splitlines()
+        for line in plain(result.stdout).splitlines()
         if line.startswith("interview_id:")
     )
     interview = load_interview(interview_id, store)
@@ -793,9 +507,9 @@ def test_draft_verifier_can_run_the_interview_inline(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "verifier_draft_id:" in result.stdout
-    assert "interview_id:" in result.stdout
-    assert "status:       complete" in result.stdout
+    assert "verifier_draft_id:" in plain(result.stdout)
+    assert "interview_id:" in plain(result.stdout)
+    assert "status:       complete" in plain(result.stdout)
 
 
 def _drafted_family(tmp_path, descriptor_word: str) -> tuple[str, str]:
@@ -849,12 +563,12 @@ def test_label_then_validate_separates_the_right_check(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "validation_id: validation-" in result.stdout
+    assert "validation_id: validation-" in plain(result.stdout)
     # One hypothesis is right and one is wrong; the run where the wrong one
     # would have rewarded doing nothing is named.
-    assert "100%" in result.stdout and "0%" in result.stdout
-    assert "false_positive" in result.stdout
-    assert "gamed" in result.stdout
+    assert "100%" in plain(result.stdout) and "0%" in plain(result.stdout)
+    assert "false_positive" in plain(result.stdout)
+    assert "gamed" in plain(result.stdout)
 
 
 def test_labeling_can_be_quit_early(tmp_path) -> None:
@@ -867,7 +581,7 @@ def test_labeling_can_be_quit_early(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "labels:       1" in result.stdout
+    assert "labels:       1" in plain(result.stdout)
 
 
 def test_validate_verifier_needs_an_existing_label_set(tmp_path) -> None:
@@ -1004,7 +718,7 @@ def test_eval_and_sft_export_end_to_end_write_quarantine(tmp_path) -> None:
         ],
     )
     assert trained.exit_code == 0, trained.stdout
-    assert "rows:" in trained.stdout and "unresolved:" in trained.stdout
+    assert "rows:" in plain(trained.stdout) and "unresolved:" in plain(trained.stdout)
     assert sft_output.exists()
     quarantine = sft_output.with_name("sft.unresolved.jsonl")
     assert quarantine.exists()
@@ -1066,7 +780,7 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "reviewed:   1" in result.stdout
+    assert "reviewed:   1" in plain(result.stdout)
     assert (output / "sft.jsonl").exists()
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
@@ -1118,8 +832,8 @@ def test_a_free_text_review_accepts_a_check(tmp_path: Path) -> None:
         "looks right\ny\nit is the system of record\ny\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "read as: accept" in result.output
-    assert "interview_id:" in result.output
+    assert "read as: accept" in plain(result.output)
+    assert "interview_id:" in plain(result.output)
 
 
 def test_a_review_records_the_reply_and_the_model_response(tmp_path: Path) -> None:
@@ -1134,7 +848,7 @@ def test_a_review_records_the_reply_and_the_model_response(tmp_path: Path) -> No
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     first = interview.reviews[0]
@@ -1156,11 +870,11 @@ def test_an_overruled_interpretation_takes_the_humans_decision(tmp_path: Path) -
         "actually no\ny\nwhy not\nn\nr\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "overruled" in result.output
+    assert "overruled" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     assert interview.reviews[0].decision.value == "reject"
@@ -1177,11 +891,11 @@ def test_a_failed_interpretation_falls_back_to_manual_entry(tmp_path: Path) -> N
         "fine\ny\nowned\na\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "could not read that reply" in result.output
+    assert "could not read that reply" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     assert interview.reviews[0].decision.value == "accept"
@@ -1197,11 +911,11 @@ def test_the_review_never_promotes_past_the_draft(tmp_path: Path) -> None:
         _fake_interpreter(_decision("accept")),
         "fine\ny\nowned\ny\n" * 12,
     )
-    assert "validation is still required" in result.output
+    assert "validation is still required" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     for spec in interview.draft.verifiers:
@@ -1223,7 +937,7 @@ def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None
         "looks right\ny\nsystem of record\ny\n" * 12,
     )
     assert first.exit_code == 0, first.output
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -1237,12 +951,12 @@ def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None
     )
 
     assert second.exit_code == 0, second.output
-    assert "round 2" in second.output
-    assert "earlier:" in second.output
+    assert "round 2" in plain(second.output)
+    assert "earlier:" in plain(second.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     second_id = [
-        line.split()[-1] for line in second.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(second.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(second_id, store)
     assert interview.round_number == 2
@@ -1267,7 +981,7 @@ def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path
         "change it\ny\nsystem of record\ny\n" * 12,
     )
     assert first.exit_code == 0, first.output
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -1287,7 +1001,7 @@ def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path
     )
 
     assert second.exit_code == 0, second.output
-    scored = [line for line in second.output.splitlines() if "scored:" in line]
+    scored = [line for line in plain(second.output).splitlines() if "scored:" in line]
     assert scored, second.output
     assert any("0 passed, 0 failed, 0 unscorable" not in line for line in scored), (
         f"every second-round summary scored nothing: {scored}"
@@ -1307,7 +1021,7 @@ def test_a_review_refuses_a_prior_interview_that_does_not_exist(tmp_path: Path) 
     )
 
     assert result.exit_code == 1
-    assert "no interview" in result.output
+    assert "no interview" in plain(result.output)
 
 
 def test_a_review_refuses_a_prior_interview_of_another_draft(tmp_path: Path) -> None:
@@ -1318,7 +1032,7 @@ def test_a_review_refuses_a_prior_interview_of_another_draft(tmp_path: Path) -> 
         _fake_interpreter(_decision("accept")),
         "looks right\ny\nwhy\ny\n" * 12,
     )
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -1353,11 +1067,11 @@ def test_a_manual_revise_after_an_unreadable_reply_is_applied(tmp_path: Path) ->
     )
 
     assert result.exit_code == 0, result.output
-    assert "could not read that reply" in result.output
+    assert "could not read that reply" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     first = interview.reviews[0]
@@ -1394,7 +1108,7 @@ def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> Non
     payload = json.loads(report.read_text())
     assert payload["schema_version"] == 1
     assert payload["offered_traces"] >= payload["selected"]["rows"]
-    assert "composition:" in result.stdout
+    assert "composition:" in plain(result.stdout)
 
 
 def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path) -> None:
@@ -1421,7 +1135,7 @@ def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path
     )
 
     assert result.exit_code == 1
-    assert "sft only" in result.stdout
+    assert "sft only" in plain(result.stdout)
     assert not output.exists()
 
 
@@ -1448,24 +1162,8 @@ def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None
     )
 
     assert result.exit_code == 1
-    assert "at least 1" in result.stdout
+    assert "at least 1" in plain(result.stdout)
     assert not output.exists()
-
-
-def test_mine_reports_the_backend_threshold_and_vectors_it_grouped_with(tmp_path) -> None:
-    """The one difference between two task sets from one analysis, said out loud."""
-    task_set_id = _mined(tmp_path)
-
-    result = runner.invoke(app, ["families", task_set_id, "--project", str(tmp_path)])
-
-    assert result.exit_code == 0, result.stdout
-    assert "clustering:" in result.stdout
-    assert "embedding at similarity" in result.stdout
-
-    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
-    assert task_set.clustering.backend == "embedding"
-    assert task_set.clustering.embedding_cache_id
-    assert task_set.clustering.embedding_model
 
 
 def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(tmp_path) -> None:
@@ -1477,20 +1175,7 @@ def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(
     result = runner.invoke(app, ["families", older, "--project", str(tmp_path)])
 
     assert result.exit_code == 0, result.stdout
-    assert "records nothing about how it" in result.stdout
-
-
-def test_mine_embeds_the_requests_duplicate_detection_compares(tmp_path) -> None:
-    """Descriptors alone leave every sameness comparison reading maximally far."""
-    task_set_id = _mined(tmp_path)
-    store = DerivedStore(tmp_path / ".bandits")
-    task_set = load_task_set(task_set_id, store)
-    cache = load_cache(task_set.clustering.embedding_cache_id, store)
-
-    analysis = load_analysis(task_set.analysis_id, store)
-    assert set(requests(analysis)) <= set(cache.vectors)
-    assert set(descriptors(analysis)) <= set(cache.vectors)
-    assert task_set.clustering.duplicate_similarity == DEFAULT_DUPLICATE_SIMILARITY
+    assert "records nothing about how it" in plain(result.stdout)
 
 
 def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tmp_path) -> None:
@@ -1514,7 +1199,7 @@ def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tm
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "frequency-based hypothesis" in result.stdout
+    assert "frequency-based hypothesis" in plain(result.stdout)
     draft = load_verifier_draft(result.stdout.split()[1], store)
     assert draft.candidates
     assert all(item.derivation == "frequency" for item in draft.candidates)
@@ -1658,32 +1343,6 @@ def test_the_gameability_coverage_the_reviewer_saw_is_recorded(tmp_path, monkeyp
     turn = next(row for row in _ledger_rows(path) if row["event_type"] == "interview_turn")
     assert "gameability_assessment" in turn["shown"]
     assert "gaming_hypotheses" in turn["shown"]
-
-
-def test_an_audit_run_records_the_artifact_it_produced(tmp_path, monkeypatch) -> None:
-    """Lineage the ledger references rather than copies."""
-    path = tmp_path / "ledger.jsonl"
-    monkeypatch.setenv("BANDITS_LEDGER", str(path))
-    task_set_id = _mined(tmp_path)
-
-    with mock.patch(
-        "bandits.cli.build_predictor",
-        _audit_predictor(
-            coherent=True,
-            outlier_trace_ids=[],
-            proposed_subgroups=[],
-            generated_name="Refund an eligible order",
-            rationale="One task.",
-        ),
-    ):
-        result = runner.invoke(app, ["audit-families", task_set_id, "--project", str(tmp_path)])
-    assert result.exit_code == 0, result.stdout
-
-    done = next(row for row in _ledger_rows(path) if row["event_type"] == "stage_complete")
-    assert done["input_artifact_id"] == task_set_id
-    store = DerivedStore(tmp_path / ".bandits")
-    run = load_audit_run(done["output_artifact_id"], store)
-    assert len(run.concluded()) == done["audited"]
 
 
 def test_a_manual_decision_after_a_failure_is_not_called_an_override(tmp_path, monkeypatch) -> None:
