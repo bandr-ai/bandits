@@ -15,44 +15,66 @@ from rich.text import Text
 
 from bandits import ledger
 from bandits.analyze import (
-    DEFAULT_BUDGET,
-    DEFAULT_DUPLICATE_SIMILARITY,
     DEFAULT_HELD_OUT,
-    DEFAULT_NEIGHBORS,
     analyze_corpus,
     load_analysis,
     load_task_set,
-    merge_families,
-    mine_task_set,
     save_analysis,
     save_task_set,
-    split_family,
 )
-from bandits.analyze.audit import (
-    DEFAULT_MODEL as AUDIT_MODEL,
+from bandits.analyze.rlm_audit import (
+    DEFAULT_MODEL as RLM_AUDIT_MODEL,
 )
-from bandits.analyze.audit import (
-    AuditError,
-    audit_task_set,
-    build_predictor,
-    load_audit_run,
-    save_audit_run,
+from bandits.analyze.rlm_audit import (
+    ClusteringAuditError,
+    _run_members,
+    audit_clustering,
 )
-from bandits.analyze.embed import (
-    DEFAULT_MODEL as EMBEDDING_MODEL,
+from bandits.analyze.rlm_audit import (
+    build_predictor as build_taxonomy_audit_predictor,
 )
-from bandits.analyze.embed import (
-    DEFAULT_SIMILARITY as EMBEDDING_SIMILARITY,
+from bandits.analyze.rlm_audit import (
+    load_audit as load_rlm_audit,
 )
-from bandits.analyze.embed import (
-    EmbeddingCache,
-    EmbeddingError,
-    build_cache,
-    descriptors,
-    embedding_distance,
-    load_cache,
-    requests,
-    save_cache,
+from bandits.analyze.rlm_audit import (
+    save_audit as save_rlm_audit,
+)
+from bandits.analyze.rlm_corpus import ReadOnlyCorpus
+from bandits.analyze.rlm_mine import (
+    DEFAULT_CHUNK_SIZE as RLM_CHUNK_SIZE,
+)
+from bandits.analyze.rlm_mine import (
+    DEFAULT_MAX_TOKENS as RLM_MAX_TOKENS,
+)
+from bandits.analyze.rlm_mine import (
+    DEFAULT_MODEL as RLM_MODEL,
+)
+from bandits.analyze.rlm_mine import (
+    DEFAULT_SEED as RLM_SEED,
+)
+from bandits.analyze.rlm_mine import (
+    MiningError,
+    load_clustering_run,
+    mine_taxonomy,
+    save_clustering_run,
+)
+from bandits.analyze.rlm_mine import (
+    build_predictor as build_rlm_predictor,
+)
+from bandits.analyze.rlm_models import (
+    DEFAULT_PASSES as RLM_PASSES,
+)
+from bandits.analyze.rlm_models import (
+    Budget,
+    TraceView,
+)
+from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
+from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
+from bandits.analyze.rlm_view import (
+    family_card,
+    live_panel,
+    print_pass_history,
+    taxonomy_overview,
 )
 from bandits.export import (
     CompositionReport,
@@ -145,6 +167,15 @@ def ingest(
         help="Redaction ruleset. 'secrets-only-v1' keeps email addresses, which are "
         "often the task's own identifier.",
     ),
+    control_marker: list[str] = typer.Option(
+        [],
+        "--control-marker",
+        help="Literal token this export writes into a message's own text that is "
+        "not part of the user's request (tau2's '###TRANSFER###', for one). "
+        "Repeatable. Declared once here rather than left for every downstream "
+        "RLM command to remember: every mining, audit and assignment run "
+        "reading this corpus strips it before a model ever sees it.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Load a trace export into the local artifact store."""
@@ -153,6 +184,8 @@ def ingest(
     except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    if control_marker:
+        corpus = corpus.replace(control_markers=tuple(control_marker))
 
     store = ArtifactStore(project / ".bandits")
     envelope = store.write(corpus, source_path=str(path))
@@ -272,33 +305,6 @@ def analyze(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-def _embedding_cache(analysis, store: DerivedStore, model: str) -> tuple[EmbeddingCache, str]:
-    """Vectors for every descriptor this analysis will be grouped on.
-
-    Reuses a saved cache when one covers the corpus, and embeds only what it is
-    missing, so re-mining the same analysis at a different threshold costs
-    nothing. Vectors from two models are never mixed — a cache pinned to another
-    model is passed over rather than extended.
-    """
-    # Both halves of what mining compares. Values remain visible in descriptors
-    # and requests, so task-defining identifiers reach both distance backends. Building
-    # only the first leaves every duplicate comparison reading maximally far.
-    wanted = descriptors(analysis) + requests(analysis)
-    existing: EmbeddingCache | None = None
-    reused_id = ""
-    for envelope in store.list(kind="embeddings"):
-        if envelope.parent_artifact_id != analysis.corpus_id:
-            continue
-        candidate = load_cache(envelope.artifact_id, store)
-        if candidate.model == model:
-            existing, reused_id = candidate, envelope.artifact_id
-            break
-
-    cache = build_cache(wanted, model=model, existing=existing)
-    if existing is not None and cache.vectors == existing.vectors:
-        return cache, reused_id
-    return cache, save_cache(cache, store, analysis.corpus_id).artifact_id
-
 
 def _derived(project: Path) -> DerivedStore:
     return DerivedStore(project / ".bandits")
@@ -400,253 +406,6 @@ def _report(task_set, envelope_id: str) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-def _report_audit_spend(run) -> None:
-    """What the pass cost, and which family cost the most of it.
-
-    A total on its own is not actionable: the reason to report a slowest family
-    is to go and look at it, and a bare duration named nothing to look at. Every
-    figure here is reported only over the families that actually carry it, so a
-    partial total is never printed as if it were the whole.
-    """
-    timed = [
-        (a.duration_seconds, a.family_id) for a in run.audits if a.duration_seconds is not None
-    ]
-    if timed:
-        slowest_seconds, slowest_family = max(timed)
-        console.print(
-            f"[dim]{len(timed)} family audit(s) took {sum(t for t, _ in timed):.1f}s, "
-            f"slowest {slowest_family} at {slowest_seconds:.1f}s[/dim]"
-        )
-
-    # The per-family budget is thirty calls, so what matters is whether a family
-    # is approaching it — a total alone would hide one family spending thirty
-    # among nine spending two.
-    counted = [(a.llm_calls, a.family_id) for a in run.audits if a.llm_calls is not None]
-    if counted:
-        most_calls, priciest = max(counted)
-        console.print(
-            f"[dim]{sum(c for c, _ in counted)} model call(s) over {len(counted)} family(ies), "
-            f"most {priciest} at {most_calls}[/dim]"
-        )
-    unreported = [a for a in run.audits if a.llm_calls is None]
-    if unreported:
-        # Said out loud rather than left as a dash in a column: a total that
-        # silently omits families reads as the whole bill.
-        console.print(
-            f"[dim]{len(unreported)} family(ies) reported no call count; "
-            "the totals above exclude them[/dim]"
-        )
-
-    totals: dict[str, int] = {}
-    for audit in run.audits:
-        for field, value in audit.tokens.items():
-            totals[field] = totals.get(field, 0) + value
-    if totals:
-        console.print(
-            "[dim]tokens: " + ", ".join(f"{k} {v}" for k, v in sorted(totals.items())) + "[/dim]"
-        )
-    else:
-        # Never estimated. A token count computed here from characters would be
-        # wrong in a way that looks authoritative on a bill.
-        console.print("[dim]no token usage was reported by the backend[/dim]")
-
-    failures = run.failed()
-    if failures:
-        console.print(
-            f"\n[yellow]{len(failures)} family audit(s) failed and reached no verdict[/yellow]"
-        )
-        for audit in failures:
-            spent = "" if audit.llm_calls is None else f" after {audit.llm_calls} call(s)"
-            console.print(f"  [yellow]failed[/yellow] {audit.family_id}{spent}: {audit.error}")
-
-
-def _report_audit(run, run_id: str, task_set) -> None:
-    """Advisory findings, kept visibly separate from what mining decided.
-
-    The audit never changed the grouping printed above it, so it reads as a
-    second opinion pointing at `split-family`, not as a result.
-    """
-    console.print(f"\naudit_id:    {run_id} ({run.model})")
-    if not run.audits and not run.skipped:
-        console.print("[dim]no families were eligible for audit[/dim]")
-        return
-
-    coherence_of = {f.family_id: f.coherence for f in task_set.families}
-    concluded = run.concluded()
-    table = Table(
-        "family_id", "semantic", "geometric", "outliers", "proposed split", "calls", "took"
-    )
-    for audit in sorted(concluded, key=lambda a: (a.coherent, a.family_id)):
-        measured = coherence_of.get(audit.family_id)
-        # Printed beside each other and never reconciled: one read the
-        # instructions, the other measured embedding distance. Where they
-        # disagree is the finding, not a conflict to resolve here.
-        geometric = (
-            "[dim]not measured[/dim]"
-            if measured is None
-            else ("[yellow]over-merged[/yellow]" if measured.over_merged else "within threshold")
-        )
-        table.add_row(
-            audit.family_id,
-            "coherent" if audit.coherent else "[yellow]incoherent[/yellow]",
-            geometric,
-            str(len(audit.outlier_trace_ids)),
-            " | ".join(str(len(g)) for g in audit.proposed_subgroups) or "-",
-            "-" if audit.llm_calls is None else str(audit.llm_calls),
-            "-" if audit.duration_seconds is None else f"{audit.duration_seconds:.1f}s",
-        )
-    if concluded:
-        console.print(table)
-    # Not gated on the table: a pass where every family failed has no rows and
-    # is exactly the run whose cost and failures most need reporting.
-    if run.audits:
-        _report_audit_spend(run)
-
-    # Names go under the table rather than in it: a generated name is prose and
-    # a column narrow enough to fit beside five others would truncate the one
-    # thing that made it worth generating.
-    for audit in sorted(concluded, key=lambda a: a.family_id):
-        if audit.generated_name:
-            console.print(
-                f"[dim]name[/dim] {audit.family_id}: {audit.generated_name}",
-                overflow="ignore",
-                crop=False,
-                soft_wrap=True,
-            )
-
-    for audit in run.incoherent():
-        console.print(f"\n[yellow]incoherent[/yellow] {audit.family_id}: {audit.rationale}")
-        if audit.outlier_trace_ids:
-            console.print(f"  outliers: {', '.join(audit.outlier_trace_ids)}")
-        if audit.proposed_subgroups:
-            # The audit proposes; `split-family` is what actually splits, and it
-            # splits deterministically by exact instruction rather than by this.
-            console.print(
-                f"  to act on this: bandits split-family {run.task_set_id} {audit.family_id}",
-                # A wrapped command cannot be copied and run; ids are long
-                # enough that a narrow terminal would break every one of them.
-                overflow="ignore",
-                crop=False,
-                soft_wrap=True,
-            )
-
-    for skip in run.skipped:
-        # Failures are reported above with what they spent; repeating them here
-        # as skips would read as two families lost rather than one.
-        if skip.failed:
-            continue
-        console.print(f"[dim]skipped[/dim] {skip.family_id}: {skip.reason}")
-    for limitation in run.limitations:
-        console.print(f"[yellow]limitation:[/yellow] {limitation}")
-
-
-def _run_audit(task_set, task_set_id: str, analysis, store, *, model: str, family_ids=None):
-    """Audit a task set and persist the result beside it. Never rewrites it."""
-    predict = build_predictor(model=model)
-    with ledger.stage("audit_run", task_set_id=task_set_id, model=model):
-        run = audit_task_set(
-            task_set,
-            task_set_id,
-            analysis,
-            predict=predict,
-            model=model,
-            family_ids=family_ids,
-            on_error=lambda fid, msg: console.print(f"[yellow]audit failed[/yellow] {fid}: {msg}"),
-        )
-        envelope = save_audit_run(run, store)
-        # Lineage rather than contents: the run is already an immutable
-        # artifact, so the ledger records which one this pass produced and lets
-        # the store hold what is in it.
-        ledger.record(
-            {
-                "event_type": "stage_complete",
-                "stage_name": "audit_run",
-                "input_artifact_id": task_set_id,
-                "output_artifact_id": envelope.artifact_id,
-                "audited": len(run.concluded()),
-                "failed": len(run.failed()),
-                "skipped": len(run.skipped),
-            }
-        )
-    _report_audit(run, envelope.artifact_id, task_set)
-    return run
-
-
-@app.command()
-def mine(
-    analysis_id: str,
-    budget: int = typer.Option(DEFAULT_BUDGET, "--budget", help="How many tasks to select."),
-    held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
-    similarity: float = typer.Option(
-        EMBEDDING_SIMILARITY,
-        "--similarity",
-        help="Higher groups more conservatively. Tuned for cosine similarity.",
-    ),
-    neighbors: int = typer.Option(
-        DEFAULT_NEIGHBORS, "--neighbors", help="Maximum mutual neighbors per descriptor."
-    ),
-    duplicate_similarity: float = typer.Option(
-        DEFAULT_DUPLICATE_SIMILARITY,
-        "--duplicate-similarity",
-        help="Above this two requests are the same one, and never straddle the split.",
-    ),
-    embedding_model: str = typer.Option(
-        EMBEDDING_MODEL, "--embedding-model", help="Fireworks embedding model."
-    ),
-    audit: bool = typer.Option(
-        True,
-        "--audit/--no-audit",
-        help="Run the advisory family coherence audit. Never changes grouping.",
-    ),
-    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Group an analysis into task families and select a representative set."""
-    store = _derived(project)
-    try:
-        analysis = load_analysis(analysis_id, store)
-    except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no analysis {analysis_id!r}")
-        raise typer.Exit(code=1) from exc
-
-    try:
-        cache, cache_id = _embedding_cache(analysis, store, embedding_model)
-    except EmbeddingError as exc:
-        # Embedding failures must stop the run rather than produce a task set
-        # whose requested clustering operation never completed.
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    task_set = mine_task_set(
-        analysis,
-        analysis_id,
-        budget=budget,
-        held_out=held_out,
-        similarity=similarity,
-        neighbors=neighbors,
-        distance=embedding_distance(cache),
-        duplicate_distance=embedding_distance(cache),
-        duplicate_similarity=duplicate_similarity,
-        backend="embedding",
-        embedding_model=embedding_model,
-        embedding_cache_id=cache_id,
-        proposed_by="model",
-    )
-    envelope = save_task_set(task_set, store)
-    _report(task_set, envelope.artifact_id)
-    console.print(f"embeddings:  {cache_id} ({len(cache.vectors)} vectors, {embedding_model})")
-
-    if not audit:
-        return
-    try:
-        # Written as its own artifact parented to the task set just saved. The
-        # task set is already persisted and is not touched again, so mining is
-        # byte-identical whether or not this pass runs.
-        _run_audit(task_set, envelope.artifact_id, analysis, store, model=audit_model)
-    except AuditError as exc:
-        # The grouping above is complete and saved. An audit that could not run
-        # is a missing second opinion, not a failed mine.
-        console.print(f"[yellow]audit skipped:[/yellow] {exc}")
 
 
 @app.command()
@@ -684,104 +443,7 @@ def families(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-@app.command(name="audit-families")
-def audit_families_command(
-    task_set_id: str,
-    family: list[str] = typer.Option(
-        None, "--family", help="Audit only these families. Repeatable."
-    ),
-    audit_model: str = typer.Option(AUDIT_MODEL, "--audit-model", help="Model for the audit."),
-    show: str = typer.Option(
-        None, "--show", help="Print a saved audit by id instead of running a new one."
-    ),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Read each family with a model and report whether it holds together.
 
-    Advisory only: proposes splits for a reviewer to apply and never changes
-    grouping, merges families, or touches clustering parameters.
-    """
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-
-    if show is not None:
-        try:
-            run = load_audit_run(show, store)
-        except FileNotFoundError as exc:
-            console.print(f"[red]error:[/red] no audit {show!r}")
-            raise typer.Exit(code=1) from exc
-        if run.task_set_id != task_set_id:
-            # The two are read independently, and nothing downstream notices the
-            # mismatch: geometric coherence is looked up by family id, so a
-            # family this task set never had reads as "not measured" rather than
-            # as wrong, and the `split-family` line would name the audit's task
-            # set beside a family judged against another one.
-            console.print(
-                f"[red]error:[/red] audit {show} is for task set {run.task_set_id}, "
-                f"not {task_set_id}"
-            )
-            raise typer.Exit(code=1)
-        _report_audit(run, show, task_set)
-        return
-
-    try:
-        analysis = load_analysis(task_set.analysis_id, store)
-    except FileNotFoundError as exc:
-        console.print(f"[red]error:[/red] no analysis {task_set.analysis_id!r}")
-        raise typer.Exit(code=1) from exc
-
-    try:
-        _run_audit(
-            task_set,
-            task_set_id,
-            analysis,
-            store,
-            model=audit_model,
-            family_ids=tuple(family) if family else None,
-        )
-    except (AuditError, ValueError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-
-@app.command(name="merge-families")
-def merge_families_command(
-    task_set_id: str,
-    family_ids: list[str] = typer.Argument(..., help="Two or more families that are one task."),
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Record a reviewer's decision that several families are the same task."""
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-    try:
-        corrected = merge_families(
-            task_set, tuple(family_ids), load_analysis(task_set.analysis_id, store)
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    envelope = save_task_set(corrected, store)
-    _report(corrected, envelope.artifact_id)
-
-
-@app.command(name="split-family")
-def split_family_command(
-    task_set_id: str,
-    family_id: str,
-    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
-) -> None:
-    """Split a family back into its exact-instruction groups."""
-    store = _derived(project)
-    task_set = _load_task_set(task_set_id, project)
-    try:
-        corrected = split_family(task_set, family_id, load_analysis(task_set.analysis_id, store))
-    except ValueError as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    envelope = save_task_set(corrected, store)
-    _report(corrected, envelope.artifact_id)
 
 
 @app.command(name="draft-verifier")
@@ -1998,3 +1660,495 @@ def interview_review_command(
 
 if __name__ == "__main__":
     app()
+
+
+# --- RLM task-family mining --------------------------------------------------
+#
+# Experimental, and kept beside the embedding miner rather than replacing it.
+# The two answer the same question by different means, and the embedding path
+# stays the baseline until this one demonstrates better semantic coherence,
+# stability, and downstream verifier transfer. Nothing here feeds `mine`.
+
+
+def _rlm_corpus(analysis_id: str, project: Path, view: str):
+    """The read-only user-message view of the corpus behind an analysis.
+
+    The miner is handed this and never the corpus, so there is no path from a
+    mining command to an assistant message, a tool call, or an outcome.
+    """
+    store = _derived(project)
+    try:
+        analysis = load_analysis(analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no analysis {analysis_id!r}")
+        raise typer.Exit(code=1) from exc
+    try:
+        corpus = ArtifactStore(project / ".bandits").read(analysis.corpus_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no corpus {analysis.corpus_id!r} behind this analysis")
+        raise typer.Exit(code=1) from exc
+    return (
+        analysis,
+        ReadOnlyCorpus(corpus, view=TraceView(view), control_markers=corpus.control_markers),
+        store,
+    )
+
+
+def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
+    """What the taxonomy could not reach. Never suppressed, never rolled into a total."""
+    for count, label, note in (
+        (ambiguous, "ambiguous", "matched several contracts and were left unplaced"),
+        (uncovered, "uncovered", "matched no contract at all"),
+        (unreadable, "unreadable", "recorded no user messages to read"),
+    ):
+        if count:
+            console.print(f"[yellow]{label}:[/yellow]   {count} trace(s) {note}")
+
+
+@app.command(name="mine-rlm")
+def mine_rlm_command(
+    analysis_id: str,
+    view: str = typer.Option(
+        TraceView.USER_MESSAGES.value,
+        "--view",
+        help=(
+            "user-messages (Path U), full-trajectory (Path F: adds assistant turns and "
+            "tool activity, rewards withheld), or first-user-message."
+        ),
+    ),
+    chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
+    passes: int = typer.Option(
+        RLM_PASSES,
+        "--passes",
+        help="Complete corpus passes before pausing for review. Each reads every trace once.",
+    ),
+    max_iterations: int = typer.Option(
+        200, "--max-iterations", help="Emergency guard on chunk count, not the stopping rule."
+    ),
+    max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
+    max_tokens: int = typer.Option(
+        RLM_MAX_TOKENS,
+        "--max-tokens",
+        help="Maximum completion tokens for each model call.",
+    ),
+    max_seconds: float = typer.Option(3600.0, "--max-seconds"),
+    max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
+    seed: int = typer.Option(RLM_SEED, "--seed"),
+    model: str = typer.Option(RLM_MODEL, "--model"),
+    resume: str = typer.Option(
+        None,
+        "--resume",
+        help="Continue a session that stopped, from the chunk it reached.",
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Discover task families from raw user requests with an iterative RLM loop."""
+    try:
+        trace_view = TraceView(view)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] unknown view {view!r}")
+        raise typer.Exit(code=1) from exc
+
+    analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value)
+    budget = Budget(
+        passes=passes,
+        max_iterations=max_iterations,
+        max_llm_calls=max_llm_calls,
+        max_seconds=max_seconds,
+        max_usd=max_usd,
+    )
+    try:
+        predict = build_rlm_predictor(model=model, view=trace_view, max_tokens=max_tokens)
+    except MiningError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    session_store = SessionStore(project / ".bandits")
+    resumed_state = None
+    if resume:
+        try:
+            resumed_state = session_store.read(resume)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no session {resume!r}")
+            raise typer.Exit(code=1) from exc
+        if resumed_state.analysis_id != analysis_id:
+            # Resuming onto a different corpus would carry a taxonomy built from
+            # one set of requests onto another and call the result one run.
+            console.print(
+                f"[red]error:[/red] session {resume!r} was mining "
+                f"{resumed_state.analysis_id!r}, not {analysis_id!r}"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.view is not trace_view:
+            console.print(
+                f"[red]error:[/red] session {resume!r} used the "
+                f"{resumed_state.view.value} view; the two arms are different experiments"
+            )
+            raise typer.Exit(code=1)
+        # The same seed, or the reshuffle of a later pass would differ from what
+        # the interrupted run would have done.
+        seed = resumed_state.seed
+        console.print(
+            f"resuming:    {resume} at pass {resumed_state.pass_index + 1}, "
+            f"{resumed_state.traces_seen_this_pass}/{resumed_state.traces_total} read, "
+            f"{len(resumed_state.contracts)} contract(s) restored"
+        )
+
+    recorder = SessionRecorder(
+        session_store,
+        # A resume continues writing to the same session, so one interrupted run
+        # stays one row in the listing rather than fragmenting across restarts.
+        session_id=resume or new_session_id(analysis_id, trace_view, seed),
+        analysis_id=analysis_id,
+        view=trace_view,
+        model=model,
+        resumed_from=resume,
+    )
+    console.print(f"session:     {recorder.session_id}")
+    console.print(f"[dim]watch: bandits rlm-session {recorder.session_id}[/dim]\n")
+
+    with ledger.stage("rlm_mining_run", analysis_id=analysis_id, view=trace_view.value, seed=seed):
+        try:
+            draft = mine_taxonomy(
+                corpus,
+                analysis_id,
+                predict=predict,
+                analysis=analysis,
+                model=model,
+                chunk_size=chunk_size,
+                seed=seed,
+                budget=budget,
+                session=recorder,
+                resume=resumed_state,
+                on_chunk=lambda c: console.print(
+                    f"[dim]pass {c.pass_index + 1} chunk {c.index}: "
+                    f"{len(c.trace_ids)} trace(s), {len(c.operations)} operation(s)"
+                    f"{' [failed: ' + c.error[:40] + ']' if c.status == 'error' else ''}[/dim]"
+                ),
+            )
+        except MiningError as exc:
+            recorder.fail(str(exc))
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        except Exception as exc:
+            # The session file is the only record of a run that died partway,
+            # so it must say so rather than being left reading as still running.
+            recorder.fail(str(exc))
+            raise
+        envelope = save_clustering_run(draft, store)
+        recorder.finish(
+            status="awaiting_review" if draft.complete else "incomplete",
+            stop_reason=draft.stop_reason.value,
+            # run_id, not draft_id: the 6a822c2 rename ("taxonomy draft" ->
+            # "clustering run") missed this call site, so every mine-rlm run
+            # crashed here after mining actually completed.
+            run_id=envelope.artifact_id,
+            completed_passes=draft.completed_passes,
+        )
+        ledger.record(
+            {
+                "event_type": "stage_complete",
+                "stage_name": "rlm_mining_run",
+                "input_artifact_id": analysis_id,
+                "output_artifact_id": envelope.artifact_id,
+                "contracts": len(draft.contracts),
+                "stop_reason": draft.stop_reason.value,
+            }
+        )
+
+    console.print(f"\ndraft_id:    {envelope.artifact_id}")
+    console.print(f"view:        {draft.view.value} (seed {draft.seed})")
+    console.print(f"contracts:   {len(draft.contracts)}")
+    console.print(f"chunks:      {len(draft.chunks)}")
+    console.print(f"passes:      {draft.completed_passes}/{draft.requested_passes} complete")
+    # The distinction the whole artifact turns on: finishing the schedule is not
+    # convergence, and a run that hit a guard did not even finish the schedule.
+    if draft.complete:
+        console.print(
+            "[green]awaiting review[/green]  every requested pass read every trace; "
+            "this is a checkpoint, not a converged taxonomy"
+        )
+    else:
+        console.print(
+            f"[yellow]incomplete:[/yellow]  stopped on {draft.stop_reason.value} "
+            "before finishing its passes"
+        )
+    console.print("")
+    console.print(taxonomy_overview(draft.contracts, members=_run_members(draft)))
+    # What the second look changed. The question a reviewer has at a pause, and
+    # one no total over the whole run answers.
+    console.print("")
+    print_pass_history(draft, console)
+    console.print(f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}[/dim]")
+    _report_unresolved(
+        len(draft.ambiguous_trace_ids),
+        len(draft.uncovered_trace_ids),
+        len(draft.unreadable_trace_ids),
+    )
+    for limitation in draft.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+@app.command(name="audit-rlm")
+def audit_rlm_command(
+    run_id: str,
+    model: str = typer.Option(RLM_AUDIT_MODEL, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Challenge every contract in a clustering run with a fresh, adversarial context.
+
+    Advisory only. This saves findings and changes nothing: no placement moves,
+    and materializing the run neither requires this nor consults it.
+    """
+    store = _derived(project)
+    try:
+        run = load_clustering_run(run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no clustering run {run_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    _, corpus, _ = _rlm_corpus(run.analysis_id, project, run.view.value)
+    try:
+        predict = build_taxonomy_audit_predictor(model=model, view=run.view)
+    except ClusteringAuditError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    audit = audit_clustering(run, run_id, corpus, predict=predict, model=model)
+    audit_envelope = save_rlm_audit(audit, store)
+    console.print(f"audit_id:    {audit_envelope.artifact_id} ({audit.model})")
+
+    for finding in audit.findings:
+        colour = "yellow" if finding.demands_action else "dim"
+        topical = " [topical grouping]" if finding.topical_only else ""
+        console.print(
+            f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}"
+            f"{topical}: {finding.rationale}"
+        )
+        if finding.least_compatible_pair:
+            left, right = finding.least_compatible_pair
+            console.print(f"    [dim]least compatible: {left} vs {right}[/dim]")
+        if finding.strongest_outsider_trace_id:
+            console.print(
+                f"    [dim]strongest outsider: {finding.strongest_outsider_trace_id}[/dim]"
+            )
+        if finding.merge_with_contract_id:
+            console.print(f"    [dim]merge with: {finding.merge_with_contract_id}[/dim]")
+
+    unresolved = audit.unresolved()
+    if unresolved:
+        console.print(
+            f"\n[yellow]{len(unresolved)} finding(s) recommend revising, splitting, or merging a "
+            "contract and are unresolved[/yellow]"
+        )
+        console.print("[dim]advisory: nothing here changed the run or its placements[/dim]")
+
+
+@app.command(name="materialize-rlm-taskset")
+def materialize_rlm_taskset_command(
+    run_id: str,
+    held_out: float = typer.Option(DEFAULT_HELD_OUT, "--held-out"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Turn the traces a clustering run placed into a TaskSet, with honest provenance."""
+    store = _derived(project)
+    try:
+        run = load_clustering_run(run_id, store)
+        analysis = load_analysis(run.analysis_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        task_set = materialize_task_set(run, analysis, held_out=held_out, run_id=run_id)
+    except MaterializationError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = save_task_set(task_set, store)
+    _report(task_set, envelope.artifact_id)
+    # Said plainly, because a TaskSet from this path carries no measured
+    # geometry and every reader downstream is used to one that does.
+    console.print(
+        "[dim]families here were proposed by a model reading user requests; no "
+        "embedding distance was computed, so none carries a coherence figure, and "
+        "membership is the miner's own placement rather than an independent pass[/dim]"
+    )
+
+
+@app.command(name="rlm-session")
+def rlm_session_command(
+    session_id: str = typer.Argument(None, help="Omit to list every session."),
+    events: int = typer.Option(0, "--events", help="Show the last N progress events."),
+    watch: bool = typer.Option(
+        False, "--watch", help="Redraw as the run progresses. Exits when it finishes."
+    ),
+    interval: float = typer.Option(1.0, "--interval", help="Seconds between redraws."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Inspect a mining session, including one still running."""
+    store = SessionStore(project / ".bandits")
+    if watch:
+        if session_id is None:
+            # Watching means watching one run. Defaulting to the newest is what
+            # a person means by "watch it" right after starting a run.
+            latest = store.list()
+            if not latest:
+                console.print("[dim]no mining sessions[/dim]")
+                return
+            session_id = latest[0].session_id
+        _watch_session(store, session_id, interval)
+        return
+    if session_id is None:
+        sessions = store.list()
+        if not sessions:
+            console.print("[dim]no mining sessions[/dim]")
+            return
+        table = Table("session", "status", "progress", "updated")
+        for state in sessions:
+            colour = {"running": "cyan", "awaiting_review": "green", "failed": "red"}.get(
+                state.status, "yellow"
+            )
+            table.add_row(
+                state.session_id,
+                f"[{colour}]{state.status}[/{colour}]",
+                state.progress,
+                state.updated_at[:19],
+            )
+        console.print(table)
+        return
+
+    try:
+        state = store.read(session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no session {session_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"session:     {state.session_id}")
+    console.print(f"status:      {state.status}")
+    console.print(f"view:        {state.view.value} (seed {state.seed})")
+    console.print(f"progress:    {state.progress}")
+    console.print(
+        f"passes:      {state.completed_passes}/{state.requested_passes} complete, "
+        f"pass {state.pass_index + 1} in flight"
+    )
+    console.print(f"assigned:    {len(state.assignments)}")
+    _report_unresolved(len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0)
+    for contract in state.contracts:
+        console.print(f"  {contract.contract_id}  {contract.name}")
+    if state.last_error:
+        console.print(f"[red]last error:[/red] {state.last_error}")
+
+    if events:
+        console.print("")
+        for event in store.read_events(session_id, limit=events):
+            name = event.get("event", "?")
+            detail = " ".join(
+                f"{k}={v}"
+                for k, v in event.items()
+                if k not in ("at", "event") and v not in ("", [], None)
+            )
+            console.print(f"[dim]{event.get('at', '')[:19]}  {name}  {detail}[/dim]")
+
+
+def _watch_session(store, session_id: str, interval: float) -> None:
+    """Redraw one session until it stops running.
+
+    Reads the session file rather than hooking into the run, so this works on a
+    run started in another terminal, in CI, or by someone else — and cannot
+    slow the run down or lose it if the viewer dies.
+    """
+    from rich.live import Live
+
+    try:
+        state = store.read(session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no session {session_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    with Live(console=console, refresh_per_second=4, screen=False) as live:
+        while True:
+            live.update(live_panel(state, recent=store.read_events(session_id, limit=6)))
+            if state.status != "running":
+                break
+            time.sleep(interval)
+            try:
+                state = store.read(session_id)
+            except (FileNotFoundError, ValueError):
+                # A read landing mid-write is expected: the writer replaces the
+                # file atomically, so the next poll gets a whole one.
+                continue
+
+    if state.status == "awaiting_review":
+        console.print(
+            "\n[green]paused for review.[/green] "
+            "[dim]families: bandits rlm-families <draft_id>[/dim]"
+        )
+
+
+@app.command(name="rlm-families")
+def rlm_families_command(
+    draft_id: str,
+    family: str = typer.Option(None, "--family", help="Show one family's card in full."),
+    audit_id: str = typer.Option(None, "--audit", help="Overlay an audit's verdicts."),
+    overview: bool = typer.Option(
+        False, "--overview", help="Table only, without the per-family cards."
+    ),
+    examples: int = typer.Option(4, "--examples", help="Member requests to show per family."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Read a mined taxonomy as reviewable family cards, not id lists."""
+    store = _derived(project)
+    try:
+        draft = load_clustering_run(draft_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no draft {draft_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    audit = None
+    if audit_id:
+        try:
+            audit = load_rlm_audit(audit_id, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no audit {audit_id!r}")
+            raise typer.Exit(code=1) from exc
+
+    # Best effort: the cards are far more useful with the requests beside the
+    # ids, but a draft whose corpus has moved must still be readable.
+    corpus = None
+    try:
+        _, corpus, _ = _rlm_corpus(draft.analysis_id, project, draft.view.value)
+    except typer.Exit:
+        console.print("[dim]corpus unavailable; showing ids without requests[/dim]")
+
+    members = _run_members(draft)
+    contracts = draft.contracts
+    if family is not None:
+        contracts = tuple(c for c in contracts if c.contract_id == family)
+        if not contracts:
+            console.print(f"[red]error:[/red] no family {family!r} in this draft")
+            raise typer.Exit(code=1)
+
+    console.print(taxonomy_overview(contracts, members=members, audit=audit))
+    if not overview:
+        for contract in contracts:
+            console.print("")
+            console.print(
+                family_card(
+                    contract,
+                    members=members.get(contract.contract_id, ()),
+                    corpus=corpus,
+                    audit=audit,
+                    max_examples=examples,
+                )
+            )
+
+    console.print("")
+    print_pass_history(draft, console)
+    _report_unresolved(
+        len(draft.ambiguous_trace_ids),
+        len(draft.uncovered_trace_ids),
+        len(draft.unreadable_trace_ids),
+    )
+    for limitation in draft.limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")

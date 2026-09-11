@@ -16,7 +16,6 @@ from bandits.analyze import (
     analyze_corpus,
     compute_analysis_id,
     compute_task_set_id,
-    mine_task_set,
 )
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, compute_label_set_id, make_label
@@ -42,25 +41,20 @@ from bandits.verify.validate import (
     save_validation,
     validate_draft,
 )
+from tests.tasksets import task_set_by_first_word
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 SUCCEEDED = "addr-1"
 """The only address run that actually changed anything."""
 
 
-def _test_distance(left: str, right: str) -> float:
-    return 0.0 if left.partition(" ")[0] == right.partition(" ")[0] else 1.0
-
 
 @pytest.fixture
 def address():
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
     family = next(f for f in task_set.families if "address" in f.descriptor)
@@ -236,12 +230,9 @@ def test_agreement_is_reported_per_split(address) -> None:
 
 def test_a_run_the_verifier_cannot_score_is_not_a_disagreement() -> None:
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
@@ -308,12 +299,9 @@ def test_an_unlabeled_held_out_side_is_called_out(address) -> None:
 def test_forging_a_before_and_after_pair_costs_more_than_writing_one_field() -> None:
     """A bare gameable flag would hide why the invariant is the better check."""
     analysis = analyze_corpus(load_corpus(FIXTURES / "traces.support.otlp.jsonl", "otlp"))
-    task_set = mine_task_set(
+    task_set = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=10,
     )
     family = next(f for f in task_set.families if "refund" in f.descriptor)
@@ -432,12 +420,9 @@ def test_a_draft_from_another_analysis_is_refused(address) -> None:
 def test_a_task_set_that_is_not_the_one_the_draft_was_built_against_is_refused(address) -> None:
     """Ids can agree while the objects do not; only the content settles it."""
     analysis, task_set, family, _draft = address
-    other = mine_task_set(
+    other = task_set_by_first_word(
         analysis,
         compute_analysis_id(analysis),
-        distance=_test_distance,
-        backend="first-word",
-        similarity=0.7,
         budget=3,
     )
 

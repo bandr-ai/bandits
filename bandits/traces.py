@@ -181,3 +181,17 @@ class TraceCorpus(Contract):
     different corpus, and without this there would be nothing to explain why two
     corpora sharing a ``source_digest`` do not match.
     """
+
+    control_markers: tuple[str, ...] = ()
+    """Literal tokens the exporting system writes into a message's own text.
+
+    A fact about this specific corpus, declared once at ingest — never
+    inferred from ``source``, which names a generic adapter (``chat-json``)
+    shared by many unrelated exports and cannot distinguish one benchmark's
+    scaffolding from another's. tau2's simulator, for one, appends
+    ``###TRANSFER###`` to a user turn's own text on most airline episodes,
+    not only the ones that actually escalate — a miner shown it would read
+    that token as evidence about what the user asked for. Empty unless the
+    ingest that produced this corpus said otherwise: a generic corpus carries
+    no assumption that it needs sanitizing.
+    """

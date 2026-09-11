@@ -364,12 +364,28 @@ class ClusteringProvenance(Contract):
     embedding_model: str | None = None
     """The model whose vectors were compared, when the backend used any.
 
-    ``EmbeddingCache`` refuses to mix vectors from two models because they are
-    not comparable. A task set grouped by those vectors inherits that constraint
-    and would otherwise record none of it.
+    None on every grouping the RLM path produces: nothing measured a distance,
+    so there is no model whose vectors a reader could go and check.
     """
 
     embedding_cache_id: str | None = None
+
+    model: str | None = None
+    """The model that proposed these families, when one did.
+
+    None for a grouping computed rather than proposed. Carried structurally
+    because "which model produced this task set" is the first question asked of
+    two task sets that disagree, and prose in ``limitations`` cannot be compared
+    across artifacts.
+    """
+
+    source_run_id: str | None = None
+    """The artifact this task set was materialized from, when it came from one.
+
+    ``analysis_id`` reaches only the analysis, so without this the run that did
+    the grouping — its seed, budget, prompt digest and stop reason — can be
+    found only by searching the store for one that happens to match.
+    """
 
     duplicate_similarity: float = Field(default=1.0, ge=0, le=1)
     """Above this, two descriptors were treated as the same request and their
@@ -393,210 +409,6 @@ class ClusteringProvenance(Contract):
             )
         return self
 
-
-class FamilyAudit(Contract):
-    """A model's advisory read of one family's coherence.
-
-    Never an input to grouping. Clustering stays reproducible without a model,
-    so this is a second pass that annotates families and proposes work for a
-    human, and the task set it describes is never rewritten by it.
-
-    Splits may be proposed; merges never are. A wrongly split family yields two
-    coherent families that each draft a valid verifier, which costs redundancy.
-    A wrongly merged one yields a single family whose evidence disagrees with
-    itself, and ``draft_verifiers`` keys a check to whichever value happened to
-    be most common — a wrong verifier that looks fine.
-    """
-
-    family_id: str
-    coherent: bool
-    """Whether the members read as one task. Semantic, and independent of
-    :attr:`FamilyCoherence.over_merged`, which measures embedding distance."""
-
-    outlier_trace_ids: tuple[str, ...] = ()
-    proposed_subgroups: tuple[tuple[str, ...], ...] = ()
-    """Suggested fragmentation, for a human to act on via ``split-family``.
-    Advisory: nothing here splits a family on its own."""
-
-    generated_name: str | None = None
-    """A legible name for reports. Presentation only — never feeds ``family_id``
-    or ``fingerprint()``, which stay derived from the mechanical descriptor."""
-
-    rationale: str
-    model: str
-    prompt_digest: str
-    """Pins the wording that produced this. A verdict is only interpretable
-    alongside the prompt that asked for it."""
-
-    inputs: dict[str, str] = Field(default_factory=dict)
-    """The predictor's arguments, as it received them.
-
-    A digest proves two runs asked the same thing and says nothing about what
-    was asked. Kept as the separate fields the signature declares rather than
-    concatenated into one string, so what is stored is the request that was
-    made and not a rendering of it. Empty on audits written before this.
-    """
-
-    rendered_prediction: str = ""
-    """The declared output fields of the final prediction, serialized.
-
-    Named for what it is. This is not the provider's response body: the reply
-    reached here already decoded by DSPy, and the fields below are then derived
-    from it — ``_clean_ids`` drops hallucinated and repeated ids, and a split
-    proposal overrides a contradicting ``coherent``. Keeping this is what makes
-    those two steps visible. Every physical call, with its raw body and token
-    usage, goes to the ledger instead; see :mod:`bandits.ledger`.
-    """
-
-    llm_calls: int | None = Field(default=None, ge=0)
-    """Requests this audit made, against its budget, as DSPy recorded them.
-
-    ``max_llm_calls`` bounds a family at thirty and nothing reported what one
-    cost, so a family that took two and a family that took thirty were
-    indistinguishable. Read from the language model's own history rather than
-    counted here, because the root model decides how many to make.
-
-    A floor rather than an exact count: litellm retries beneath DSPy, so a
-    request retried into success is one entry here and more than one call to
-    the provider. ``None`` means no backend reported a history at all, which is
-    not the same as zero.
-    """
-
-    tokens: dict[str, int] = Field(default_factory=dict)
-    """Usage summed over the entries that reported it, never estimated.
-
-    Empty when nothing reported, which reads as unknown; a zero would read as
-    free. The per-call bodies and the provider's own cost figures go to the
-    ledger, which is where a bill is reconstructed from.
-    """
-
-    duration_seconds: float | None = Field(default=None, ge=0)
-    """Wall clock for the whole audit, including every internal call and the
-    code it ran. ``None`` on audits written before it was timed."""
-
-    status: Literal["success", "error"] = "success"
-    error: str = ""
-    """Why an audit failed, on the record that failed.
-
-    A failure still spent rate-limit budget and may have spent tokens, and it
-    is the case most worth having: an audit absent from the run reads as one
-    that was never attempted.
-    """
-
-    @model_validator(mode="after")
-    def validate_subgroups(self) -> FamilyAudit:
-        """Reject an audit that names the same trace twice or contradicts itself.
-
-        A model writes these ids, so they are checked at the boundary rather
-        than trusted: a subgroup naming one trace twice would silently drop a
-        member on the way to a split.
-        """
-        seen: set[str] = set()
-        for group in self.proposed_subgroups:
-            if not group:
-                raise ValueError(f"audit for {self.family_id} proposes an empty subgroup")
-            repeated = seen.intersection(group)
-            if repeated or len(set(group)) != len(group):
-                raise ValueError(
-                    f"audit for {self.family_id} places a trace in two subgroups: "
-                    f"{sorted(repeated or {t for t in group if group.count(t) > 1})}"
-                )
-            seen.update(group)
-
-        if len(self.proposed_subgroups) == 1:
-            raise ValueError(
-                f"audit for {self.family_id} proposes a single subgroup, which is "
-                "the family it already is"
-            )
-        if self.coherent and self.proposed_subgroups:
-            raise ValueError(
-                f"audit for {self.family_id} calls the family coherent and still "
-                "proposes splitting it"
-            )
-        if not self.rationale.strip():
-            raise ValueError(f"audit for {self.family_id} carries no rationale")
-        return self
-
-
-class SkippedAudit(Contract):
-    """A family the audit did not read, and why. Never silently absent."""
-
-    family_id: str
-    reason: str
-
-    failed: bool = False
-    """Whether this family was attempted and failed, rather than never tried.
-
-    The two were one list and read the same, but they are not the same fact: a
-    single-member family cost nothing and had nothing to find, while a failed
-    one spent rate-limit budget and may have spent tokens. The attempt itself
-    is stored as a :class:`FamilyAudit` with ``status="error"``, so the
-    request, duration and spend live in one shape rather than being copied into
-    a second set of fields here.
-    """
-
-
-class FamilyAuditRun(Contract):
-    """One advisory audit pass over a task set's families.
-
-    Its own artifact, parented to the task set: an audit must never rewrite the
-    grouping it read, and re-mining without this pass must reproduce the same
-    families byte for byte.
-    """
-
-    schema_version: int = 1
-    task_set_id: str
-    audits: tuple[FamilyAudit, ...] = ()
-    skipped: tuple[SkippedAudit, ...] = ()
-    model: str
-    limitations: tuple[str, ...] = ()
-
-    @model_validator(mode="after")
-    def validate_audits(self) -> FamilyAuditRun:
-        audited = [a.family_id for a in self.audits]
-        if len(audited) != len(set(audited)):
-            raise ValueError("audit run reports the same family twice")
-        # A family that was attempted and failed appears in both: the skip says
-        # it produced no verdict, and the audit beside it says what the attempt
-        # asked, spent and hit. Only a family with a *concluded* audit may not
-        # also be skipped, since that would be two answers for one family.
-        failed = {a.family_id for a in self.audits if a.status == "error"}
-        overlap = (set(audited) - failed).intersection(s.family_id for s in self.skipped)
-        if overlap:
-            raise ValueError(f"families both audited and skipped: {sorted(overlap)}")
-        for skip in self.skipped:
-            if skip.failed and skip.family_id not in failed:
-                raise ValueError(
-                    f"skip for {skip.family_id} claims a failed attempt with no record of it"
-                )
-        return self
-
-    def audit_by_family(self) -> dict[str, FamilyAudit]:
-        return {a.family_id: a for a in self.audits}
-
-    def concluded(self) -> tuple[FamilyAudit, ...]:
-        """The audits that actually reached a verdict, in a stable order.
-
-        Failed attempts are stored as audits so their cost is recoverable, and
-        they carry ``coherent=True`` because nothing was concluded. Anything
-        counting findings or coverage has to read this rather than ``audits``,
-        or a failed family reads as a family that came back clean.
-        """
-        return tuple(
-            sorted((a for a in self.audits if a.status == "success"), key=lambda a: a.family_id)
-        )
-
-    def failed(self) -> tuple[FamilyAudit, ...]:
-        """Attempts that reached no verdict, with what they cost."""
-        return tuple(
-            sorted((a for a in self.audits if a.status == "error"), key=lambda a: a.family_id)
-        )
-
-    def incoherent(self) -> tuple[FamilyAudit, ...]:
-        """What a reviewer should look at, in a stable order."""
-        return tuple(
-            sorted((a for a in self.concluded() if not a.coherent), key=lambda a: a.family_id)
-        )
 
 
 class TaskSet(Contract):
