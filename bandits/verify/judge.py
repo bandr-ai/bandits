@@ -236,9 +236,20 @@ def resolve_api_key() -> str:
     return api_key
 
 
-def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
-    """Call Fireworks with one rendered rubric prompt."""
+def fireworks_completion(
+    model: str,
+    prompt: str,
+    temperature: float,
+    *,
+    system_prompt: str | None = None,
+) -> str:
+    """Call Fireworks with a prompt and an optional higher-priority policy."""
     api_key = resolve_api_key()
+
+    messages = []
+    if system_prompt is not None:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
 
     request = urllib.request.Request(
         "https://api.fireworks.ai/inference/v1/chat/completions",
@@ -250,7 +261,7 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
                 # before emitting their short visible answer. Seven hundred
                 # truncated real structured SFT reviews halfway through JSON.
                 "max_tokens": 2000,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
             }
         ).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -263,7 +274,11 @@ def fireworks_completion(model: str, prompt: str, temperature: float) -> str:
     with ledger.model_call(
         provider="fireworks",
         model=model,
-        request={"temperature": temperature, "max_tokens": 2000, "prompt": prompt},
+        request={
+            "temperature": temperature,
+            "max_tokens": 2000,
+            "messages": messages,
+        },
     ) as call:
         try:
             payload = request_with_retry(send)

@@ -1,9 +1,7 @@
-"""Human verdicts about what actually happened in a run.
+"""Attributed verdicts about what actually happened in a run.
 
-A label is the only thing in this system that can settle a disagreement between
-verifiers, and the only evidence a verifier can be calibrated against. It lives
-outside ``verify`` on purpose: whether a run succeeded is a fact about the run,
-not about whichever check happened to ask.
+A label can be a strong human decision or a weaker model judgment. Attribution
+is explicit so agreement with a model is never presented as human calibration.
 
 Labels are expensive, so they are spent where they buy the most — the runs a
 family's verifiers disagree about. One label there resolves an ambiguity that
@@ -15,6 +13,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import model_validator
 
@@ -28,7 +27,7 @@ class Verdict(str, Enum):
     FAILURE = "failure"
 
     UNCLEAR = "unclear"
-    """A human looked and could not tell.
+    """The labeler could not tell.
 
     Kept rather than discarded: a run experts cannot adjudicate is a fact about
     the task, and silently dropping it would inflate every agreement rate that
@@ -42,6 +41,8 @@ class Label(Contract):
     family_id: str
     verdict: Verdict
     labeler: str
+    source: Literal["human", "model"] = "human"
+    """Who made the decision. Model labels never receive human-label trust."""
     rationale: str = ""
     created_at: str
     prompted_by: str | None = None
@@ -51,12 +52,20 @@ class Label(Contract):
         """A label is evidence like any other, and ranks accordingly."""
         return Evidence(
             evidence_id=f"ev-{self.label_id}",
-            claim="human_label",
+            claim=f"{self.source}_label",
             value={"verdict": self.verdict.value, "rationale": self.rationale},
             visibility=Visibility.POST_HOC,
-            provenance="human",
-            strength="strong" if self.verdict is not Verdict.UNCLEAR else "weak",
-            kind=EvidenceKind.HUMAN_LABEL,
+            provenance=self.source,
+            strength=(
+                "strong"
+                if self.source == "human" and self.verdict is not Verdict.UNCLEAR
+                else "moderate"
+                if self.verdict is not Verdict.UNCLEAR
+                else "weak"
+            ),
+            kind=(
+                EvidenceKind.HUMAN_LABEL if self.source == "human" else EvidenceKind.MODEL_JUDGMENT
+            ),
             trace_id=self.trace_id,
         )
 
@@ -97,14 +106,16 @@ def make_label(
     labeler: str,
     rationale: str = "",
     prompted_by: str | None = None,
+    source: Literal["human", "model"] = "human",
 ) -> Label:
-    digest = hashlib.sha256(f"{family_id}\0{trace_id}\0{labeler}".encode()).hexdigest()
+    digest = hashlib.sha256(f"{family_id}\0{trace_id}\0{labeler}\0{source}".encode()).hexdigest()
     return Label(
         label_id=f"label-{digest[:16]}",
         trace_id=trace_id,
         family_id=family_id,
         verdict=verdict,
         labeler=labeler,
+        source=source,
         rationale=rationale,
         created_at=datetime.now(UTC).isoformat(),
         prompted_by=prompted_by,
