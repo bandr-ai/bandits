@@ -1839,7 +1839,10 @@ def mine_rlm_command(
         recorder.finish(
             status="awaiting_review" if draft.complete else "incomplete",
             stop_reason=draft.stop_reason.value,
-            draft_id=envelope.artifact_id,
+            # run_id, not draft_id: the 6a822c2 rename ("taxonomy draft" ->
+            # "clustering run") missed this call site, so every mine-rlm run
+            # crashed here after mining actually completed.
+            run_id=envelope.artifact_id,
             completed_passes=draft.completed_passes,
         )
         ledger.record(
