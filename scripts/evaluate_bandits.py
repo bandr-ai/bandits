@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from bandits.analyze import analyze_corpus, load_analysis, load_task_set, save_analysis
+from bandits.analyze.rlm_mine import DEFAULT_MODEL as RLM_MODEL
 from bandits.export import Partition, build_eval_export, save_export, write_jsonl
 from bandits.ingest import load_corpus
 from bandits.labels import LabelSet, Verdict, load_label_set, make_label, save_label_set
@@ -132,8 +133,18 @@ The commands below are the same flow written out for manual operation.
 
 ## Mine and inspect
 
+Mining calls a real model and makes paid API calls, on top of the paid
+labeling and verifier-drafting calls later in the workflow. `bandits mine-rlm`
+below defaults to no cost ceiling at all; pass `--max-usd` to cap it. The
+guided `review`/`start` commands are stricter: their `--rlm-max-usd` defaults
+to a conservative $5, since they run mining without asking first. Override
+either with `--model`/`--max-usd` below, or `--rlm-model`/`--rlm-max-usd` on
+the guided command.
+
 ```bash
-uv run bandits mine {analysis_id} --project {project} --no-audit
+uv run bandits mine-rlm {analysis_id} --project {project} --model <model> --max-usd <ceiling>
+uv run bandits rlm-families <clustering-run-id> --project {project}
+uv run bandits materialize-rlm-taskset <clustering-run-id> --project {project}
 uv run bandits families <task-set-id> --project {project}
 ```
 
@@ -197,6 +208,42 @@ def _load_local_env(project: Path) -> tuple[Path, ...]:
             if key.isidentifier():
                 os.environ.setdefault(key, value.strip().strip("'\""))
     return tuple(loaded)
+
+
+def _mine_and_materialize(
+    project: Path,
+    store: DerivedStore,
+    analysis_env,
+    rlm_model: str,
+    rlm_max_usd: float,
+):
+    """Discover task families with the RLM miner, then turn the run into a TaskSet.
+
+    Later stages (model labeling, verifier drafting) already make paid model
+    calls. RLM mining adds a new, potentially large paid setup stage before the
+    browser even opens, so its cost ceiling defaults conservatively and callers
+    can raise or lower it with ``--rlm-max-usd`` rather than discovering the
+    spend only after the fact.
+    """
+    print(
+        f"Mining families with {rlm_model} (paid API calls, ceiling ${rlm_max_usd:.2f})…",
+        flush=True,
+    )
+    _run_bandits(
+        project,
+        "mine-rlm",
+        analysis_env.artifact_id,
+        "--model",
+        rlm_model,
+        "--max-usd",
+        str(rlm_max_usd),
+    )
+    run_env = _newest(store, "rlm_clustering_run")
+    if run_env is None:
+        raise RuntimeError("mining completed without creating a clustering run")
+    print("Turning the clustering run into a task set…", flush=True)
+    _run_bandits(project, "materialize-rlm-taskset", run_env.artifact_id)
+    return _newest(store, "taskset")
 
 
 def _newest(store: DerivedStore, kind: str, *, family_id: str | None = None):
@@ -425,7 +472,7 @@ addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA')return;if(e.key=
     return result["id"]
 
 
-def review_app(project: Path, labeler: str) -> None:
+def review_app(project: Path, labeler: str, rlm_model: str, rlm_max_usd: float) -> None:
     """Run family selection, labeling, check review, and export in one browser app."""
     _load_local_env(project)
     store = DerivedStore(project / ".bandits")
@@ -436,9 +483,7 @@ def review_app(project: Path, labeler: str) -> None:
             raise ValueError("run prepare first; this project contains no analysis")
         # Mining is the only long setup stage. It happens before interaction so
         # the browser never offers families that do not exist yet.
-        print("Mining families once, then opening the reviewer…", flush=True)
-        _run_bandits(project, "mine", analysis_env.artifact_id, "--no-audit")
-        taskset_env = _newest(store, "taskset")
+        taskset_env = _mine_and_materialize(project, store, analysis_env, rlm_model, rlm_max_usd)
     if taskset_env is None:
         raise RuntimeError("mining completed without creating a task set")
     taskset = load_task_set(taskset_env.artifact_id, store)
@@ -818,7 +863,9 @@ function showError(e){statusEl.innerHTML=`<span class=error>${esc(e.message)}</s
 </script></body></html>"""
 
 
-def guided_review(project: Path, labeler: str, limit: int) -> None:
+def guided_review(
+    project: Path, labeler: str, limit: int, rlm_model: str, rlm_max_usd: float
+) -> None:
     """Drive the normal HITL commands while preserving their native questions."""
     env_files = _load_local_env(project)
     if env_files:
@@ -830,8 +877,7 @@ def guided_review(project: Path, labeler: str, limit: int) -> None:
         if analysis_env is None:
             raise ValueError("run prepare first; this project contains no analysis")
         print("\n[1/7] Mining task families…", flush=True)
-        _run_bandits(project, "mine", analysis_env.artifact_id, "--no-audit")
-        taskset_env = _newest(store, "taskset")
+        taskset_env = _mine_and_materialize(project, store, analysis_env, rlm_model, rlm_max_usd)
     if taskset_env is None:
         raise RuntimeError("mining completed without creating a task set")
     taskset = load_task_set(taskset_env.artifact_id, store)
@@ -1126,9 +1172,17 @@ def main() -> None:
     starter.add_argument("--redaction", default="secrets-only-v1")
     starter.add_argument("--project", type=Path, required=True)
     starter.add_argument("--labeler", required=True)
+    starter.add_argument("--rlm-model", default=RLM_MODEL, help="Model for RLM family mining (paid)")
+    starter.add_argument(
+        "--rlm-max-usd", type=float, default=5.0, help="Safety ceiling on RLM mining spend"
+    )
     reviewer = sub.add_parser("review")
     reviewer.add_argument("--project", type=Path, required=True)
     reviewer.add_argument("--labeler", required=True)
+    reviewer.add_argument("--rlm-model", default=RLM_MODEL, help="Model for RLM family mining (paid)")
+    reviewer.add_argument(
+        "--rlm-max-usd", type=float, default=5.0, help="Safety ceiling on RLM mining spend"
+    )
     labeling = sub.add_parser("prelabel")
     labeling.add_argument("--project", type=Path, required=True)
     scoring = sub.add_parser("score")
@@ -1145,9 +1199,9 @@ def main() -> None:
         print(f"runbook: {args.project / 'RUNBOOK.md'}")
     elif args.command == "start":
         prepare(args.traces, args.source, args.project, args.redaction)
-        review_app(args.project, args.labeler)
+        review_app(args.project, args.labeler, args.rlm_model, args.rlm_max_usd)
     elif args.command == "review":
-        review_app(args.project, args.labeler)
+        review_app(args.project, args.labeler, args.rlm_model, args.rlm_max_usd)
     elif args.command == "prelabel":
         prelabel(args.project)
     elif args.command == "score":

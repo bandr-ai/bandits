@@ -193,6 +193,28 @@ def test_exact_duplicate_requests_never_cross_the_split() -> None:
     assert not ({"t1", "t2"} & fit and {"t1", "t2"} & held), "one request landed on both sides"
 
 
+def test_differently_parameterized_requests_are_independent_groups() -> None:
+    """Two runs naming different files are different requests, not a repeat.
+
+    normalize_instruction lowercases and collapses punctuation but drops nothing:
+    a filename, a date, or an amount survives into the normalized text, so two
+    runs with different values there compare unequal and never union. Grouping
+    by exact normalized-request equality already tells them apart without a
+    dedicated parameter extractor.
+    """
+    analysis = _analysis(
+        ("t1", None, "send the note referencing owe_list.csv"),
+        ("t2", None, "send the note referencing debt_list.csv"),
+        ("t3", None, "send the note referencing list_of_debts.csv"),
+    )
+    run = _run(analysis, {f"t{i}": "c1" for i in range(1, 4)})
+
+    family = materialize_task_set(run, analysis, held_out=0.67).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert len(fit) >= 1 and len(held) >= 1, "differently parameterized requests split freely"
+
+
 def test_a_family_of_one_group_says_it_cannot_be_validated() -> None:
     analysis = _analysis(("t1", "L1", "refund"), ("t2", "L1", "refund"))
     run = _run(analysis, {"t1": "c1", "t2": "c1"})
