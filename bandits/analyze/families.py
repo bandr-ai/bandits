@@ -117,8 +117,10 @@ def normalize_request(instruction: str) -> str:
 _PARAMETER_RULES = (
     # Read off the raw instruction rather than the normalized form, which drops
     # the punctuation that makes these recognisable at all.
-    re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
+    # Quoted output is the outermost answer-determining value, so it owns any
+    # dates or numbers nested inside it.
     re.compile(r"[\"'“‘]([^\"'”’\n]{1,120})[\"'”’]"),
+    re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
     re.compile(r"(~?[\w./-]*\.[A-Za-z]{2,5})\b"),
     re.compile(r"(~/[\w./-]+)"),
     re.compile(r"\$?(\d[\d,]*(?:\.\d+)?)"),

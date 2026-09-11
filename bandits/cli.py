@@ -11,6 +11,7 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from bandits import ledger
 from bandits.analyze import (
@@ -938,9 +939,12 @@ def _brief(value: object, limit: int = 180) -> str:
 
 def _show_label_card(trace_id: str, task, evidence: list, position: int, total: int) -> None:
     """Show only the facts a reviewer needs; raw evidence remains in the artifact."""
-    console.rule(f"Review {position}/{total} · {trace_id}")
+    console.rule(Text(f"Review {position}/{total} · {trace_id}"))
     console.print("[bold cyan]Request[/bold cyan]")
-    console.print(_brief(task.instruction, 500) if task is not None else "[not recorded]")
+    console.print(
+        _brief(task.instruction, 500) if task is not None else "[not recorded]",
+        markup=False,
+    )
 
     states = [item for item in evidence if item.claim == "final_state_field"]
     errors = [item for item in evidence if item.claim in {"span_error", "missing_tool_result"}]
@@ -958,19 +962,19 @@ def _show_label_card(trace_id: str, task, evidence: list, position: int, total: 
         for tool, facts in list(by_tool.items())[-3:]:
             visible = facts[:6]
             suffix = f" (+{len(facts) - 6} more)" if len(facts) > 6 else ""
-            console.print(f"  [magenta]{tool}[/magenta]: {', '.join(visible)}{suffix}")
+            console.print(f"  {tool}: {', '.join(visible)}{suffix}", markup=False)
     elif not errors and not scores:
         console.print("  [yellow]No structured outcome was recorded.[/yellow]")
     for item in errors:
-        console.print(f"  [red]{item.claim}:[/red] {_brief(item.value)}")
+        console.print(f"  {item.claim}: {_brief(item.value)}", markup=False)
     for item in scores:
-        console.print(f"  {item.claim}: {_brief(item.value)}")
+        console.print(f"  {item.claim}: {_brief(item.value)}", markup=False)
 
     console.print("\n[bold cyan]Agent's final response[/bold cyan]")
     if finals:
         value = finals[-1].value
         output = value.get("output") if isinstance(value, dict) else value
-        console.print(_brief(output, 600))
+        console.print(_brief(output, 600), markup=False)
     else:
         console.print("[yellow]None recorded.[/yellow]")
 

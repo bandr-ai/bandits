@@ -118,6 +118,33 @@ def test_labels_separate_the_right_hypothesis_from_the_wrong_one(address) -> Non
     assert fit["paid"] == 0.0
 
 
+def test_validation_can_keep_held_out_traces_sealed(address) -> None:
+    analysis, task_set, family, draft = address
+    label_set = _labels(
+        family,
+        lambda trace_id: Verdict.SUCCESS if trace_id == SUCCEEDED else Verdict.FAILURE,
+        task_set=task_set,
+    )
+
+    validation = validate_draft(
+        draft,
+        compute_verifier_draft_id(draft),
+        task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
+        include_held_out=False,
+    )
+
+    assert {agreement.split for agreement in validation.agreements} == {"fit"}
+    assert validation.labels_used == len(family.fit_trace_ids)
+    assert all(
+        counterexample.trace_id not in family.held_out_trace_ids
+        for agreement in validation.agreements
+        for counterexample in agreement.counterexamples
+    )
+
+
 def test_a_check_on_a_tool_that_never_reported_is_a_coverage_gap(address) -> None:
     """Naming the reporting tool turns a silent pass into a visible gap.
 

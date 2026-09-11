@@ -873,6 +873,15 @@ def test_request_parameters_keep_dates_whole_and_roles_ordered() -> None:
     )
 
 
+def test_request_parameters_keep_quoted_values_containing_dates_distinct() -> None:
+    assert request_parameters('send note "alpha on 2024-02-01"') == (
+        "alpha on 2024-02-01",
+    )
+    assert request_parameters('send note "beta on 2024-02-01"') == (
+        "beta on 2024-02-01",
+    )
+
+
 def test_duplicate_evidence_is_transitive() -> None:
     """A joined to B and B to C is one group, not two overlapping pairs."""
     analysis = _requests(
