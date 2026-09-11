@@ -198,9 +198,9 @@ def test_differently_parameterized_requests_are_independent_groups() -> None:
 
     normalize_instruction lowercases and collapses punctuation but drops nothing:
     a filename, a date, or an amount survives into the normalized text, so two
-    runs with different values there compare unequal and never union. Grouping
-    by exact normalized-request equality already tells them apart without a
-    dedicated parameter extractor.
+    runs with different values there compare unequal under exact-text grouping.
+    The paraphrase signature does not override that: different values mean a
+    different signature too, so these still split freely.
     """
     analysis = _analysis(
         ("t1", None, "send the note referencing owe_list.csv"),
@@ -213,6 +213,46 @@ def test_differently_parameterized_requests_are_independent_groups() -> None:
 
     fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
     assert len(fit) >= 1 and len(held) >= 1, "differently parameterized requests split freely"
+
+
+def test_paraphrased_requests_naming_the_same_value_never_cross_the_split() -> None:
+    """A paraphrase is not caught by exact-text equality, but it is the same
+    task run twice: measuring a verifier against a reworded copy of what it
+    was drafted from proves nothing, same as an exact duplicate.
+
+    The paraphrase key requires both a shared named value *and* shared
+    content words, so "refund order 7741" pairs with its reworded copy but
+    not with "cancel order 7741", which shares only the order id.
+    """
+    analysis = _analysis(
+        ("t1", None, "refund order 7741"),
+        ("t2", None, "please issue a refund for order 7741"),
+        ("t3", None, "cancel order 7741"),
+        ("t4", None, "change my seat"),
+        ("t5", None, "add a bag"),
+    )
+    run = _run(analysis, {f"t{i}": "c1" for i in range(1, 6)})
+
+    family = materialize_task_set(run, analysis, held_out=0.4).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert not ({"t1", "t2"} & fit and {"t1", "t2"} & held), "paraphrase pair split across sides"
+
+
+def test_same_named_value_with_a_different_action_is_not_a_paraphrase() -> None:
+    """Sharing an order id is not sharing a request: the verb changes what a
+    correct answer looks like, so these are two independent groups and the
+    split is free to hold one out while fitting on the other."""
+    analysis = _analysis(
+        ("t1", None, "refund order 7741"),
+        ("t2", None, "cancel order 7741"),
+    )
+    run = _run(analysis, {"t1": "c1", "t2": "c1"})
+
+    family = materialize_task_set(run, analysis, held_out=0.5).families[0]
+
+    assert family.held_out_trace_ids, "different-action requests were forced into one group"
+    assert family.fit_trace_ids, "different-action requests were forced into one group"
 
 
 def test_a_family_of_one_group_says_it_cannot_be_validated() -> None:

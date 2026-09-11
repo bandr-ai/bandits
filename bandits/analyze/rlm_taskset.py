@@ -36,7 +36,7 @@ from bandits.analyze.models import (
     TaskSet,
 )
 from bandits.analyze.rlm_models import RLMClusteringRun, TraceView
-from bandits.analyze.text import normalize_instruction
+from bandits.analyze.text import normalize_instruction, request_signature
 
 
 def backend_for(view: TraceView) -> str:
@@ -63,17 +63,26 @@ def _stable_fraction(*parts: str) -> float:
 def _split_groups(analysis: CorpusAnalysis, trace_ids: tuple[str, ...]) -> dict[str, list[str]]:
     """The indivisible groups inside one family.
 
-    Two traces share a group when the analysis declares the same lineage *or*
-    when their requests normalize identically, and those two relations compose:
-    a trace joined to one group by lineage and to another by an identical
-    request merges both into one. Reading the second rule as a fallback for
-    traces without lineage — which an ``elif`` here once did — leaves two runs
-    of the same request in different retry chains free to land on opposite
+    Two traces share a group when the analysis declares the same lineage, when
+    their requests normalize identically, *or* when they name the same
+    answer-determining value (an order id, a filename, a date, an amount) and
+    agree on every other content word once that value and stopwords are
+    stripped — a paraphrase, not just a coincidence. All three relations
+    compose: a trace joined to one group by lineage and to another by an
+    identical or paraphrased request merges both into one. Reading any of
+    these as a fallback for traces the others miss — which an ``elif`` here
+    once did — leaves two runs of the same request free to land on opposite
     sides, which is exactly the leak this exists to close.
 
-    The second rule matters as much as the first: a corpus that never recorded
-    lineage still repeats requests, and splitting a repeated request across the
-    boundary measures a verifier against the run it was drafted from.
+    "refund order 7741" and "please issue a refund for order 7741" name the
+    same order and share every other content word, so they join. "refund
+    order 7741" and "cancel order 7741" name the same order but differ on the
+    verb, so they do not — sharing a value is necessary, not sufficient.
+
+    Every rule matters as much as the others: a corpus that never recorded
+    lineage still repeats requests verbatim or as paraphrases, and splitting a
+    repeated request across the boundary measures a verifier against the run
+    it was drafted from.
     """
     by_trace = {task.trace_id: task for task in analysis.tasks}
 
@@ -107,6 +116,13 @@ def _split_groups(analysis: CorpusAnalysis, trace_ids: tuple[str, ...]) -> dict[
             union(node, f"lineage:{task.lineage_id}")
         if task.instruction:
             union(node, f"request:{normalize_instruction(task.instruction)}")
+            parameters, content_words = request_signature(task.instruction)
+            # A signature with no named value carries no more information than
+            # the exact-text union above; only a real parameter (an id, a
+            # filename, a date, an amount) makes "same value, same words"
+            # meaningfully narrower than "identical text".
+            if parameters:
+                union(node, f"paraphrase:{parameters}:{sorted(content_words)}")
 
     groups: dict[str, list[str]] = {}
     for trace_id in trace_ids:
