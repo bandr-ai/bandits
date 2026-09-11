@@ -114,6 +114,76 @@ def normalize_request(instruction: str) -> str:
     return normalize_instruction(instruction)
 
 
+_PARAMETER_RULES = (
+    # Read off the raw instruction rather than the normalized form, which drops
+    # the punctuation that makes these recognisable at all.
+    # Quoted output is the outermost answer-determining value, so it owns any
+    # dates or numbers nested inside it.
+    re.compile(r"[\"'“‘]([^\"'”’\n]{1,120})[\"'”’]"),
+    re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
+    re.compile(r"(~?[\w./-]*\.[A-Za-z]{2,5})\b"),
+    re.compile(r"(~/[\w./-]+)"),
+    re.compile(r"\$?(\d[\d,]*(?:\.\d+)?)"),
+    re.compile(
+        r"\b(january|february|march|april|june|july|august|september|october|november"
+        r"|december|today|yesterday|tomorrow|this year|last year|this month|last month"
+        r"|this week|last week)\b",
+        re.IGNORECASE,
+    ),
+    # "may" is ordinarily a modal verb. Treat it as the month only with a
+    # preposition that supplies date context.
+    re.compile(r"\b(?:in|on|by|since|before|after|during)\s+(may)\b", re.IGNORECASE),
+)
+"""Where a request carries a value that decides what its correct answer is."""
+
+_QUOTED_DATE_RANGE = re.compile(
+    r"^\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(?:to|through|until|-)\s+"
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*$",
+    re.IGNORECASE,
+)
+
+
+def request_parameters(instruction: str) -> tuple[str, ...]:
+    """The values that make one request specific rather than a kind of request.
+
+    A filename, an amount, a date: change one and the correct answer changes
+    with it, even though almost every word of the instruction is unchanged.
+    Kept in textual order so role reversals such as "move A to B" versus
+    "move B to A" remain different requests.
+
+    Deliberately lexical. It recognises a value written down, not a scope
+    described in prose — 'my playlists' against 'my song library' names two
+    different things and yields no parameter here.
+    """
+    found: list[tuple[int, int, str]] = []
+    for rule in _PARAMETER_RULES:
+        for match in rule.finditer(instruction):
+            value = match.group(1).strip().lower()
+            span = match.span(1)
+            # Quoting an otherwise bare date range does not change the two
+            # answer-determining values. Keep arbitrary quoted prose whole,
+            # because there the enclosing value is the requested output.
+            if rule is _PARAMETER_RULES[0] and (
+                date_range := _QUOTED_DATE_RANGE.fullmatch(match.group(1))
+            ):
+                offset = match.start(1)
+                for index in (1, 2):
+                    date_span = date_range.span(index)
+                    found.append(
+                        (
+                            offset + date_span[0],
+                            offset + date_span[1],
+                            date_range.group(index).lower(),
+                        )
+                    )
+                continue
+            # Higher-priority compound values (notably ISO dates) own their
+            # entire span; do not also extract their numeric components.
+            if value and not any(span[0] < end and start < span[1] for start, end, _ in found):
+                found.append((*span, value))
+    return tuple(value for _, _, value in sorted(found))
+
+
 def fingerprint(instruction: str) -> str:
     normalized = normalize_instruction(instruction)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
@@ -155,6 +225,7 @@ class _TraceFeatures:
         "instruction",
         "normalized",
         "request",
+        "parameters",
         "tools",
         "span_count",
         "has_failure",
@@ -177,6 +248,7 @@ class _TraceFeatures:
         self.instruction = instruction
         self.normalized = normalize_instruction(instruction)
         self.request = normalize_request(instruction)
+        self.parameters = request_parameters(instruction)
         self.tools = tools
         self.span_count = span_count
         self.has_failure = has_failure
@@ -345,7 +417,10 @@ def _duplicate_edges(
     second, and held-out agreement reports memorisation as generalisation.
 
     Compared over normalized requests. Values are preserved, so different
-    identifiers remain different requests and can still land on opposite sides.
+    identifiers remain different requests and can still land on opposite sides —
+    including on the near-identical path, where sentence distance alone would
+    read two runs of one task as one request because only a filename or a date
+    told them apart.
     """
     by_request: dict[str, list[_TraceFeatures]] = {}
     for feature in members:
@@ -387,13 +462,21 @@ def _duplicate_edges(
     for index, left in enumerate(requests):
         for right in requests[index + 1 :]:
             similarity = 1.0 - duplicate_distance(left, right)
-            if similarity >= duplicate_similarity:
-                join(
-                    representative[left],
-                    representative[right],
-                    "near_identical_descriptor",
-                    similarity,
-                )
+            if similarity < duplicate_similarity:
+                continue
+            # Nearness is measured over whole sentences, and a request differing
+            # only in the file it names or the month it asks about reads as
+            # almost identical while having an entirely different correct
+            # answer. Joining those two costs the family its held-out side to
+            # prevent a leak that cannot happen, so the values decide.
+            if representative[left].parameters != representative[right].parameters:
+                continue
+            join(
+                representative[left],
+                representative[right],
+                "near_identical_descriptor",
+                similarity,
+            )
     return edges
 
 

@@ -613,8 +613,12 @@ def validate_draft(
     label_set_id: str,
     *,
     success_threshold: float = DEFAULT_SUCCESS_THRESHOLD,
+    include_held_out: bool = True,
 ) -> Validation:
-    """Measure each verifier against labels on both splits, then try to game it.
+    """Measure each verifier against labels on the selected splits, then try to game it.
+
+    ``include_held_out=False`` keeps evaluation traces out of pre-selection
+    validation. They can then be scored only after the verifier is frozen.
 
     Every artifact here is independently valid, so a mismatched set of them
     produces a measurement about the wrong examples rather than an error. The
@@ -686,22 +690,30 @@ def validate_draft(
         )
 
     verdicts = label_set.adjudicated()
+    measured_trace_ids = (
+        family_traces if include_held_out else set(family.fit_trace_ids)
+    )
+    measured_verdicts = {
+        trace_id: verdict
+        for trace_id, verdict in verdicts.items()
+        if trace_id in measured_trace_ids
+    }
 
     agreements: list[Agreement] = []
     gameability: list[GameabilityResult] = []
     assessments: list[GameabilityAssessment] = []
     for spec in draft.verifiers:
-        for split, trace_ids in (
-            ("fit", family.fit_trace_ids),
-            ("held_out", family.held_out_trace_ids),
-        ):
+        splits = [("fit", family.fit_trace_ids)]
+        if include_held_out:
+            splits.append(("held_out", family.held_out_trace_ids))
+        for split, trace_ids in splits:
             agreements.append(
                 _agreement(
                     spec=spec,
                     split=split,
                     trace_ids=trace_ids,
                     evidence_by_trace=evidence_by_trace,
-                    verdicts=verdicts,
+                    verdicts=measured_verdicts,
                     threshold=success_threshold,
                 )
             )
@@ -710,19 +722,24 @@ def validate_draft(
         assessments.append(assess_gameability(spec, probed))
 
     limitations: list[str] = []
-    if not any(a.split == "held_out" and a.labeled for a in agreements):
+    if include_held_out and not any(
+        a.split == "held_out" and a.labeled for a in agreements
+    ):
         limitations.append(
             "no held-out trace carries a label; every agreement below is measured on "
             "the traces the checks were drafted from and is not an honest estimate"
         )
-    unclear = len(label_set.labels) - len(verdicts)
+    measured_labels = [
+        label for label in label_set.labels if label.trace_id in measured_trace_ids
+    ]
+    unclear = len(measured_labels) - len(measured_verdicts)
     if unclear:
         limitations.append(
             f"{unclear} labeled run(s) a human could not adjudicate are excluded from "
             "every rate above rather than counted as either outcome"
         )
 
-    in_family = [verdicts[trace_id] for trace_id in family_traces if trace_id in verdicts]
+    in_family = list(measured_verdicts.values())
     successes = sum(1 for verdict in in_family if verdict is Verdict.SUCCESS)
 
     return Validation(

@@ -118,6 +118,76 @@ def test_labels_separate_the_right_hypothesis_from_the_wrong_one(address) -> Non
     assert fit["paid"] == 0.0
 
 
+def test_validation_can_keep_held_out_traces_sealed(address) -> None:
+    analysis, task_set, family, draft = address
+    label_set = _labels(
+        family,
+        lambda trace_id: Verdict.SUCCESS if trace_id == SUCCEEDED else Verdict.FAILURE,
+        task_set=task_set,
+    )
+
+    validation = validate_draft(
+        draft,
+        compute_verifier_draft_id(draft),
+        task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
+        include_held_out=False,
+    )
+
+    assert {agreement.split for agreement in validation.agreements} == {"fit"}
+    assert validation.labels_used == len(family.fit_trace_ids)
+    assert all(
+        counterexample.trace_id not in family.held_out_trace_ids
+        for agreement in validation.agreements
+        for counterexample in agreement.counterexamples
+    )
+
+
+def test_sealed_validation_with_no_fit_side_uses_no_labels(address) -> None:
+    analysis, task_set, family, _ = address
+    sealed_family = family.model_copy(
+        update={"fit_trace_ids": (), "held_out_trace_ids": family.trace_ids}
+    )
+    sealed_task_set = task_set.model_copy(
+        update={
+            "families": tuple(
+                sealed_family if item.family_id == family.family_id else item
+                for item in task_set.families
+            )
+        }
+    )
+    task_set_id = compute_task_set_id(sealed_task_set)
+    draft = draft_verifiers(
+        sealed_task_set,
+        task_set_id,
+        analysis,
+        family.family_id,
+        limit=6,
+    )
+    label_set = _labels(
+        sealed_family,
+        lambda _: Verdict.SUCCESS,
+        task_set_id=task_set_id,
+    )
+
+    validation = validate_draft(
+        draft,
+        compute_verifier_draft_id(draft),
+        sealed_task_set,
+        analysis,
+        label_set,
+        compute_label_set_id(label_set),
+        include_held_out=False,
+    )
+
+    assert validation.labels_used == 0
+    assert validation.success_labels == 0
+    assert validation.failure_labels == 0
+    assert all(agreement.labeled == 0 for agreement in validation.agreements)
+
+
 def test_a_check_on_a_tool_that_never_reported_is_a_coverage_gap(address) -> None:
     """Naming the reporting tool turns a silent pass into a visible gap.
 

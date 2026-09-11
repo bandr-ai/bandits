@@ -31,6 +31,7 @@ from bandits.analyze.families import (
     _features,
     _medoid,
     _TraceFeatures,
+    request_parameters,
 )
 from bandits.analyze.models import (
     ClusteringProvenance,
@@ -803,6 +804,89 @@ def test_a_paraphrase_is_held_together_when_a_backend_can_measure_sameness() -> 
     assert edge.similarity == pytest.approx(0.98)
     sides = (set(family.fit_trace_ids), set(family.held_out_trace_ids))
     assert any({"monday", "tuesday"} <= side for side in sides)
+
+
+def test_one_task_run_against_two_files_is_not_one_request() -> None:
+    """Near-identical sentences, entirely different correct answers.
+
+    Sentence distance cannot see the difference: every word but the filename is
+    shared, so the pair scores far above any duplicate threshold. Holding them
+    to one side to prevent a leak would cost the family its held-out side to
+    prevent a leak that cannot happen — neither run is evidence about the other,
+    because neither one's answer is derivable from the other's file.
+    """
+    analysis = _requests(
+        ("monday", "pay everyone listed in owe_list.csv", "sess-a"),
+        ("tuesday", "pay everyone listed in debt_list.csv", "sess-b"),
+    )
+
+    family = _mined(
+        analysis,
+        distance=lambda left, right: 0.0,
+        duplicate_distance=lambda left, right: 0.01,
+        duplicate_similarity=0.95,
+    ).families[0]
+
+    assert family.duplicate_lineages == ()
+    assert family.fit_trace_ids and family.held_out_trace_ids
+
+
+def test_a_paraphrase_naming_the_same_file_is_still_one_request() -> None:
+    """The guard reads the values, not the wording, so a paraphrase still joins."""
+    analysis = _requests(
+        ("monday", "pay everyone listed in owe_list.csv", "sess-a"),
+        ("tuesday", "settle up with each person in owe_list.csv", "sess-b"),
+    )
+
+    family = _mined(
+        analysis,
+        distance=lambda left, right: 0.0,
+        duplicate_distance=lambda left, right: 0.01,
+        duplicate_similarity=0.95,
+    ).families[0]
+
+    edge = next(item for item in family.duplicate_lineages)
+    assert edge.basis == "near_identical_descriptor"
+
+
+def test_request_parameters_reads_the_values_that_decide_the_answer() -> None:
+    assert request_parameters("pay everyone in owe_list.csv") == ("owe_list.csv",)
+    assert request_parameters("friends made since January this year") == ("january", "this year")
+    assert request_parameters('request $13 with note "for the meal"') == ("13", "for the meal")
+    # Prose naming a scope is not a value written down, and is not recognised.
+    assert request_parameters("the genre I liked most in my song library") == ()
+
+
+def test_request_parameters_do_not_treat_bare_may_as_a_date() -> None:
+    assert request_parameters("I may return the order") == ()
+    assert request_parameters("orders placed in May") == ("may",)
+
+
+def test_request_parameters_keep_dates_whole_and_roles_ordered() -> None:
+    assert request_parameters("move 2024-02-01 to 2024-03-02") == (
+        "2024-02-01",
+        "2024-03-02",
+    )
+    assert request_parameters("move 2024-03-02 to 2024-02-01") == (
+        "2024-03-02",
+        "2024-02-01",
+    )
+
+
+def test_request_parameters_keep_quoted_values_containing_dates_distinct() -> None:
+    assert request_parameters('send note "alpha on 2024-02-01"') == (
+        "alpha on 2024-02-01",
+    )
+    assert request_parameters('send note "beta on 2024-02-01"') == (
+        "beta on 2024-02-01",
+    )
+
+
+def test_request_parameters_treat_quoted_and_unquoted_date_ranges_equally() -> None:
+    expected = ("2024-02-01", "2024-03-01")
+
+    assert request_parameters("report from 2024-02-01 to 2024-03-01") == expected
+    assert request_parameters('report from "2024-02-01 to 2024-03-01"') == expected
 
 
 def test_duplicate_evidence_is_transitive() -> None:
