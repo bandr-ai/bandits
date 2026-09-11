@@ -150,3 +150,41 @@ other. It needs k > 1 attempts per task.
 3. **Sibling consensus** is worth wiring into `bandits/export/` as a
    precision-first per-trajectory signal for any corpus with repeated rollouts,
    kept separate from `ReviewedVerifier`.
+
+## Third corpus: TRAIL (`scripts/trail_signal.py`)
+
+TRAIL (Patronus AI, arXiv:2505.08638) is a third, independent test: 116 scorable
+GAIA traces (open-web tool-use tasks, not retail or multi-app), each with a
+**human QA reviewer's** reliability score from 1-5 -- not a hidden database check,
+not a benchmark grader, an actual person reading the trace. The raw data and
+annotations are checked directly into `github.com/patronus-ai/trail-benchmark`
+(clone it; no Hugging Face gate needed despite the HF listing being gated).
+
+Scored two ways: Spearman correlation against the continuous 1-5 score, and AUC
+on the top and bottom tertiles (score <= 2.75 vs >= 3.75).
+
+| signal | Spearman | AUC (tertiles) |
+| --- | --- | --- |
+| step count | 0.01 | 0.47 |
+| no span errors | 0.08 | 0.55 |
+| has a final answer | n/a | 0.50 |
+| **holistic LLM judge** (same 1-5 rubric a human used) | **0.31** | **0.57** |
+
+Structural signals repeat the same wall a third time. The judge is different
+here: a real, if modest, positive correlation, the first anywhere in this
+investigation. The likely reason is what TRAIL's own results already suggested
+-- models are comparatively better at the *reasoning* failure categories
+(hallucinated tool results, skipping a step in your own stated plan, ignoring
+instructions) than at *task-verification* categories (is this specific answer
+correct), and GAIA's human `overall` score reflects both. A judge can partly see
+"the agent claimed a fact with no tool call behind it" even when it cannot see
+"the agent's final answer was numerically wrong." tau2 and AppWorld's failures
+were almost entirely the second kind; GAIA's are a mix, and the judge picks up
+the visible half.
+
+Read against the earlier corpora: the wall is not that judges are always useless
+on traces. It is that a judge cannot see failures whose evidence lives outside
+the trace (a hidden database goal, an external correct answer). Failures whose
+evidence is *in* the trace -- a claim with no supporting tool call, a skipped
+planned step -- are the failures a grounded judge has a real, measurable, if
+partial, shot at.
