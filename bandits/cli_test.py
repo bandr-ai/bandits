@@ -138,6 +138,107 @@ def test_mine_rlm_exposes_the_per_call_token_ceiling() -> None:
     assert "--max-tokens" in plain(result.stdout)
 
 
+def test_mine_rlm_then_materialize_rlm_taskset_through_the_real_cli(tmp_path) -> None:
+    """Exercises the exact commands evaluate_bandits.py's orchestration runs as
+    subprocesses: `mine-rlm --model ... --max-usd ...` then
+    `materialize-rlm-taskset`. Only the model call itself is mocked — argument
+    parsing, corpus loading, artifact writing, and materialization all run for
+    real, so a rename or signature change to either command breaks this test
+    instead of only breaking at run time months later."""
+    from datetime import UTC, datetime
+
+    from bandits.analyze import save_analysis
+    from bandits.analyze.analysis import analyze_corpus
+    from bandits.store import ArtifactStore, DerivedStore
+    from bandits.traces import Span, SpanKind, Trace, TraceCorpus, UserTurn
+
+    def _trace(trace_id: str, instruction: str) -> Trace:
+        moment = datetime(2024, 1, 1, tzinfo=UTC)
+        return Trace(
+            trace_id=trace_id,
+            source="chat-json",
+            source_digest="0" * 64,
+            task=instruction,
+            user_turns=(UserTurn(text=instruction),),
+            spans=(
+                Span(
+                    span_id=f"{trace_id}:span-0",
+                    kind=SpanKind.MODEL,
+                    name="model",
+                    started_at=moment,
+                    ended_at=moment,
+                ),
+            ),
+        )
+
+    corpus = TraceCorpus(
+        source="chat-json",
+        traces=(
+            _trace("t1", "Refund order 7741"),
+            _trace("t2", "Cancel order 8820"),
+            _trace("t3", "Change the shipping address"),
+        ),
+    )
+    artifact_store = ArtifactStore(tmp_path / ".bandits")
+    derived_store = DerivedStore(tmp_path / ".bandits")
+    artifact_store.write(corpus, source_path="synthetic")
+    analysis_envelope = save_analysis(analyze_corpus(corpus), derived_store)
+
+    def fake_predictor(*, model, view, max_tokens):
+        def predict(*, chunk, taxonomy, question):
+            trace_ids = [row["trace_id"] for row in json.loads(chunk)]
+            return SimpleNamespace(
+                contracts=[
+                    {
+                        "contract_id": "c1",
+                        "name": "Handle an order",
+                        "definition": "resolve a request about an order",
+                        "required_outcome_shape": ["the request is resolved"],
+                    }
+                ],
+                operations=[],
+                assignments={trace_id: "c1" for trace_id in trace_ids},
+                ambiguous_trace_ids=[],
+                uncovered_trace_ids=[],
+            )
+
+        return predict
+
+    with mock.patch("bandits.cli.build_rlm_predictor", fake_predictor):
+        mined = runner.invoke(
+            app,
+            [
+                "mine-rlm",
+                analysis_envelope.artifact_id,
+                "--model",
+                "test-model",
+                "--max-usd",
+                "5.0",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+    assert mined.exit_code == 0, mined.stdout
+    run_id = next(
+        line.split("draft_id:", 1)[1].strip()
+        for line in plain(mined.stdout).splitlines()
+        if line.startswith("draft_id:")
+    )
+
+    materialized = runner.invoke(
+        app, ["materialize-rlm-taskset", run_id, "--project", str(tmp_path)]
+    )
+    assert materialized.exit_code == 0, materialized.stdout
+
+    task_set_id = next(
+        line.split("taskset_id:", 1)[1].strip()
+        for line in plain(materialized.stdout).splitlines()
+        if line.startswith("taskset_id:")
+    )
+    task_set = load_task_set(task_set_id, derived_store)
+    assert task_set.families
+
+
 def test_rlm_corpus_forwards_control_markers_from_the_stored_artifact(tmp_path) -> None:
     """Every RLM mining/audit/assignment command builds its corpus through
     this one function — a marker declared at ingest must reach the miner
