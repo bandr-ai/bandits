@@ -239,6 +239,22 @@ def test_paraphrased_requests_naming_the_same_value_never_cross_the_split() -> N
     assert not ({"t1", "t2"} & fit and {"t1", "t2"} & held), "paraphrase pair split across sides"
 
 
+def test_quoted_date_range_paraphrases_never_cross_the_split() -> None:
+    analysis = _analysis(
+        ("t1", None, "report from 2024-02-01 to 2024-03-01"),
+        ("t2", None, 'please report from "2024-02-01 to 2024-03-01"'),
+        ("t3", None, "report from 2024-04-01 to 2024-05-01"),
+        ("t4", None, "change my seat"),
+        ("t5", None, "add a bag"),
+    )
+    run = _run(analysis, {f"t{i}": "c1" for i in range(1, 6)})
+
+    family = materialize_task_set(run, analysis, held_out=0.4).families[0]
+
+    fit, held = set(family.fit_trace_ids), set(family.held_out_trace_ids)
+    assert not ({"t1", "t2"} & fit and {"t1", "t2"} & held), "date-range pair split"
+
+
 def test_same_named_value_with_a_different_action_is_not_a_paraphrase() -> None:
     """Sharing an order id is not sharing a request: the verb changes what a
     correct answer looks like, so these are two independent groups and the

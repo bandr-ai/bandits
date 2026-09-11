@@ -35,6 +35,14 @@ def test_a_quoted_value_is_the_named_parameter_not_a_content_word() -> None:
     assert parameters == ("pay before friday",)
 
 
+def test_quoted_and_unquoted_date_ranges_have_the_same_signature() -> None:
+    plain = request_signature("report from 2024-02-01 to 2024-03-01")
+    quoted = request_signature('please report from "2024-02-01 to 2024-03-01"')
+
+    assert plain == quoted
+    assert plain[0] == ("2024-02-01", "2024-03-01")
+
+
 def test_a_request_with_no_named_value_still_has_a_signature() -> None:
     parameters, content_words = request_signature("list my playlists")
 
