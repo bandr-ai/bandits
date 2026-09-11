@@ -29,12 +29,17 @@ _PARAMETER_RULES = (
 )
 """Where a request carries a value that decides what its correct answer is.
 
-Narrower than the embedding miner's original rule set — no bare month names,
-no quoted date ranges — because this only feeds ``request_signature``'s
-paraphrase check, not a similarity-threshold join. False negatives here just
-mean two paraphrases treated as unrelated groups, which is always safe; false
-positives would silently merge two different requests, which is not.
+Narrower than the embedding miner's original rule set — no bare month names —
+because this only feeds ``request_signature``'s paraphrase check, not a
+similarity-threshold join. False positives would silently merge two different
+requests, while false negatives can let repeat work cross the evaluation split.
 """
+
+_QUOTED_DATE_RANGE = re.compile(
+    r"^\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(?:to|through|until|-)\s+"
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*$",
+    re.IGNORECASE,
+)
 
 _STOPWORDS = frozenset(
     "a an the to for of on in at by from with please could can would kindly "
@@ -58,6 +63,23 @@ def request_parameter_values(instruction: str) -> tuple[str, ...]:
         for match in rule.finditer(instruction):
             value = match.group(1).strip().lower()
             span = match.span(1)
+            # Quotes do not turn an otherwise bare date range into one opaque
+            # value. Extract its two dates in the same order as the unquoted
+            # spelling, while leaving arbitrary quoted output whole.
+            if rule is _PARAMETER_RULES[0] and (
+                date_range := _QUOTED_DATE_RANGE.fullmatch(match.group(1))
+            ):
+                offset = match.start(1)
+                for index in (1, 2):
+                    date_span = date_range.span(index)
+                    found.append(
+                        (
+                            offset + date_span[0],
+                            offset + date_span[1],
+                            date_range.group(index).lower(),
+                        )
+                    )
+                continue
             # Higher-priority compound values (quoted text, ISO dates) own
             # their entire span; do not also extract their numeric components.
             if value and not any(span[0] < end and start < span[1] for start, end, _ in found):
