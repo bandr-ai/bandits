@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -30,6 +31,16 @@ from bandits.verify.validate import Agreement, Validation, save_validation
 from tests.tasksets import task_set_by_first_word
 
 runner = CliRunner()
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """Strip ANSI codes before substring checks: CI renders --help output
+    with color (unlike a local run), which can split a plain-text match
+    across color codes and fail even though the text is visibly present."""
+    return _ANSI_ESCAPE.sub("", text)
+
+
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
 SUPPORT_FIXTURE = (
     Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
@@ -56,14 +67,15 @@ def _mined(tmp_path: Path) -> str:
     task_set = task_set_by_first_word(analysis, analysis_id, budget=10)
     return save_task_set(task_set, store).artifact_id
 
+
 def test_ingest_prints_artifact_summary(tmp_path) -> None:
     result = runner.invoke(
         app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
     )
 
     assert result.exit_code == 0
-    assert "artifact_id: corpus-" in result.stdout
-    assert "traces:      2" in result.stdout
+    assert "artifact_id: corpus-" in plain(result.stdout)
+    assert "traces:      2" in plain(result.stdout)
 
 
 def test_ingest_unknown_source_exits_nonzero(tmp_path) -> None:
@@ -97,7 +109,7 @@ def test_ingest_records_declared_control_markers(tmp_path) -> None:
     assert result.exit_code == 0
     artifact_id = next(
         line.split("artifact_id: ", 1)[1]
-        for line in result.stdout.splitlines()
+        for line in plain(result.stdout).splitlines()
         if line.startswith("artifact_id:")
     )
     corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
@@ -112,7 +124,7 @@ def test_ingest_without_control_marker_leaves_it_empty(tmp_path) -> None:
     )
     artifact_id = next(
         line.split("artifact_id: ", 1)[1]
-        for line in result.stdout.splitlines()
+        for line in plain(result.stdout).splitlines()
         if line.startswith("artifact_id:")
     )
     corpus = ArtifactStore(tmp_path / ".bandits").read(artifact_id)
@@ -123,7 +135,7 @@ def test_mine_rlm_exposes_the_per_call_token_ceiling() -> None:
     result = runner.invoke(app, ["mine-rlm", "--help"])
 
     assert result.exit_code == 0, result.stdout
-    assert "--max-tokens" in result.stdout
+    assert "--max-tokens" in plain(result.stdout)
 
 
 def test_rlm_corpus_forwards_control_markers_from_the_stored_artifact(tmp_path) -> None:
@@ -174,7 +186,7 @@ def test_list_shows_ingested_artifact(tmp_path) -> None:
     result = runner.invoke(app, ["list", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "otlp" in result.stdout
+    assert "otlp" in plain(result.stdout)
 
 
 def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
@@ -183,14 +195,14 @@ def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
 
     overview = runner.invoke(app, ["show", artifact_id, "--project", str(tmp_path)])
     assert overview.exit_code == 0
-    assert "trace-1" in overview.stdout
-    assert "trace-2" in overview.stdout
+    assert "trace-1" in plain(overview.stdout)
+    assert "trace-2" in plain(overview.stdout)
 
     detail = runner.invoke(
         app, ["show", artifact_id, "--trace", "trace-1", "--project", str(tmp_path)]
     )
     assert detail.exit_code == 0
-    assert "lookup_order" in detail.stdout
+    assert "lookup_order" in plain(detail.stdout)
 
 
 CODING_FIXTURE = (
@@ -205,9 +217,9 @@ def test_analyze_reports_tasks_and_never_hides_limitations(tmp_path) -> None:
     result = runner.invoke(app, ["analyze", artifact_id, "--tasks", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "analysis_id: analysis-" in result.stdout
-    assert "task-trace-1" in result.stdout
-    assert "limitation:" in result.stdout
+    assert "analysis_id: analysis-" in plain(result.stdout)
+    assert "task-trace-1" in plain(result.stdout)
+    assert "limitation:" in plain(result.stdout)
 
 
 def test_analyze_reads_a_coding_corpus_too(tmp_path) -> None:
@@ -219,7 +231,7 @@ def test_analyze_reads_a_coding_corpus_too(tmp_path) -> None:
     result = runner.invoke(app, ["analyze", artifact_id, "--tasks", "--project", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "task-code-1" in result.stdout
+    assert "task-code-1" in plain(result.stdout)
 
 
 def test_analyze_unknown_artifact_exits_nonzero(tmp_path) -> None:
@@ -267,9 +279,9 @@ def test_families_shows_one_family_in_full(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
-    assert family.descriptor in result.stdout
-    assert family.medoid_trace_id in result.stdout
-    assert "held_out" in result.stdout
+    assert family.descriptor in plain(result.stdout)
+    assert family.medoid_trace_id in plain(result.stdout)
+    assert "held_out" in plain(result.stdout)
 
 
 def test_families_rejects_an_unknown_family(tmp_path) -> None:
@@ -353,10 +365,10 @@ def test_interview_verifier_completes_a_bounded_review(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "status:       complete" in result.stdout
+    assert "status:       complete" in plain(result.stdout)
     interview_id = next(
         line.split(maxsplit=1)[1]
-        for line in result.stdout.splitlines()
+        for line in plain(result.stdout).splitlines()
         if line.startswith("interview_id:")
     )
     interview = load_interview(interview_id, store)
@@ -394,9 +406,9 @@ def test_draft_verifier_can_run_the_interview_inline(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "verifier_draft_id:" in result.stdout
-    assert "interview_id:" in result.stdout
-    assert "status:       complete" in result.stdout
+    assert "verifier_draft_id:" in plain(result.stdout)
+    assert "interview_id:" in plain(result.stdout)
+    assert "status:       complete" in plain(result.stdout)
 
 
 def _drafted_family(tmp_path, descriptor_word: str) -> tuple[str, str]:
@@ -450,12 +462,12 @@ def test_label_then_validate_separates_the_right_check(tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "validation_id: validation-" in result.stdout
+    assert "validation_id: validation-" in plain(result.stdout)
     # One hypothesis is right and one is wrong; the run where the wrong one
     # would have rewarded doing nothing is named.
-    assert "100%" in result.stdout and "0%" in result.stdout
-    assert "false_positive" in result.stdout
-    assert "gamed" in result.stdout
+    assert "100%" in plain(result.stdout) and "0%" in plain(result.stdout)
+    assert "false_positive" in plain(result.stdout)
+    assert "gamed" in plain(result.stdout)
 
 
 def test_labeling_can_be_quit_early(tmp_path) -> None:
@@ -468,7 +480,7 @@ def test_labeling_can_be_quit_early(tmp_path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "labels:       1" in result.stdout
+    assert "labels:       1" in plain(result.stdout)
 
 
 def test_validate_verifier_needs_an_existing_label_set(tmp_path) -> None:
@@ -605,7 +617,7 @@ def test_eval_and_sft_export_end_to_end_write_quarantine(tmp_path) -> None:
         ],
     )
     assert trained.exit_code == 0, trained.stdout
-    assert "rows:" in trained.stdout and "unresolved:" in trained.stdout
+    assert "rows:" in plain(trained.stdout) and "unresolved:" in plain(trained.stdout)
     assert sft_output.exists()
     quarantine = sft_output.with_name("sft.unresolved.jsonl")
     assert quarantine.exists()
@@ -667,7 +679,7 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "reviewed:   1" in result.stdout
+    assert "reviewed:   1" in plain(result.stdout)
     assert (output / "sft.jsonl").exists()
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
@@ -719,8 +731,8 @@ def test_a_free_text_review_accepts_a_check(tmp_path: Path) -> None:
         "looks right\ny\nit is the system of record\ny\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "read as: accept" in result.output
-    assert "interview_id:" in result.output
+    assert "read as: accept" in plain(result.output)
+    assert "interview_id:" in plain(result.output)
 
 
 def test_a_review_records_the_reply_and_the_model_response(tmp_path: Path) -> None:
@@ -735,7 +747,7 @@ def test_a_review_records_the_reply_and_the_model_response(tmp_path: Path) -> No
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     first = interview.reviews[0]
@@ -757,11 +769,11 @@ def test_an_overruled_interpretation_takes_the_humans_decision(tmp_path: Path) -
         "actually no\ny\nwhy not\nn\nr\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "overruled" in result.output
+    assert "overruled" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     assert interview.reviews[0].decision.value == "reject"
@@ -778,11 +790,11 @@ def test_a_failed_interpretation_falls_back_to_manual_entry(tmp_path: Path) -> N
         "fine\ny\nowned\na\n" * 12,
     )
     assert result.exit_code == 0, result.output
-    assert "could not read that reply" in result.output
+    assert "could not read that reply" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     assert interview.reviews[0].decision.value == "accept"
@@ -798,11 +810,11 @@ def test_the_review_never_promotes_past_the_draft(tmp_path: Path) -> None:
         _fake_interpreter(_decision("accept")),
         "fine\ny\nowned\ny\n" * 12,
     )
-    assert "validation is still required" in result.output
+    assert "validation is still required" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     for spec in interview.draft.verifiers:
@@ -824,7 +836,7 @@ def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None
         "looks right\ny\nsystem of record\ny\n" * 12,
     )
     assert first.exit_code == 0, first.output
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -838,12 +850,12 @@ def test_a_second_round_reads_the_decisions_of_the_first(tmp_path: Path) -> None
     )
 
     assert second.exit_code == 0, second.output
-    assert "round 2" in second.output
-    assert "earlier:" in second.output
+    assert "round 2" in plain(second.output)
+    assert "earlier:" in plain(second.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     second_id = [
-        line.split()[-1] for line in second.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(second.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(second_id, store)
     assert interview.round_number == 2
@@ -868,7 +880,7 @@ def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path
         "change it\ny\nsystem of record\ny\n" * 12,
     )
     assert first.exit_code == 0, first.output
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -888,7 +900,7 @@ def test_a_second_round_scores_the_verifier_the_revision_produced(tmp_path: Path
     )
 
     assert second.exit_code == 0, second.output
-    scored = [line for line in second.output.splitlines() if "scored:" in line]
+    scored = [line for line in plain(second.output).splitlines() if "scored:" in line]
     assert scored, second.output
     assert any("0 passed, 0 failed, 0 unscorable" not in line for line in scored), (
         f"every second-round summary scored nothing: {scored}"
@@ -908,7 +920,7 @@ def test_a_review_refuses_a_prior_interview_that_does_not_exist(tmp_path: Path) 
     )
 
     assert result.exit_code == 1
-    assert "no interview" in result.output
+    assert "no interview" in plain(result.output)
 
 
 def test_a_review_refuses_a_prior_interview_of_another_draft(tmp_path: Path) -> None:
@@ -919,7 +931,7 @@ def test_a_review_refuses_a_prior_interview_of_another_draft(tmp_path: Path) -> 
         _fake_interpreter(_decision("accept")),
         "looks right\ny\nwhy\ny\n" * 12,
     )
-    first_id = [line.split()[-1] for line in first.output.splitlines() if "interview_id:" in line][
+    first_id = [line.split()[-1] for line in plain(first.output).splitlines() if "interview_id:" in line][
         0
     ]
 
@@ -954,11 +966,11 @@ def test_a_manual_revise_after_an_unreadable_reply_is_applied(tmp_path: Path) ->
     )
 
     assert result.exit_code == 0, result.output
-    assert "could not read that reply" in result.output
+    assert "could not read that reply" in plain(result.output)
 
     store = DerivedStore(tmp_path / ".bandits")
     interview_id = [
-        line.split()[-1] for line in result.output.splitlines() if "interview_id:" in line
+        line.split()[-1] for line in plain(result.output).splitlines() if "interview_id:" in line
     ][0]
     interview = load_interview(interview_id, store)
     first = interview.reviews[0]
@@ -995,7 +1007,7 @@ def test_sft_export_writes_a_composition_report_beside_its_rows(tmp_path) -> Non
     payload = json.loads(report.read_text())
     assert payload["schema_version"] == 1
     assert payload["offered_traces"] >= payload["selected"]["rows"]
-    assert "composition:" in result.stdout
+    assert "composition:" in plain(result.stdout)
 
 
 def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path) -> None:
@@ -1022,7 +1034,7 @@ def test_an_eval_export_refuses_sampling_caps_rather_than_ignoring_them(tmp_path
     )
 
     assert result.exit_code == 1
-    assert "sft only" in result.stdout
+    assert "sft only" in plain(result.stdout)
     assert not output.exists()
 
 
@@ -1049,7 +1061,7 @@ def test_a_cap_below_one_is_refused_before_anything_is_written(tmp_path) -> None
     )
 
     assert result.exit_code == 1
-    assert "at least 1" in result.stdout
+    assert "at least 1" in plain(result.stdout)
     assert not output.exists()
 
 
@@ -1062,7 +1074,7 @@ def test_a_task_set_recording_no_grouping_says_so_rather_than_reading_as_normal(
     result = runner.invoke(app, ["families", older, "--project", str(tmp_path)])
 
     assert result.exit_code == 0, result.stdout
-    assert "records nothing about how it" in result.stdout
+    assert "records nothing about how it" in plain(result.stdout)
 
 
 def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tmp_path) -> None:
@@ -1086,7 +1098,7 @@ def test_draft_verifier_reports_candidate_behavior_and_says_when_uncalibrated(tm
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "frequency-based hypothesis" in result.stdout
+    assert "frequency-based hypothesis" in plain(result.stdout)
     draft = load_verifier_draft(result.stdout.split()[1], store)
     assert draft.candidates
     assert all(item.derivation == "frequency" for item in draft.candidates)
