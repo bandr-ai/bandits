@@ -362,7 +362,7 @@ const cards=__CARDS__;let i=0;const decisions={};const app=document.querySelecto
 const esc=s=>String(s??'Not recorded').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function render(){if(i>=cards.length){finish();return}const c=cards[i], facts=c.states.map(x=>`<div class=fact><b>${esc(x.tool)}</b> · ${esc(x.key)} = ${esc(JSON.stringify(x.value))}</div>`).join('')||'<div class=fact>No structured state recorded</div>';app.innerHTML=`<div class=top><span>${c.disputed?'⚡ Disputed case':'Review case'}</span><span>${i+1} / ${cards.length}</span></div><div class=bar><i style="width:${100*i/cards.length}%"></i></div><section class=card><h2>Request</h2><div class=request>${esc(c.instruction)}</div><h2>What changed</h2><div class=facts>${facts}${c.errors.map(e=>`<div class="fact error">${esc(e.kind)}: ${esc(e.value)}</div>`).join('')}</div><h2>Agent's final response</h2><div class=final>${esc(c.final)}</div><textarea id=why placeholder="Optional note: why?"></textarea><div class=buttons><button class=success onclick="pick('success')">Success <kbd>S</kbd></button><button class=failure onclick="pick('failure')">Failure <kbd>F</kbd></button><button class=unclear onclick="pick('unclear')">Unclear <kbd>U</kbd></button></div></section>`}
 function pick(verdict){decisions[cards[i].trace_id]={verdict,rationale:document.querySelector('#why').value};i++;render()}
-async function finish(){app.innerHTML='<div id=done><h1>Saving review…</h1></div>';const r=await fetch('/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(decisions)});const d=await r.json();app.innerHTML=`<div id=done><h1>Review saved</h1><p>${esc(d.label_set_id)}</p><p>You can return to the terminal.</p></div>`}
+async function finish(){app.innerHTML='<div id=done><h1>Saving review…</h1></div>';try{const r=await fetch('/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(decisions)}),d=await r.json();if(!r.ok)throw Error(d.error||'Review could not be saved');app.innerHTML=`<div id=done><h1>Review saved</h1><p>${esc(d.label_set_id)}</p><p>You can return to the terminal.</p></div>`}catch(e){app.innerHTML=`<div id=done><h1>Review not saved</h1><p class=error>${esc(e.message)}</p><button id=retry>Retry save</button></div>`;document.querySelector('#retry').onclick=finish}}
 addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA')return;if(e.key==='s')pick('success');if(e.key==='f')pick('failure');if(e.key==='u')pick('unclear')});render();
 </script></body></html>""".replace("__CARDS__", json.dumps(cards).replace("</", "<\\/"))
 
@@ -407,14 +407,14 @@ addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA')return;if(e.key=
                 response = json.dumps({"label_set_id": env.artifact_id}).encode()
                 self.send_response(200)
             except Exception as exc:
-                result["error"] = str(exc)
                 response = json.dumps({"error": str(exc)}).encode()
                 self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            if "id" in result:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     url = f"http://127.0.0.1:{server.server_port}"
@@ -422,8 +422,6 @@ addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA')return;if(e.key=
     webbrowser.open(url)
     server.serve_forever()
     server.server_close()
-    if "error" in result:
-        raise ValueError(f"invalid browser review: {result['error']}")
     return result["id"]
 
 

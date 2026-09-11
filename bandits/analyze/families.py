@@ -136,6 +136,12 @@ _PARAMETER_RULES = (
 )
 """Where a request carries a value that decides what its correct answer is."""
 
+_QUOTED_DATE_RANGE = re.compile(
+    r"^\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(?:to|through|until|-)\s+"
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*$",
+    re.IGNORECASE,
+)
+
 
 def request_parameters(instruction: str) -> tuple[str, ...]:
     """The values that make one request specific rather than a kind of request.
@@ -154,6 +160,23 @@ def request_parameters(instruction: str) -> tuple[str, ...]:
         for match in rule.finditer(instruction):
             value = match.group(1).strip().lower()
             span = match.span(1)
+            # Quoting an otherwise bare date range does not change the two
+            # answer-determining values. Keep arbitrary quoted prose whole,
+            # because there the enclosing value is the requested output.
+            if rule is _PARAMETER_RULES[0] and (
+                date_range := _QUOTED_DATE_RANGE.fullmatch(match.group(1))
+            ):
+                offset = match.start(1)
+                for index in (1, 2):
+                    date_span = date_range.span(index)
+                    found.append(
+                        (
+                            offset + date_span[0],
+                            offset + date_span[1],
+                            date_range.group(index).lower(),
+                        )
+                    )
+                continue
             # Higher-priority compound values (notably ISO dates) own their
             # entire span; do not also extract their numeric components.
             if value and not any(span[0] < end and start < span[1] for start, end, _ in found):

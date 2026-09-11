@@ -691,7 +691,7 @@ def validate_draft(
 
     verdicts = label_set.adjudicated()
     measured_trace_ids = (
-        family_traces if include_held_out else set(family.fit_trace_ids or family.trace_ids)
+        family_traces if include_held_out else set(family.fit_trace_ids)
     )
     measured_verdicts = {
         trace_id: verdict

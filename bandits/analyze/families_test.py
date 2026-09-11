@@ -882,6 +882,13 @@ def test_request_parameters_keep_quoted_values_containing_dates_distinct() -> No
     )
 
 
+def test_request_parameters_treat_quoted_and_unquoted_date_ranges_equally() -> None:
+    expected = ("2024-02-01", "2024-03-01")
+
+    assert request_parameters("report from 2024-02-01 to 2024-03-01") == expected
+    assert request_parameters('report from "2024-02-01 to 2024-03-01"') == expected
+
+
 def test_duplicate_evidence_is_transitive() -> None:
     """A joined to B and B to C is one group, not two overlapping pairs."""
     analysis = _requests(
