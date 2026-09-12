@@ -1826,6 +1826,10 @@ def mine_rlm_command(
                     f"{' [failed: ' + c.error[:40] + ']' if c.status == 'error' else ''}[/dim]"
                 ),
             )
+        except KeyboardInterrupt:
+            recorder.fail("interrupted by user")
+            console.print("\n[yellow]interrupted:[/yellow] session recorded as failed")
+            raise typer.Exit(code=130) from None
         except MiningError as exc:
             recorder.fail(str(exc))
             console.print(f"[red]error:[/red] {exc}")
