@@ -33,7 +33,7 @@ from typing import Any
 
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _LINEAGE_KEYS = (
     "gen_ai.conversation.id",
@@ -147,6 +147,51 @@ def _declared_completion(attributes: dict[str, Any]) -> object:
     if text:
         return "\n".join(text)
     return attributes.get("gen_ai.completion")
+
+
+def _user_turns(spans: tuple[Span, ...]) -> tuple[tuple[UserTurn, ...], int]:
+    """Recover user turns from successive GenAI input snapshots.
+
+    Most exporters repeat the complete conversation in every model span. Only
+    the suffix added since the preceding snapshot is new; treating every
+    snapshot independently would duplicate the opening request once per model
+    call. Exporters which record only the current call's input are also valid:
+    when snapshots do not overlap, the whole later snapshot is new.
+
+    A user-role message with no textual representation is counted rather than
+    silently discarded. Its placement is anchored immediately before the
+    model span that consumed it, after the preceding normalized span.
+    """
+    turns: list[UserTurn] = []
+    unrepresented = 0
+    previous: list[dict[str, Any]] = []
+    preceding_span_id: str | None = None
+
+    for span in spans:
+        if span.kind is not SpanKind.MODEL:
+            preceding_span_id = span.span_id
+            continue
+
+        current = _messages(span.attributes.get("gen_ai.input.messages"))
+        overlap = 0
+        for size in range(min(len(previous), len(current)), 0, -1):
+            if previous[-size:] == current[:size]:
+                overlap = size
+                break
+
+        for message in current[overlap:]:
+            if message.get("role") not in ("user", "human"):
+                continue
+            content = _message_text(message)
+            if content:
+                turns.append(UserTurn(text=content, after_span_id=preceding_span_id))
+            else:
+                unrepresented += 1
+
+        previous = current
+        preceding_span_id = span.span_id
+
+    return tuple(turns), unrepresented
 
 
 def _tool_result(value: object) -> object:
@@ -409,6 +454,7 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
         )
         ordered = _embedded_tool_spans(ordered)
         tools, system_prompt, context = _declared_context(ordered)
+        user_turns, unrepresented_user_turns = _user_turns(ordered)
         traces.append(
             Trace(
                 trace_id=trace_id,
@@ -419,6 +465,8 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
                 tools_available=tools,  # type: ignore[arg-type]
                 system_prompt=system_prompt,
                 runtime_context=context,
+                user_turns=user_turns,
+                unrepresented_user_turns=unrepresented_user_turns,
                 spans=ordered,
             )
         )

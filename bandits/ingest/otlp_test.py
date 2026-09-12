@@ -74,6 +74,10 @@ def test_reads_standard_genai_messages_and_embedded_tool_result(tmp_path) -> Non
                 }
             ],
         },
+        {
+            "role": "user",
+            "parts": [{"type": "text", "content": "Use the weekday alarm."}],
+        },
     ]
     definitions = [
         {
@@ -130,6 +134,16 @@ def test_reads_standard_genai_messages_and_embedded_tool_result(tmp_path) -> Non
     trace = load_otlp(path).traces[0]
 
     assert trace.task == "Set my alarm snooze to five minutes."
+    assert [turn.text for turn in trace.user_turns] == [
+        (
+            "Context: policy text kept in the raw attribute.\n"
+            "Task from supervisor:\nSet my alarm snooze to five minutes."
+        ),
+        "Use the weekday alarm.",
+    ]
+    assert trace.user_turns[0].after_span_id is None
+    assert trace.user_turns[1].after_span_id.endswith(":tool:call-1")
+    assert trace.unrepresented_user_turns == 0
     assert trace.lineage_id == "task-295"
     assert trace.tools_available is not None
     assert [tool.name for tool in trace.tools_available] == ["phone__update_alarm"]
@@ -161,6 +175,29 @@ def test_reads_standard_otlp_error_status(tmp_path) -> None:
     path.write_text(json.dumps(record) + "\n")
 
     assert load_otlp(path).traces[0].spans[0].status is SpanStatus.ERROR
+
+
+def test_counts_a_user_message_that_has_no_text(tmp_path) -> None:
+    path = tmp_path / "non-text-user.jsonl"
+    record = {
+        "trace_id": "trace-user-image",
+        "span_id": "chat-1",
+        "name": "chat model-a",
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": [
+                {"role": "user", "parts": [{"type": "image", "url": "redacted"}]}
+            ],
+        },
+    }
+    path.write_text(json.dumps(record) + "\n")
+
+    trace = load_otlp(path).traces[0]
+
+    assert trace.user_turns == ()
+    assert trace.unrepresented_user_turns == 1
 
 
 def test_malformed_line_becomes_an_issue_not_a_failure() -> None:
