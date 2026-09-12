@@ -84,3 +84,46 @@ def test_family_discovery_selects_on_fit_and_reports_held_out() -> None:
     assert result["signals"][0]["fit"]["auc"] == 1.0
     assert result["signals"][0]["held_out"]["auc"] == 1.0
     assert result["baselines"]["no_span_error"]["held_out"]["auc"] == 1.0
+
+
+def test_rejected_signal_keeps_the_model_output_for_audit() -> None:
+    traces = {
+        trace_id: _trace(trace_id, reliable)
+        for trace_id, reliable in {
+            "p1": True,
+            "p2": True,
+            "n1": False,
+            "n2": False,
+            "hp": True,
+            "hn": False,
+        }.items()
+    }
+    labels = {trace_id: trace["spans"][0]["status"] == "ok" for trace_id, trace in traces.items()}
+    family = TaskFamily(
+        family_id="family-test",
+        descriptor="research tasks",
+        trace_ids=tuple(traces),
+        medoid_trace_id="p1",
+        workload_mass=len(traces),
+        fit_trace_ids=("p1", "p2", "n1", "n2"),
+        held_out_trace_ids=("hp", "hn"),
+    )
+    proposal = ProposedSignal(
+        name="wrong_entrypoint",
+        hypothesis="Malformed on purpose.",
+        code="def other(trace):\n    return 1.0",
+    )
+
+    result = evaluate_family(
+        family,
+        traces,
+        labels,
+        lambda **_: SimpleNamespace(signals=[proposal]),
+        keep_auc=0.62,
+    )
+
+    rejected = result["signals"][0]
+    assert rejected["status"] == "rejected"
+    assert rejected["code"] == proposal.code
+    assert rejected["fit"] is None
+    assert rejected["held_out"] is None
