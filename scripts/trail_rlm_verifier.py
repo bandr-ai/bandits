@@ -229,12 +229,28 @@ def evaluate_family(
     rows = []
     for proposal in proposed:
         if "trace_id" in proposal.code:
-            rows.append({"name": proposal.name, "status": "rejected", "reason": "trace-id access"})
+            rows.append(
+                {
+                    **proposal.model_dump(),
+                    "status": "rejected",
+                    "reason": "trace-id access",
+                    "fit": None,
+                    "held_out": None,
+                }
+            )
             continue
         try:
             signal = _compile_signal(proposal.code)
         except Exception as exc:  # noqa: BLE001
-            rows.append({"name": proposal.name, "status": "rejected", "reason": str(exc)})
+            rows.append(
+                {
+                    **proposal.model_dump(),
+                    "status": "rejected",
+                    "reason": str(exc),
+                    "fit": None,
+                    "held_out": None,
+                }
+            )
             continue
         values = _run_over_corpus(signal, all_family)
         fit = _metric(proposal.name, values, fit_labels)
