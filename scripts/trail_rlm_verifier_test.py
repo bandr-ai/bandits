@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
-from trail_rlm_verifier import ProposedSignal, _binary_labels, _load_labels, evaluate_family
+from trail_rlm_verifier import (
+    ProposedSignal,
+    _balanced_example_ids,
+    _binary_labels,
+    _load_labels,
+    evaluate_family,
+)
 
 from bandits.analyze.models import TaskFamily
 
@@ -35,6 +41,13 @@ def test_loads_tau2_sealed_labels(tmp_path) -> None:
     assert provenance["format"] == "tau2 sealed success"
 
 
+def test_discovery_sample_is_balanced_and_bounded() -> None:
+    labels = {**{f"p{i}": True for i in range(10)}, **{f"n{i}": False for i in range(10)}}
+    selected = _balanced_example_ids(labels, 6)
+    assert len(selected) == 6
+    assert sum(labels[trace_id] for trace_id in selected) == 3
+
+
 def test_family_discovery_selects_on_fit_and_reports_held_out() -> None:
     traces = {
         trace_id: _trace(trace_id, reliable)
@@ -62,6 +75,7 @@ def test_family_discovery_selects_on_fit_and_reports_held_out() -> None:
     def predict(**kwargs):
         assert "hp" not in kwargs["fit_examples"]
         assert "hn" not in kwargs["fit_examples"]
+        assert kwargs["correction"] == ""
         return SimpleNamespace(
             signals=[
                 ProposedSignal(
@@ -127,3 +141,46 @@ def test_rejected_signal_keeps_the_model_output_for_audit() -> None:
     assert rejected["code"] == proposal.code
     assert rejected["fit"] is None
     assert rejected["held_out"] is None
+
+
+def test_all_rejected_proposals_trigger_one_bounded_repair() -> None:
+    traces = {
+        trace_id: _trace(trace_id, reliable)
+        for trace_id, reliable in {
+            "p1": True,
+            "p2": True,
+            "n1": False,
+            "n2": False,
+            "hp": True,
+            "hn": False,
+        }.items()
+    }
+    labels = {trace_id: trace["spans"][0]["status"] == "ok" for trace_id, trace in traces.items()}
+    family = TaskFamily(
+        family_id="family-test",
+        descriptor="research tasks",
+        trace_ids=tuple(traces),
+        medoid_trace_id="p1",
+        workload_mass=len(traces),
+        fit_trace_ids=("p1", "p2", "n1", "n2"),
+        held_out_trace_ids=("hp", "hn"),
+    )
+    corrections = []
+
+    def predict(**kwargs):
+        corrections.append(kwargs["correction"])
+        code = (
+            "def other(trace):\n    return 1.0"
+            if not kwargs["correction"]
+            else "def signal(trace):\n    return 1.0 if tool_spans(trace)[0].get('status') == 'ok' else 0.0"
+        )
+        return SimpleNamespace(
+            signals=[ProposedSignal(name="candidate", hypothesis="test", code=code)]
+        )
+
+    result = evaluate_family(family, traces, labels, predict, keep_auc=0.62)
+
+    assert len(corrections) == 2
+    assert "no callable named 'signal'" in corrections[1]
+    assert result["repair_attempts"] == 1
+    assert result["signals"][0]["status"] == "kept"
