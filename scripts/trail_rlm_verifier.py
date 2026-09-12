@@ -36,7 +36,7 @@ class ProposedSignal(BaseModel):
     gaming_hypotheses: list[str] = []
 
 
-def _render(trace: dict[str, Any], limit: int = 12_000) -> str:
+def _render(trace: dict[str, Any], limit: int = 6_000) -> str:
     lines = [f"TASK: {trace.get('task') or '(missing)'}"]
     for span in trace.get("spans", []):
         role = "ASSISTANT" if span.get("kind") == "model" else "TOOL"
@@ -61,6 +61,18 @@ def _examples(
             f"{_render(traces[trace_id])}"
         )
     return "\n\n".join(blocks)
+
+
+def _balanced_example_ids(labels: dict[str, bool], maximum: int) -> tuple[str, ...]:
+    """Choose a deterministic, balanced discovery sample from fit only."""
+    positives = sorted(trace_id for trace_id, value in labels.items() if value)
+    negatives = sorted(trace_id for trace_id, value in labels.items() if not value)
+    each = max(1, maximum // 2)
+    chosen = positives[:each] + negatives[:each]
+    if len(chosen) < maximum:
+        remainder = [trace_id for trace_id in sorted(labels) if trace_id not in chosen]
+        chosen.extend(remainder[: maximum - len(chosen)])
+    return tuple(chosen)
 
 
 _INSTRUCTION = textwrap.dedent(
@@ -110,6 +122,9 @@ def build_predictor(
     class Discover(dspy.Signature):
         family_contract: str = dspy.InputField()
         fit_examples: str = dspy.InputField()
+        correction: str = dspy.InputField(
+            desc="empty initially; otherwise exact host-side rejection errors to repair"
+        )
         signals: list[ProposedSignal] = dspy.OutputField()
 
     Discover.__doc__ = _INSTRUCTION
@@ -120,9 +135,13 @@ def build_predictor(
         sub_lm=lm,
     )
 
-    def predict(*, family_contract: str, fit_examples: str) -> Any:
+    def predict(*, family_contract: str, fit_examples: str, correction: str = "") -> Any:
         with dspy.context(lm=lm):
-            return rlm(family_contract=family_contract, fit_examples=fit_examples)
+            return rlm(
+                family_contract=family_contract,
+                fit_examples=fit_examples,
+                correction=correction,
+            )
 
     return predict
 
@@ -179,6 +198,8 @@ def evaluate_family(
     predict: Callable[..., Any],
     *,
     keep_auc: float,
+    max_fit_examples: int = 12,
+    repair_attempts: int = 1,
 ) -> dict[str, Any]:
     fit_labels = {
         trace_id: labels[trace_id] for trace_id in family.fit_trace_ids if trace_id in labels
@@ -208,15 +229,40 @@ def evaluate_family(
         },
         indent=2,
     )
-    reply = predict(
-        family_contract=contract,
-        fit_examples=_examples(traces, fit_labels, family.fit_trace_ids),
+    rendered_examples = _examples(
+        traces,
+        fit_labels,
+        _balanced_example_ids(fit_labels, max_fit_examples),
     )
-    raw = getattr(reply, "signals", [])
-    proposed = [
-        item if isinstance(item, ProposedSignal) else ProposedSignal.model_validate(item)
-        for item in raw
-    ]
+    proposed: list[ProposedSignal] = []
+    correction = ""
+    repairs_used = 0
+    for attempt in range(repair_attempts + 1):
+        reply = predict(
+            family_contract=contract,
+            fit_examples=rendered_examples,
+            correction=correction,
+        )
+        raw = getattr(reply, "signals", [])
+        proposed = [
+            item if isinstance(item, ProposedSignal) else ProposedSignal.model_validate(item)
+            for item in raw
+        ]
+        failures = []
+        for proposal in proposed:
+            try:
+                _compile_signal(proposal.code)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{proposal.name}: {exc}")
+        if proposed and len(failures) < len(proposed):
+            break
+        if attempt < repair_attempts:
+            repairs_used += 1
+            correction = (
+                "Every proposal was rejected by the host. Return complete, self-contained "
+                "`def signal(trace)` functions with no imports. Exact errors:\n- "
+                + "\n- ".join(failures or ["no proposals returned"])
+            )
 
     all_family = [traces[trace_id] for trace_id in family.trace_ids if trace_id in traces]
     baselines = {
@@ -268,6 +314,7 @@ def evaluate_family(
         "status": "evaluated",
         "fit_labels": len(fit_labels),
         "held_out_labels": len(held_labels),
+        "repair_attempts": repairs_used,
         "baselines": baselines,
         "signals": rows,
     }
@@ -283,6 +330,8 @@ def main() -> None:
     parser.add_argument("--model", default="accounts/fireworks/models/deepseek-v4-flash-0731")
     parser.add_argument("--keep-auc", type=float, default=0.62)
     parser.add_argument("--max-families", type=int, default=5)
+    parser.add_argument("--max-fit-examples", type=int, default=12)
+    parser.add_argument("--repair-attempts", type=int, default=1)
     parser.add_argument("--max-iterations", type=int, default=15)
     parser.add_argument("--max-llm-calls", type=int, default=30)
     parser.add_argument("--max-tokens", type=int, default=16_000)
@@ -303,7 +352,15 @@ def main() -> None:
     eligible = sorted(task_set.families, key=lambda family: -len(family.trace_ids))
     results = []
     for family in eligible:
-        result = evaluate_family(family, traces, labels, predict, keep_auc=args.keep_auc)
+        result = evaluate_family(
+            family,
+            traces,
+            labels,
+            predict,
+            keep_auc=args.keep_auc,
+            max_fit_examples=args.max_fit_examples,
+            repair_attempts=args.repair_attempts,
+        )
         results.append(result)
         print(
             f"{family.family_id}: {result['status']} "
