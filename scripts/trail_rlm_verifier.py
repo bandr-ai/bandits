@@ -75,6 +75,14 @@ _INSTRUCTION = textwrap.dedent(
             # trace is a dict containing task, user_turns, and spans
             # return 0..1 (higher means reliable), or None when not applicable
 
+    Executable schema (this is the contract the returned code receives):
+    - trace['task']: str | None
+    - trace['user_turns']: user messages only; NEVER contains tool calls or tool results
+    - trace['spans']: list[dict]
+    - each span has kind ('model' or 'tool'), name, status ('ok' or 'error'), arguments, output
+    - helpers already in scope: spans(trace), tool_spans(trace), model_texts(trace), json_dumps(x)
+    Read tool activity from tool_spans(trace), never from user_turns.
+
     No imports, I/O, network, eval, exec, open, dunder access, or trace-id tests. Prefer checks
     that connect the requested outcome to recorded tool evidence over surface proxies. State
     blind spots and how an agent could game each signal. Return distinct candidates.
