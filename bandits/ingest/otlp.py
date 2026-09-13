@@ -33,7 +33,7 @@ from typing import Any
 
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue
+from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
 
 _LINEAGE_KEYS = (
     "gen_ai.conversation.id",
@@ -324,6 +324,33 @@ def _parse_record(record: dict, *, location: str) -> tuple[Span, str, str | None
     return span, trace_id, task, lineage_id
 
 
+def _user_turns(spans: tuple[Span, ...]) -> tuple[UserTurn, ...]:
+    """The user messages the export recorded, placed after the span they followed.
+
+    Read from the *trailing* user-role messages of each span's
+    ``gen_ai.input.messages``: the ones after the last assistant or tool
+    message in that input. An exporter that sends the whole history on every
+    call repeats every earlier user message as a non-trailing one, so this
+    reads each message once, at the call it arrived for. Nothing is inferred
+    from ``task`` — a turn here is a message the source recorded with a user
+    role, or it is not a turn.
+    """
+    turns: list[UserTurn] = []
+    previous: str | None = None
+    for span in spans:
+        messages = _messages(span.attributes.get("gen_ai.input.messages"))
+        trailing: list[str] = []
+        for message in reversed(messages):
+            if message.get("role") not in ("user", "human"):
+                break
+            text = _message_text(message)
+            if text:
+                trailing.append(text)
+        turns.extend(UserTurn(text=text, after_span_id=previous) for text in reversed(trailing))
+        previous = span.span_id
+    return tuple(turns)
+
+
 def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
     """The toolset, system prompt and settings declared on the episode's root span.
 
@@ -419,6 +446,7 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
                 tools_available=tools,  # type: ignore[arg-type]
                 system_prompt=system_prompt,
                 runtime_context=context,
+                user_turns=_user_turns(ordered),
                 spans=ordered,
             )
         )
