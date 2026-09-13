@@ -25,6 +25,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from bandits.analyze.rlm_audit_session import AuditSessionState
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_models import FamilyContract, RLMClusteringAudit, RLMClusteringRun
 from bandits.analyze.rlm_session import SessionState
@@ -242,6 +243,79 @@ def live_panel(state: SessionState, *, recent: Sequence[dict] = ()) -> Panel:
         subtitle=f"[dim]{state.view.value} · seed {state.seed}[/dim]",
         border_style=status_colour,
     )
+
+
+def audit_live_panel(state: AuditSessionState, *, recent: Sequence[dict] = ()) -> Panel:
+    """The whole audit session in one screen, for watching it happen.
+
+    Deliberately its own function rather than a branch inside ``live_panel``:
+    an audit session has no passes, chunks or taxonomy-under-construction to
+    show, only a fixed contract list and the findings reached against it so
+    far, so most of ``live_panel``'s fields would be meaningless here.
+    """
+    status_colour = {
+        "running": "cyan",
+        "awaiting_review": "green",
+        "interrupted": "yellow",
+        "failed": "red",
+        "incomplete": "yellow",
+    }.get(state.status, "white")
+
+    header = Table.grid(padding=(0, 2))
+    header.add_column(style="dim")
+    header.add_column()
+    header.add_row("status", f"[{status_colour}]{state.status}[/{status_colour}]")
+    header.add_row(
+        "contracts", _bar(len(state.completed_contract_ids), len(state.contract_order))
+    )
+    header.add_row("spend", f"{state.llm_calls} calls · ${state.cost_usd:.4f}")
+    if state.resumed_from:
+        header.add_row("resumed from", state.resumed_from)
+
+    body: list[object] = [header]
+
+    if state.findings:
+        body.append(Text(""))
+        table = Table("contract", "verdict", box=None, pad_edge=False)
+        for finding in state.findings[-12:]:
+            colour = "yellow" if finding.demands_action else "dim"
+            table.add_row(
+                finding.contract_id, f"[{colour}]{finding.recommendation}[/{colour}]"
+            )
+        body.append(table)
+    else:
+        body.append(Text("\nno findings yet", style="dim"))
+
+    if recent:
+        body.append(Text(""))
+        for event in recent:
+            body.append(Text(f"  {_audit_event_line(event)}", style="dim"))
+
+    if state.last_error:
+        body.append(Text(f"\nlast error: {state.last_error}", style="red"))
+
+    return Panel(
+        Group(*body),
+        title=f"[bold]{state.session_id}[/bold]",
+        subtitle=f"[dim]auditing {state.run_id}[/dim]",
+        border_style=status_colour,
+    )
+
+
+def _audit_event_line(event: dict) -> str:
+    name = event.get("event", "?")
+    if name == "contract_audited":
+        return (
+            f"{event.get('contract_id')}: {event.get('recommendation')} "
+            f"({event.get('done')}/{event.get('of')})"
+        )
+    if name == "session_started":
+        return f"started · {event.get('contracts')} contract(s) to audit"
+    if name == "session_finished":
+        return f"finished · {event.get('status')} ({event.get('stop_reason')})"
+    if name == "session_failed":
+        return f"failed: {event.get('error', '')[:60]}"
+    return name
 
 
 def _bar(done: int, total: int, width: int = 24) -> str:
