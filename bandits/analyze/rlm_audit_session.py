@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -139,8 +140,17 @@ class AuditSessionStore:
 
 
 def new_audit_session_id(run_id: str) -> str:
+    """A readable, collision-resistant id naming the run this audits.
+
+    The timestamp alone has only one-second precision, so two audits of the
+    same run started in the same second would otherwise pick the same
+    directory and overwrite each other's checkpoints. The random suffix makes
+    that collision astronomically unlikely without needing directory-exists
+    retry logic.
+    """
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    return f"rlm-audit-{run_id[-8:]}-{stamp}"
+    suffix = secrets.token_hex(3)
+    return f"rlm-audit-{run_id[-8:]}-{stamp}-{suffix}"
 
 
 class AuditSessionRecorder:

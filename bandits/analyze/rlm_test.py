@@ -1173,6 +1173,37 @@ def test_a_reassignment_named_by_an_operation_is_accepted() -> None:
     assert moved == 1
 
 
+def test_a_keep_does_not_justify_a_reassignment_of_the_same_trace() -> None:
+    """KEEP affirms a trace's *current* contract. A chunk that says "KEEP t1"
+    for c1 while separately reassigning t1's ``assignments`` entry to c2 must
+    not use that KEEP as license for the move — that would be the same bug as
+    the bare-reassignment case, just with an unrelated op naming the trace."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1"), "c2": _contract("c2", "cancel an order")}
+    state.assignments = {"t1": "c1"}
+    limitations: list[str] = []
+    result = ChunkResult(
+        index=0,
+        pass_index=1,
+        trace_ids=("t1",),
+        operations=(
+            TaxonomyOperation(
+                operation=Operation.KEEP,
+                contract_ids=("c1",),
+                trace_ids=("t1",),
+                rationale="c1 still fits",
+            ),
+        ),
+        assignments={"t1": "c2"},
+    )
+    moved = state.apply(result, [], limitations=limitations)
+    assert state.assignments == {"t1": "c1"}
+    assert moved == 0
+    assert any("t1" in lim and "c2" in lim for lim in limitations)
+
+
 def test_a_first_time_placement_needs_no_justifying_operation() -> None:
     """The guard is only for *changing* an existing placement — a trace with
     no previous assignment is always free to be placed."""

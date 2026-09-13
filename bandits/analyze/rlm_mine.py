@@ -887,8 +887,15 @@ class _TaxonomyState:
         for contract in contracts:
             self.contracts[contract.contract_id] = contract
 
+        # KEEP names a trace to affirm its *current* contract, not to license
+        # moving it elsewhere - a response that says "KEEP t1" for t1's
+        # existing family while separately assigning t1 to a different
+        # contract must not count as an operation justifying that move.
         justified_moves = {
-            trace_id for op in result.operations for trace_id in op.trace_ids
+            trace_id
+            for op in result.operations
+            if op.operation is not Operation.KEEP
+            for trace_id in op.trace_ids
         }
 
         moved = 0

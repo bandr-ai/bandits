@@ -2298,11 +2298,12 @@ def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
                 "\n[green]paused for review.[/green] "
                 "[dim]families: bandits rlm-families <draft_id>[/dim]"
             )
-    elif state.status == "interrupted":
-        console.print(
-            "\n[yellow]interrupted.[/yellow] "
-            f"[dim]resume with --resume {session_id}[/dim]"
-        )
+    elif state.status in ("interrupted", "incomplete"):
+        if kind == "audit":
+            resume_command = f"bandits audit-rlm {state.run_id} --resume {session_id}"
+        else:
+            resume_command = f"bandits mine-rlm {state.analysis_id} --resume {session_id}"
+        console.print(f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]")
 
 
 @app.command(name="rlm-families")
