@@ -615,6 +615,18 @@ class RLMClusteringAudit(Contract):
     model: str
     prompt_digest: str
     limitations: tuple[str, ...] = ()
+    status: str = "complete"
+    """"complete" once every contract in the run has a finding, "incomplete"
+    when saved from a session that stopped early (interrupted or budget-exhausted).
+
+    An incomplete audit is still inspectable — the findings it does have are
+    real — but it must never be read as "the contracts it is silent about were
+    checked and passed"."""
+
+    stop_reason: str = "complete"
+    """Why the audit stopped: "complete", "interrupted", or one of the audit
+    budget ceilings. Mirrors :class:`StopReason` without importing mining's
+    enum, since an audit budget is its own, smaller set of guards."""
 
     @model_validator(mode="after")
     def one_finding_per_contract(self) -> RLMClusteringAudit:
@@ -633,18 +645,29 @@ class RLMClusteringAudit(Contract):
         )
 
 
-DEFAULT_PASSES = 2
+DEFAULT_PASSES = 1
 """Complete corpus passes before pausing for review.
 
-Two, then stop. The first pass builds a taxonomy from nothing, so its early
-chunks were judged against definitions that did not exist yet; the second is the
-first time every trace is read against a taxonomy that has already seen the
-whole corpus. One pass is a run, two is a run that has been checked, and the
-pause after them is what keeps this from becoming a loop that runs until the
-model stops objecting to itself.
+One, then stop. A second pass rereads every trace against a taxonomy that has
+already seen the whole corpus, which is a real check in principle — but a
+run over 40 diverse SWE-bench traces went from 40 contracts to 44, with a
+trace silently moved into an unrelated family and no operation recorded to
+explain the move. ``_TaxonomyState.apply`` now rejects a bare reassignment —
+one with no MERGE, SPLIT or REVISE naming the trace — which blocks that
+specific failure. It does not make a second pass safe in general: a CREATE
+that names an already-assigned trace still counts as "justified" today, so a
+chunk can still duplicate a trace's coverage into a new contract without a
+real transition sanctioning it, and there is no dedicated check yet for
+duplicate CREATEs or orphaned zero-member contracts. Treat this as mitigation,
+not a fixed second pass, until that validation exists, so it is not requested
+by default.
 
-A pass is complete only when every eligible trace appeared in it. Two clean
-chunks are not two passes, and the difference is the whole stopping rule.
+Pass ``--passes 2`` explicitly to opt back in for the self-check pass anyway,
+with its output reviewed by hand.
+
+A pass is complete only when every eligible trace appeared in it. A handful of
+clean chunks are not a pass on their own — coverage of the whole corpus is the
+whole stopping rule, whatever ``--passes`` asks for.
 
 Continuing after the pause is a separate, human-initiated operation —
 :class:`ResumeScope` — which resumes the same workspace rather than starting
@@ -705,6 +728,35 @@ class Budget(Contract):
     max_seconds: float = Field(default=3600.0, gt=0)
     max_usd: float | None = Field(default=None, gt=0)
     """None means no monetary ceiling was set, not that the run was free."""
+
+
+class AuditBudget(Contract):
+    """Hard ceilings on one audit session.
+
+    Deliberately its own, smaller type rather than reusing mining's
+    :class:`Budget`: an audit has no passes or chunk iterations, only a flat
+    list of contracts to get through, so max_iterations/max_passes fields on
+    mining's Budget would sit on this one meaning nothing.
+    """
+
+    max_llm_calls: int = Field(default=400, ge=1)
+    max_seconds: float = Field(default=3600.0, gt=0)
+    max_usd: float | None = Field(default=None, gt=0)
+    """None means no monetary ceiling was set, not that the audit was free."""
+
+    max_contracts: int | None = Field(default=None, ge=1)
+    """Optional cap on contracts audited in one session, independent of cost
+    or time — useful for a bounded smoke run over a large taxonomy."""
+
+
+class AuditStopReason(str, Enum):
+    ALL_CONTRACTS_AUDITED = "all_contracts_audited"
+    INTERRUPTED = "interrupted"
+    MAX_LLM_CALLS = "max_llm_calls"
+    MAX_SECONDS = "max_seconds"
+    MAX_USD = "max_usd"
+    MAX_CONTRACTS = "max_contracts"
+    ERROR = "error"
 
 
 class StopReason(str, Enum):
