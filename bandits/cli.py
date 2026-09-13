@@ -318,7 +318,6 @@ def analyze(
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-
 def _derived(project: Path) -> DerivedStore:
     return DerivedStore(project / ".bandits")
 
@@ -419,8 +418,6 @@ def _report(task_set, envelope_id: str) -> None:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
 
-
-
 @app.command()
 def families(
     task_set_id: str,
@@ -454,9 +451,6 @@ def families(
     console.print(table)
     for limitation in found.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
-
-
-
 
 
 @app.command(name="draft-verifier")
@@ -1669,6 +1663,318 @@ def interview_review_command(
         "[yellow]note:[/yellow] review refined the hypothesis; validation is still required "
         "before calibrated or reviewed status"
     )
+
+
+# ---------------------------------------------------------------- next-state
+
+
+def _archetype(value: str):
+    from bandits.verify.nextstate import Archetype
+
+    try:
+        return Archetype(value)
+    except ValueError:
+        console.print(
+            f"[red]error:[/red] --archetype must be one of: {', '.join(a.value for a in Archetype)}"
+        )
+        raise typer.Exit(code=1) from None
+
+
+def _corpus_traces(corpus_id: str, project: Path, trace_ids: tuple[str, ...] | None = None):
+    try:
+        corpus = ArtifactStore(project / ".bandits").read(corpus_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no corpus {corpus_id!r}")
+        raise typer.Exit(code=1) from exc
+    traces = corpus.traces
+    if trace_ids is not None:
+        wanted = set(trace_ids)
+        traces = tuple(t for t in traces if t.trace_id in wanted)
+    return traces
+
+
+@app.command(name="judge-turns")
+def judge_turns_command(
+    corpus_id: str,
+    archetype: str = typer.Option(
+        ..., "--archetype", help="support, coding, computer-use or generic."
+    ),
+    task_set_id: str = typer.Option(
+        None, "--task-set", help="Restrict to one family of this task set."
+    ),
+    family_id: str = typer.Option(None, "--family"),
+    limit: int = typer.Option(None, "--limit", help="Only the first N traces, for a cheap look."),
+    votes: int = typer.Option(1, "--votes", min=1, help="Samples per turn; majority wins."),
+    temperature: float = typer.Option(0.0, "--temperature"),
+    workers: int = typer.Option(8, "--workers", min=1),
+    model: str = typer.Option(None, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Score every turn of every trace by what happened next."""
+    from bandits.verify.judge import fireworks_completion
+    from bandits.verify.nextstate import DEFAULT_MODEL, judge_turns, save_turn_judge_run
+
+    kind = _archetype(archetype)
+    trace_ids = None
+    if family_id:
+        if not task_set_id:
+            console.print("[red]error:[/red] --family needs --task-set")
+            raise typer.Exit(code=1)
+        task_set = _load_task_set(task_set_id, project)
+        family = task_set.family_by_id().get(family_id)
+        if family is None:
+            console.print(f"[red]error:[/red] no family {family_id!r} in {task_set_id}")
+            raise typer.Exit(code=1)
+        trace_ids = family.trace_ids
+    traces = _corpus_traces(corpus_id, project, trace_ids)
+    if limit:
+        traces = traces[:limit]
+    if not traces:
+        console.print("[red]error:[/red] no traces to judge")
+        raise typer.Exit(code=1)
+
+    def progress(done: int, total: int) -> None:
+        if done == total or done % 50 == 0:
+            console.print(f"  judged {done}/{total} turn(s)")
+
+    with ledger.stage("judge_turns", corpus_id=corpus_id, archetype=kind.value):
+        run = judge_turns(
+            traces,
+            corpus_id,
+            kind,
+            # The judge is told to think first; at the default budget one reply
+            # in fifteen was cut off before the score.
+            predict=functools.partial(fireworks_completion, max_tokens=6000),
+            model=model or DEFAULT_MODEL,
+            votes=votes,
+            temperature=temperature,
+            workers=workers,
+            on_progress=progress,
+        )
+    envelope = save_turn_judge_run(run, _derived(project))
+    console.print(f"turn_judge_run_id: {envelope.artifact_id}")
+    console.print(f"archetype:         {kind.value}")
+    console.print(f"traces:            {len(run.trace_ids)}")
+    for key in ("turns", "scored", "negative", "failed"):
+        console.print(f"{key + ':':<19}{envelope.summary[key]}")
+    passing = sum(1 for s in run.signals if s.passes)
+    console.print(f"passing traces:    {passing} of {len(run.signals)} (no negative turn)")
+
+
+@app.command(name="propose-verifier")
+def propose_verifier_command(
+    judge_run_id: str,
+    family_id: str = typer.Option(
+        None, "--family", help="Label for the family. Defaults to the corpus."
+    ),
+    rounds: int = typer.Option(2, "--rounds", min=1),
+    sample: int = typer.Option(120, "--sample", help="Turns shown to the model per round."),
+    min_fired: int = typer.Option(3, "--min-fired"),
+    min_precision: float = typer.Option(0.6, "--min-precision"),
+    max_iterations: int = typer.Option(20, "--max-iterations"),
+    max_llm_calls: int = typer.Option(40, "--max-llm-calls"),
+    model: str = typer.Option(None, "--model"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Have the RLM propose checks over a family's turns, re-execute them, keep survivors."""
+    from bandits.verify.nextstate import load_turn_judge_run
+    from bandits.verify.propose import (
+        DEFAULT_MODEL,
+        ProposalError,
+        build_proposer,
+        propose_verifier,
+        save_family_verifier,
+    )
+    from bandits.verify.turns import extract_turns
+
+    store = _derived(project)
+    try:
+        run = load_turn_judge_run(judge_run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no turn judge run {judge_run_id!r}")
+        raise typer.Exit(code=1) from exc
+    traces = _corpus_traces(run.corpus_id, project, run.trace_ids)
+    turns = [turn for trace in traces for turn in extract_turns(trace)]
+    tasks = {trace.trace_id: trace.task for trace in traces}
+    chosen_model = model or DEFAULT_MODEL
+    # The REPL trace goes to stderr. When the sandbox dies, the code the model
+    # ran just before is the only thing that explains it, and it is not
+    # recorded anywhere else.
+    import logging
+
+    logging.getLogger("dspy.predict.rlm").setLevel(logging.INFO)
+    propose = build_proposer(
+        archetype=run.archetype,
+        model=chosen_model,
+        max_iterations=max_iterations,
+        max_llm_calls=max_llm_calls,
+    )
+    try:
+        with ledger.stage("propose_verifier", judge_run_id=judge_run_id):
+            verifier = propose_verifier(
+                turns,
+                tasks,
+                run,
+                judge_run_id,
+                family_id=family_id or f"corpus:{run.corpus_id}",
+                propose=propose,
+                model=chosen_model,
+                rounds=rounds,
+                sample=sample,
+                min_fired=min_fired,
+                min_precision=min_precision,
+            )
+    except ProposalError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_family_verifier(verifier, store)
+    console.print(f"family_verifier_id: {envelope.artifact_id}")
+    console.print(f"proposed: {verifier.proposed}  survived: {envelope.summary['survived']}")
+    _show_checks(verifier)
+
+
+def _show_checks(verifier) -> None:
+    table = Table("check", "survived", "fired", "precision", "recall", "decision", "reason")
+    for check in verifier.checks:
+        stats = check.stats
+        table.add_row(
+            check.name[:28],
+            "[green]yes[/green]" if check.survived else "[red]no[/red]",
+            str(stats.fired),
+            "n/a" if stats.precision is None else f"{stats.precision:.0%}",
+            "n/a" if stats.recall is None else f"{stats.recall:.0%}",
+            check.decision,
+            check.reason[:48],
+        )
+    console.print(table)
+
+
+_CHECK_KEYS = {"a": "accepted", "r": "rejected"}
+
+
+@app.command(name="review-checks")
+def review_checks_command(
+    verifier_id: str,
+    all_checks: bool = typer.Option(
+        False, "--all", help="Also review checks that did not survive."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Accept or reject each proposed check. One prompt per check; skip and resume freely."""
+    from bandits.verify.propose import decide_check, load_family_verifier, save_family_verifier
+    from bandits.verify.turns import extract_turns
+
+    store = _derived(project)
+    try:
+        verifier = load_family_verifier(verifier_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no family verifier {verifier_id!r}")
+        raise typer.Exit(code=1) from exc
+    traces = _corpus_traces(verifier.corpus_id, project)
+    turns = {(t.trace_id, t.index): t for trace in traces for t in extract_turns(trace)}
+
+    queue = [c for c in verifier.pending() if c.survived or all_checks]
+    console.print(f"family: {verifier.family_id}  archetype: {verifier.archetype.value}")
+    console.print(f"to review: {len(queue)} check(s)\n")
+    envelope = None
+    for check in queue:
+        stats = check.stats
+        console.print(f"[bold]{check.name}[/bold] — {check.hypothesis}")
+        console.print(Text(check.code.rstrip(), style="dim"))
+        precision = "n/a" if stats.precision is None else f"{stats.precision:.0%}"
+        recall = "n/a" if stats.recall is None else f"{stats.recall:.0%}"
+        console.print(
+            f"  fired on {stats.fired} of {stats.turns} turn(s); agrees with the judge's -1 on "
+            f"{precision} of the {stats.fired_scored} it fired on that were judged; catches {recall} of "
+            f"the judge's {stats.negatives} negatives"
+        )
+        console.print(
+            f"  {'[green]survived[/green]' if check.survived else '[red]did not survive[/red]'}: {check.reason}"
+        )
+        for trace_id, index in stats.examples[:3]:
+            turn = turns.get((trace_id, index))
+            if turn is None:
+                continue
+            state = (turn.next_state() or "").replace("\n", " ")[:160]
+            console.print(f"  [dim]{trace_id}:{index}[/dim] {state}")
+        raw = typer.prompt("  [a]ccept/[r]eject/[s]kip/[q]uit", default="s")
+        key = raw.strip().lower()[:1]
+        if key == "q":
+            break
+        if key not in _CHECK_KEYS:
+            continue
+        note = typer.prompt("  why (optional)", default="", show_default=False)
+        verifier = decide_check(verifier, check.name, _CHECK_KEYS[key], note)
+        envelope = save_family_verifier(verifier, store)
+        ledger.record(
+            {
+                "event_type": "check_review",
+                "verifier_id": envelope.artifact_id,
+                "check": check.name,
+                "decision": _CHECK_KEYS[key],
+                "note": note,
+            }
+        )
+        console.print()
+
+    console.print(f"\nfamily_verifier_id: {envelope.artifact_id if envelope else verifier_id}")
+    console.print(f"accepted: {len(verifier.accepted())}  pending: {len(verifier.pending())}")
+
+
+@app.command(name="score-traces")
+def score_traces_command(
+    verifier_id: str,
+    include_judge: bool = typer.Option(
+        True, "--judge/--no-judge", help="Also flag turns the judge scored -1."
+    ),
+    survivors: bool = typer.Option(
+        False, "--survivors", help="Apply every surviving check, not only accepted ones."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Score every trace of the family with the accepted checks and the judge."""
+    from bandits.verify.nextstate import load_turn_judge_run
+    from bandits.verify.propose import apply_verifier, load_family_verifier, save_verifier_scores
+    from bandits.verify.turns import extract_turns
+
+    store = _derived(project)
+    try:
+        verifier = load_family_verifier(verifier_id, store)
+        run = load_turn_judge_run(verifier.judge_run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    traces = _corpus_traces(verifier.corpus_id, project, run.trace_ids)
+    turns = [turn for trace in traces for turn in extract_turns(trace)]
+    tasks = {trace.trace_id: trace.task for trace in traces}
+    checks = tuple(c for c in verifier.checks if c.survived) if survivors else None
+    scores = apply_verifier(
+        verifier,
+        turns,
+        tasks,
+        run,
+        verifier_id=verifier_id,
+        judge_run_id=verifier.judge_run_id,
+        include_judge=include_judge,
+        checks=checks,
+    )
+    envelope = save_verifier_scores(scores, store)
+    console.print(f"verifier_scores_id: {envelope.artifact_id}")
+    console.print(
+        f"checks applied:     {', '.join(scores.checks_applied) or '(none)'}{' + judge' if include_judge else ''}"
+    )
+    console.print(f"passing:            {envelope.summary['passing']} of {len(scores.scores)}")
+    table = Table("trace", "turns", "observed", "flagged", "score", "passes")
+    for item in sorted(scores.scores, key=lambda s: (s.score is None, -(s.score or 0)))[:40]:
+        table.add_row(
+            item.trace_id[:20],
+            str(item.turns),
+            str(item.observed),
+            str(len(item.flagged)),
+            "n/a" if item.score is None else f"{item.score:.2f}",
+            "yes" if item.passes else "no",
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":
