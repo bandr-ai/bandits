@@ -854,21 +854,54 @@ class _TaxonomyState:
                 del self.assignments[trace_id]
                 self.uncovered.add(trace_id)
 
-    def apply(self, result: ChunkResult, contracts: Sequence[FamilyContract]) -> int:
+    def apply(
+        self,
+        result: ChunkResult,
+        contracts: Sequence[FamilyContract],
+        *,
+        limitations: list[str] | None = None,
+    ) -> int:
         """Fold one chunk's output in, and report how many assignments moved.
 
         The churn figure is the count of traces whose *previous* placement
         changed — not the count of assignments made. A trace placed for the
         first time has not moved; counting it as movement would make an early
         sweep over unseen traces look unstable by construction.
+
+        A trace that already had a placement may only move to a *different*
+        contract when some operation in this chunk actually names it. Without
+        that check a chunk could return ``operations: []`` and still move an
+        already-assigned trace's ``assignments`` entry to an unrelated
+        contract — recorded in a real run: a trace assigned to a contract
+        about Requests' Unicode handling in pass 1 came back in pass 2 under a
+        sparse-SVM contract, with no MERGE, SPLIT or REVISE naming either
+        contract or that trace to explain the move. ``apply_operations``
+        already retires a contract's members correctly for a real MERGE or
+        SPLIT — first, so the trace lands on the survivor — and REVISE never
+        moves a trace to a different contract at all. So a bare reassignment
+        that isn't the target of any operation here is not a second, quieter
+        way to do the same thing; it is rejected and the trace stays where it
+        was, with the rejection recorded rather than silently applied.
         """
         self.apply_operations(result.operations, contracts)
         for contract in contracts:
             self.contracts[contract.contract_id] = contract
 
+        justified_moves = {
+            trace_id for op in result.operations for trace_id in op.trace_ids
+        }
+
         moved = 0
         for trace_id, contract_id in result.assignments.items():
             previous = self.assignments.get(trace_id)
+            if previous is not None and previous != contract_id and trace_id not in justified_moves:
+                if limitations is not None:
+                    limitations.append(
+                        f"{trace_id} was already assigned to {previous!r}; a chunk tried "
+                        f"to move it to {contract_id!r} with no operation naming it, so "
+                        "the move was rejected and the trace stays on its previous contract"
+                    )
+                continue
             if previous is not None and previous != contract_id:
                 moved += 1
             self.assignments[trace_id] = contract_id
@@ -1154,7 +1187,7 @@ def mine_taxonomy(
 
             if result.status != "error":
                 contracts = [state.contracts[cid] for cid in result.assignments.values()]
-                state.apply(result, contracts)
+                state.apply(result, contracts, limitations=limitations)
                 pass_operations.extend(result.operations)
 
             if on_chunk is not None:
@@ -1205,6 +1238,7 @@ def mine_taxonomy(
                 state.apply(
                     reconciled,
                     [state.contracts[cid] for cid in reconciled.assignments.values()],
+                    limitations=limitations,
                 )
                 pass_operations.extend(reconciled.operations)
                 recovered = len(unplaced) - len(state.ambiguous | state.uncovered)
