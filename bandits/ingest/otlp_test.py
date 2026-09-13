@@ -217,3 +217,51 @@ def test_a_toolset_declared_mid_episode_is_not_read_as_the_offered_one(tmp_path)
     )
 
     assert load_otlp(path).traces[0].tools_available is None
+
+
+def test_user_turns_come_from_trailing_user_messages(tmp_path) -> None:
+    """Each user message is read once, at the call it arrived for, even when the
+    exporter repeats the whole history on every span."""
+    path = tmp_path / "turns.jsonl"
+    history_1 = [{"role": "user", "content": "cancel my order"}]
+    history_2 = history_1 + [
+        {"role": "assistant", "content": "which one?"},
+        {"role": "user", "content": "the second one"},
+        {"role": "user", "content": "#W2"},
+    ]
+    records = [
+        {
+            "trace_id": "t",
+            "span_id": "c1",
+            "parent_span_id": None,
+            "name": "m",
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": "2026-01-01T00:00:01Z",
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": history_1,
+                "gen_ai.completion": "which one?",
+            },
+        },
+        {
+            "trace_id": "t",
+            "span_id": "tool1",
+            "parent_span_id": "c1",
+            "name": "cancel",
+            "start_time": "2026-01-01T00:00:02Z",
+            "end_time": "2026-01-01T00:00:03Z",
+            "attributes": {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.call.arguments": {"id": "#W2"},
+                "gen_ai.tool.call.result": "ok",
+                "gen_ai.input.messages": history_2,
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    trace = load_otlp(path).traces[0]
+    assert [(t.text, t.after_span_id) for t in trace.user_turns] == [
+        ("cancel my order", None),
+        ("the second one", "c1"),
+        ("#W2", "c1"),
+    ]

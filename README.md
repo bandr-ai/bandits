@@ -232,6 +232,10 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `validate-verifier` | Measure fit/held-out agreement and probe gameability |
 | `interview-review` | Review a draft's checks in free text, read by a model, confirmed by you |
 | `review-verifier` | Promote a calibrated verifier a review round accepted |
+| `judge-turns` | Score every turn by what happened next (+1 / 0 / −1), per archetype |
+| `propose-verifier` | Have the RLM propose checks over a family's turns; re-execute and keep survivors |
+| `review-checks` | Accept or reject each proposed check, one prompt each, resumable |
+| `score-traces` | Flag turns with the accepted checks and the judge; pass/score per trace |
 | `judge` | Sample a rubric judge for unstructured outcomes |
 | `export` | Write verifier-gated eval or SFT JSONL plus quarantine and composition report |
 

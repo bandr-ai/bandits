@@ -12,15 +12,17 @@ from pathlib import Path
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.otlp import load_otlp
+from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
 from bandits.traces import TraceCorpus
 
-CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "claude-code")
+CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "chat-json", "claude-code", "trail")
 
 _LOADERS = {
     "otlp": load_otlp,
     "chat-json": load_chat_json,
     "claude-code": load_claude_code,
+    "trail": load_trail,
 }
 
 
