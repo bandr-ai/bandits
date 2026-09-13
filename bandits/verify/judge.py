@@ -242,8 +242,14 @@ def fireworks_completion(
     temperature: float,
     *,
     system_prompt: str | None = None,
+    max_tokens: int = 2000,
 ) -> str:
-    """Call Fireworks with a prompt and an optional higher-priority policy."""
+    """Call Fireworks with a prompt and an optional higher-priority policy.
+
+    ``max_tokens`` is the whole budget, reasoning included. The rubric judge
+    fits in the default; the next-state judge, which is told to think first,
+    ran out of it 29 times in 436 and lost the boxed score each time.
+    """
     api_key = resolve_api_key()
 
     messages = []
@@ -260,7 +266,7 @@ def fireworks_completion(
                 # Reasoning models may spend a substantial part of this budget
                 # before emitting their short visible answer. Seven hundred
                 # truncated real structured SFT reviews halfway through JSON.
-                "max_tokens": 2000,
+                "max_tokens": max_tokens,
                 "messages": messages,
             }
         ).encode(),
@@ -276,7 +282,7 @@ def fireworks_completion(
         model=model,
         request={
             "temperature": temperature,
-            "max_tokens": 2000,
+            "max_tokens": max_tokens,
             "messages": messages,
         },
     ) as call:
