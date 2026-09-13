@@ -184,7 +184,9 @@ def build_predictor(
                 outsiders=outsiders,
             )
 
-    return with_cost(scoped_to_history(predict, language_model))
+    wrapped = with_cost(scoped_to_history(predict, language_model))
+    wrapped.rlm = rlm  # type: ignore[attr-defined]
+    return wrapped
 
 
 _OUTSIDER_SAMPLE = 12
@@ -446,6 +448,7 @@ def audit_clustering(
     baseline_elapsed = resume.elapsed_seconds if resume is not None else 0.0
     stop_reason = AuditStopReason.ALL_CONTRACTS_AUDITED
     interrupted = False
+    contracts_done_this_run = 0
 
     for contract in run.contracts:
         if contract.contract_id in already_done:
@@ -462,11 +465,22 @@ def audit_clustering(
             started=started,
             baseline_elapsed=baseline_elapsed,
             usd=usd,
-            contracts_done=len(already_done),
+            contracts_done=contracts_done_this_run,
         )
         if budget_hit is not None:
             stop_reason = budget_hit
             break
+
+        # `max_llm_calls` is a ceiling on physical calls, but one contract's
+        # audit is a whole dspy.RLM sub-loop that can issue many of them
+        # before returning. Capping the sub-loop's own limit to whatever
+        # remains of the session budget means it raises and stops mid-contract
+        # rather than the budget only being noticed at the next contract
+        # boundary, by which point it could already be exceeded.
+        rlm = getattr(predict, "rlm", None)
+        if rlm is not None:
+            remaining = budget.max_llm_calls - calls
+            rlm.max_llm_calls = max(remaining, 0)
 
         members = assigned.get(contract.contract_id, ())
         pool = sorted(all_readable - set(members))
@@ -513,6 +527,7 @@ def audit_clustering(
 
         findings.append(finding)
         already_done.add(contract.contract_id)
+        contracts_done_this_run += 1
         # One contract's audit is a whole dspy.RLM sub-loop, not one physical
         # call: it can issue anywhere from one call up to that predictor's own
         # max_llm_calls before returning. `predict.spend.entries`, set by

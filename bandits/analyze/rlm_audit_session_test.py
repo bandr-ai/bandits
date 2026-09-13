@@ -469,6 +469,46 @@ def test_max_llm_calls_budget_stops_the_session_early() -> None:
     assert len(audit.findings) == 1
 
 
+def test_max_llm_calls_of_one_cannot_issue_a_second_physical_call() -> None:
+    """One contract's audit is a whole dspy.RLM sub-loop that can make many
+    physical calls before returning, so checking --max-llm-calls only between
+    contracts is not enough: a single contract could blow straight through a
+    limit of 1. The remaining budget must be pushed into the sub-loop's own
+    ceiling so it cannot make a second call, no matter how many the contract
+    would otherwise have made.
+    """
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund")))
+    run = _run(contracts=(_contract("c1"),))
+
+    class _FakeRLM:
+        def __init__(self):
+            self.max_llm_calls = 999
+            self.calls_made = 0
+
+        def issue(self, n: int) -> None:
+            if self.calls_made + n > self.max_llm_calls:
+                raise RuntimeError(
+                    f"LLM call limit exceeded: {self.calls_made} + {n} > {self.max_llm_calls}"
+                )
+            self.calls_made += n
+
+    rlm = _FakeRLM()
+
+    def predict(**_):
+        rlm.issue(2)  # this contract would make two physical calls if allowed
+        return SimpleNamespace(recommendation="keep", rationale="fine")
+
+    predict.rlm = rlm
+    predict.spend = SimpleNamespace(entries=[])
+    predict.cost = lambda: None
+
+    audit = audit_clustering(run, "run-1", corpus, predict=predict, budget=AuditBudget(max_llm_calls=1))
+
+    assert rlm.max_llm_calls == 1
+    assert rlm.calls_made == 0
+    assert audit.findings[0].recommendation == "uncertain"
+
+
 def test_a_contract_that_makes_several_dspy_calls_counts_all_of_them(tmp_path) -> None:
     """A contract's audit is a whole dspy.RLM sub-loop, not one physical call.
 
@@ -761,3 +801,8 @@ def test_new_audit_session_id_is_distinguishable_from_a_mining_session_id() -> N
     mining_id = new_session_id("analysis-abcd1234", TraceView.USER_MESSAGES, 42)
     assert audit_id.startswith("rlm-audit-")
     assert not mining_id.startswith("rlm-audit-")
+
+
+def test_new_audit_session_id_does_not_collide_within_the_same_second() -> None:
+    ids = {new_audit_session_id("run-abcd1234") for _ in range(50)}
+    assert len(ids) == 50
