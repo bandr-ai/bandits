@@ -23,6 +23,9 @@ from bandits.analyze import (
     save_task_set,
 )
 from bandits.analyze.rlm_audit import (
+    DEFAULT_MAX_TOKENS as RLM_AUDIT_MAX_TOKENS,
+)
+from bandits.analyze.rlm_audit import (
     DEFAULT_MODEL as RLM_AUDIT_MODEL,
 )
 from bandits.analyze.rlm_audit import (
@@ -37,7 +40,15 @@ from bandits.analyze.rlm_audit import (
     load_audit as load_rlm_audit,
 )
 from bandits.analyze.rlm_audit import (
+    prompt_digest as rlm_audit_prompt_digest,
+)
+from bandits.analyze.rlm_audit import (
     save_audit as save_rlm_audit,
+)
+from bandits.analyze.rlm_audit_session import (
+    AuditSessionRecorder,
+    AuditSessionStore,
+    new_audit_session_id,
 )
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_mine import (
@@ -65,12 +76,14 @@ from bandits.analyze.rlm_models import (
     DEFAULT_PASSES as RLM_PASSES,
 )
 from bandits.analyze.rlm_models import (
+    AuditBudget,
     Budget,
     TraceView,
 )
 from bandits.analyze.rlm_session import SessionRecorder, SessionStore, new_session_id
 from bandits.analyze.rlm_taskset import MaterializationError, materialize_task_set
 from bandits.analyze.rlm_view import (
+    audit_live_panel,
     family_card,
     live_panel,
     print_pass_history,
@@ -1893,12 +1906,33 @@ def mine_rlm_command(
 def audit_rlm_command(
     run_id: str,
     model: str = typer.Option(RLM_AUDIT_MODEL, "--model"),
+    max_tokens: int = typer.Option(
+        RLM_AUDIT_MAX_TOKENS,
+        "--max-tokens",
+        help="Maximum completion tokens for each model call.",
+    ),
+    max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
+    max_seconds: float = typer.Option(3600.0, "--max-seconds"),
+    max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
+    max_contracts: int = typer.Option(
+        None, "--max-contracts", help="Audit at most this many contracts this session."
+    ),
+    resume: str = typer.Option(
+        None,
+        "--resume",
+        help="Continue an audit session that stopped, skipping contracts it already covered.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Challenge every contract in a clustering run with a fresh, adversarial context.
 
     Advisory only. This saves findings and changes nothing: no placement moves,
     and materializing the run neither requires this nor consults it.
+
+    Checkpointed after every contract to .bandits/sessions/audits/<session_id>,
+    so Ctrl+C or a crash loses at most the one contract in flight; resume with
+    --resume <session_id>. Every model call is also recorded to the path in the
+    BANDITS_LEDGER env var, if set, one row per call with cost and duration.
     """
     store = _derived(project)
     try:
@@ -1909,14 +1943,128 @@ def audit_rlm_command(
 
     _, corpus, _ = _rlm_corpus(run.analysis_id, project, run.view.value)
     try:
-        predict = build_taxonomy_audit_predictor(model=model, view=run.view)
+        predict = build_taxonomy_audit_predictor(model=model, view=run.view, max_tokens=max_tokens)
     except ClusteringAuditError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    audit = audit_clustering(run, run_id, corpus, predict=predict, model=model)
+    budget = AuditBudget(
+        max_llm_calls=max_llm_calls,
+        max_seconds=max_seconds,
+        max_usd=max_usd,
+        max_contracts=max_contracts,
+    )
+    digest = rlm_audit_prompt_digest(model)
+
+    session_store = AuditSessionStore(project / ".bandits")
+    resumed_state = None
+    if resume:
+        try:
+            resumed_state = session_store.read(resume)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no audit session {resume!r}")
+            raise typer.Exit(code=1) from exc
+        if resumed_state.run_id != run_id:
+            console.print(
+                f"[red]error:[/red] session {resume!r} was auditing "
+                f"{resumed_state.run_id!r}, not {run_id!r}"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.model != model:
+            console.print(
+                f"[red]error:[/red] session {resume!r} used model "
+                f"{resumed_state.model!r}, not {model!r}"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.prompt_digest != digest:
+            console.print(
+                f"[red]error:[/red] session {resume!r} audited under a different prompt; "
+                "its existing findings do not answer the same question a fresh contract would be asked"
+            )
+            raise typer.Exit(code=1)
+        console.print(
+            f"resuming:    {resume} at {len(resumed_state.completed_contract_ids)}/"
+            f"{len(resumed_state.contract_order)} contracts, "
+            f"${resumed_state.cost_usd:.4f} spent so far"
+        )
+
+    recorder = AuditSessionRecorder(
+        session_store,
+        session_id=resume or new_audit_session_id(run_id),
+        run_id=run_id,
+        model=model,
+        view=run.view,
+        prompt_digest=digest,
+        resumed_from=resume,
+        seed_state=resumed_state,
+    )
+    console.print(f"session:     {recorder.session_id}")
+    console.print(f"[dim]watch: bandits rlm-session {recorder.session_id} --watch[/dim]\n")
+
+    interrupted = {"flag": False}
+
+    def _on_interrupt_signal(_signum: int, _frame: object) -> None:
+        # Set-and-return rather than raising: the loop in audit_clustering
+        # polls this between contracts and stops cleanly, saving the session
+        # as interrupted with everything checkpointed so far intact. Raising
+        # here instead could land mid-write to the session file. Handled for
+        # both SIGINT (Ctrl+C) and SIGTERM (`kill`, `timeout`, a supervisor
+        # stopping the process) — a session killed either way must end up
+        # marked interrupted, not stuck reading "running" forever because
+        # nothing ever told it otherwise.
+        interrupted["flag"] = True
+        console.print(
+            "\n[yellow]stopping after the contract in flight; "
+            "progress so far is saved[/yellow]"
+        )
+
+    import signal
+
+    previous_sigint = signal.signal(signal.SIGINT, _on_interrupt_signal)
+    previous_sigterm = signal.signal(signal.SIGTERM, _on_interrupt_signal)
+    try:
+        with ledger.stage("rlm_taxonomy_audit_run", run_id=run_id, model=model):
+            try:
+                audit = audit_clustering(
+                    run,
+                    run_id,
+                    corpus,
+                    predict=predict,
+                    model=model,
+                    budget=budget,
+                    session=recorder,
+                    resume=resumed_state,
+                    should_stop=lambda: interrupted["flag"],
+                )
+            except ClusteringAuditError as exc:
+                recorder.fail(str(exc))
+                console.print(f"[red]error:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+            except Exception as exc:
+                recorder.fail(str(exc))
+                raise
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
     audit_envelope = save_rlm_audit(audit, store)
+    ledger.record(
+        {
+            "event_type": "stage_complete",
+            "stage_name": "rlm_taxonomy_audit_run",
+            "input_artifact_id": run_id,
+            "output_artifact_id": audit_envelope.artifact_id,
+            "findings": len(audit.findings),
+            "status": audit.status,
+            "stop_reason": audit.stop_reason,
+        }
+    )
     console.print(f"audit_id:    {audit_envelope.artifact_id} ({audit.model})")
+    if audit.status != "complete":
+        console.print(
+            f"[yellow]incomplete:[/yellow] stopped on {audit.stop_reason} — "
+            f"resume with: bandits audit-rlm {run_id} --resume {recorder.session_id}"
+        )
 
     for finding in audit.findings:
         colour = "yellow" if finding.demands_action else "dim"
@@ -1976,6 +2124,22 @@ def materialize_rlm_taskset_command(
     )
 
 
+def _find_session(
+    mining_store: SessionStore, audit_store: AuditSessionStore, session_id: str
+):
+    """Locate a session by id in whichever store actually has it.
+
+    Session ids are self-describing (``rlm-audit-...`` vs ``rlm-...``) but
+    this checks both stores rather than trusting the prefix, so a renamed or
+    hand-typed id still resolves instead of failing on a naming assumption.
+    """
+    if audit_store.exists(session_id):
+        return "audit", audit_store.read(session_id)
+    if mining_store.exists(session_id):
+        return "mining", mining_store.read(session_id)
+    return None, None
+
+
 @app.command(name="rlm-session")
 def rlm_session_command(
     session_id: str = typer.Argument(None, help="Omit to list every session."),
@@ -1986,30 +2150,52 @@ def rlm_session_command(
     interval: float = typer.Option(1.0, "--interval", help="Seconds between redraws."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Inspect a mining session, including one still running."""
-    store = SessionStore(project / ".bandits")
+    """Inspect a mining or audit session, including one still running.
+
+    Lists and watches both kinds, labeled by kind: mine-rlm's discovery
+    sessions and audit-rlm's per-contract audit sessions live in separate
+    stores on disk but are one surface here.
+    """
+    mining_store = SessionStore(project / ".bandits")
+    audit_store = AuditSessionStore(project / ".bandits")
+
     if watch:
         if session_id is None:
-            # Watching means watching one run. Defaulting to the newest is what
-            # a person means by "watch it" right after starting a run.
-            latest = store.list()
-            if not latest:
-                console.print("[dim]no mining sessions[/dim]")
+            candidates = [("mining", s) for s in mining_store.list()] + [
+                ("audit", s) for s in audit_store.list()
+            ]
+            if not candidates:
+                console.print("[dim]no sessions[/dim]")
                 return
-            session_id = latest[0].session_id
-        _watch_session(store, session_id, interval)
-        return
-    if session_id is None:
-        sessions = store.list()
-        if not sessions:
-            console.print("[dim]no mining sessions[/dim]")
+            kind, latest = max(candidates, key=lambda pair: pair[1].updated_at)
+            session_id = latest.session_id
+            _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
             return
-        table = Table("session", "status", "progress", "updated")
-        for state in sessions:
-            colour = {"running": "cyan", "awaiting_review": "green", "failed": "red"}.get(
-                state.status, "yellow"
-            )
+        kind, _ = _find_session(mining_store, audit_store, session_id)
+        if kind is None:
+            console.print(f"[red]error:[/red] no session {session_id!r}")
+            raise typer.Exit(code=1)
+        _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
+        return
+
+    if session_id is None:
+        sessions = [("mining", s) for s in mining_store.list()] + [
+            ("audit", s) for s in audit_store.list()
+        ]
+        if not sessions:
+            console.print("[dim]no sessions[/dim]")
+            return
+        sessions.sort(key=lambda pair: pair[1].updated_at, reverse=True)
+        table = Table("kind", "session", "status", "progress", "updated")
+        for kind, state in sessions:
+            colour = {
+                "running": "cyan",
+                "awaiting_review": "green",
+                "failed": "red",
+                "interrupted": "yellow",
+            }.get(state.status, "yellow")
             table.add_row(
+                kind,
                 state.session_id,
                 f"[{colour}]{state.status}[/{colour}]",
                 state.progress,
@@ -2018,26 +2204,45 @@ def rlm_session_command(
         console.print(table)
         return
 
-    try:
-        state = store.read(session_id)
-    except FileNotFoundError as exc:
+    kind, state = _find_session(mining_store, audit_store, session_id)
+    if kind is None:
         console.print(f"[red]error:[/red] no session {session_id!r}")
-        raise typer.Exit(code=1) from exc
+        raise typer.Exit(code=1)
 
-    console.print(f"session:     {state.session_id}")
-    console.print(f"status:      {state.status}")
-    console.print(f"view:        {state.view.value} (seed {state.seed})")
-    console.print(f"progress:    {state.progress}")
-    console.print(
-        f"passes:      {state.completed_passes}/{state.requested_passes} complete, "
-        f"pass {state.pass_index + 1} in flight"
-    )
-    console.print(f"assigned:    {len(state.assignments)}")
-    _report_unresolved(len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0)
-    for contract in state.contracts:
-        console.print(f"  {contract.contract_id}  {contract.name}")
-    if state.last_error:
-        console.print(f"[red]last error:[/red] {state.last_error}")
+    store = mining_store if kind == "mining" else audit_store
+
+    if kind == "audit":
+        console.print(f"session:     {state.session_id}")
+        console.print("kind:        audit")
+        console.print(f"status:      {state.status}")
+        console.print(f"run:         {state.run_id}")
+        console.print(f"view:        {state.view.value}")
+        console.print(f"progress:    {state.progress}")
+        if state.resumed_from:
+            console.print(f"resumed from: {state.resumed_from}")
+        for finding in state.findings:
+            colour = "yellow" if finding.demands_action else "dim"
+            console.print(
+                f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}"
+            )
+        if state.last_error:
+            console.print(f"[red]last error:[/red] {state.last_error}")
+    else:
+        console.print(f"session:     {state.session_id}")
+        console.print("kind:        mining")
+        console.print(f"status:      {state.status}")
+        console.print(f"view:        {state.view.value} (seed {state.seed})")
+        console.print(f"progress:    {state.progress}")
+        console.print(
+            f"passes:      {state.completed_passes}/{state.requested_passes} complete, "
+            f"pass {state.pass_index + 1} in flight"
+        )
+        console.print(f"assigned:    {len(state.assignments)}")
+        _report_unresolved(len(state.ambiguous_trace_ids), len(state.uncovered_trace_ids), 0)
+        for contract in state.contracts:
+            console.print(f"  {contract.contract_id}  {contract.name}")
+        if state.last_error:
+            console.print(f"[red]last error:[/red] {state.last_error}")
 
     if events:
         console.print("")
@@ -2051,7 +2256,7 @@ def rlm_session_command(
             console.print(f"[dim]{event.get('at', '')[:19]}  {name}  {detail}[/dim]")
 
 
-def _watch_session(store, session_id: str, interval: float) -> None:
+def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
     """Redraw one session until it stops running.
 
     Reads the session file rather than hooking into the run, so this works on a
@@ -2066,10 +2271,13 @@ def _watch_session(store, session_id: str, interval: float) -> None:
         console.print(f"[red]error:[/red] no session {session_id!r}")
         raise typer.Exit(code=1) from exc
 
+    panel = audit_live_panel if kind == "audit" else live_panel
+    terminal_statuses = {"awaiting_review", "failed", "interrupted", "incomplete"}
+
     with Live(console=console, refresh_per_second=4, screen=False) as live:
         while True:
-            live.update(live_panel(state, recent=store.read_events(session_id, limit=6)))
-            if state.status != "running":
+            live.update(panel(state, recent=store.read_events(session_id, limit=6)))
+            if state.status in terminal_statuses:
                 break
             time.sleep(interval)
             try:
@@ -2080,9 +2288,20 @@ def _watch_session(store, session_id: str, interval: float) -> None:
                 continue
 
     if state.status == "awaiting_review":
+        if kind == "audit":
+            console.print(
+                "\n[green]audit complete.[/green] "
+                "[dim]bandits rlm-families <draft_id> --audit <audit_id>[/dim]"
+            )
+        else:
+            console.print(
+                "\n[green]paused for review.[/green] "
+                "[dim]families: bandits rlm-families <draft_id>[/dim]"
+            )
+    elif state.status == "interrupted":
         console.print(
-            "\n[green]paused for review.[/green] "
-            "[dim]families: bandits rlm-families <draft_id>[/dim]"
+            "\n[yellow]interrupted.[/yellow] "
+            f"[dim]resume with --resume {session_id}[/dim]"
         )
 
 

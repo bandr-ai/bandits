@@ -304,7 +304,7 @@ def test_discovery_runs_every_requested_pass_then_pauses() -> None:
             {"contract_id": "c1"},
         ]
     )
-    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=3, budget=Budget(passes=2))
     assert run.stop_reason is StopReason.PASSES_COMPLETE
     assert run.complete
     assert run.awaiting_review
@@ -332,7 +332,7 @@ def test_every_eligible_trace_is_read_once_in_every_pass() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(40))))
-    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10, budget=Budget(passes=2))
     assert run.completed_passes == 2
     assert set(seen) == {f"t{i}" for i in range(40)}
     assert all(count == 2 for count in seen.values()), seen
@@ -349,6 +349,7 @@ def test_each_pass_reshuffles_under_its_own_recorded_seed() -> None:
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
         seed=7,
+        budget=Budget(passes=2),
     )
     assert [p.seed for p in run.passes] == [7, 8]
     assert run.passes[0].trace_ids != run.passes[1].trace_ids
@@ -391,7 +392,7 @@ def test_a_failed_chunk_does_not_shrink_a_pass_coverage() -> None:
         )
 
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(30))))
-    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10)
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=10, budget=Budget(passes=2))
     assert run.completed_passes == 2
     assert all(count == 2 for count in seen.values())
 
@@ -403,6 +404,7 @@ def test_pass_diff_reports_what_the_second_look_changed() -> None:
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=2,
+        budget=Budget(passes=2),
     )
     diff = run.pass_diff()
     assert diff
@@ -434,7 +436,11 @@ def test_a_run_that_never_settles_stops_on_budget_and_is_incomplete() -> None:
         ]
     )
     run = mine_taxonomy(
-        corpus, "analysis-1", predict=predict, chunk_size=2, budget=Budget(max_iterations=3)
+        corpus,
+        "analysis-1",
+        predict=predict,
+        chunk_size=2,
+        budget=Budget(max_iterations=3, passes=2),
     )
     assert run.stop_reason is StopReason.MAX_ITERATIONS
     assert not run.complete
@@ -449,6 +455,7 @@ def test_two_chunks_are_not_two_passes() -> None:
         "analysis-1",
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
+        budget=Budget(passes=2),
     )
     # Four chunks per pass, two passes: never fewer, however quiet they were.
     assert len(run.chunks) == 8
@@ -624,7 +631,7 @@ def test_chunks_mix_unseen_traces_with_review() -> None:
     """Chunk boundaries must not become family boundaries."""
     corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(8))))
     predict = _ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}])
-    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=4)
+    mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=4, budget=Budget(passes=2))
     import json
 
     later = [json.loads(c) for c in predict.seen_chunks[2:]]
@@ -1112,6 +1119,104 @@ def test_a_split_naming_no_replacement_does_not_delete_the_family() -> None:
     assert state.assignments == {"t1": "c1"}
 
 
+def test_a_bare_reassignment_with_no_operation_is_rejected() -> None:
+    """The exact bug from a recorded run: pass 2 returned a changed
+    ``assignments`` entry for an already-placed trace with ``operations: []``
+    — no MERGE, SPLIT or REVISE naming the old contract, the new one, or the
+    trace itself. A trace assigned to a Requests/Unicode-handling contract in
+    pass 1 came back reassigned to an unrelated sparse-SVM contract in pass 2
+    with nothing to justify the move. That must be rejected, not applied.
+    """
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1"), "c2": _contract("c2", "cancel an order")}
+    state.assignments = {"t1": "c1"}
+    limitations: list[str] = []
+    result = ChunkResult(
+        index=0,
+        pass_index=1,
+        trace_ids=("t1",),
+        operations=(),
+        assignments={"t1": "c2"},
+    )
+    moved = state.apply(result, [], limitations=limitations)
+    assert state.assignments == {"t1": "c1"}
+    assert moved == 0
+    assert any("t1" in lim and "c2" in lim for lim in limitations)
+
+
+def test_a_reassignment_named_by_an_operation_is_accepted() -> None:
+    """The same shape, but this time an operation actually names the trace
+    that moved — a legitimate REVISE or correction, not a silent drift."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1"), "c2": _contract("c2", "cancel an order")}
+    state.assignments = {"t1": "c1"}
+    result = ChunkResult(
+        index=0,
+        pass_index=1,
+        trace_ids=("t1",),
+        operations=(
+            TaxonomyOperation(
+                operation=Operation.REVISE,
+                contract_ids=("c2",),
+                trace_ids=("t1",),
+                rationale="t1 was actually about cancellation, not refunds",
+            ),
+        ),
+        assignments={"t1": "c2"},
+    )
+    moved = state.apply(result, [])
+    assert state.assignments == {"t1": "c2"}
+    assert moved == 1
+
+
+def test_a_first_time_placement_needs_no_justifying_operation() -> None:
+    """The guard is only for *changing* an existing placement — a trace with
+    no previous assignment is always free to be placed."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1")}
+    state.assignments = {}
+    result = ChunkResult(
+        index=0, pass_index=0, trace_ids=("t1",), operations=(), assignments={"t1": "c1"}
+    )
+    moved = state.apply(result, [])
+    assert state.assignments == {"t1": "c1"}
+    assert moved == 0
+
+
+def test_a_merge_still_moves_members_without_naming_them_individually() -> None:
+    """apply_operations already retires a merged contract's members correctly
+    before the reassignment guard runs — a real MERGE must keep working even
+    though it doesn't name each moved trace_id in trace_ids."""
+    from bandits.analyze.rlm_mine import _TaxonomyState
+
+    state = _TaxonomyState()
+    state.contracts = {"c1": _contract("c1"), "c2": _contract("c2", "cancel an order")}
+    state.assignments = {"t1": "c2", "t2": "c1"}
+    result = ChunkResult(
+        index=0,
+        pass_index=0,
+        trace_ids=("t2",),
+        operations=(
+            TaxonomyOperation(
+                operation=Operation.MERGE,
+                contract_ids=("c2", "c1"),
+                trace_ids=("t2",),
+                rationale="same outcome check",
+            ),
+        ),
+        assignments={"t2": "c1"},
+    )
+    moved = state.apply(result, [])
+    assert state.assignments == {"t1": "c1", "t2": "c1"}
+    assert moved == 0  # t2 didn't move; t1 moved via _retire, counted separately
+
+
 def test_an_operation_naming_a_contract_nobody_holds_is_reported() -> None:
     """A declared change that could not be applied must not pass silently."""
     corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "refund")))
@@ -1241,6 +1346,7 @@ def test_state_is_written_after_every_chunk_not_every_pass(tmp_path) -> None:
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
         session=recorder,
+        budget=Budget(passes=2),
     )
     events = [e for e in store.read_events("sess-1") if e["event"] == "chunk_complete"]
     assert len(events) == 8
@@ -1291,6 +1397,7 @@ def test_progress_line_reads_without_parsing_anything(tmp_path) -> None:
         predict=_ScriptedMiner([{"contracts": [_RAW_CONTRACT], "contract_id": "c1"}]),
         chunk_size=5,
         session=recorder,
+        budget=Budget(passes=2),
     )
     progress = store.read("sess-p").progress
     assert "pass 2/2" in progress
@@ -1514,7 +1621,12 @@ def test_a_resumed_run_finishes_the_pass_it_died_in(tmp_path) -> None:
 
     with pytest.raises(KeyboardInterrupt):
         mine_taxonomy(
-            corpus, "analysis-1", predict=_crash_after(5, seen), chunk_size=10, session=recorder
+            corpus,
+            "analysis-1",
+            predict=_crash_after(5, seen),
+            chunk_size=10,
+            session=recorder,
+            budget=Budget(passes=2),
         )
     crashed = store.read("sess-r")
     assert crashed.pass_index == 1
@@ -1535,6 +1647,7 @@ def test_a_resumed_run_finishes_the_pass_it_died_in(tmp_path) -> None:
         chunk_size=10,
         session=resumed,
         resume=crashed,
+        budget=Budget(passes=2),
     )
     assert run.completed_passes == 2
     assert run.stop_reason is StopReason.PASSES_COMPLETE
@@ -1588,7 +1701,12 @@ def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
     seen: dict[str, int] = {}
     with pytest.raises(KeyboardInterrupt):
         mine_taxonomy(
-            corpus, "analysis-1", predict=_crash_after(1, seen), chunk_size=10, session=recorder
+            corpus,
+            "analysis-1",
+            predict=_crash_after(1, seen),
+            chunk_size=10,
+            session=recorder,
+            budget=Budget(passes=2),
         )
     crashed = store.read("sess-o")
     resumed = SessionRecorder(
@@ -1605,6 +1723,7 @@ def test_a_resumed_pass_keeps_the_order_it_was_reading(tmp_path) -> None:
         chunk_size=10,
         session=resumed,
         resume=crashed,
+        budget=Budget(passes=2),
     )
     assert run.passes[0].trace_ids == crashed.pass_order
     assert all(count == 2 for count in seen.values())
