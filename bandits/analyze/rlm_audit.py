@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from bandits import ledger
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_models import (
     VIEW_PREAMBLES,
+    AuditBudget,
     AuditFinding,
+    AuditStopReason,
     FamilyContract,
     RLMClusteringAudit,
     RLMClusteringRun,
@@ -38,6 +42,7 @@ from bandits.analyze.rlm_models import (
 from bandits.store import DerivedEnvelope, DerivedStore
 
 DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MAX_TOKENS = 24000
 PROMPT_VERSION = 2
 
 _INSTRUCTION_HEAD = """You are auditing one proposed task-family contract by trying to \
@@ -121,6 +126,7 @@ def build_predictor(
     view: TraceView = TraceView.USER_MESSAGES,
     max_iterations: int = 12,
     max_llm_calls: int = 30,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> _Predictor:
     """A ``dspy.RLM`` over one contract, imported only when an audit runs."""
     try:
@@ -131,6 +137,7 @@ def build_predictor(
         ) from exc
 
     from bandits.analyze.rlm_history import scoped_to_history
+    from bandits.analyze.rlm_mine import with_cost
     from bandits.verify.judge import resolve_api_key
 
     key = api_key or resolve_api_key()
@@ -138,6 +145,7 @@ def build_predictor(
         f"fireworks_ai/{model}",
         api_key=key,
         temperature=0.0,
+        max_tokens=max_tokens,
     )
 
     # Instructions on the signature, not in an input field: an input field
@@ -176,7 +184,7 @@ def build_predictor(
                 outsiders=outsiders,
             )
 
-    return scoped_to_history(predict, language_model)
+    return with_cost(scoped_to_history(predict, language_model))
 
 
 _OUTSIDER_SAMPLE = 12
@@ -343,6 +351,35 @@ def audit_contract(
     )
 
 
+def _audit_budget_stop(
+    budget: AuditBudget,
+    *,
+    calls: int,
+    started: float,
+    baseline_elapsed: float,
+    usd: float,
+    contracts_done: int,
+) -> AuditStopReason | None:
+    """Which ceiling, if any, this audit session has hit.
+
+    Checked before each contract rather than after, so a session never spends
+    past a limit it has already reached. ``baseline_elapsed`` is the time a
+    resumed session had already spent before this process started — without
+    adding it in, --max-seconds would restart its clock on every resume, so a
+    session interrupted and resumed five times could run five times as long as
+    the ceiling actually allows.
+    """
+    if calls >= budget.max_llm_calls:
+        return AuditStopReason.MAX_LLM_CALLS
+    if baseline_elapsed + (time.monotonic() - started) >= budget.max_seconds:
+        return AuditStopReason.MAX_SECONDS
+    if budget.max_usd is not None and usd >= budget.max_usd:
+        return AuditStopReason.MAX_USD
+    if budget.max_contracts is not None and contracts_done >= budget.max_contracts:
+        return AuditStopReason.MAX_CONTRACTS
+    return None
+
+
 def audit_clustering(
     run: RLMClusteringRun,
     run_id: str,
@@ -350,19 +387,87 @@ def audit_clustering(
     *,
     predict: _Predictor,
     model: str = DEFAULT_MODEL,
+    budget: AuditBudget | None = None,
+    session: Any = None,
+    resume: Any = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> RLMClusteringAudit:
     """Challenge every contract in a run, one pass each.
 
     A contract whose audit fails is recorded as ``uncertain`` rather than
     skipped: an absent finding reads as a contract nobody objected to, and the
     freeze gate would then pass on the strength of a call that never happened.
+
+    ``session``, when given, is checkpointed after every contract so a run
+    that dies mid-audit is resumable and a run in flight is observable.
+    ``resume``, when given (an ``AuditSessionState``), skips contracts it
+    already has a finding for and carries its cumulative calls/cost/elapsed
+    forward. ``should_stop``, when given, is polled before each contract so a
+    SIGINT handler can ask the loop to stop cleanly and save what it has.
     """
-    assigned = _run_members(run)
-    all_readable = set(corpus.readable_trace_ids())
-    findings: list[AuditFinding] = []
+    budget = budget or AuditBudget()
+    digest = prompt_digest(model)
+
+    if resume is not None:
+        if resume.run_id != run_id:
+            raise ClusteringAuditError(
+                f"session was auditing run {resume.run_id!r}, not {run_id!r}"
+            )
+        if resume.model != model:
+            raise ClusteringAuditError(
+                f"session used model {resume.model!r}, this call uses {model!r}"
+            )
+        if resume.view is not corpus.view:
+            raise ClusteringAuditError(
+                f"session used the {resume.view.value} view, this call uses "
+                f"{corpus.view.value}"
+            )
+        if resume.prompt_digest != digest:
+            raise ClusteringAuditError(
+                "the audit prompt has changed since this session started; its "
+                "existing findings do not answer the same question a fresh "
+                "contract would be asked"
+            )
+
+    already_done = set(resume.completed_contract_ids) if resume is not None else set()
+    findings: list[AuditFinding] = list(resume.findings) if resume is not None else []
     limitations: list[str] = []
 
+    assigned = _run_members(run)
+    all_readable = set(corpus.readable_trace_ids())
+    contract_order = tuple(c.contract_id for c in run.contracts)
+
+    if session is not None:
+        session.begin(contract_order=contract_order)
+
+    calls = resume.llm_calls if resume is not None else 0
+    usd = resume.cost_usd if resume is not None else 0.0
+    started = time.monotonic()
+    baseline_elapsed = resume.elapsed_seconds if resume is not None else 0.0
+    stop_reason = AuditStopReason.ALL_CONTRACTS_AUDITED
+    interrupted = False
+
     for contract in run.contracts:
+        if contract.contract_id in already_done:
+            continue
+
+        if should_stop is not None and should_stop():
+            interrupted = True
+            stop_reason = AuditStopReason.INTERRUPTED
+            break
+
+        budget_hit = _audit_budget_stop(
+            budget,
+            calls=calls,
+            started=started,
+            baseline_elapsed=baseline_elapsed,
+            usd=usd,
+            contracts_done=len(already_done),
+        )
+        if budget_hit is not None:
+            stop_reason = budget_hit
+            break
+
         members = assigned.get(contract.contract_id, ())
         pool = sorted(all_readable - set(members))
         outsiders = (
@@ -372,42 +477,95 @@ def audit_clustering(
         )
         try:
             with ledger.stage("rlm_taxonomy_audit", contract_id=contract.contract_id, model=model):
-                findings.append(
-                    audit_contract(
-                        contract,
-                        corpus,
-                        members=members,
-                        outsiders=outsiders,
-                        sibling_contracts=tuple(
-                            sibling
-                            for sibling in run.contracts
-                            if sibling.contract_id != contract.contract_id
-                        ),
-                        predict=predict,
-                    )
+                finding = audit_contract(
+                    contract,
+                    corpus,
+                    members=members,
+                    outsiders=outsiders,
+                    sibling_contracts=tuple(
+                        sibling
+                        for sibling in run.contracts
+                        if sibling.contract_id != contract.contract_id
+                    ),
+                    predict=predict,
                 )
-        except Exception as exc:  # noqa: BLE001 - one failure must not lose the pass
-            findings.append(
-                AuditFinding(
-                    contract_id=contract.contract_id,
-                    recommendation="uncertain",
-                    rationale=f"the audit of this contract failed and reached no verdict: {exc}",
-                )
+        except Exception as exc:  # noqa: BLE001 - one failure must not lose the session
+            if should_stop is not None and should_stop():
+                # A SIGINT during this exact call propagates to the RLM
+                # sandbox subprocess and kills it, which surfaces here as an
+                # ordinary exception — but the call did not fail on its own
+                # merits, it was cut off by the same interrupt this loop is
+                # about to honor. Recording an "uncertain" finding for it
+                # would manufacture a permanent verdict out of an interrupt
+                # and make resume skip a contract that was never actually
+                # audited. So this contract is left untouched: not appended
+                # to findings, not added to already_done, and the loop stops
+                # here rather than checkpointing anything for it.
+                interrupted = True
+                stop_reason = AuditStopReason.INTERRUPTED
+                break
+            finding = AuditFinding(
+                contract_id=contract.contract_id,
+                recommendation="uncertain",
+                rationale=f"the audit of this contract failed and reached no verdict: {exc}",
             )
             limitations.append(f"the audit of {contract.contract_id} failed: {exc}")
 
+        findings.append(finding)
+        already_done.add(contract.contract_id)
+        # One contract's audit is a whole dspy.RLM sub-loop, not one physical
+        # call: it can issue anywhere from one call up to that predictor's own
+        # max_llm_calls before returning. `predict.spend.entries`, set by
+        # `scoped_to_history`, holds exactly the calls *this* contract's
+        # predict() just made, so its length is the real count — a flat +1
+        # here would silently make --max-llm-calls (and every calls figure
+        # shown to a person watching) count contracts instead of the thing its
+        # name promises.
+        spend = getattr(predict, "spend", None)
+        calls += len(getattr(spend, "entries", None) or ()) or 1
+        call_cost = getattr(predict, "cost", lambda: None)()
+        if call_cost is not None:
+            usd += call_cost
+
+        if session is not None:
+            session.checkpoint(
+                finding,
+                calls=calls,
+                usd=usd,
+                elapsed=baseline_elapsed + (time.monotonic() - started),
+            )
+
     findings = _normalize_reciprocal_merges(findings)
-    if findings:
+    complete = stop_reason == AuditStopReason.ALL_CONTRACTS_AUDITED
+    if complete and findings:
         limitations.append(
             "audit output is advisory and uncalibrated: it never edits a contract, and "
             "it has not been measured against labelled same-family pairs"
         )
+    if not complete:
+        limitations.append(
+            f"this audit stopped early ({stop_reason.value}) and covers "
+            f"{len(already_done)}/{len(contract_order)} contract(s); contracts with no "
+            "finding here were never checked, not passed"
+        )
+
+    if session is not None:
+        if complete:
+            session_status = "awaiting_review"
+        elif interrupted:
+            session_status = "interrupted"
+        else:
+            session_status = "incomplete"
+        session.finish(status=session_status, stop_reason=stop_reason.value)
+
     return RLMClusteringAudit(
         run_id=run_id,
         findings=tuple(findings),
         model=model,
-        prompt_digest=prompt_digest(model),
+        prompt_digest=digest,
         limitations=tuple(dict.fromkeys(limitations)),
+        status="complete" if complete else "incomplete",
+        stop_reason=stop_reason.value,
     )
 
 
