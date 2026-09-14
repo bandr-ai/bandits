@@ -16,6 +16,7 @@ from bandits.verify.propose import (
     load_family_verifier,
     parse_checks,
     propose_verifier,
+    revise_check,
     run_check,
     sample_turns,
     save_family_verifier,
@@ -247,6 +248,60 @@ def test_a_dead_repl_round_is_retried_over_another_sample_then_skipped() -> None
 
     with pytest.raises(ProposalError):
         propose_verifier(turns, {}, run, "j", family_id="f", propose=dead, rounds=2)
+
+
+def test_revise_check_queues_a_scored_child_and_marks_the_parent() -> None:
+    turns = _turns()
+    run = _judge_run(turns)
+    verifier = propose_verifier(
+        turns,
+        {},
+        run,
+        "judge-1",
+        family_id="fam",
+        rounds=1,
+        propose=lambda **kw: SimpleNamespace(
+            checks=[{"name": "nf", "hypothesis": "log says not found", "code": NOISY}]
+        ),
+    )
+    original = verifier.checks[0]
+    assert not original.survived  # NOISY fires on everything; a real reviewer would revise it
+
+    seen: dict[str, str] = {}
+
+    def reviser(*, feedback: str, turns: str) -> SimpleNamespace:
+        seen["feedback"] = feedback
+        seen["turns"] = turns
+        return SimpleNamespace(checks=[{"name": "nf_v2", "hypothesis": "revised", "code": GOOD}])
+
+    revised = revise_check(
+        verifier,
+        original.check_id,
+        "fires on turns with no error at all",
+        [("a", 1)],
+        turns,
+        {},
+        run,
+        reviser=reviser,
+    )
+    assert seen["feedback"] == "fires on turns with no error at all"
+    assert '"trace_id": "a"' in seen["turns"] and '"judge"' in seen["turns"]
+
+    parent = next(c for c in revised.checks if c.check_id == original.check_id)
+    child = next(c for c in revised.checks if c.parent_check_id == original.check_id)
+    assert parent.decision == "revised" and child.check_id in parent.note
+    assert child.name == "nf_v2" and child.code == GOOD and child.survived
+    assert child.round_number == original.round_number + 1
+    assert revised.proposed == verifier.proposed + 1
+
+    with pytest.raises(ValueError):
+        revise_check(verifier, "missing", "why", [("a", 1)], turns, {}, run, reviser=reviser)
+    with pytest.raises(ValueError):
+        revise_check(verifier, original.check_id, "why", [], turns, {}, run, reviser=reviser)
+    with pytest.raises(ValueError):
+        revise_check(
+            verifier, original.check_id, "why", [("zzz", 99)], turns, {}, run, reviser=reviser
+        )
 
 
 def test_sample_payload_is_clipped_but_execution_payload_is_not() -> None:
