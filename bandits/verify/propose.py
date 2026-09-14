@@ -479,6 +479,11 @@ class CheckStats(Contract):
     examples: tuple[tuple[str, int], ...] = ()
     """(trace_id, index) of turns it fired on, for a reviewer to open."""
 
+    missed: tuple[tuple[str, int], ...] = ()
+    """(trace_id, index) of turns the judge scored −1 that this check did NOT
+    fire on — candidate false negatives, for a reviewer revising a check that
+    is too narrow. A sample, same cap as ``examples``."""
+
     @property
     def precision(self) -> float | None:
         return None if not self.fired_scored else self.fired_negative / self.fired_scored
@@ -510,13 +515,16 @@ def evaluate_check(
     results, errors = run_check(fn, turns)
     fired = fired_scored = fired_negative = fired_positive = 0
     sample: list[tuple[str, int]] = []
+    missed: list[tuple[str, int]] = []
     for key, value in results.items():
+        verdict = verdicts.get(key)
         if not value:
+            if len(missed) < examples and verdict is not None and verdict.score == -1:
+                missed.append(key)
             continue
         fired += 1
         if len(sample) < examples:
             sample.append(key)
-        verdict = verdicts.get(key)
         if verdict is None or verdict.score is None:
             continue
         fired_scored += 1
@@ -533,17 +541,31 @@ def evaluate_check(
         negatives=sum(1 for v in verdicts.values() if v.score == -1),
         errors=errors,
         examples=tuple(sample),
+        missed=tuple(missed),
     ), None
 
 
-def _check_id(code: str) -> str:
-    """A stable identity for a check, independent of the model-chosen name.
+def _code_digest(code: str) -> str:
+    """A content digest of a check's code, used only to detect duplicates.
 
-    Names are not unique: the model can propose two different predicates
-    called ``not_found``. Reviewing and scoring must key off something that
-    cannot collide, so every check carries a digest of its own code.
+    Not a record identity: two different rounds can legitimately propose the
+    same code (a revision that fails to change anything, for one), and giving
+    both records the same id would let a decision on one silently apply to
+    the other.
     """
     return hashlib.sha256(code.encode()).hexdigest()[:12]
+
+
+def _check_id(code: str, ordinal: int) -> str:
+    """A unique identity for one check record.
+
+    ``ordinal`` is the record's position in the verifier's checks — the
+    length of the tuple before it was appended — which is monotonic for a
+    verifier's whole lifetime (checks are only ever appended, never
+    reordered or removed), so two records never collide even when their code
+    is identical.
+    """
+    return f"{_code_digest(code)}-{ordinal:03d}"
 
 
 class FamilyCheck(Contract):
@@ -551,6 +573,7 @@ class FamilyCheck(Contract):
     name: str
     hypothesis: str
     code: str
+    code_digest: str
     stats: CheckStats
     survived: bool
     reason: str
@@ -576,6 +599,14 @@ class FamilyVerifier(Contract):
     failed_rounds: int = 0
     """Rounds that produced no prediction after a retry. Reported, so a verifier
     with few checks can be told apart from one that never got its second round."""
+
+    min_fired: int = 3
+    min_precision: float = 0.6
+    """The acceptance bar this verifier's checks were measured against. A
+    revision has to be held to the same bar as a first proposal — recorded
+    here rather than left to whatever a caller happens to pass, so a verifier
+    built at a stricter bar can't quietly grow a child accepted at the
+    default one."""
 
     raw_replies: tuple[str, ...] = ()
 
@@ -768,10 +799,11 @@ def propose_verifier(
             if error is not None:
                 kept.append(
                     FamilyCheck(
-                        check_id=_check_id(check.code),
+                        check_id=_check_id(check.code, len(kept)),
                         name=check.name,
                         hypothesis=check.hypothesis,
                         code=check.code,
+                        code_digest=_code_digest(check.code),
                         stats=stats,
                         survived=False,
                         reason=f"rejected: {error}",
@@ -783,10 +815,11 @@ def propose_verifier(
             survived, reason = survival(stats, min_fired=min_fired, min_precision=min_precision)
             kept.append(
                 FamilyCheck(
-                    check_id=_check_id(check.code),
+                    check_id=_check_id(check.code, len(kept)),
                     name=check.name,
                     hypothesis=check.hypothesis,
                     code=check.code,
+                    code_digest=_code_digest(check.code),
                     stats=stats,
                     survived=survived,
                     reason=reason,
@@ -815,6 +848,8 @@ def propose_verifier(
         proposed=proposed,
         rounds=rounds,
         failed_rounds=failed_rounds,
+        min_fired=min_fired,
+        min_precision=min_precision,
         raw_replies=tuple(replies),
     )
 
@@ -854,8 +889,8 @@ def revise_check(
     judge_run: TurnJudgeRun,
     *,
     reviser: Reviser,
-    min_fired: int = 3,
-    min_precision: float = 0.6,
+    min_fired: int | None = None,
+    min_precision: float | None = None,
 ) -> FamilyVerifier:
     """Send one check back with feedback and counterexamples; score what comes back.
 
@@ -866,6 +901,11 @@ def revise_check(
     new pending check linked to the original by ``parent_check_id``. The
     original is marked "revised", not discarded, so a reviewer can see what it
     used to be.
+
+    ``min_fired``/``min_precision`` default to the bar the verifier itself was
+    built at, not a fresh default — a verifier proposed at a stricter bar must
+    hold a revision to it too, or a "survived" child could pass only because
+    revision quietly relaxed the threshold.
     """
     original = next((c for c in verifier.checks if c.check_id == check_id), None)
     if original is None:
@@ -889,18 +929,27 @@ def revise_check(
         raise ProposalError("the revision returned no check")
     proposal = revised[0]
 
+    digest = _code_digest(proposal.code)
+    existing = next((c for c in verifier.checks if c.code_digest == digest), None)
+    if existing is not None:
+        same = "the original" if existing.check_id == original.check_id else f"{existing.name!r}"
+        raise ProposalError(f"the revision is identical to {same}; nothing changed")
+
     full = turn_payload(turns, tasks, verdicts, with_judge=False)
     stats, error = evaluate_check(proposal.code, full, verdicts)
+    bar_fired = verifier.min_fired if min_fired is None else min_fired
+    bar_precision = verifier.min_precision if min_precision is None else min_precision
     if error is not None:
         survived, reason = False, f"rejected: {error}"
     else:
-        survived, reason = survival(stats, min_fired=min_fired, min_precision=min_precision)
+        survived, reason = survival(stats, min_fired=bar_fired, min_precision=bar_precision)
 
     child = FamilyCheck(
-        check_id=_check_id(proposal.code),
+        check_id=_check_id(proposal.code, len(verifier.checks)),
         name=proposal.name,
         hypothesis=proposal.hypothesis,
         code=proposal.code,
+        code_digest=digest,
         stats=stats,
         survived=survived,
         reason=reason,

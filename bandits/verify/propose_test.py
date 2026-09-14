@@ -304,6 +304,106 @@ def test_revise_check_queues_a_scored_child_and_marks_the_parent() -> None:
         )
 
 
+def test_revise_check_rejects_unchanged_code() -> None:
+    """A failed revision that returns the original code must not silently mint
+    a second record with the same identity as the first (the exact bug a
+    reviewer reported: check_id was pure content-digest, so parent and an
+    unchanged "revision" collided, and accepting one accepted both)."""
+    turns = _turns()
+    run = _judge_run(turns)
+    verifier = propose_verifier(
+        turns,
+        {},
+        run,
+        "judge-1",
+        family_id="fam",
+        rounds=1,
+        propose=lambda **kw: SimpleNamespace(
+            checks=[{"name": "nf", "hypothesis": "h", "code": NOISY}]
+        ),
+    )
+    original = verifier.checks[0]
+    unchanged = lambda **kw: SimpleNamespace(  # noqa: E731
+        checks=[{"name": "nf", "hypothesis": "h", "code": NOISY}]
+    )
+    with pytest.raises(ProposalError, match="identical"):
+        revise_check(
+            verifier, original.check_id, "why", [("a", 1)], turns, {}, run, reviser=unchanged
+        )
+
+
+def test_revise_check_inherits_the_verifiers_own_acceptance_bar() -> None:
+    """A verifier built at a stricter bar must hold its revisions to that same
+    bar, not the function's own defaults."""
+    turns = _turns()
+    run = _judge_run(turns)
+    verifier = propose_verifier(
+        turns,
+        {},
+        run,
+        "judge-1",
+        family_id="fam",
+        rounds=1,
+        min_fired=3,
+        min_precision=0.6,
+        propose=lambda **kw: SimpleNamespace(
+            checks=[{"name": "nf", "hypothesis": "h", "code": NOISY}]
+        ),
+    )
+    assert verifier.min_fired == 3 and verifier.min_precision == 0.6
+    original = verifier.checks[0]
+    stricter = verifier.replace(min_precision=0.99)
+
+    revised = revise_check(
+        stricter,
+        original.check_id,
+        "why",
+        [("a", 1)],
+        turns,
+        {},
+        run,
+        reviser=lambda **kw: SimpleNamespace(
+            checks=[{"name": "nf_v2", "hypothesis": "h", "code": GOOD}]
+        ),
+    )
+    child = next(c for c in revised.checks if c.parent_check_id == original.check_id)
+    # GOOD scores 1.0 precision, so it survives even the 0.99 bar inherited
+    # from `stricter` -- proving the bar was actually read from the verifier.
+    assert child.survived
+    explicit_bar = revise_check(
+        verifier,
+        original.check_id,
+        "why",
+        [("a", 1)],
+        turns,
+        {},
+        run,
+        reviser=lambda **kw: SimpleNamespace(
+            checks=[{"name": "nf_v3", "hypothesis": "h", "code": GOOD}]
+        ),
+        min_precision=1.01,
+    )
+    explicit_child = next(
+        c for c in explicit_bar.checks if c.parent_check_id == original.check_id
+    )
+    assert not explicit_child.survived  # an explicit override still wins over the verifier's own
+
+
+def test_evaluate_check_reports_missed_negatives() -> None:
+    turns = _turns()
+    run = _judge_run(turns)
+    payload = turn_payload(turns, {}, {}, with_judge=False)
+    # A check that only ever returns False fires nowhere, so every negative
+    # the judge scored is a miss it should be revised to catch.
+    stats, error = evaluate_check(
+        "def check(turn): return False", payload, run.verdict_by_key()
+    )
+    assert error is None
+    assert stats.fired == 0
+    assert set(stats.missed) == {("a", 0), ("a", 2), ("b", 0), ("b", 2), ("c", 0)}
+    assert len(stats.missed) == 5  # capped at the default `examples` sample size
+
+
 def test_sample_payload_is_clipped_but_execution_payload_is_not() -> None:
     long = "x" * 5000
     turn = Turn(
