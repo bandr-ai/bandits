@@ -1847,8 +1847,21 @@ def review_checks_command(
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Accept or reject each proposed check. One prompt per check; skip and resume freely."""
-    from bandits.verify.propose import decide_check, load_family_verifier, save_family_verifier
+    """Accept or reject each proposed check. One prompt per check; skip and resume freely.
+
+    Revising sends a check back with feedback: pick which shown examples it got
+    wrong, say why, and a revised check is proposed, re-scored, and queued as a
+    new pending check for a later pass.
+    """
+    from bandits.verify.nextstate import load_turn_judge_run
+    from bandits.verify.propose import (
+        ProposalError,
+        build_reviser,
+        decide_check,
+        load_family_verifier,
+        revise_check,
+        save_family_verifier,
+    )
     from bandits.verify.turns import extract_turns
 
     store = _derived(project)
@@ -1857,8 +1870,15 @@ def review_checks_command(
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no family verifier {verifier_id!r}")
         raise typer.Exit(code=1) from exc
+    try:
+        judge_run = load_turn_judge_run(verifier.judge_run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no turn judge run {verifier.judge_run_id!r}")
+        raise typer.Exit(code=1) from exc
     traces = _corpus_traces(verifier.corpus_id, project)
-    turns = {(t.trace_id, t.index): t for trace in traces for t in extract_turns(trace)}
+    all_turns = [t for trace in traces for t in extract_turns(trace)]
+    tasks = {trace.trace_id: trace.task for trace in traces}
+    turns = {(t.trace_id, t.index): t for t in all_turns}
 
     queue = [c for c in verifier.pending() if c.survived or all_checks]
     console.print(f"family: {verifier.family_id}  archetype: {verifier.archetype.value}")
@@ -1884,10 +1904,70 @@ def review_checks_command(
                 continue
             state = (turn.next_state() or "").replace("\n", " ")[:160]
             console.print(f"  [dim]{trace_id}:{index}[/dim] {state}")
-        raw = typer.prompt("  [a]ccept/[r]eject/[s]kip/[q]uit", default="s")
+        raw = typer.prompt("  [a]ccept/[r]eject/[v]revise/[s]kip/[q]uit", default="s")
         key = raw.strip().lower()[:1]
         if key == "q":
             break
+        if key == "v":
+            shown = stats.examples[:3]
+            if not shown:
+                console.print("  [red]no examples to revise against; skipping[/red]\n")
+                continue
+            feedback = typer.prompt("  what's wrong with it")
+            picks = typer.prompt(
+                f"  which shown example(s) are wrong (1-{len(shown)}, comma-separated)",
+                default=",".join(str(i + 1) for i in range(len(shown))),
+            )
+            try:
+                counterexamples = [
+                    shown[int(p.strip()) - 1]
+                    for p in picks.split(",")
+                    if p.strip() and 1 <= int(p.strip()) <= len(shown)
+                ]
+            except ValueError:
+                counterexamples = []
+            if not counterexamples:
+                console.print("  [red]no valid examples selected; skipping[/red]\n")
+                continue
+            reviser = build_reviser(
+                archetype=verifier.archetype,
+                name=check.name,
+                hypothesis=check.hypothesis,
+                code=check.code,
+                model=verifier.model,
+            )
+            try:
+                verifier = revise_check(
+                    verifier,
+                    check.check_id,
+                    feedback,
+                    counterexamples,
+                    all_turns,
+                    tasks,
+                    judge_run,
+                    reviser=reviser,
+                )
+            except ProposalError as exc:
+                console.print(f"  [red]revision failed:[/red] {exc}\n")
+                continue
+            envelope = save_family_verifier(verifier, store)
+            child = verifier.checks[-1]
+            ledger.record(
+                {
+                    "event_type": "check_revised",
+                    "verifier_id": envelope.artifact_id,
+                    "check": check.name,
+                    "check_id": check.check_id,
+                    "revised_check_id": child.check_id,
+                    "feedback": feedback,
+                }
+            )
+            console.print(
+                f"  [green]revised as {child.name!r}[/green] "
+                f"({'survived' if child.survived else 'did not survive'}: {child.reason}); "
+                "queued for a later review pass\n"
+            )
+            continue
         if key not in _CHECK_KEYS:
             continue
         note = typer.prompt("  why (optional)", default="", show_default=False)
