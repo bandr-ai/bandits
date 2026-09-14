@@ -1904,13 +1904,14 @@ def review_checks_command(
         if key not in _CHECK_KEYS:
             continue
         note = typer.prompt("  why (optional)", default="", show_default=False)
-        verifier = decide_check(verifier, check.name, _CHECK_KEYS[key], note)
+        verifier = decide_check(verifier, check.check_id, _CHECK_KEYS[key], note)
         envelope = save_family_verifier(verifier, store)
         ledger.record(
             {
                 "event_type": "check_review",
                 "verifier_id": envelope.artifact_id,
                 "check": check.name,
+                "check_id": check.check_id,
                 "decision": _CHECK_KEYS[key],
                 "note": note,
             }
