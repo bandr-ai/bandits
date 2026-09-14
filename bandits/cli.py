@@ -1898,29 +1898,34 @@ def review_checks_command(
         console.print(
             f"  {'[green]survived[/green]' if check.survived else '[red]did not survive[/red]'}: {check.reason}"
         )
-        for trace_id, index in stats.examples[:3]:
-            turn = turns.get((trace_id, index))
+        shown = [(key, "fired") for key in stats.examples[:3]] + [
+            (key, "missed") for key in stats.missed[:3]
+        ]
+        for i, (turn_key, label) in enumerate(shown, start=1):
+            trace_id, index = turn_key
+            turn = turns.get(turn_key)
             if turn is None:
                 continue
             state = (turn.next_state() or "").replace("\n", " ")[:160]
-            console.print(f"  [dim]{trace_id}:{index}[/dim] {state}")
+            tag = "fired" if label == "fired" else "[yellow]missed[/yellow]"
+            console.print(f"  {i}. [dim]{trace_id}:{index}[/dim] ({tag}) {state}")
         raw = typer.prompt("  [a]ccept/[r]eject/[v]revise/[s]kip/[q]uit", default="s")
         key = raw.strip().lower()[:1]
         if key == "q":
             break
         if key == "v":
-            shown = stats.examples[:3]
             if not shown:
                 console.print("  [red]no examples to revise against; skipping[/red]\n")
                 continue
             feedback = typer.prompt("  what's wrong with it")
             picks = typer.prompt(
-                f"  which shown example(s) are wrong (1-{len(shown)}, comma-separated)",
+                f"  which numbered example(s) are wrong (1-{len(shown)}, comma-separated; "
+                "'fired' means a false positive, 'missed' a false negative)",
                 default=",".join(str(i + 1) for i in range(len(shown))),
             )
             try:
                 counterexamples = [
-                    shown[int(p.strip()) - 1]
+                    shown[int(p.strip()) - 1][0]
                     for p in picks.split(",")
                     if p.strip() and 1 <= int(p.strip()) <= len(shown)
                 ]
