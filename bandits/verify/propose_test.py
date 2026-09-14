@@ -16,6 +16,7 @@ from bandits.verify.propose import (
     load_family_verifier,
     parse_checks,
     propose_verifier,
+    run_check,
     sample_turns,
     save_family_verifier,
     save_verifier_scores,
@@ -105,6 +106,40 @@ def test_sandbox_rejects_imports_dunders_and_judge_reads() -> None:
         compile_check("def a(turn): return True\ndef b(turn): return False")
     with pytest.raises(RejectedCheck):
         compile_check("x = 1")
+    with pytest.raises(RejectedCheck):
+        compile_check("while True:\n    pass\ndef check(turn): return False")
+
+
+def test_sandbox_check_cannot_mutate_the_shared_turn() -> None:
+    fn = compile_check('def check(turn):\n    turn["next_state"] = "poisoned"\n    return False')
+    turn = {"next_state": "original"}
+    assert fn(dict(turn)) is False  # sanity: the function itself does mutate its argument
+    results, errors = run_check(fn, [{"trace_id": "t", "index": 0, "next_state": "original"}])
+    assert errors == 0
+    assert results[("t", 0)] is False
+
+
+def test_decide_check_targets_code_identity_not_name() -> None:
+    verifier = propose_verifier(
+        _turns(),
+        {},
+        _judge_run(_turns()),
+        "judge-1",
+        family_id="fam",
+        rounds=1,
+        propose=lambda **kw: SimpleNamespace(
+            checks=[
+                {"name": "same_name", "hypothesis": "a", "code": GOOD},
+                {"name": "same_name", "hypothesis": "b", "code": NOISY},
+            ]
+        ),
+    )
+    ids = {c.check_id for c in verifier.checks}
+    assert len(ids) == 2  # distinct code -> distinct identity, despite the shared name
+    good_id = next(c.check_id for c in verifier.checks if c.code == GOOD)
+    decided = decide_check(verifier, good_id, "accepted")
+    accepted_ids = {c.check_id for c in decided.checks if c.decision == "accepted"}
+    assert accepted_ids == {good_id}
 
 
 def test_a_single_function_under_any_name_is_the_check() -> None:
@@ -244,7 +279,8 @@ def test_decide_and_apply(tmp_path) -> None:
     )
     with pytest.raises(ValueError):
         decide_check(verifier, "missing", "accepted")
-    accepted = decide_check(verifier, "nf", "accepted", note="yes")
+    check_id = verifier.checks[0].check_id
+    accepted = decide_check(verifier, check_id, "accepted", note="yes")
     assert accepted.accepted()[0].note == "yes"
 
     scores = apply_verifier(

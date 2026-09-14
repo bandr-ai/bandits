@@ -17,6 +17,7 @@ either a discovery or a mistake — which is what the human review decides.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import random
@@ -219,6 +220,16 @@ def _check_ast(code: str) -> None:
         tree = ast.parse(code)
     except SyntaxError as exc:
         raise RejectedCheck(f"syntax error: {exc}") from exc
+    # Only function definitions (plus an optional docstring) may appear at
+    # module level. A top-level `while True: pass` or similar runs inside
+    # compile_check's exec(), before run_check's per-call alarm exists to
+    # kill it, and would otherwise hang the process forever.
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        raise RejectedCheck(f"only function definitions are allowed at module level, got {type(node).__name__}")
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             raise RejectedCheck("imports are not allowed")
@@ -320,7 +331,9 @@ def run_check(
             if old is not None:
                 signal_mod.setitimer(signal_mod.ITIMER_REAL, seconds)
             try:
-                value = fn(turn)
+                # A defensive copy: a check must not be able to poison the
+                # shared payload for the checks that run after it.
+                value = fn(copy.deepcopy(turn))
                 results[key] = None if value is None else bool(value)
             except (_Timeout, Exception):  # noqa: BLE001
                 errors += 1
@@ -411,7 +424,18 @@ def evaluate_check(
     ), None
 
 
+def _check_id(code: str) -> str:
+    """A stable identity for a check, independent of the model-chosen name.
+
+    Names are not unique: the model can propose two different predicates
+    called ``not_found``. Reviewing and scoring must key off something that
+    cannot collide, so every check carries a digest of its own code.
+    """
+    return hashlib.sha256(code.encode()).hexdigest()[:12]
+
+
 class FamilyCheck(Contract):
+    check_id: str
     name: str
     hypothesis: str
     code: str
@@ -629,6 +653,7 @@ def propose_verifier(
             if error is not None:
                 kept.append(
                     FamilyCheck(
+                        check_id=_check_id(check.code),
                         name=check.name,
                         hypothesis=check.hypothesis,
                         code=check.code,
@@ -643,6 +668,7 @@ def propose_verifier(
             survived, reason = survival(stats, min_fired=min_fired, min_precision=min_precision)
             kept.append(
                 FamilyCheck(
+                    check_id=_check_id(check.code),
                     name=check.name,
                     hypothesis=check.hypothesis,
                     code=check.code,
@@ -682,14 +708,22 @@ def propose_verifier(
 
 
 def decide_check(
-    verifier: FamilyVerifier, name: str, decision: Literal["accepted", "rejected"], note: str = ""
+    verifier: FamilyVerifier,
+    check_id: str,
+    decision: Literal["accepted", "rejected"],
+    note: str = "",
 ) -> FamilyVerifier:
-    """Record one human decision. The decision is the human's, whatever survived said."""
-    if not any(c.name == name for c in verifier.checks):
-        raise ValueError(f"no check named {name!r}")
+    """Record one human decision, targeting the check's code digest.
+
+    Names are model-chosen and can collide across two different predicates;
+    ``check_id`` is a digest of the code itself, so a decision can never land
+    on the wrong check.
+    """
+    if not any(c.check_id == check_id for c in verifier.checks):
+        raise ValueError(f"no check with id {check_id!r}")
     return verifier.replace(
         checks=tuple(
-            c.replace(decision=decision, note=note) if c.name == name else c
+            c.replace(decision=decision, note=note) if c.check_id == check_id else c
             for c in verifier.checks
         )
     )
