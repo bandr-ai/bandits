@@ -158,33 +158,145 @@ def build_proposer(
     )
 
     def propose(*, turns: str, library: str, correction: str = "") -> Any:
-        import time
-
-        from dspy.clients.lm import LMRateLimitError, LMServerError
-        from dspy.primitives.code_interpreter import CodeInterpreterError
-
-        from bandits.transport import backoff_delay
-
-        # Two kinds of retry, and only these. The Deno REPL has been seen to
-        # die mid-execution on a first boot, and a rate limit mid-loop loses
-        # the whole invocation — both are fixed by trying again. A model reply
-        # that fails to parse is not, and gets no retry here.
-        sandbox_failures = 0
-        for attempt in range(6):
-            try:
-                with dspy.context(lm=language_model):
-                    return rlm(turns=turns, library=library, correction=correction)
-            except CodeInterpreterError as exc:
-                sandbox_failures += 1
-                if sandbox_failures > 1:
-                    raise ProposalError(f"the REPL sandbox failed twice: {exc}") from exc
-            except (LMRateLimitError, LMServerError) as exc:
-                if attempt == 5:
-                    raise ProposalError(f"the model stayed unavailable: {exc}") from exc
-                time.sleep(backoff_delay(attempt))
-        raise ProposalError("unreachable")  # pragma: no cover
+        return _run_rlm(rlm, language_model, turns=turns, library=library, correction=correction)
 
     return propose
+
+
+def _run_rlm(rlm: Any, language_model: Any, **kwargs: Any) -> Any:
+    """Call a ``dspy.RLM`` with the retry policy shared by proposing and revising."""
+    import time
+
+    import dspy
+    from dspy.clients.lm import LMRateLimitError, LMServerError
+    from dspy.primitives.code_interpreter import CodeInterpreterError
+
+    from bandits.transport import backoff_delay
+
+    # Two kinds of retry, and only these. The Deno REPL has been seen to
+    # die mid-execution on a first boot, and a rate limit mid-loop loses
+    # the whole invocation — both are fixed by trying again. A model reply
+    # that fails to parse is not, and gets no retry here.
+    sandbox_failures = 0
+    for attempt in range(6):
+        try:
+            with dspy.context(lm=language_model):
+                return rlm(**kwargs)
+        except CodeInterpreterError as exc:
+            sandbox_failures += 1
+            if sandbox_failures > 1:
+                raise ProposalError(f"the REPL sandbox failed twice: {exc}") from exc
+        except (LMRateLimitError, LMServerError) as exc:
+            if attempt == 5:
+                raise ProposalError(f"the model stayed unavailable: {exc}") from exc
+            time.sleep(backoff_delay(attempt))
+    raise ProposalError("unreachable")  # pragma: no cover
+
+
+_REVISE_INSTRUCTION = textwrap.dedent(
+    """\
+    You previously proposed one predicate for a family of agent trajectories. A human
+    reviewer looked at turns it fired on and says it is wrong in some way — a false
+    positive it should not have flagged, a false negative it missed, or a hypothesis
+    that does not hold up. Fix it; do not just restate the original.
+
+    Kind of trace: {archetype}. {vocabulary}
+
+    The predicate being revised:
+        name: {name}
+        hypothesis: {hypothesis}
+
+    ```python
+    {code}
+    ```
+
+    `feedback` is the reviewer's own words on what is wrong with it.
+
+    `turns` is a JSON string: a list of the specific turns the reviewer pointed at,
+    with keys trace_id, index, task, action, next_state, reactions, observed, errored,
+    judge (+1 / 0 / -1 / null), hint. Parse it with json.loads and study why the check's
+    verdict on each of these turns disagreed with the reviewer.
+
+    Same contract as a first proposal:
+
+        def check(turn):
+            \"\"\"<one-line hypothesis>\"\"\"
+            ...
+            return True   # the turn is bad
+            # or False when it is fine, or None when the predicate does not apply
+
+    - A pure function of `turn` (minus judge and hint — they will not be there).
+    - No imports, no I/O, no eval/exec/open, no attribute starting with `__`.
+      Builtins available: len any all sum min max sorted set list dict str int float bool
+      range enumerate zip abs round isinstance tuple map filter reversed, and re_search(pattern, text).
+    - Under 25 lines.
+
+    Test the revision against `turns` in the REPL before returning it: it should no
+    longer misjudge the turns the reviewer flagged.
+
+    Return `checks`: a list with exactly one revised {{name, hypothesis, code}} object.
+    """
+)
+
+
+def revise_instruction_for(archetype: Archetype, *, name: str, hypothesis: str, code: str) -> str:
+    return _REVISE_INSTRUCTION.format(
+        archetype=archetype.value,
+        vocabulary=ARCHETYPE_VOCABULARY[archetype],
+        name=name,
+        hypothesis=hypothesis,
+        code=code,
+    )
+
+
+class Reviser(Protocol):
+    def __call__(self, *, feedback: str, turns: str) -> Any: ...
+
+
+def build_reviser(
+    *,
+    archetype: Archetype,
+    name: str,
+    hypothesis: str,
+    code: str,
+    model: str = DEFAULT_MODEL,
+    api_key: str | None = None,
+    max_iterations: int = 10,
+    max_llm_calls: int = 20,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> Reviser:
+    """A ``dspy.RLM`` that revises one existing predicate against reviewer feedback."""
+    try:
+        import dspy
+    except ImportError as exc:  # pragma: no cover - depends on the extra
+        raise ProposalError("revising needs the 'audit' extra: uv sync --extra audit") from exc
+
+    from bandits.verify.judge import resolve_api_key
+
+    language_model = dspy.LM(
+        f"fireworks_ai/{model}",
+        api_key=api_key or resolve_api_key(),
+        temperature=0.0,
+        max_tokens=max_tokens,
+        num_retries=8,
+    )
+
+    class _Revise(dspy.Signature):
+        feedback: str = dspy.InputField(desc="what a human reviewer said is wrong with it")
+        turns: str = dspy.InputField(
+            desc="JSON list of the turns the reviewer pointed at, with judge verdicts"
+        )
+        checks: list[ProposedCheck] = dspy.OutputField()
+
+    _Revise.__doc__ = revise_instruction_for(archetype, name=name, hypothesis=hypothesis, code=code)
+    rlm = dspy.RLM(
+        _Revise, max_iters=max_iterations, max_llm_calls=max_llm_calls, sub_lm=language_model
+    )
+
+    def revise(*, feedback: str, turns: str) -> Any:
+        return _run_rlm(rlm, language_model, feedback=feedback, turns=turns)
+
+    return revise
 
 
 # ------------------------------------------------------------------ sandbox
@@ -443,8 +555,11 @@ class FamilyCheck(Contract):
     survived: bool
     reason: str
     round_number: int = 1
-    decision: Literal["pending", "accepted", "rejected"] = "pending"
+    decision: Literal["pending", "accepted", "rejected", "revised"] = "pending"
     note: str = ""
+    parent_check_id: str | None = None
+    """The check this one was revised from, if any. A revised parent is kept
+    (decision "revised") rather than deleted, so the history stays legible."""
 
 
 class FamilyVerifier(Contract):
@@ -727,6 +842,78 @@ def decide_check(
             for c in verifier.checks
         )
     )
+
+
+def revise_check(
+    verifier: FamilyVerifier,
+    check_id: str,
+    feedback: str,
+    counterexamples: Sequence[tuple[str, int]],
+    turns: Sequence[Turn],
+    tasks: Mapping[str, str | None],
+    judge_run: TurnJudgeRun,
+    *,
+    reviser: Reviser,
+    min_fired: int = 3,
+    min_precision: float = 0.6,
+) -> FamilyVerifier:
+    """Send one check back with feedback and counterexamples; score what comes back.
+
+    The reviewer's note alone was previously stored as inert provenance — this
+    is the loop the reviewer asked for: it feeds the note and the specific
+    turns it disagreed on back into another RLM round, re-executes the result
+    against the whole family exactly like a first proposal, and queues it as a
+    new pending check linked to the original by ``parent_check_id``. The
+    original is marked "revised", not discarded, so a reviewer can see what it
+    used to be.
+    """
+    original = next((c for c in verifier.checks if c.check_id == check_id), None)
+    if original is None:
+        raise ValueError(f"no check with id {check_id!r}")
+    if not counterexamples:
+        raise ValueError("revise needs at least one counterexample turn")
+
+    verdicts = judge_run.verdict_by_key()
+    by_key = {(t.trace_id, t.index): t for t in turns}
+    missing = [key for key in counterexamples if key not in by_key]
+    if missing:
+        raise ValueError(f"unknown turn(s): {missing}")
+
+    shown = [by_key[key] for key in counterexamples]
+    payload = json.dumps(
+        turn_payload(shown, tasks, verdicts, with_judge=True, clip=SAMPLE_CLIP), default=str
+    )
+    prediction = reviser(feedback=feedback, turns=payload)
+    revised = parse_checks(prediction)
+    if not revised:
+        raise ProposalError("the revision returned no check")
+    proposal = revised[0]
+
+    full = turn_payload(turns, tasks, verdicts, with_judge=False)
+    stats, error = evaluate_check(proposal.code, full, verdicts)
+    if error is not None:
+        survived, reason = False, f"rejected: {error}"
+    else:
+        survived, reason = survival(stats, min_fired=min_fired, min_precision=min_precision)
+
+    child = FamilyCheck(
+        check_id=_check_id(proposal.code),
+        name=proposal.name,
+        hypothesis=proposal.hypothesis,
+        code=proposal.code,
+        stats=stats,
+        survived=survived,
+        reason=reason,
+        round_number=original.round_number + 1,
+        parent_check_id=original.check_id,
+    )
+    updated_original = original.replace(
+        decision="revised", note=f"revised as {child.check_id}: {feedback}"[:400]
+    )
+    checks = tuple(
+        updated_original if c.check_id == check_id else c for c in verifier.checks
+    ) + (child,)
+    return verifier.replace(checks=checks, proposed=verifier.proposed + 1)
 
 
 class FlaggedTurn(Contract):
