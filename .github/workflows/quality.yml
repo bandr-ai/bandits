@@ -10,6 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra dev
+      - run: uv sync --extra dev --extra diagnose
       - run: uv run ruff check .
       - run: uv run pytest --cov=bandits --cov-report=term-missing
