@@ -1362,3 +1362,35 @@ def test_a_claude_code_tool_call_span_is_not_read_as_the_model(tmp_path) -> None
     policy = generating_policy(load_claude_code(path).traces[0])
 
     assert "change_order" not in policy["models"]
+
+
+def test_a_new_tool_schema_field_cannot_leak_into_the_published_export() -> None:
+    """D68. Adding ``output_schema`` to ``ToolSchema`` silently changed four
+    payloads, because each dumped the whole contract. The published shape is a
+    declared projection: nulls are kept, the simulator-only field is not.
+    """
+    from bandits.traces import ToolSchema
+
+    tool = ToolSchema(
+        name="change_order",
+        parameters={"type": "object"},
+        output_schema={"type": "object"},
+    )
+    assert tool.offered_projection() == {
+        "name": "change_order",
+        "description": None,
+        "parameters": {"type": "object"},
+    }
+    # The simulator needs the result schema; the published shape must not carry it.
+    assert tool.simulation_projection()["output_schema"] == {"type": "object"}
+    assert "output_schema" not in tool.offered_projection()
+
+
+def test_a_declared_boolean_output_schema_survives_the_simulation_projection() -> None:
+    """D63 keeps boolean schemas, including ``False``. A projection written as
+    an omit-empties rule would drop the wrong things; this one is explicit.
+    """
+    from bandits.traces import ToolSchema
+
+    tool = ToolSchema(name="x", parameters={}, output_schema=False)
+    assert tool.simulation_projection()["output_schema"] is False
