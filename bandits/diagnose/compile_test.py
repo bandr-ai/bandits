@@ -21,6 +21,7 @@ from bandits.diagnose.compile import (
     strip_markers,
 )
 from bandits.diagnose.models import (
+    DeltaGroundTruthStatus,
     ExpectedEffect,
     HiddenUserProfile,
     Partition,
@@ -290,6 +291,117 @@ def test_errored_result_contributes_no_state() -> None:
         )
     )
     assert reconstruct_state(trace, "s2").fields == ()
+
+
+# --- inferred_state_delta -----------------------------------------------
+
+
+def test_cross_tool_delta_is_unavailable_not_a_silent_empty_dict() -> None:
+    """The real-corpus case: cancel_reservation's fields are tool-prefixed
+    differently from the get_reservation_details fields that populated
+    state_before, so no reported field can be aligned even though the
+    cancellation obviously changed status. UNAVAILABLE must be reported
+    explicitly rather than an indistinguishable empty {}."""
+    transitions = extract_transitions(_trace(), family_id="family-451ae91f975c")
+    cancel = next(t for t in transitions if t.action_tool == "cancel_reservation")
+    assert cancel.inferred_state_delta == {}
+    assert cancel.delta_ground_truth_status is DeltaGroundTruthStatus.UNAVAILABLE
+    assert "cancel_reservation.3RK2T9.status" in cancel.unmatched_post_paths
+
+
+def test_aligned_path_produces_a_measured_delta() -> None:
+    """When a later call reports a result under the SAME path family an
+    earlier call already populated, the value can genuinely be compared."""
+    trace = _trace(
+        spans=(
+            _model("s1", tool="get_reservation_details", arguments={"reservation_id": "3RK2T9"}),
+            _tool(
+                "s2",
+                "get_reservation_details",
+                {"reservation_id": "3RK2T9", "status": "confirmed"},
+            ),
+            _model("s3", tool="get_reservation_details", arguments={"reservation_id": "3RK2T9"}),
+            _tool(
+                "s4",
+                "get_reservation_details",
+                {"reservation_id": "3RK2T9", "status": "cancelled"},
+            ),
+        )
+    )
+    transitions = extract_transitions(trace, family_id="family-451ae91f975c")
+    second_lookup = transitions[1]
+    assert second_lookup.delta_ground_truth_status is DeltaGroundTruthStatus.MEASURED
+    assert second_lookup.inferred_state_delta == {
+        "get_reservation_details.3RK2T9.status": "cancelled"
+    }
+    assert second_lookup.unmatched_post_paths == ()
+
+
+def test_partial_alignment_is_conservatively_unavailable_not_measured() -> None:
+    """A repeated call that reports one aligned field (genuinely changed) AND
+    one brand-new field the earlier call never reported: the whole delta must
+    be UNAVAILABLE, not a partial MEASURED delta that silently omits the
+    unaligned field and overstates completeness."""
+    trace = _trace(
+        spans=(
+            _model("s1", tool="get_reservation_details", arguments={"reservation_id": "3RK2T9"}),
+            _tool(
+                "s2",
+                "get_reservation_details",
+                {"reservation_id": "3RK2T9", "status": "confirmed"},
+            ),
+            _model("s3", tool="get_reservation_details", arguments={"reservation_id": "3RK2T9"}),
+            _tool(
+                "s4",
+                "get_reservation_details",
+                {
+                    "reservation_id": "3RK2T9",
+                    "status": "cancelled",
+                    "refund_amount": 430,
+                },
+            ),
+        )
+    )
+    transitions = extract_transitions(trace, family_id="family-451ae91f975c")
+    second_lookup = transitions[1]
+    assert second_lookup.delta_ground_truth_status is DeltaGroundTruthStatus.UNAVAILABLE
+    assert second_lookup.inferred_state_delta == {}
+    assert "get_reservation_details.3RK2T9.refund_amount" in second_lookup.unmatched_post_paths
+
+
+def test_uncorrelatable_reaction_is_unavailable_not_not_applicable() -> None:
+    """A batch calling the same tool twice with no tool_call_id on either
+    side: real mutation evidence exists in both reactions, but neither can be
+    attributed to a specific call, so correlation fails for both. This must
+    read as UNAVAILABLE (evidence existed, couldn't be used) -- returning
+    NOT_APPLICABLE here would be indistinguishable from a transition that
+    reported nothing comparable at all."""
+    trace = _trace(
+        spans=(
+            _model("s1", tool="get_reservation_details", arguments={"reservation_id": "A"}),
+            _model("s2", tool="get_reservation_details", arguments={"reservation_id": "B"}),
+            _tool("s3", "get_reservation_details", {"status": "confirmed"}),
+            _tool("s4", "get_reservation_details", {"status": "cancelled"}),
+        )
+    )
+    transitions = extract_transitions(trace, family_id="f")
+    assert transitions[0].delta_ground_truth_status is DeltaGroundTruthStatus.UNAVAILABLE
+    assert transitions[0].inferred_state_delta == {}
+
+
+def test_no_reported_fields_is_not_applicable() -> None:
+    """A read whose only prior result has nothing comparable carries no
+    ground-truth claim at all -- distinct from a genuinely-verified no-op."""
+    trace = _trace(
+        spans=(
+            _model("s1", tool="transfer_to_human_agents", arguments={}),
+            _tool("s2", "transfer_to_human_agents", {}),
+        )
+    )
+    transitions = extract_transitions(trace, family_id="family-451ae91f975c")
+    assert transitions[0].delta_ground_truth_status is DeltaGroundTruthStatus.NOT_APPLICABLE
+    assert transitions[0].inferred_state_delta == {}
+    assert transitions[0].unmatched_post_paths == ()
 
 
 # --- transitions --------------------------------------------------------

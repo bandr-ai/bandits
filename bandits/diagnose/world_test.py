@@ -116,7 +116,10 @@ def test_no_evidence_abstains_without_calling_the_model() -> None:
     assert not calls  # no spend on a question with no evidence behind it
 
 
-def test_a_malformed_answer_abstains_rather_than_being_salvaged() -> None:
+def test_a_malformed_answer_is_output_invalid_not_abstention() -> None:
+    """Invalid JSON is an attempted-but-malformed answer, not the model
+    declining to answer -- collapsing the two hid a parser/prompt defect
+    behind a metric (abstention) that reads as legitimate model behaviour."""
     result = step_tool_world(
         _predictor("not json at all"),
         calls=(ActionCall(tool="cancel_reservation"),),
@@ -125,8 +128,41 @@ def test_a_malformed_answer_abstains_rather_than_being_salvaged() -> None:
         history="",
         examples=_supported(),
     )
-    assert result.abstain
-    assert "contract" in result.abstain_reason
+    assert result.output_invalid
+    assert not result.abstain
+    assert result.output_invalid_errors
+
+
+def test_a_genuinely_empty_response_still_abstains() -> None:
+    """The boundary Fix 1 must not overcorrect: a predictor that truly
+    returned nothing (None, "") is "no answer," not a malformed one."""
+    for empty_payload in (None, ""):
+        result = step_tool_world(
+            _predictor(empty_payload),
+            calls=(ActionCall(tool="cancel_reservation"),),
+            content=None,
+            state=ScenarioState(),
+            history="",
+            examples=_supported(),
+        )
+        assert result.abstain
+        assert not result.output_invalid
+
+
+def test_valid_json_of_the_wrong_shape_is_output_invalid() -> None:
+    """A parseable-but-non-object response (an array, a bare number) is also
+    an attempted answer that does not fit the contract -- not "no answer"."""
+    for wrong_shape in ("[1, 2, 3]", "42"):
+        result = step_tool_world(
+            _predictor(wrong_shape),
+            calls=(ActionCall(tool="cancel_reservation"),),
+            content=None,
+            state=ScenarioState(),
+            history="",
+            examples=_supported(),
+        )
+        assert result.output_invalid
+        assert not result.abstain
 
 
 def test_an_abstaining_proposal_cannot_also_propose_changes() -> None:

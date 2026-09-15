@@ -37,6 +37,7 @@ from typing import Any
 from pydantic import Field
 
 from bandits.diagnose.models import (
+    DeltaGroundTruthStatus,
     GroundingObservation,
     GroundingTransition,
     HiddenUserProfile,
@@ -89,6 +90,14 @@ class TransitionFidelity(Contract):
     abstain_correct: bool | None = None
     """True when abstaining was right — nothing supported a prediction here."""
 
+    output_invalid: bool = False
+    """The model attempted an answer that did not parse into the transition
+    contract -- a prompt/parser failure, not the model declining to answer.
+    Mutually exclusive with ``abstained``: conflating the two would let a
+    structured-output defect masquerade as a legitimate abstention rate."""
+
+    output_invalid_errors: tuple[str, ...] = ()
+
     fields: tuple[FieldComparison, ...] = ()
     status_correct: bool | None = None
     """Whether success-versus-error was predicted correctly. The coarsest
@@ -97,6 +106,12 @@ class TransitionFidelity(Contract):
     error_predicted: bool | None = None
     error_recorded: bool | None = None
     delta_correct: bool | None = None
+    delta_ground_truth_status: DeltaGroundTruthStatus = DeltaGroundTruthStatus.NOT_APPLICABLE
+    """Whether delta_correct is even a meaningful comparison for this row.
+    None/absent-looking delta_correct with status MEASURED means a genuinely
+    verified no-op was compared; UNAVAILABLE means no comparison was possible
+    at all, which delta_correct=None alone cannot distinguish on its own."""
+
     invariant_violations: tuple[str, ...] = ()
     support: SupportLevel = SupportLevel.NONE
     validator_rejected: bool = False
@@ -108,6 +123,23 @@ class TransitionFidelity(Contract):
     """
 
     validator_rejections: tuple[str, ...] = ()
+
+    unmatched_call_observations: tuple[str, ...] = ()
+    """Call ids (or tool names) whose recorded observation could not be
+    correlated with a predicted one -- e.g. a batch where the model's
+    committed_observations and the recorded tool_call_ids never overlap.
+    Distinct from a validator rejection: the proposal was accepted, but part
+    of it cannot be scored for field accuracy because there is nothing to
+    compare it against.
+
+    A non-empty tuple here means `fields`/`status_correct`/`error_predicted`/
+    `error_recorded` are ALL absent (empty/None), not a partial score over
+    whichever calls did match: scoring only the matched subset and reporting
+    it as this transition's field_accuracy would let one perfectly-correlated
+    call in a two-call batch report 1.0 while the other call goes entirely
+    unscored and invisible. An accepted-but-incompletely-correlated
+    prediction is unscorable as a whole, and this tuple says why.
+    """
 
     @property
     def field_accuracy(self) -> float | None:
@@ -171,23 +203,49 @@ class FidelityReport(Contract):
         return len(self.transitions)
 
     @property
+    def model_output_invalid_rate(self) -> float | None:
+        """Share of considered transitions where the model answered but the
+        answer did not fit the transition contract (a parser/prompt failure).
+
+        Kept separate from abstention_rate and, among accepted-vs-attempted
+        accuracy figures, from every accuracy number: an invalid-output row
+        carries no fields to score and must not silently inflate or deflate
+        either abstention or accuracy the way folding it into "abstained"
+        used to.
+        """
+        if not self.transitions:
+            return None
+        return sum(1 for row in self.transitions if row.output_invalid) / self.considered
+
+    @property
     def validation_rejection_rate(self) -> float | None:
-        """Share of attempted predictions the runtime would refuse (D71)."""
-        attempted = [row for row in self.transitions if not row.abstained]
+        """Share of attempted predictions the runtime would refuse (D71).
+
+        "Attempted" here means the model neither abstained nor produced an
+        output-invalid response -- both of those are excluded from
+        ``attempted`` and scored by their own rates instead.
+        """
+        attempted = [row for row in self.transitions if not row.abstained and not row.output_invalid]
         if not attempted:
             return None
         return sum(1 for row in attempted if row.validator_rejected) / len(attempted)
 
     @property
     def attempted(self) -> int:
-        """Transitions where a prediction was actually made."""
-        return sum(1 for row in self.transitions if not row.abstained)
+        """Transitions where a prediction was actually made and parsed.
+
+        Excludes both abstentions (the model declined) and output-invalid
+        rows (the model tried but its answer didn't fit the contract) -- the
+        latter is a distinct failure mode with its own rate, not evidence the
+        model attempted nothing.
+        """
+        return sum(1 for row in self.transitions if not row.abstained and not row.output_invalid)
 
     @property
     def abstention_rate(self) -> float | None:
         if not self.transitions:
             return None
-        return 1 - self.attempted / self.considered
+        return sum(1 for row in self.transitions if row.abstained) / self.considered
 
     @property
     def wrong_abstention_rate(self) -> float | None:
@@ -240,6 +298,26 @@ class FidelityReport(Contract):
         if not scored:
             return None
         return sum(1 for row in scored if row.delta_correct) / len(scored)
+
+    @property
+    def delta_ground_truth_coverage(self) -> float | None:
+        """Share of considered transitions where a real delta comparison was
+        even possible (status MEASURED).
+
+        Low coverage means delta_accuracy is being computed over a small,
+        possibly unrepresentative slice -- most commonly because state paths
+        are tool-prefixed and a mutating tool's paths never align with the
+        read tool's paths that populated state_before (status UNAVAILABLE).
+        Report this beside delta_accuracy, never delta_accuracy alone.
+        """
+        if not self.transitions:
+            return None
+        measured = sum(
+            1
+            for row in self.transitions
+            if row.delta_ground_truth_status is DeltaGroundTruthStatus.MEASURED
+        )
+        return measured / self.considered
 
     @property
     def premature_disclosure_rate(self) -> float | None:
@@ -313,6 +391,62 @@ def _recorded_observation(transition: GroundingTransition) -> GroundingObservati
     )
 
 
+def _correlate_observations(
+    transition: GroundingTransition, committed_observations: dict[str, Any]
+) -> tuple[dict[str, tuple[Any, GroundingObservation]], tuple[str, ...]]:
+    """Pair each recorded tool observation with the prediction that answers it.
+
+    committed_observations is keyed by call_id (or tool name, only when the
+    sole submitted call has no call_id -- see validate_transition). Recorded
+    GroundingObservations carry tool_call_id, which in real tau2 data is
+    frequently None even for a single unbatched call: the source simply never
+    assigned one. Matching is therefore, in order:
+
+    1. tool_call_id == a committed call_id (both sides have real ids);
+    2. exactly one action_call and exactly one recorded tool observation and
+       exactly one committed observation, all unlabeled -- the unambiguous
+       single-call case, paired positionally;
+    3. otherwise unmatched -- never guessed at with a bare [0].
+
+    Returns (matched: {call_key: (predicted_content, recorded_observation)}, ...)
+    -- pairs keyed by a stable id, unmatched_call_ids). The recorded side is
+    the FULL GroundingObservation, not just its content: an error recorded
+    via the ``error`` flag with a payload that doesn't itself look like an
+    error (no "error" key, no "error"-prefixed string) must not be invisible
+    to the caller just because only .content was kept.
+    """
+    tool_observations = [obs for obs in transition.observations if obs.role == "tool"]
+    calls = transition.action_calls
+
+    pairs: dict[str, tuple[Any, GroundingObservation]] = {}
+    unmatched: list[str] = []
+
+    if len(calls) == 1 and len(tool_observations) == 1 and len(committed_observations) == 1:
+        # The unambiguous single-call case: one call submitted, one tool
+        # reaction recorded, one committed prediction -- pair them even when
+        # neither side carries a call_id, since there is no other call this
+        # observation could answer.
+        (only_key, only_predicted) = next(iter(committed_observations.items()))
+        pairs[only_key] = (only_predicted, tool_observations[0])
+        return pairs, ()
+
+    for call in calls:
+        key = call.call_id or call.tool
+        if key not in committed_observations:
+            unmatched.append(key)
+            continue
+        recorded = next(
+            (obs for obs in tool_observations if obs.tool_call_id == call.call_id),
+            None,
+        )
+        if recorded is None:
+            unmatched.append(key)
+            continue
+        pairs[key] = (committed_observations[key], recorded)
+
+    return pairs, tuple(unmatched)
+
+
 def score_transition_fidelity(
     transition: GroundingTransition,
     predict: ToolWorldPredictor,
@@ -338,6 +472,27 @@ def score_transition_fidelity(
         history=history_text,
         examples=examples,
     )
+
+    if proposal.output_invalid:
+        # The model attempted an answer; it did not fit the contract. This is
+        # a structural failure, not an epistemic one -- it must not touch
+        # abstention or accuracy metrics. It also never reaches
+        # validate_transition (score_transition_fidelity returns here first),
+        # so validator_rejected stays False: that flag means "the runtime
+        # validator specifically refused this," which did not happen here,
+        # there was nothing parseable to hand it. model_output_invalid_rate
+        # is the metric for this failure mode, not validation_rejection_rate
+        # -- both FidelityReport properties already treat these rows as
+        # mutually exclusive; setting validator_rejected=True here would
+        # contradict that split even though the rate computation itself
+        # already excludes output_invalid rows.
+        return TransitionFidelity(
+            transition_id=transition.transition_id,
+            trace_id=transition.trace_id,
+            output_invalid=True,
+            output_invalid_errors=proposal.output_invalid_errors,
+            support=proposal.support,
+        )
 
     if proposal.abstain:
         order = [SupportLevel.NONE, SupportLevel.LOW, SupportLevel.MEDIUM, SupportLevel.HIGH]
@@ -377,24 +532,77 @@ def score_transition_fidelity(
             validator_rejections=validation.rejections,
         )
 
-    recorded_payload = recorded.content if recorded else None
-    error_recorded = bool(recorded and recorded.error) or _looks_like_error(recorded_payload)
-    error_predicted = _looks_like_error(proposal.observation)
+    # Fidelity must compare the same canonical observation the runtime
+    # validator accepted -- not proposal.observation directly, which is left
+    # empty ({}) by design whenever the model correctly used the batch
+    # call_outcomes form. validation.committed_observations is that
+    # canonical, call-correlated mapping; _correlate_observations pairs each
+    # entry against the recorded GroundingObservation it actually answers.
+    pairs, unmatched = _correlate_observations(transition, validation.committed_observations)
+
+    def _recorded_error(recorded_obs: GroundingObservation) -> bool:
+        # The recorded ``error`` flag is authoritative provenance (D-whatever
+        # marked the span itself as a runtime error) and must be checked
+        # alongside the payload-shape heuristic: a call whose error flag is
+        # True but whose payload happens not to look like an error (no
+        # "error" key, no "error"-prefixed string) must still read as an
+        # error here, not silently as a success.
+        return bool(recorded_obs.error) or _looks_like_error(recorded_obs.content)
+
+    fields: list[FieldComparison] = []
+    for predicted_payload, recorded_obs in pairs.values():
+        fields.extend(compare_observation(predicted_payload, recorded_obs.content))
+
+    # Per-call, not "did any call in the batch error": aggregating status
+    # across calls means a batch where call A errored and B didn't, matched
+    # against a prediction where B errored and A didn't, would both read as
+    # "an error happened somewhere" and score status_correct=True despite
+    # the error being attributed to the wrong call entirely.
+    per_call_status_correct = [
+        _looks_like_error(predicted_payload) == _recorded_error(recorded_obs)
+        for predicted_payload, recorded_obs in pairs.values()
+    ]
+    error_recorded = bool(recorded and recorded.error) or any(
+        _recorded_error(recorded_obs) for _, recorded_obs in pairs.values()
+    )
+    error_predicted = any(_looks_like_error(predicted_payload) for predicted_payload, _ in pairs.values())
 
     violations = tuple(message for check in invariants if (message := check(proposal)) is not None)
-    predicted_delta = {delta.path: delta.new_value for delta in proposal.state_delta}
+    # validation.committed, not proposal.state_delta: the latter is the
+    # top-level aggregate field, left empty by design whenever the model used
+    # the batch call_outcomes form (its deltas live inside each outcome
+    # instead). validation.committed is the validator's own canonical,
+    # already-flattened result -- the same one score_transition_fidelity must
+    # use for observations, for the same reason.
+    predicted_delta = {field.path: field.value for field in validation.committed}
     recorded_delta = dict(transition.inferred_state_delta)
+    # delta_correct is only meaningful when the recorded delta was actually
+    # measured (before/after paths aligned). UNAVAILABLE means "we don't know
+    # if anything changed," not "nothing changed" -- scoring against it would
+    # silently launder an alignment gap into a fidelity number.
+    delta_measured = transition.delta_ground_truth_status is DeltaGroundTruthStatus.MEASURED
+
+    # Incomplete correlation must not report a confident number computed only
+    # over whichever calls happened to match. A batch where call A correlated
+    # perfectly and call B did not must not read as field_accuracy=1.0 --
+    # that hides an entire unscored call behind a number that looks complete.
+    # unmatched_call_observations already names which calls are missing; the
+    # accuracy fields themselves fall back to "not scorable" rather than
+    # scoring a strict subset and calling it whole.
+    fully_correlated = not unmatched
 
     return TransitionFidelity(
         transition_id=transition.transition_id,
         trace_id=transition.trace_id,
-        fields=compare_observation(proposal.observation, recorded_payload),
-        status_correct=error_predicted == error_recorded,
-        error_predicted=error_predicted,
-        error_recorded=error_recorded,
-        delta_correct=predicted_delta == recorded_delta if recorded_delta else None,
+        fields=tuple(fields) if fully_correlated else (),
+        status_correct=(all(per_call_status_correct) if pairs else None) if fully_correlated else None,
+        error_predicted=(error_predicted if pairs else None) if fully_correlated else None,
+        error_recorded=(error_recorded if pairs else None) if fully_correlated else None,
+        delta_correct=(predicted_delta == recorded_delta) if delta_measured else None,
+        delta_ground_truth_status=transition.delta_ground_truth_status,
         invariant_violations=violations,
         support=proposal.support,
+        unmatched_call_observations=unmatched,
     )
 
 
@@ -557,9 +765,23 @@ def multi_step_drift(
             ),
         )
         expected = {field.path: field.value for field in transition.state_before.fields}
-        expected.update(transition.inferred_state_delta)
+        # Only MEASURED deltas are trustworthy ground truth for this step's
+        # change. UNAVAILABLE's inferred_state_delta is {} the same shape as
+        # a genuine no-op, so it is never merged into `expected` here --
+        # doing so would assert "nothing changed" for paths ground truth
+        # simply could not verify.
+        if transition.delta_ground_truth_status is DeltaGroundTruthStatus.MEASURED:
+            expected.update(transition.inferred_state_delta)
+
+        # Score only paths `expected` actually has an opinion on -- state
+        # carries every path the simulator has accumulated across ALL prior
+        # steps (state.fields is cumulative), and scoring the union with
+        # `expected` penalised the predictor for any self-consistent path
+        # `expected` never asserted anything about, including this step's own
+        # UNAVAILABLE-delta prediction. A path `expected` is silent on is
+        # unmeasurable at this step, not evidence the prediction was wrong.
         predicted = {field.path: field.value for field in state.fields}
-        paths = set(expected) | set(predicted)
+        paths = set(expected)
         accuracy = (
             sum(expected.get(path) == predicted.get(path) for path in paths) / len(paths)
             if paths
@@ -598,6 +820,7 @@ def build_report(
             by_tool[tool] = {
                 "considered": float(len(rows)),
                 "abstained": float(sum(1 for r in rows if r.abstained)),
+                "output_invalid": float(sum(1 for r in rows if r.output_invalid)),
                 "field_accuracy": sum(scored) / len(scored) if scored else 0.0,
                 "status_accuracy": (
                     sum(1 for r in statuses if r.status_correct) / len(statuses)

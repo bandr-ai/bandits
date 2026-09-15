@@ -356,6 +356,31 @@ I31 (outcome completeness), I32 (fidelity runs the runtime validator), I33 (expl
 serialization projections), I34 (real tau2 smoke test), D72 (standards-compliant input
 validation), and I8. Full suite 919 passed, 0 failed; ruff clean.
 
+## Closed in v4/S12
+
+First real-model fidelity run (`scripts/run_awm_fidelity.py`, DeepSeek V4 Flash 0731,
+against the pinned tau2 family) found and closed four new issues, all discovered because
+they blocked interpreting the run's own result:
+
+- **I35** (P0, FIXED): `_coerce` could not parse a real `dspy.Prediction` object at all
+  (no `model_dump`, not a dict) — every real model answer silently read as abstention. See
+  `awm-decisions-v4.md` D75.
+- **I36** (P0, FIXED): malformed structured output collapsed into the same abstention path
+  as a genuine decline, hiding a prompt/parser defect behind a metric that looked
+  epistemic. D75.
+- **I37** (P0, FIXED): fidelity compared the wrong observation representation for the
+  (D67-sanctioned) batch `call_outcomes` form, and batch status accuracy aggregated "did
+  any call error" across a whole batch instead of comparing per correlated call. D76, D78.
+- **I38** (P1, FIXED): `inferred_state_delta` was every reported field, not a diff against
+  `state_before`; fixing that exposed that cross-tool entity-path prefixes leave delta
+  ground truth `unavailable`/`not_applicable` for 100% of the pinned family — an honest,
+  reported limitation now (`delta_ground_truth_status`, `delta_ground_truth_coverage`), not
+  a silently-wrong number. D77.
+
+Full suite 932 passed, 0 failed (`uv run pytest -q`, no targeted subset). See
+`awm-decisions-v4.md` S12/E33-E38/D75-D78 for the executed evidence and Q19/Q20 for what
+remains open (a reviewed tau2 path canonicalizer; user-policy output-invalid taxonomy).
+
 ## Current next steps
 
 1. Inspect one persisted deterministic campaign, including invalid/abstained attempts and
