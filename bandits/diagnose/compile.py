@@ -28,6 +28,7 @@ from typing import Any
 from bandits.analyze.models import TaskFamily
 from bandits.diagnose.models import (
     ActionCall,
+    DeltaGroundTruthStatus,
     GroundingObservation,
     GroundingTransition,
     Partition,
@@ -371,6 +372,8 @@ def extract_transitions(
             (i for i, step in enumerate(prefix_all) if step.span_id == first.span_id),
             len(prefix_all),
         )
+        state_before = reconstruct_state(trace, _previous_span_id(trace, first.span_id))
+        delta, delta_status, unmatched_paths = _delta(reactions, state_before, calls)
         transitions.append(
             GroundingTransition(
                 transition_id=f"transition-{_digest(trace.trace_id, first.span_id)}",
@@ -380,13 +383,15 @@ def extract_transitions(
                 turn_index=index,
                 task_context=task_context or (trace.task or ""),
                 history_before=prefix_all[:cut],
-                state_before=reconstruct_state(trace, _previous_span_id(trace, first.span_id)),
+                state_before=state_before,
                 action_span_id=first.span_id,
                 action_span_ids=tuple(span.span_id for span in action),
                 action_content=content,
                 action_calls=calls,
                 observations=tuple(observations),
-                inferred_state_delta=_delta(reactions),
+                inferred_state_delta=delta,
+                delta_ground_truth_status=delta_status,
+                unmatched_post_paths=unmatched_paths,
                 observed=bool(observations),
                 stripped_markers=user_markers,
             )
@@ -403,19 +408,93 @@ def _previous_span_id(trace: Trace, span_id: str) -> str | None:
     return previous
 
 
-def _delta(results: Sequence[Span]) -> dict[str, Any]:
-    """State paths a reaction reports, without claiming they changed.
+def _delta(
+    results: Sequence[Span], state_before: ScenarioState, calls: Sequence[ActionCall]
+) -> tuple[dict[str, Any], DeltaGroundTruthStatus, tuple[str, ...]]:
+    """Confirmed mutations, and how much that claim is actually worth.
 
-    Named a delta because that is what the AWM must later propose, but read off
-    a recorded result it is only what the result said. Whether a field changed
-    needs the value before it, which the caller holds and this does not.
+    A reaction reports the tool's whole result, not a diff, so most reported
+    fields are unchanged context (origin, cabin, passenger count for a
+    cancellation) rather than something the action did. Calling all of it a
+    "delta" made fidelity's delta_correct compare a prediction against a
+    ground truth that was mostly noise.
+
+    A field only counts as a confirmed mutation when the pre-action value was
+    known AND differs from the post-action value. state_before's paths are
+    entity-prefixed by ``_entity_prefix`` (reconstruct_state's own scheme:
+    ``<tool>.<entity_id>.<field>``), so a reaction's raw, unprefixed
+    ``_state_paths`` output must be prefixed the same way -- using the SAME
+    call's tool/arguments, correlated by tool_call_id/span order the way
+    GroundingObservation.tool_call_id is -- before it can be compared at all.
+    Even then, tool-prefixing means a cancellation reports
+    ``cancel_reservation.X.status`` while the pre-state only knows
+    ``get_reservation_details.X.status``, so a real mutation's before and
+    after paths routinely never align. When that happens the honest answer is
+    "cannot tell," not "nothing changed" -- the status distinguishes the two
+    rather than letting an empty dict mean either.
     """
-    delta: dict[str, Any] = {}
+    call_by_tool_call_id = {
+        str(call.call_id): call for call in calls if call.call_id is not None
+    }
+    # A reaction's own tool_call_id is what actually correlates it to a call
+    # in a batch; falling back to "the one call of this tool" only when that
+    # is unambiguous (exactly one call named this tool in the batch).
+    calls_by_tool: dict[str, list[ActionCall]] = {}
+    for call in calls:
+        calls_by_tool.setdefault(call.tool, []).append(call)
+
+    reported: dict[str, Any] = {}
+    had_uncorrelatable_evidence = False
     for result in results:
         if result.status is SpanStatus.ERROR:
             continue
-        delta.update(_state_paths(_json_value(result.output)))
-    return delta
+        result_paths = _state_paths(_json_value(result.output))
+        if not result_paths:
+            continue
+        tool_call_id = str(result.arguments.get("tool_call_id") or "") or None
+        call = call_by_tool_call_id.get(tool_call_id) if tool_call_id else None
+        if call is None:
+            same_tool = calls_by_tool.get(result.name, [])
+            call = same_tool[0] if len(same_tool) == 1 else None
+        if call is None:
+            # Cannot even identify which call this reaction answers -- do not
+            # guess an entity prefix, which risks silently attributing a
+            # field to the wrong reservation/user. This is mutation evidence
+            # that exists but could not be correlated -- UNAVAILABLE, not
+            # NOT_APPLICABLE (which means no such evidence existed at all).
+            had_uncorrelatable_evidence = True
+            continue
+        prefix = _entity_prefix(call.tool, call.arguments)
+        for path, value in result_paths.items():
+            reported[f"{prefix}.{path}"] = value
+
+    if not reported:
+        if had_uncorrelatable_evidence:
+            return {}, DeltaGroundTruthStatus.UNAVAILABLE, ()
+        return {}, DeltaGroundTruthStatus.NOT_APPLICABLE, ()
+
+    delta: dict[str, Any] = {}
+    unmatched: list[str] = []
+    for path, new_value in reported.items():
+        known = state_before.get(path)
+        if known is None:
+            unmatched.append(path)
+        elif known.value != new_value:
+            delta[path] = new_value
+
+    if unmatched:
+        # Conservative by design, even when some fields WERE confirmed
+        # changed: a partial delta is not the same claim as a complete one.
+        # If any reported field could not be aligned, that unmatched field
+        # might be exactly the one this action actually changed, so
+        # "inferred_state_delta holds every real mutation" cannot be
+        # asserted -- only "these fields definitely changed, and there may be
+        # more we can't see." Scoring delta_correct against a partial delta
+        # would penalise a predictor for reporting a real change ground truth
+        # simply failed to capture.
+        return {}, DeltaGroundTruthStatus.UNAVAILABLE, tuple(unmatched)
+
+    return delta, DeltaGroundTruthStatus.MEASURED, tuple(unmatched)
 
 
 def cut_points(trace: Trace) -> tuple[str, ...]:

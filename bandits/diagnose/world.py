@@ -65,8 +65,33 @@ Rules:
 - Enforce the tool's own preconditions, not the agent's policy. If the tool
   would execute a call the agent should not have made, execute it. Judging the
   agent is the verifier's job, and refusing on its behalf hides the mistake.
-- If the retrieved evidence does not determine the outcome, ABSTAIN. Say so in
-  `support.level: "none"`. A plausible invention is worse than no answer.
+- If the retrieved evidence does not determine the outcome, ABSTAIN. Say so by
+  setting `abstain: true` and `support: "none"`. A plausible invention is
+  worse than no answer.
+
+OUTPUT SHAPE -- this is a strict contract, not a description to paraphrase.
+
+`call_outcomes` is a list with exactly one entry per call id shown in ACTION,
+using that exact call id. Every entry has this shape, with no other keys:
+    {"call_id": "<exactly the id from ACTION>", "executed": true,
+     "observation": <the tool's result for this call, any JSON value>,
+     "error": false, "state_delta": [...], "events": [...],
+     "evidence_ids": ["<ids from EVIDENCE this outcome is grounded in>"]}
+Do not put business fields (like "reservation_id" or "status") directly on a
+call_outcome -- they belong inside its "observation" or "state_delta".
+
+`state_delta` (both at the top level and inside a call_outcome) is a list of
+path operations, one per changed field, each shaped exactly like:
+    {"path": "<tool>.<entity_id>.<field>", "old_value": <value before, or null
+     if unknown>, "new_value": <value after>}
+Never put a whole business object as one state_delta entry. Only include a
+field here if the action actually changed it -- an unchanged field is not a
+delta, even if it also appears in "observation".
+
+If ACTION named exactly one call and you are not using call_outcomes for it,
+you may instead answer with the top-level `observation`/`state_delta`/`events`
+fields directly (the aggregate form) -- but never fill in both call_outcomes
+and the top-level fields for the same action.
 
 Return only the required structured fields."""
 
@@ -154,6 +179,17 @@ class ProposedTransition(Contract):
     evidence_ids: tuple[str, ...] = ()
     abstain: bool = False
     abstain_reason: str = ""
+    output_invalid: bool = False
+    """The model attempted an answer that did not fit this contract.
+
+    Distinct from ``abstain``: abstention is the model saying it lacks
+    evidence, this is the model saying something else entirely that _coerce
+    could not parse into ProposedCallOutcome/StateDelta shapes. Conflating the
+    two hides a parser/prompt defect behind a metric that looks epistemic.
+    """
+
+    output_invalid_errors: tuple[str, ...] = ()
+    """Raw validation errors from the failed parse, for diagnosis."""
 
     @model_validator(mode="after")
     def abstention_proposes_nothing(self) -> ProposedTransition:
@@ -188,6 +224,18 @@ class ValidationOutcome(Contract):
     output_schema_validation: dict[
         str, Literal["validated", "unavailable", "invalid"]
     ] = Field(default_factory=dict)
+
+    committed_observations: dict[str, Any] = Field(default_factory=dict)
+    """The accepted per-call observation, keyed by call_id.
+
+    The one canonical mapping from a submitted call to what the environment
+    said it returned -- batch (call_outcomes) and aggregate (single-call
+    top-level observation) forms both normalize into this same shape here, so
+    a caller (fidelity scoring, a rollout) never has to re-derive which model
+    field corresponds to which call. A call with no call_id (an unbatched
+    single call the source never assigned one to) is keyed by its tool name
+    instead, since it is unambiguous only when exactly one such call exists.
+    """
 
 
 def _tool_contract(
@@ -302,8 +350,18 @@ def render_state(state: ScenarioState, *, limit: int = 80) -> str:
 
 
 def render_action(calls: Sequence[ActionCall], content: Any = None) -> str:
+    """Each call rendered with its call_id, when it has one.
+
+    A batched call_outcome must cite the exact call_id it answers (D70/the
+    validator's own unanswered-call check), so that id has to be visible here
+    -- a predictor asked to echo an id it was never shown can only guess one.
+    """
     parts = [
-        f"{call.tool}({json.dumps(call.arguments, sort_keys=True, default=str)})" for call in calls
+        f"call_id={call.call_id} tool={call.tool} "
+        f"arguments={json.dumps(call.arguments, sort_keys=True, default=str)}"
+        if call.call_id is not None
+        else f"{call.tool}({json.dumps(call.arguments, sort_keys=True, default=str)})"
+        for call in calls
     ]
     if content:
         parts.append(f'(said: "{str(content)[:400]}")')
@@ -353,6 +411,12 @@ def validate_transition(
     """
     rejections: list[str] = []
 
+    if proposal.output_invalid:
+        return ValidationOutcome(
+            accepted=False,
+            rejections=("the environment's output did not fit the transition contract",)
+            + proposal.output_invalid_errors,
+        )
     if proposal.abstain:
         return ValidationOutcome(accepted=False, rejections=("the environment abstained",))
 
@@ -361,6 +425,7 @@ def validate_transition(
     executed_call_ids: tuple[str, ...] = ()
     committed_call_ids: tuple[str, ...] = ()
     canonical_events: tuple[dict[str, Any], ...] = ()
+    committed_observations: dict[str, Any] = {}
     schema_validation: dict[str, str] = {}
     if proposal.call_outcomes:
         outcome_ids = [outcome.call_id for outcome in proposal.call_outcomes]
@@ -422,6 +487,9 @@ def validate_transition(
                 )
             ),
         )
+        committed_observations = {
+            outcome.call_id: outcome.observation for outcome in proposal.call_outcomes
+        }
         for call_outcome in proposal.call_outcomes:
             call = call_by_id.get(call_outcome.call_id)
             if call is None:
@@ -461,7 +529,23 @@ def validate_transition(
             executed_call_ids = tuple(call.call_id for call in calls if call.call_id)
             if proposal.state_delta or proposal.events:
                 committed_call_ids = executed_call_ids
+        if len(calls) > 1:
+            # The aggregate top-level observation answers exactly one call.
+            # This branch is reached by a genuine batch (multiple calls, no
+            # call_outcomes, no aggregate effects either) that never said
+            # which call the aggregate observation belongs to -- attributing
+            # it to calls[0] would be a guess, and D70's own "every call must
+            # be answered" rule already implies the others got no answer at
+            # all. Reject explicitly rather than mis-key.
+            rejections.append(
+                "a batched action with no call_outcomes cannot use the aggregate "
+                "single-call observation form -- it does not say which call it answers"
+            )
         identity = calls[0].call_id
+        # The aggregate form's single top-level observation answers the one
+        # submitted call (guaranteed unique here: the multi-call case above
+        # just rejected). Key by its call_id when it has one, else its tool.
+        committed_observations = {(identity or calls[0].tool): proposal.observation}
         canonical_event_list: list[dict[str, Any]] = []
         for event in proposal.events:
             supplied = event.get("_call_id")
@@ -559,6 +643,7 @@ def validate_transition(
         committed_call_ids=committed_call_ids,
         events=canonical_events,
         output_schema_validation=schema_validation,
+        committed_observations=committed_observations,
     )
 
 
@@ -570,25 +655,69 @@ def commit(state: ScenarioState, committed: Sequence[StateField]) -> ScenarioSta
     return ScenarioState(fields=tuple(fields.values()))
 
 
-def _coerce(payload: Any, model: type[Contract]) -> Any:
-    """Read a predictor's answer into the contract, abstaining if it will not fit.
+class _CoerceFailure:
+    """Payload existed but did not fit the contract -- distinct from nothing at all.
 
-    A malformed answer is an abstention, never a guess. Salvaging a partial
-    structured response is how a simulator starts committing fields the model
-    never actually asserted.
+    Carries the raw validation errors so a caller can report *why* parsing
+    failed instead of collapsing every failure into one unexplained abstention.
+    """
+
+    def __init__(self, errors: tuple[str, ...]) -> None:
+        self.errors = errors
+
+
+def _coerce(payload: Any, model: type[Contract]) -> Any:
+    """Read a predictor's answer into the contract.
+
+    Returns the parsed model on success, ``None`` when there was truly nothing
+    to parse (no payload, or a string that isn't even JSON), or a
+    ``_CoerceFailure`` carrying the validation errors when a real payload
+    existed but did not fit the contract's shape. Callers must not treat the
+    latter as an abstention: the model attempted an answer, and salvaging a
+    partial structured response would let it commit fields it never actually
+    asserted, but silently discarding the attempt as "no answer" hides a
+    prompt/parser defect behind a metric that looks epistemic.
     """
     if isinstance(payload, model):
         return payload
-    try:
-        if isinstance(payload, str):
+    if not payload:
+        # Nothing was returned at all -- this alone is "no answer," never a
+        # malformed one.
+        return None
+
+    if isinstance(payload, str):
+        try:
             payload = json.loads(payload)
-        if hasattr(payload, "model_dump"):
-            payload = payload.model_dump()
-        if isinstance(payload, dict):
-            return model.model_validate(payload)
-    except (TypeError, ValueError):
-        pass
-    return None
+        except (TypeError, ValueError) as exc:
+            # A non-empty string that isn't even valid JSON is an attempted
+            # answer that failed to parse -- distinct from no answer at all.
+            return _CoerceFailure((f"response was not valid JSON: {exc}",))
+    elif hasattr(payload, "model_dump"):
+        payload = payload.model_dump()
+    elif hasattr(payload, "toDict"):
+        # dspy.Prediction (returned by dspy.Predict) is not a pydantic model
+        # and has no model_dump -- without this branch every real prediction
+        # fell straight through to `return None` below, silently misreported
+        # as "the model returned nothing" (which step_tool_world reads as an
+        # abstention) regardless of what the model actually said.
+        payload = payload.toDict()
+
+    if not isinstance(payload, dict):
+        # Parsed to something real (a JSON array, a bare scalar, ...) but not
+        # a shape that could ever fit the contract -- attempted, not absent.
+        return _CoerceFailure((f"response parsed to {type(payload).__name__}, expected an object",))
+    try:
+        return model.model_validate(payload)
+    except (TypeError, ValueError) as exc:
+        detail = getattr(exc, "errors", None)
+        if callable(detail):
+            errors = tuple(
+                f"{'.'.join(str(p) for p in err.get('loc', ()))}: {err.get('msg', '')}"
+                for err in exc.errors()
+            )
+        else:
+            errors = (str(exc),)
+        return _CoerceFailure(errors)
 
 
 def step_tool_world(
@@ -623,13 +752,23 @@ def step_tool_world(
         action=render_action(calls, content),
         evidence=render_evidence(examples),
     )
-    proposal = _coerce(raw, ProposedTransition)
-    if proposal is None:
+    coerced = _coerce(raw, ProposedTransition)
+    if isinstance(coerced, _CoerceFailure):
+        # The model attempted an answer; it just didn't fit the contract.
+        # This is a parse/prompt failure, not the model declining to answer,
+        # and must not be scored as an abstention.
+        return ProposedTransition(
+            output_invalid=True,
+            output_invalid_errors=coerced.errors,
+            support=SupportLevel.NONE,
+        )
+    if coerced is None:
         return ProposedTransition(
             abstain=True,
             abstain_reason="the world model returned nothing that fit the transition contract",
             support=SupportLevel.NONE,
         )
+    proposal = coerced
 
     retrieved = SupportLevel(found)
     order = [SupportLevel.NONE, SupportLevel.LOW, SupportLevel.MEDIUM, SupportLevel.HIGH]
@@ -660,13 +799,18 @@ def step_user_policy(
         message=message,
         evidence=render_evidence(examples) if examples else "(no example turns retrieved)",
     )
-    turn = _coerce(raw, ProposedUserTurn)
-    if turn is None:
+    coerced = _coerce(raw, ProposedUserTurn)
+    if not isinstance(coerced, ProposedUserTurn):
+        # ProposedUserTurn carries no output_invalid distinction yet (D23's
+        # user-policy fidelity work is separate scope); a failed parse -- gate
+        # or contract mismatch -- still reads as abstention here rather than
+        # crashing on a _CoerceFailure, but see world.py's ProposedTransition
+        # for the taxonomy this should eventually get too.
         return ProposedUserTurn(
             abstain=True,
             abstain_reason="the user policy returned nothing that fit the contract",
         )
-    return turn
+    return coerced
 
 
 def build_tool_world_predictor(
@@ -694,13 +838,18 @@ def build_tool_world_predictor(
     class _Transition(dspy.Signature):
         state: str = dspy.InputField(desc="what is currently known about the world")
         history: str = dspy.InputField(desc="the conversation so far")
-        action: str = dspy.InputField(desc="the call the agent just made")
+        action: str = dspy.InputField(desc="the call the agent just made, with its call_id")
         evidence: str = dspy.InputField(desc="real recorded transitions from this system")
-        observation: dict = dspy.OutputField()
-        call_outcomes: list[dict] = dspy.OutputField(
-            desc="one independently grounded result per call id; required for batches"
+        observation: dict = dspy.OutputField(
+            desc="only for the single-call aggregate form; leave {} when using call_outcomes"
         )
-        state_delta: list[dict] = dspy.OutputField()
+        call_outcomes: list[ProposedCallOutcome] = dspy.OutputField(
+            desc="exactly one entry per call_id shown in ACTION, using that exact call_id; "
+            "leave empty [] only when answering via the aggregate observation/state_delta form"
+        )
+        state_delta: list[StateDelta] = dspy.OutputField(
+            desc="top-level aggregate form only; leave [] when using call_outcomes"
+        )
         events: list[dict] = dspy.OutputField()
         terminal: bool = dspy.OutputField()
         support: str = dspy.OutputField(desc="high, medium, low, or none")

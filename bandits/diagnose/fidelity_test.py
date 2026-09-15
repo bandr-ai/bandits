@@ -11,6 +11,7 @@ from bandits.diagnose.fidelity import (
 )
 from bandits.diagnose.models import (
     ActionCall,
+    DeltaGroundTruthStatus,
     GroundingObservation,
     GroundingTransition,
     HiddenUserProfile,
@@ -18,7 +19,12 @@ from bandits.diagnose.models import (
     SupportLevel,
 )
 from bandits.diagnose.retrieve import RetrievedExample
-from bandits.diagnose.world import ProposedTransition, ProposedUserTurn, StateDelta
+from bandits.diagnose.world import (
+    ProposedCallOutcome,
+    ProposedTransition,
+    ProposedUserTurn,
+    StateDelta,
+)
 
 
 def test_list_contents_are_compared_not_only_their_lengths() -> None:
@@ -90,11 +96,279 @@ def _transition(tid: str, *, before: ScenarioState = ScenarioState(), value="can
         ),
         state_before=before,
         inferred_state_delta={"reservations.ABC.status": value},
+        delta_ground_truth_status=DeltaGroundTruthStatus.MEASURED,
     )
 
 
 def _example(transition: GroundingTransition) -> RetrievedExample:
     return RetrievedExample(transition=transition, score=1.0, reasons=("exact_tool",))
+
+
+def _batched_transition(tid: str, *, call_ids: tuple[str, ...]) -> GroundingTransition:
+    """A transition whose action batched len(call_ids) calls to the same tool,
+    each with its own recorded tool_call_id-correlated observation."""
+    return GroundingTransition(
+        transition_id=tid,
+        trace_id=f"trace-{tid}",
+        family_id="family",
+        turn_index=0,
+        action_span_id=f"span-{tid}",
+        action_calls=tuple(
+            ActionCall(call_id=cid, tool="cancel_reservation", arguments={"reservation_id": cid})
+            for cid in call_ids
+        ),
+        observations=tuple(
+            GroundingObservation(
+                role="tool",
+                tool_name="cancel_reservation",
+                tool_call_id=cid,
+                content={"reservation_id": cid, "status": "cancelled"},
+            )
+            for cid in call_ids
+        ),
+        state_before=ScenarioState(),
+    )
+
+
+def _batched_predictor_response(
+    outcomes: tuple[ProposedCallOutcome, ...]
+) -> ProposedTransition:
+    return ProposedTransition(call_outcomes=outcomes, support=SupportLevel.HIGH)
+
+
+def test_single_call_field_accuracy_compares_the_committed_observation() -> None:
+    """The regression this whole correlation path exists for: a model that
+    correctly used the batch call_outcomes form for a single call must still
+    be scored against what it actually said, not against the (correctly
+    empty) top-level proposal.observation."""
+    transition = _batched_transition("single", call_ids=("call-1",))
+
+    def predictor(**_):
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-1",
+                    observation={"reservation_id": "call-1", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    result = score_transition_fidelity(
+        transition, predictor, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    assert result.field_accuracy == 1.0
+    assert result.unmatched_call_observations == ()
+
+
+def test_reordered_batch_still_correlates_by_call_id() -> None:
+    """Calls answered out of order must still pair with the right recorded
+    observation -- correlation is by call_id, never by position."""
+    transition = _batched_transition("reordered", call_ids=("call-A", "call-B"))
+
+    def predictor(**_):
+        # Outcomes deliberately returned in reverse order.
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-B",
+                    observation={"reservation_id": "call-B", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+                ProposedCallOutcome(
+                    call_id="call-A",
+                    observation={"reservation_id": "call-A", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    result = score_transition_fidelity(
+        transition, predictor, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    assert result.field_accuracy == 1.0
+    assert result.unmatched_call_observations == ()
+
+
+def test_partial_batch_scores_matched_calls_and_flags_the_rest() -> None:
+    """A batch where only some calls got an outcome: the validator rejects
+    this outright (D70 -- every submitted call must be answered), so fidelity
+    must see a validator rejection, not a partial/guessed score."""
+    transition = _batched_transition("partial", call_ids=("call-A", "call-B"))
+
+    def predictor(**_):
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-A",
+                    observation={"reservation_id": "call-A", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    result = score_transition_fidelity(
+        transition, predictor, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    assert result.validator_rejected is True
+    assert result.fields == ()
+
+
+def test_batch_status_correctness_is_per_call_not_aggregate() -> None:
+    """A batch where call-A actually errored and call-B did not: a prediction
+    that swaps which call errored must be scored wrong, even though "an error
+    happened somewhere in the batch" is true on both sides. Aggregating
+    error_predicted/error_recorded across the whole batch (the old behaviour)
+    could not detect this -- both sides say "yes, one call errored" and the
+    comparison passes despite attributing the failure to the wrong call.
+    """
+    transition = GroundingTransition(
+        transition_id="swapped-error",
+        trace_id="trace-swapped-error",
+        family_id="family",
+        turn_index=0,
+        action_span_id="span-swapped-error",
+        action_calls=(
+            ActionCall(call_id="call-A", tool="cancel_reservation", arguments={"reservation_id": "A"}),
+            ActionCall(call_id="call-B", tool="cancel_reservation", arguments={"reservation_id": "B"}),
+        ),
+        observations=(
+            GroundingObservation(
+                role="tool", tool_name="cancel_reservation", tool_call_id="call-A",
+                content={"reservation_id": "A", "status": "error"}, error=True,
+            ),
+            GroundingObservation(
+                role="tool", tool_name="cancel_reservation", tool_call_id="call-B",
+                content={"reservation_id": "B", "status": "cancelled"},
+            ),
+        ),
+        state_before=ScenarioState(),
+    )
+
+    def predictor(**_):
+        # Swapped: predicts B errored and A succeeded -- the reverse of what
+        # actually happened.
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-A",
+                    observation={"reservation_id": "A", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+                ProposedCallOutcome(
+                    call_id="call-B",
+                    observation={"reservation_id": "B", "status": "error"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    result = score_transition_fidelity(
+        transition, predictor, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    assert result.unmatched_call_observations == ()
+    assert result.status_correct is False
+
+
+def test_recorded_error_flag_counts_even_without_an_error_shaped_payload() -> None:
+    """A recorded observation can be flagged error=True while its payload
+    looks perfectly fine (no "error" key, no "error"-prefixed string) -- the
+    source system's own error signal, not the payload shape, is authoritative.
+    A prediction that (correctly, per the actual recorded outcome) also
+    predicts an error must be scored right; one that predicts success must be
+    scored wrong, in both cases driven by the .error flag, not just content.
+    """
+    transition = GroundingTransition(
+        transition_id="silent-error",
+        trace_id="trace-silent-error",
+        family_id="family",
+        turn_index=0,
+        action_span_id="span-silent-error",
+        action_calls=(
+            ActionCall(call_id="call-1", tool="cancel_reservation", arguments={"reservation_id": "X"}),
+        ),
+        observations=(
+            GroundingObservation(
+                role="tool",
+                tool_name="cancel_reservation",
+                tool_call_id="call-1",
+                # error=True but the payload itself doesn't look like an
+                # error at all -- no "error" key, no "error"-prefixed string.
+                content={"reservation_id": "X", "status": "pending"},
+                error=True,
+            ),
+        ),
+        state_before=ScenarioState(),
+    )
+
+    def predicts_success(**_):
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-1",
+                    observation={"reservation_id": "X", "status": "pending"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    result = score_transition_fidelity(
+        transition, predicts_success, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    # The predicted payload doesn't look like an error and the model never
+    # flagged one -- but the recorded call DID error (per its .error flag),
+    # so this must be scored wrong, not right.
+    assert result.status_correct is False
+
+
+def test_unmatched_call_id_is_flagged_not_silently_dropped() -> None:
+    """An outcome citing a call_id the validator never even sees matched to a
+    recorded observation (mismatched ids on both sides) must show up as
+    unmatched, never silently vanish from field accuracy."""
+    transition = _batched_transition("unmatched", call_ids=("call-A", "call-B"))
+
+    def predictor(**_):
+        # Outcome call_ids match the submitted calls (so the validator
+        # accepts), but the recorded side's tool_call_id for one of them is
+        # deliberately absent from this transition's own observations by
+        # construction below.
+        return _batched_predictor_response(
+            (
+                ProposedCallOutcome(
+                    call_id="call-A",
+                    observation={"reservation_id": "call-A", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+                ProposedCallOutcome(
+                    call_id="call-B",
+                    observation={"reservation_id": "call-B", "status": "cancelled"},
+                    evidence_ids=("support",),
+                ),
+            )
+        )
+
+    # Rebuild the transition with call-B's recorded observation missing its
+    # tool_call_id, so the correlator cannot pair it despite the validator
+    # accepting the proposal (both submitted calls got an outcome).
+    broken = transition.replace(
+        observations=(
+            transition.observations[0],
+            transition.observations[1].replace(tool_call_id=None),
+        )
+    )
+
+    result = score_transition_fidelity(
+        broken, predictor, examples=(_example(transition.replace(transition_id="support")),)
+    )
+    assert result.validator_rejected is False
+    assert "call-B" in result.unmatched_call_observations
+    assert "call-A" not in result.unmatched_call_observations
+    # Incomplete correlation makes the WHOLE transition unscorable, not a
+    # partial score over call-A alone: reporting call-A's fields as if they
+    # were the transition's field_accuracy would hide that call-B was never
+    # scored at all.
+    assert result.fields == ()
+    assert result.status_correct is None
 
 
 def test_delta_fidelity_compares_values_not_only_paths() -> None:

@@ -14,6 +14,7 @@ work without running it; everything below is measured, not asserted.
 | S9 | Record what the green suite did not cover | D68–D74; I8 held open, I31–I34 opened |
 | S10 | User ratifies v4 and sets Q13–Q15 | Explicit projections; legacy ids pinned; input validation is a Gate 0 blocker |
 | S11 | Close I31, I33, D72, I32, I34 in that order | 919 passed, 0 failed; each closed by an executed check |
+| S12 | First real-model fidelity run (`scripts/run_awm_fidelity.py`, DeepSeek V4 Flash) against the pinned tau2 family; ten defects found and fixed as they blocked interpretation | 932 passed, 0 failed; one held-out transition scored correctly end to end (`field_accuracy=1.0`) |
 
 ## Evidence
 
@@ -102,6 +103,71 @@ docstring in `compile_test.py:40` recording D36's provenance. Every diagnose tes
 on fixtures. D36 said a fixture is a claim about the data and an unverified claim is as
 wrong as unverified code — that rule is currently satisfied by comment, not by a test.
 
+### E33. `_coerce` never handled a real DSPy prediction; every real model answer read as abstention.
+
+`build_tool_world_predictor` returns `dspy.Predict(...)`'s result, a `dspy.Prediction`
+object. `_coerce` only handled `isinstance(payload, model)`, a JSON string, or
+`hasattr(payload, "model_dump")`. `dspy.Prediction` has none of these — it exposes
+`toDict()`, not `model_dump()` — so every real prediction fell straight through to
+`return None`, which `step_tool_world` reports as abstention regardless of what the model
+actually said. Measured directly: `hasattr(dspy.Prediction(...), "model_dump")` is `False`;
+the first two live runs (Nemotron, DeepSeek) both logged `abstain=false` in the raw model
+response and `abstained=true` in the scored `TransitionFidelity`, a contradiction that
+traces to this one gap.
+
+### E34. Malformed structured output and abstention shared one code path.
+
+Once E33 was fixed, DeepSeek's response parsed far enough to reach `ProposedTransition`
+validation and still failed it: `call_outcomes` items carried business fields
+(`reservation_id`, `status`) directly rather than the `{call_id, executed, observation,
+state_delta, ...}` shape, because the DSPy signature declared `call_outcomes: list[dict]`
+with only a natural-language `desc=`, giving the model no actual nested schema.
+`_coerce`'s `except (TypeError, ValueError): pass` swallowed the six resulting pydantic
+errors and returned `None`, again read as abstention. A model that attempted a
+well-reasoned answer and a model that declined outright were indistinguishable downstream.
+
+### E35. `inferred_state_delta` was every reported field, not a diff.
+
+`compile._delta()` updated a dict with every reported field's post-action value and never
+consulted `state_before`. Measured against the real corpus: the target family's own
+`cancel_reservation` transitions reported ~14 fields including `origin`, `cabin`, and
+`passenger.length`, none of which the cancellation changed — only `status` and
+`payment_history` did. `delta_correct` was therefore comparing a prediction against a
+ground truth that was mostly unrelated context.
+
+### E36. Confirmed mutations require entity-prefixed path alignment, which mostly does not exist in this family.
+
+Fixing E35 to diff against `state_before` exposed a second problem: `state_before`'s paths
+are entity-prefixed by `_entity_prefix` (`<tool>.<entity_id>.<field>`, from
+`reconstruct_state`), but `_delta`'s reported paths were bare field names. Even after
+prefixing reactions the same way, a mutation crossing tools — `get_reservation_details.X.status`
+(read) vs `cancel_reservation.X.status` (write) — never aligns, because the two calls use
+different tool prefixes for the same entity field. Measured: every one of the 371
+transitions in the pinned family now reports `delta_ground_truth_status` of either
+`not_applicable` (252) or `unavailable` (119) — zero `measured`. Delta ground truth is
+currently unmeasurable for this entire family without a reviewed tau2 entity-path
+canonicalizer, which does not exist (D26/D27's fail-closed rule: an unreviewed mapping is
+not built here).
+
+### E37. Fidelity scored the wrong observation representation for the batch form.
+
+`score_transition_fidelity` diffed `proposal.observation` — the top-level aggregate field —
+against the recorded result. A model using the (D67-sanctioned) batch `call_outcomes` form
+correctly leaves that top-level field empty (`{}`) and puts its actual answer inside
+`call_outcomes[i].observation`. Measured on the real DeepSeek run: the model's per-call
+observation was a near-exact match to the recorded cancellation, but `field_accuracy` scored
+`0.0` because the comparison was against the deliberately-empty top-level field. The correct
+comparison target is `validate_transition`'s own canonical, call-correlated result — the same
+one the runtime would commit — not a field the caller re-derives independently.
+
+### E38. Batch status accuracy aggregated "did any call error" instead of comparing per call.
+
+`status_correct` was `error_predicted == error_recorded`, each an `any()` over every call in
+a batch. Constructed case: call A actually errors and call B does not; a prediction that
+swaps which call errored (B errors, A succeeds) produces `error_predicted=True,
+error_recorded=True` and scores correct, despite attributing the failure to the wrong call
+entirely.
+
 ## Decisions
 
 ### D68. A contract field must not reach an artifact by default. **Decided**
@@ -179,6 +245,102 @@ implementation session believed were closed.
 No issue moves to `FIXED` on implementation. It moves on a named executed check. I8
 stays open until D70 and D71 land with tests.
 
+### D75. A parseable-but-malformed answer is a distinct outcome from abstention. **Decided**
+
+From E33/E34. `ProposedTransition` gains `output_invalid: bool` and
+`output_invalid_errors: tuple[str, ...]`. `_coerce` returns three distinguishable things:
+`None` only when nothing was returned at all (empty/absent payload); the parsed contract on
+success; a new `_CoerceFailure` carrying the raw validation errors when a real, non-empty
+payload existed but did not fit the contract (invalid JSON, wrong shape, or a schema
+mismatch). `step_tool_world` and `validate_transition` both check `output_invalid` before
+`abstain`. `TransitionFidelity` and `FidelityReport` carry the same split:
+`model_output_invalid_rate` is now a first-class metric, disjoint from
+`abstention_rate`/`wrong_abstention_rate` and from `validation_rejection_rate` (an
+output-invalid row never reaches `validate_transition` and does not set
+`validator_rejected` — that flag means the runtime specifically refused a parseable
+proposal, which did not happen here).
+
+This is the same shape as D27: an abstention is honest behavior the design asks for, and
+counting a parser defect against it would teach the wrong lesson twice — once by hiding the
+defect, once by penalizing legitimate declining as if it were the defect.
+
+### D76. Fidelity compares the validator's canonical, call-correlated result — never a field the scorer re-derives. **Decided**
+
+From E37/E38. `ValidationOutcome` gains `committed_observations: dict[str, Any]`, keyed by
+call_id (or tool name only when the sole submitted call has no call_id). Both the batch
+(`call_outcomes`) and aggregate (single-call top-level) forms normalize into this same
+mapping inside `validate_transition`, so a caller never re-derives which model field answers
+which call. `score_transition_fidelity` correlates each recorded `GroundingObservation` to
+its `committed_observations` entry by `tool_call_id`/`call_id` (falling back to positional
+pairing only in the unambiguous single-call, single-observation, single-committed-result
+case — real tau2 data frequently omits `tool_call_id` even for unbatched calls). A batched
+action reaching the aggregate top-level form with more than one call is rejected outright
+(new validator check): attributing an unlabeled aggregate observation to `calls[0]` would be
+a guess the design forbids elsewhere (D53/D70).
+
+Status correctness (`status_correct`) is computed per correlated call and required to hold
+for every pair, not aggregated across the batch — E38's swapped-error case is exactly what
+an aggregate `any()` comparison cannot catch. The recorded side of a correlated pair keeps
+the full `GroundingObservation`, not just its `.content`: a call flagged `error=True` whose
+payload does not itself look like an error (no `"error"` key, no `"error"`-prefixed string)
+must still score as an error, driven by the recorded provenance rather than payload shape
+alone.
+
+Incomplete correlation — any submitted call whose recorded observation could not be paired —
+makes the *entire* transition's field/status accuracy unscorable (`fields=()`,
+`status_correct=None`), not a partial score over whichever calls happened to match. A
+two-call batch where one call correlates perfectly must not report `field_accuracy=1.0`
+while the other call goes unscored and invisible; `unmatched_call_observations` names which
+calls are missing so the gap is visible rather than silently shrinking what "1.0" claims to
+cover.
+
+### D77. `inferred_state_delta` carries an explicit ground-truth status, and reports only what before/after comparison actually established. **Decided**
+
+From E35/E36. `compile._delta()` now diffs a reaction's reported fields against
+`state_before`, entity-prefixed the same way `reconstruct_state` prefixes state (correlating
+each reaction to the specific call it answers by `tool_call_id`, falling back to the sole
+call of that tool only when unambiguous — never a bare positional guess). A field counts as
+a confirmed mutation only when the pre-action value was known and differs from the
+post-action value.
+
+`GroundingTransition` gains `delta_ground_truth_status: DeltaGroundTruthStatus` (`measured`,
+`unavailable`, `not_applicable`) and `unmatched_post_paths: tuple[str, ...]`. An empty
+`inferred_state_delta` is ambiguous on its own — "verified no-op" and "could not compare
+anything" are different facts — so the status makes the distinction explicit rather than
+collapsing both into `{}`:
+
+- `measured`: at least one field was compared and none were left unmatched. A `measured`
+  delta with zero entries is a genuine verified no-op.
+- `unavailable`: some reported field could not be aligned to any `state_before` path
+  (typically a cross-tool prefix mismatch, E36) — conservatively applied even when other
+  fields in the same reaction WERE confirmed changed, since a partial delta is not the same
+  claim as a complete one, and the unmatched field might be exactly the one that changed.
+  Also applied when a reaction reported real structured content but could not be correlated
+  to any submitted call at all (an ambiguous batch, e.g. two calls to the same tool with no
+  `tool_call_id` on either side) — mutation evidence existed, it simply could not be used,
+  which is a different fact from no evidence existing.
+- `not_applicable`: no reaction reported any comparable structured content at all.
+
+`delta_correct` and `multi_step_drift`'s per-step `expected` state are both gated on
+`delta_ground_truth_status is MEASURED`; an `unavailable`/`not_applicable` row contributes
+`delta_correct=None` (excluded from `delta_accuracy`) rather than being scored against an
+empty dict that looks identical to a real no-op. `multi_step_drift` additionally scores only
+the paths `expected` has an opinion on for that step — `state.fields` is cumulative across
+all prior steps, and scoring the union with `expected` penalized a predictor for any
+self-consistent path `expected` was silent on, including that step's own unmeasurable delta.
+`FidelityReport` gains `delta_ground_truth_coverage`, reported beside `delta_accuracy` always
+— on the pinned family this measures `0.0`: delta fidelity is not yet a usable metric here,
+which is the honest result E36 established, not a bug to paper over.
+
+### D78. `predicted_delta` compares the validator's committed result, not the proposal's raw aggregate field. **Decided**
+
+A narrower instance of D76's principle, called out separately because it was found and
+fixed after D76 landed: `score_transition_fidelity` computed `predicted_delta` from
+`proposal.state_delta`, the same top-level aggregate field E37 already identified as
+deliberately empty under the batch form. `predicted_delta` now reads
+`validation.committed` — the validator's own flattened, accepted result — so `delta_correct`
+compares the same representation for both the batch and aggregate encodings.
+
 ## Issues opened
 
 - **I31** (P0): incomplete and zero-outcome batches accepted; execution fabricated from
@@ -187,6 +349,16 @@ stays open until D70 and D71 land with tests.
 - **I33** (P1): `ToolSchema` fields leak into four artifact payloads via bare
   `model_dump()`. E27/E28 → D68, D69.
 - **I34** (P2): no real-artifact tau2 smoke test. E32 → D73.
+- **I35** (P0): `_coerce` cannot parse a real `dspy.Prediction`; every real model answer
+  silently read as abstention. E33 → D75.
+- **I36** (P0): malformed structured output collapses into abstention, hiding a
+  prompt/parser defect behind a metric that looks epistemic. E34 → D75.
+- **I37** (P0): fidelity's observation/status comparison used the wrong (uncorrelated,
+  aggregate-only) representation, and batch status aggregated across calls instead of
+  comparing per call. E37/E38 → D76, D78.
+- **I38** (P1): `inferred_state_delta` was every reported field, not a diff, and even after
+  diffing, cross-tool path prefixes leave the pinned family's delta ground truth entirely
+  unmeasurable. E35/E36 → D77.
 
 I8 remains **OPEN** (was `IMPLEMENTED; AWAITING VERIFICATION`). Its output-schema,
 event-provenance, and cross-call-matching claims are verified and hold; its per-call
@@ -284,6 +456,48 @@ D72 was the stated Gate 0 blocker and is closed. Per S10's condition -- no real
 AWM/candidate experiments until I31, D72, and I32 are closed by executed checks -- that
 condition is now met.
 
+## S12 — first real-model fidelity run, ten defects found and fixed by running it
+
+`scripts/run_awm_fidelity.py` is the thin orchestration layer D65 deferred: load the pinned
+tau2 family, build the fit-only index, select a stratified held-out sample, call a real
+Fireworks-backed AWM through `build_tool_world_predictor`, score with
+`score_transition_fidelity`, checkpoint every raw model response/proposal/validator result,
+and print the aggregate report. No GEPA, no candidate rollouts -- the first question was
+narrower: does the real-model path even function, and is one real prediction trustworthy.
+
+It was not, four times over, before it was. Two live single-transition runs (Nemotron
+Lightning 3.5, then DeepSeek V4 Flash 0731) against the real `cancel_reservation`
+transition `transition-06c1350d8743` both scored `abstained=true` despite the raw model
+response showing `abstain=false` -- E33. Fixing that exposed E34 (malformed output still
+read as abstention), which exposed a genuine model answer whose *content* was already
+correct -- DeepSeek's observation matched the recorded cancellation on all 36 compared
+fields, including the reversed gift-card refund -- but which the fidelity scorer still
+reported as `field_accuracy=0.0` for an unrelated reason (E37: comparing the wrong
+representation). Fixing E37 surfaced E38 (batch status aggregation) and prompted an audit
+of `predicted_delta` that found D78's instance of the same class of bug. In parallel, D77's
+work on `inferred_state_delta` (E35/E36) found that entity-path prefixes make delta ground
+truth currently unmeasurable for the whole pinned family -- a real, reportable limit rather
+than a code defect.
+
+Every fix was verified against the real corpus or replayed against the real saved model
+response (`work/awm-fidelity/baseline-fixed2.raw.jsonl`, gitignored scratch output, not
+committed) -- zero additional model spend beyond the two live calls. Final replay after all
+six fixes: `status_correct=True, field_accuracy=1.0, output_invalid=False,
+validator_rejected=False, unmatched_call_observations=(), delta_ground_truth_status=
+UNAVAILABLE, delta_correct=None`. That is the first trustworthy real-model fidelity
+observation this project has produced.
+
+D75-D78 land with the tests in `world_test.py`, `fidelity_test.py`, and `compile_test.py`
+listed in their entries. Full suite: **932 passed, 0 failed** (`uv run pytest -q`, no
+targeted subset). I35-I38 closed by the same executed checks (D74's rule).
+
+Held open, deliberately not attempted this session: a reviewed tau2 entity-path
+canonicalizer (D77 named the alternative and rejected inventing one unreviewed), user-policy
+output-invalid taxonomy (`ProposedUserTurn` still collapses a failed parse into abstention --
+noted inline in `step_user_policy`, out of scope for the tool-world work this session did),
+and the ten-transition stratified run itself (Experiment 1 proper) -- this session verified
+the plumbing on one transition per your explicit request to fix before scaling.
+
 ## Open questions
 
 - **Q16.** `validation_rejection_rate` is gateable but has no threshold, like every other
@@ -295,3 +509,13 @@ condition is now met.
   `tool-call SFT` row)?
 - **Q18.** The smoke test pins counts from one family. Does Gate 0 extend it to the other
   15 mined families, or is one family's fidelity to the artifact sufficient?
+- **Q19.** Delta ground truth is `unavailable`/`not_applicable` for 100% of the pinned
+  family (D77/E36). Is a reviewed tau2 entity-path canonicalizer (mapping
+  `cancel_reservation.X.status` and `get_reservation_details.X.status` to one canonical
+  `reservation.X.status`) worth building before the ten-transition run, or does the
+  fidelity report simply carry `model_output_invalid_rate=0.0
+  /delta_ground_truth_coverage=0.0` as an honest, standing limitation?
+- **Q20.** `ProposedUserTurn`/`step_user_policy` still has no `output_invalid` distinction
+  (D75 covers only the tool-world side). Does the user-policy half need the same taxonomy
+  before Experiment 6 (user-policy fidelity) runs, given 189/371 of this family's
+  transitions are user replies?

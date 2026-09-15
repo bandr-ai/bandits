@@ -93,6 +93,33 @@ class ResultStatus(str, Enum):
     """
 
 
+class DeltaGroundTruthStatus(str, Enum):
+    """What ``inferred_state_delta`` actually establishes, distinct from its content.
+
+    An empty ``inferred_state_delta`` is ambiguous on its own: it could mean
+    "compared before/after and confirmed nothing changed" or "could not align
+    any reported field against a pre-action path at all." Those are different
+    facts about the same empty dict, and collapsing them let a genuine
+    cross-tool alignment gap (state paths are tool-prefixed, e.g.
+    ``get_reservation_details.X.status`` vs ``cancel_reservation.X.status``,
+    so a real mutation's before/after never share a path) read as a verified
+    no-op instead of as "this cannot be measured yet."
+    """
+
+    MEASURED = "measured"
+    """At least one field was compared before/after; inferred_state_delta
+    holds exactly the confirmed changes (possibly zero, if genuinely none)."""
+
+    UNAVAILABLE = "unavailable"
+    """Reactions reported fields, but none could be path-matched against
+    state_before -- typically a cross-tool entity-path mismatch. Whether
+    anything changed is unknown, not "no." See unmatched_post_paths."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """No reactions reported any comparable state paths at all (e.g. no tool
+    observation, or a result with nothing structured to diff)."""
+
+
 class ToolEffect(str, Enum):
     """Whether calling a tool can change the world."""
 
@@ -650,6 +677,16 @@ class GroundingTransition(Contract):
     """Every reaction, in order, each paired to the call it answers."""
 
     inferred_state_delta: dict[str, Any] = Field(default_factory=dict)
+    """Confirmed mutations only -- see DeltaGroundTruthStatus before trusting
+    an empty dict here as "verified no change." Check delta_ground_truth_status
+    first."""
+
+    delta_ground_truth_status: DeltaGroundTruthStatus = DeltaGroundTruthStatus.NOT_APPLICABLE
+    unmatched_post_paths: tuple[str, ...] = ()
+    """Post-action paths that were reported but could not be aligned against
+    any state_before path (status UNAVAILABLE). Kept for a future reviewed
+    tau2 path canonicalizer to consume -- never guessed at automatically."""
+
     observed: bool = True
     """False when nothing followed the action.
 
