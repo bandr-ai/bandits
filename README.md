@@ -227,6 +227,12 @@ bandits/
 ├── store.py     # content-addressed corpus and derived-artifact storage
 ├── redact.py    # deterministic redaction policies
 └── cli.py       # Typer command-line interface
+
+tests/           # pytest suite, mirroring the package layout
+├── fixtures/    # trace fixtures the suite reads
+└── tasksets.py  # shared task-set helpers
+
+scripts/         # manual and paid runs, not collected by pytest
 ```
 
 Bandits is intentionally domain-agnostic: coding agents, support workflows, browser automation, research, API agents, and other tool-using systems all enter through the same evidence model. Domain-specific definitions of success belong in reviewable verifier checks, not hidden inside the trace format.
