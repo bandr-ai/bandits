@@ -69,7 +69,7 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
             _observed(
                 trace_id=trace.trace_id,
                 claim="available_tools",
-                value=[tool.model_dump(mode="json") for tool in trace.tools_available],
+                value=[tool.offered_projection() for tool in trace.tools_available],
                 visibility=Visibility.AT_START,
                 strength="strong",
             )
