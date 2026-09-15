@@ -29,10 +29,14 @@ def _one(declared: Any) -> ToolSchema | None:
     if not isinstance(parameters, dict):
         parameters = body.get("input_schema")
     description = body.get("description")
+    output_schema = body.get("output_schema")
+    if not isinstance(output_schema, (dict, bool)):
+        output_schema = body.get("outputSchema")
     return ToolSchema(
         name=name,
         description=description if isinstance(description, str) else None,
         parameters=parameters if isinstance(parameters, dict) else None,
+        output_schema=output_schema if isinstance(output_schema, (dict, bool)) else None,
     )
 
 

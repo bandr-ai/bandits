@@ -8,7 +8,7 @@ from bandits.ingest import UnknownSourceError, load_corpus
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.otlp import load_otlp
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 def test_dispatches_otlp() -> None:
