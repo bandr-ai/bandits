@@ -91,6 +91,39 @@ class ToolSchema(Contract):
     """The parameter schema the source declared. None means the tool was named
     without a definition, so a call to it may not be reproducible anywhere."""
 
+    output_schema: dict[str, Any] | bool | None = None
+    """JSON Schema for the tool result, when the source declared one.
+
+    None means validation is unavailable, never that an arbitrary result was
+    validated. Boolean schemas are retained because they are valid JSON Schema,
+    including ``false`` for a tool that can produce no valid JSON instance.
+    Kept separate from the input parameter schema.
+    """
+
+    def offered_projection(self) -> dict[str, Any]:
+        """The published shape: what the source declared the agent could call.
+
+        D68. Explicit rather than ``model_dump()``, so a field added to this
+        contract cannot reach an export, an eval case, or hashed analysis
+        evidence by default. Nulls are kept (``description`` has always
+        shipped), which is why this is a projection and not ``exclude_none``.
+        Extending the published shape is a versioned migration (D69).
+        """
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
+
+    def simulation_projection(self) -> dict[str, Any]:
+        """The offered shape plus the declared result schema.
+
+        Only the simulator needs this: ``output_schema`` is what lets a
+        proposed tool result be validated (D63) rather than taken on trust.
+        It stays out of the published shape above.
+        """
+        return {**self.offered_projection(), "output_schema": self.output_schema}
+
 
 class UserTurn(Contract):
     """One user message, and the point in the trajectory it arrived at."""

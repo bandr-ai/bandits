@@ -16,6 +16,11 @@ audit = [
     # or a REPL sandbox; their tests inject a predictor instead.
     "dspy[deno]>=3.3.1",
 ]
+diagnose = [
+    # Prompt optimization and schema-checked trace-grounded world simulation.
+    "dspy[deno]>=3.3.1",
+    "jsonschema>=4.23",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

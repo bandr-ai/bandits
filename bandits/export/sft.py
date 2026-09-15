@@ -655,7 +655,7 @@ def build_sft_export(
                 example_id=f"sft-{digest}",
                 messages=messages,
                 tools=(
-                    tuple(tool.model_dump(mode="json") for tool in trace.tools_available)
+                    tuple(tool.offered_projection() for tool in trace.tools_available)
                     if trace.tools_available is not None
                     else None
                 ),
