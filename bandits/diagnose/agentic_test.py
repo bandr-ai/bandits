@@ -1244,3 +1244,50 @@ def test_react_can_build_its_fallback_signature() -> None:
             raise AssertionError(f"ReAct could not build its fallback signature: {exc}") from exc
     except Exception:  # noqa: BLE001 -- reaching the provider is the success case
         pass
+
+
+def test_react_scaffolding_fields_do_not_fail_coercion(monkeypatch) -> None:
+    """dspy.ReAct returns `trajectory` and `reasoning` alongside the declared
+    outputs. ProposedTransition forbids extra fields, so passing the
+    Prediction through untouched fails _coerce with "trajectory: Extra inputs
+    are not permitted" -- recorded as output_invalid, which reads as a
+    model/prompt failure when it is really an adapter seam. dspy.Predict has
+    no such fields, so world.py's fixed-RAG path never hit it, and the real
+    smoke run lost all three cases to it.
+
+    Drives the real predictor with ReAct stubbed to return a ReAct-shaped
+    Prediction, so the stripping under test is the predictor's own, not the
+    test's.
+    """
+    import dspy
+
+    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+
+    class _FakeReAct:
+        def __init__(self, signature, tools, max_iters):
+            pass
+
+        def __call__(self, **kwargs):
+            return dspy.Prediction(
+                observation={"status": "confirmed"},
+                call_outcomes=[],
+                state_delta=[],
+                events=[],
+                terminal=False,
+                support="high",
+                evidence_ids=[],
+                abstain=False,
+                abstain_reason="",
+                # ReAct's own scaffolding -- what broke the real smoke run.
+                trajectory={"thought_0": "checking", "tool_name_0": "read_world_state"},
+                reasoning="I read the reservation.",
+            )
+
+    monkeypatch.setattr(dspy, "ReAct", _FakeReAct)
+    raw, _trace = predict(instruction="probe", context=_reservation_context())
+
+    from bandits.diagnose.world import ProposedTransition, _coerce, _CoerceFailure
+
+    coerced = _coerce(raw, ProposedTransition)
+    assert not isinstance(coerced, _CoerceFailure), getattr(coerced, "errors", None)
+    assert coerced.observation == {"status": "confirmed"}
