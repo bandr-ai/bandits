@@ -193,7 +193,23 @@ class ProposedTransition(Contract):
 
     @model_validator(mode="after")
     def abstention_proposes_nothing(self) -> ProposedTransition:
-        if self.abstain and (self.call_outcomes or self.state_delta or self.events):
+        # "Proposes changes" means actual effects, not the mere presence of a
+        # call_outcomes entry. A model that abstains and reports the call as
+        # unexecuted -- observation null, no deltas, no events -- has proposed
+        # nothing; it filled in the batch's shape, which the contract asks for
+        # whenever ACTION names a call. Rejecting that shape outright turned a
+        # correct abstention into output_invalid, scoring a right answer as a
+        # parser failure.
+        #
+        # Effects are what must never accompany an abstention, and this now
+        # matches ProposedCallOutcome.an_unexecuted_call_has_no_effect, which
+        # already tested effects rather than presence. Any executed outcome
+        # still counts: claiming a call ran is itself a claim about the world.
+        proposes_effects = bool(self.state_delta or self.events) or any(
+            outcome.executed or outcome.state_delta or outcome.events
+            for outcome in self.call_outcomes
+        )
+        if self.abstain and proposes_effects:
             raise ValueError("an abstaining transition cannot also propose changes")
         return self
 
