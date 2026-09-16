@@ -1337,31 +1337,59 @@ def step_agentic_tool_world(
     return proposal.replace(support=capped), trace
 
 
-def _null_unsupported_observation_fields(proposal, unsupported_keys, *, single_call_id=None):
-    """Pre-fix behavior: dict-only walk, path-global keys."""
-    from bandits.diagnose.world import ProposedCallOutcome
-    unsupported_paths = {path for _cid, path in unsupported_keys}
+def _null_unsupported_observation_fields(
+    proposal: Any,
+    unsupported_keys: set[tuple[str | None, str]],
+    *,
+    single_call_id: str | None = None,
+) -> Any:
+    """Replace a fabricated observation field's value with None (explicit
+    unknown) rather than let it pass through unflagged. Only observation
+    fields are touched here -- state_delta/events with any unsupported claim
+    are handled by the caller as a full rejection, never partially nulled,
+    since a partially-nulled *mutation* is not a meaningful thing to commit.
 
-    def _null_dict(payload, prefix=""):
-        if not isinstance(payload, dict):
-            return payload
-        result = {}
-        for key, value in payload.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            if path in unsupported_paths:
-                result[key] = None
-            elif isinstance(value, dict):
-                result[key] = _null_dict(value, path)
-            else:
-                result[key] = value
-        return result
+    Walks lists as well as dicts, emitting exactly the paths
+    ``_flatten_paths`` produces ("flights[0].destination"). A dict-only walk
+    silently skipped every list-nested field: the fabricated value stayed in
+    the response while its claim was still dropped from the surviving-claims
+    support computation -- so the fabrication survived *and* raised the
+    proposal's support. Scalars nested in lists are nulled in place rather
+    than dropped, keeping list length and element positions intact (the
+    ".length" claim stays true, and sibling indices keep their meaning).
+
+    Keyed by ``(call_id, path)``: in a batch, call A's unsupported "status"
+    must not null call B's exact "status".
+    """
+    from bandits.diagnose.world import ProposedCallOutcome
+
+    def _null_payload(payload: Any, call_id: str | None, prefix: str = "") -> Any:
+        if isinstance(payload, dict):
+            result = {}
+            for key, value in payload.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if (call_id, path) in unsupported_keys:
+                    result[key] = None
+                else:
+                    result[key] = _null_payload(value, call_id, path)
+            return result
+        if isinstance(payload, list):
+            items = []
+            for index, value in enumerate(payload):
+                path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+                if (call_id, path) in unsupported_keys:
+                    items.append(None)
+                else:
+                    items.append(_null_payload(value, call_id, path))
+            return items
+        return payload
 
     if proposal.call_outcomes:
         new_outcomes = tuple(
-            outcome.replace(observation=_null_dict(outcome.observation))
+            outcome.replace(observation=_null_payload(outcome.observation, outcome.call_id))
             if isinstance(outcome, ProposedCallOutcome)
             else outcome
             for outcome in proposal.call_outcomes
         )
         return proposal.replace(call_outcomes=new_outcomes)
-    return proposal.replace(observation=_null_dict(proposal.observation))
+    return proposal.replace(observation=_null_payload(proposal.observation, single_call_id))
