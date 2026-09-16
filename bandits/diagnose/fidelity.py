@@ -36,8 +36,10 @@ from typing import Any
 
 from pydantic import Field
 
+from bandits.diagnose.grounding import assess_grounding
 from bandits.diagnose.models import (
     DeltaGroundTruthStatus,
+    GroundingAssessment,
     GroundingObservation,
     GroundingTransition,
     HiddenUserProfile,
@@ -47,8 +49,7 @@ from bandits.diagnose.models import (
     ToolEffectCatalog,
     WorldOrigin,
 )
-from bandits.diagnose.retrieve import RetrievedExample
-from bandits.diagnose.retrieve import support_level as retrieved_support_level
+from bandits.diagnose.retrieve import RetrievedExample, support_level
 from bandits.diagnose.world import (
     ProposedTransition,
     ProposedUserTurn,
@@ -89,6 +90,13 @@ class TransitionFidelity(Contract):
     abstained: bool = False
     abstain_correct: bool | None = None
     """True when abstaining was right — nothing supported a prediction here."""
+
+    grounding: GroundingAssessment | None = None
+    """What was and wasn't identifiable (I39), on every row -- abstained,
+    output-invalid, rejected, or accepted. Not only an abstention-correctness
+    input: it also answers whether an accepted success was state-grounded,
+    and whether a non-abstaining answer was fabricated on an unidentifiable
+    case. None only if scoring never reached grounding assessment at all."""
 
     output_invalid: bool = False
     """The model attempted an answer that did not parse into the transition
@@ -473,6 +481,14 @@ def score_transition_fidelity(
         examples=examples,
     )
 
+    # Computed unconditionally, not only on the abstain path: whether the
+    # AWM fabricated an unavailable fact on a non-abstaining answer, whether
+    # an output-invalid response was actually facing an identifiable case, and
+    # whether an accepted success was state-grounded are all questions this
+    # answers too -- an auditor that only runs when the model already declined
+    # cannot see any of them.
+    grounding = assess_grounding(transition, state_before=transition.state_before, examples=examples)
+
     if proposal.output_invalid:
         # The model attempted an answer; it did not fit the contract. This is
         # a structural failure, not an epistemic one -- it must not touch
@@ -492,16 +508,31 @@ def score_transition_fidelity(
             output_invalid=True,
             output_invalid_errors=proposal.output_invalid_errors,
             support=proposal.support,
+            grounding=grounding,
         )
 
     if proposal.abstain:
-        order = [SupportLevel.NONE, SupportLevel.LOW, SupportLevel.MEDIUM, SupportLevel.HIGH]
-        found = SupportLevel(retrieved_support_level(examples))
+        # I39, narrowly: aggregate behavioral support (SupportLevel) is not
+        # licence to require an exact-value answer from a single-call
+        # get_user_details/get_reservation_details read -- a same-tool-
+        # different-entity example can clear `minimum_support` while the
+        # specific entity's fields remain genuinely unknown. Everything else
+        # (writes, batches, non-entity tools) is outside what grounding.py
+        # was reviewed to classify; values_identifiable is None there and the
+        # prior SupportLevel-based rule is kept unchanged, not reinterpreted.
+        identifiable = grounding.values_identifiable
+        if identifiable is None:
+            order = [SupportLevel.NONE, SupportLevel.LOW, SupportLevel.MEDIUM, SupportLevel.HIGH]
+            found = SupportLevel(support_level(examples))
+            abstain_correct = order.index(found) < order.index(minimum_support)
+        else:
+            abstain_correct = not identifiable
         return TransitionFidelity(
             transition_id=transition.transition_id,
             trace_id=transition.trace_id,
             abstained=True,
-            abstain_correct=order.index(found) < order.index(minimum_support),
+            abstain_correct=abstain_correct,
+            grounding=grounding,
             support=proposal.support,
         )
 
@@ -530,6 +561,7 @@ def score_transition_fidelity(
             support=proposal.support,
             validator_rejected=True,
             validator_rejections=validation.rejections,
+            grounding=grounding,
         )
 
     # Fidelity must compare the same canonical observation the runtime
@@ -603,6 +635,7 @@ def score_transition_fidelity(
         invariant_violations=violations,
         support=proposal.support,
         unmatched_call_observations=unmatched,
+        grounding=grounding,
     )
 
 

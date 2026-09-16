@@ -381,6 +381,108 @@ Full suite 932 passed, 0 failed (`uv run pytest -q`, no targeted subset). See
 `awm-decisions-v4.md` S12/E33-E38/D75-D78 for the executed evidence and Q19/Q20 for what
 remains open (a reviewed tau2 path canonicalizer; user-policy output-invalid taxonomy).
 
+## I39 — CLOSED (narrowly) in v4/S13
+
+**I39** (P0, FIXED — scorer-only, single-call record-materialization reads): `support_level()`
+(`retrieve.py`) and the `abstain_correct` check it fed were entity-blind — a retrieved example
+that called the *same tool* for a *different* entity counted as support, with no check that
+the transition under test's specific entity (reservation/user id) was ever actually observed
+anywhere in `state_before` or retrieval.
+
+Found running the ten-transition stratified experiment (E39): six of ten held-out transitions
+asked the AWM to reproduce a specific entity's private record it was never given (e.g.
+`get_user_details("emma_kim_9957")`, expecting Emma Kim's exact name/address/email/DOB/payment
+methods — none of which appear in `state_before` or in the retrieved examples, which concerned
+other users entirely). The model correctly declined on all six; the scorer read two of those as
+`wrong_abstention` and (via the separate, already-fixed D75/Q22 structural issue) four as
+`output_invalid`, because retrieval supplied same-tool-different-entity evidence that
+`support_level()` treated as sufficient grounding for an exact record it could not possibly
+determine.
+
+**What shipped.** `bandits/diagnose/grounding.py` (new) plus `CallGroundingAssessment`/
+`GroundingAssessment`/`EntityRef`/`GroundingKind` in `models.py`. Per Q21's resolution (D79,
+below), grounding is assessed at scoring time from the transition's actual `state_before` and
+retrieved evidence, using evaluation demand read from the recorded result's field paths.
+Deliberately narrow, per review of an over-general first draft:
+
+- entity identity is tool-independent (`reservation:Q69X3R`, never
+  `get_reservation_details.Q69X3R`) so the same entity resolves identically across tools;
+- grounding is assessed **per call**, correlated by `tool_call_id` (falling back to
+  positional pairing only for single-call transitions, where this corpus often carries no
+  call id on either side) — never pooled across a batch;
+- `GroundingAssessment.values_identifiable` is `None` for any multi-call batch, not just a
+  mixed one: two calls that individually agree (both unidentifiable) must not let the
+  aggregate collapse to a false "batch abstention correct," since proposal-wide abstain has
+  no single correct label for a batch;
+- behavioral evidence (`behavior_supported`) is filtered to examples whose retrieved
+  transition actually called *this call's* tool, not the whole query's `exact_tool` reason;
+- `state_before` wins outright on conflict with a retrieved value (it is this rollout's own
+  history; a retrieved trace can be a stale snapshot of the same entity from a different
+  episode); two retrieved examples about the same entity that disagree on a field have that
+  field dropped rather than letting whichever example was iterated last silently win;
+- restricted to exactly `get_user_details`/`get_reservation_details` single-call reads
+  (`ENTITY_TOOLS` in `grounding.py`) — writes, batches, `book_reservation`, and non-entity
+  tools (`transfer_to_human_agents`, search, calculate) report `GroundingKind.UNAVAILABLE`
+  and fall back to the prior `SupportLevel`-based abstain-correctness rule, unchanged;
+- `DERIVABLE_FROM_STATE` is reserved in the enum for a future mutation classifier (e.g.
+  cancellation, whose post-state is a transformation of known pre-state) and is never emitted
+  by the current read-only classifier — a record-materialization read reports a record, it
+  does not derive one, so it is always `EXACT_ENTITY_FACT`;
+- `TransitionFidelity.grounding` is attached on every scored row (abstained, output-invalid,
+  validator-rejected, accepted), not only on abstentions — an auditor that only ran on
+  declines could not answer whether an accepted success was state-grounded, or whether a
+  non-abstaining answer was fabricated on an unidentifiable case;
+- `output_invalid`'s short-circuit (D75) is untouched: a malformed response is never
+  reclassified as a correct abstention regardless of what grounding finds.
+
+**Verification executed this session (v4/S13).**
+
+```text
+uv run pytest bandits/diagnose/grounding_test.py bandits/diagnose/fidelity_test.py -q
+  → 32 passed, 0 failed  (14 grounding, 18 fidelity)
+
+uv run pytest -q   (full default testpaths: tests/ + bandits/)
+  → 946 passed, 0 failed
+
+ruff check bandits/diagnose/ scripts/rescore_awm_fidelity.py
+  → all checks passed
+
+git diff --check
+  → clean
+```
+
+Real-artifact zero-model-call rescore, `scripts/rescore_awm_fidelity.py` (new) against the
+real DeepSeek V4 Flash `baseline-fixed2` run — reloads the pinned tau2 family, rebuilds
+retrieval, and replays each saved `raw_model_response` through the updated scorer. Refuses to
+proceed (raises) if reconstructed retrieved-transition-ids or any of the four reconstructed
+rendered strings (instruction/state/history/action/evidence) differ from what the original run
+saved, so a rescore can never silently change the inputs alongside the scorer:
+
+```text
+uv run python scripts/rescore_awm_fidelity.py \
+  --input work/awm-fidelity/baseline-fixed2.json \
+  --output work/awm-fidelity/baseline-grounding-rescore.json
+
+  → 2 of 2 clean lookup abstentions: wrong_abstention → correct_abstention
+  → 4 of 4 malformed lookup responses: unchanged, still output_invalid
+  → cancellation: unchanged, still accepted (36/36 fields)
+  → 3 transfers: unchanged
+  → wrong_abstention_rate: 1.0 → 0.0
+  → correct_abstention_rate: 0.0 → 1.0
+  → model_output_invalid_rate: 0.4 (unchanged)
+  → attempted: 4/10 (unchanged)
+```
+
+Re-run a second time in this session: byte-identical output to the first rescore artifact.
+
+**Scope of the close.** This closes I39 as: *exact-value abstention calibration for supported
+single-call tau2 record-materialization reads (`get_user_details`, `get_reservation_details`)
+is fixed and empirically verified against a real model run.* It does not extend to writes,
+batches, or non-entity tools (still `SupportLevel`-based, unchanged), and it is not the
+agentic AWM-centered runtime (`read_world_state`/`search_transitions`/`inspect_tool_contract`/
+etc.) described earlier in this document — that remains separate, unbuilt future work and
+should get its own issue when scoped.
+
 ## Current next steps
 
 1. Inspect one persisted deterministic campaign, including invalid/abstained attempts and
