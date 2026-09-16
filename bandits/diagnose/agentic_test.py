@@ -1104,3 +1104,119 @@ def test_batch_claims_stay_separate_under_claim_level_attribution() -> None:
     assert proposal.abstain is True
     assert "Q2" in proposal.abstain_reason
 
+
+# --- P0: list-nested nulling and call-scoped nulling -----------------------
+
+
+def test_unsupported_field_inside_a_list_is_nulled() -> None:
+    """P0. ``_flatten_paths`` emits list-nested paths ("flights[0].destination"),
+    so a fabricated field inside a list is correctly classified UNSUPPORTED and
+    dropped from the surviving-claims support computation -- but a dict-only
+    nulling walk left its value sitting in the response. Worst case: the
+    fabrication survives AND removing its claim raises the proposal's support.
+    """
+
+    def fake_predict(*, instruction, context):
+        trace = AWMExecutionTrace(
+            grounding_calls=(
+                AWMToolCall(
+                    index=0,
+                    tool="read_world_state",
+                    state_paths_read=("get_reservation_details.Q69X3R.flights[0].origin",),
+                    state_values_read={"flights[0].origin": "PHL"},
+                    entity=("reservation", "Q69X3R"),
+                ),
+            )
+        )
+        return (
+            ProposedTransition(
+                observation={
+                    "flights": [{"origin": "PHL", "destination": "Mars"}],
+                },
+                support=SupportLevel.HIGH,
+            ),
+            trace,
+        )
+
+    proposal, _ = step_agentic_tool_world(fake_predict, context=_reservation_context())
+    flight = proposal.observation["flights"][0]
+    # The read field survives; the fabricated sibling is an explicit unknown.
+    assert flight["origin"] == "PHL"
+    assert flight["destination"] is None
+    # List shape is preserved -- length and element positions are untouched.
+    assert len(proposal.observation["flights"]) == 1
+
+
+def test_scalar_directly_inside_a_list_is_nulled_in_place() -> None:
+    """A fabricated scalar list element is nulled in place rather than
+    dropped, so the list's ".length" claim stays true and sibling indices
+    keep their meaning."""
+
+    def fake_predict(*, instruction, context):
+        trace = AWMExecutionTrace(
+            grounding_calls=(
+                AWMToolCall(
+                    index=0,
+                    tool="read_world_state",
+                    state_paths_read=("get_reservation_details.Q69X3R.seats[0]",),
+                    state_values_read={"seats[0]": "12A"},
+                    entity=("reservation", "Q69X3R"),
+                ),
+            )
+        )
+        return (
+            ProposedTransition(
+                observation={"seats": ["12A", "99Z"]},
+                support=SupportLevel.HIGH,
+            ),
+            trace,
+        )
+
+    proposal, _ = step_agentic_tool_world(fake_predict, context=_reservation_context())
+    assert proposal.observation["seats"] == ["12A", None]
+
+
+def test_batch_nulling_is_scoped_to_the_offending_call() -> None:
+    """P0. Nulling keyed by path alone let call A's unsupported "status" null
+    call B's exactly-grounded "status". Nulling must be keyed by
+    (call_id, path)."""
+    from bandits.diagnose.world import ProposedCallOutcome
+
+    context = _reservation_context(
+        candidate_calls=(
+            ActionCall(call_id="a", tool="get_reservation_details", arguments={"reservation_id": "AAA111"}),
+            ActionCall(call_id="b", tool="get_reservation_details", arguments={"reservation_id": "BBB222"}),
+        ),
+    )
+
+    def fake_predict(*, instruction, context):
+        trace = AWMExecutionTrace(
+            grounding_calls=(
+                # Only call B's entity was ever read.
+                AWMToolCall(
+                    index=0,
+                    tool="read_world_state",
+                    state_paths_read=("get_reservation_details.BBB222.status",),
+                    state_values_read={"status": "confirmed"},
+                    entity=("reservation", "BBB222"),
+                ),
+            )
+        )
+        return (
+            ProposedTransition(
+                call_outcomes=(
+                    # Call A: nothing grounded this entity at all -> fabricated.
+                    ProposedCallOutcome(call_id="a", observation={"status": "cancelled"}),
+                    # Call B: exactly what was read.
+                    ProposedCallOutcome(call_id="b", observation={"status": "confirmed"}),
+                ),
+                support=SupportLevel.HIGH,
+            ),
+            trace,
+        )
+
+    proposal, _ = step_agentic_tool_world(fake_predict, context=context)
+    by_id = {o.call_id: o for o in proposal.call_outcomes}
+    assert by_id["a"].observation["status"] is None
+    # The grounded call keeps its value -- it shares a path name, not a claim.
+    assert by_id["b"].observation["status"] == "confirmed"
