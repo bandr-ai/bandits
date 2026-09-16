@@ -130,6 +130,19 @@ class AWMExecutionTrace(Contract):
     episode) -- set by the caller from a counter with_budget itself
     increments, since dspy.ReAct.forward swallows the raised exception into
     an observation string and never lets it reach this frame directly."""
+    raw_prediction: dict[str, Any] | None = None
+    """The ReAct Prediction as returned, before projection onto the contract's
+    declared fields -- including `trajectory` (the per-iteration thought /
+    tool_name / tool_args / observation log) and `reasoning`. Kept so a parse
+    failure is diagnosable after the fact: without it, a run that produced no
+    structured output left nothing to inspect but a warning line, and the
+    stage that actually failed (tool selection vs final extraction) could
+    not be told apart from a repetition loop. Never read by scoring."""
+    lm_history: tuple[dict[str, Any], ...] = ()
+    """Per-LM-call records for this episode (stage, response text, token
+    usage, finish reason), captured from dspy's own history. The signal that
+    distinguishes an empty `text` with a long `reasoning_content` (a
+    repetition loop) from a genuinely truncated near-complete answer."""
     rejected_unsupported_claim_paths: tuple[str, ...] = ()
     """Set by step_agentic_tool_world when it abstained a proposal because a
     committed mutation/event claim was insufficiently grounded
@@ -870,11 +883,66 @@ def render_agentic_state_summary(context: AWMRuntimeContext) -> str:
     )
 
 
+def _summarize_lm_entry(entry: dict[str, Any], stage: str) -> dict[str, Any]:
+    """One dspy history record, reduced to what diagnosing a protocol failure
+    needs. Deliberately not the whole record: `messages` carries the full
+    rendered prompt (the corpus history, every tool result so far) and would
+    dwarf the result file while duplicating what the audit trail already has.
+
+    `text_len` vs `reasoning_len` is the discriminating pair. A repetition
+    loop shows empty text beside a very long reasoning_content; a genuinely
+    truncated near-complete answer shows substantial text. Both merely look
+    like "unparseable response" from outside.
+    """
+    usage = entry.get("usage") or {}
+    outputs = entry.get("outputs") or []
+    text = ""
+    reasoning = ""
+    if outputs:
+        first = outputs[0]
+        if isinstance(first, dict):
+            text = first.get("text") or ""
+            reasoning = first.get("reasoning_content") or ""
+        elif isinstance(first, str):
+            text = first
+    return {
+        "stage": stage,
+        "text_len": len(text),
+        "reasoning_len": len(reasoning),
+        "text_head": text[:400],
+        "reasoning_tail": reasoning[-600:],
+        "max_tokens": (entry.get("kwargs") or {}).get("max_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "cost": entry.get("cost"),
+    }
+
+
+def _recent_lm_history(*stage_lms: Any) -> tuple[dict[str, Any], ...]:
+    """Per-stage LM records for the episode just run.
+
+    Each ReAct stage holds its own LM copy (they carry different token
+    budgets), so each keeps its own history list; reading only the base LM
+    would come back empty. Best-effort throughout: diagnostics must never
+    fail a run that otherwise succeeded.
+    """
+    records: list[dict[str, Any]] = []
+    for stage, lm in stage_lms:
+        try:
+            for entry in getattr(lm, "history", []) or []:
+                records.append(_summarize_lm_entry(entry, stage))
+        except Exception:  # noqa: BLE001 -- diagnostics never fail the run
+            continue
+    return tuple(records)
+
+
 def build_agentic_tool_world_predictor(
     *,
     model: str,
     api_key: str | None = None,
     max_tokens: int = 6000,
+    select_max_tokens: int = 800,
+    extract_max_tokens: int = 3000,
     max_grounding_calls: int = MAX_GROUNDING_CALLS_DEFAULT,
     max_iters: int = 8,
     on_grounding_call: Callable[[AWMToolCall], None] | None = None,
@@ -945,6 +1013,18 @@ def build_agentic_tool_world_predictor(
         )
         _AgenticTransition.__doc__ = instruction
         react = dspy.ReAct(_AgenticTransition, tools=tools, max_iters=max_iters)
+        # ReAct runs two structurally different stages against one LM, and a
+        # single budget serves neither. Tool selection emits three short
+        # fields (next_thought/next_tool_name/next_tool_args) and needs only
+        # a few hundred tokens; giving it thousands lets a model that starts
+        # repeating itself burn the whole budget and return empty `text`,
+        # which surfaces as an unparseable response rather than as the
+        # protocol failure it is. Final extraction emits the full transition
+        # contract and needs room. Budgeting them apart bounds the failure
+        # instead of enlarging it -- raising a single shared ceiling buys
+        # proportionally more repetition, not a valid answer.
+        react.react.lm = language_model.copy(max_tokens=select_max_tokens)
+        react.extract.lm = language_model.copy(max_tokens=extract_max_tokens)
         # dspy.ReAct.forward wraps every tool call in a bare `except Exception`
         # and turns it into an observation string fed back to the model --
         # BudgetExceeded raised inside a tool never reaches this frame. Two
@@ -977,12 +1057,15 @@ def build_agentic_tool_world_predictor(
         # dropped here, keeping ProposedTransition's strictness -- which is
         # what stops a model from smuggling in undeclared fields -- intact.
         declared = set(_AgenticTransition.output_fields)
-        if hasattr(raw, "toDict"):
-            raw = {k: v for k, v in raw.toDict().items() if k in declared}
+        raw_prediction = raw.toDict() if hasattr(raw, "toDict") else None
+        if raw_prediction is not None:
+            raw = {k: v for k, v in raw_prediction.items() if k in declared}
         trace = AWMExecutionTrace(
             grounding_calls=tuple(audit),
             exhausted_budget=len(audit) >= max_grounding_calls,
             budget_rejection_attempted=bool(rejections),
+            raw_prediction=raw_prediction,
+            lm_history=_recent_lm_history(("select", react.react.lm), ("extract", react.extract.lm)),
         )
         return raw, trace
 

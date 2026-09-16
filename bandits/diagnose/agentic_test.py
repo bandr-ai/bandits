@@ -1263,9 +1263,16 @@ def test_react_scaffolding_fields_do_not_fail_coercion(monkeypatch) -> None:
 
     predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
 
+    class _FakeStage:
+        """Stands in for ReAct's `react`/`extract` sub-predictors, which the
+        predictor gives separate token budgets."""
+
+        lm = None
+
     class _FakeReAct:
         def __init__(self, signature, tools, max_iters):
-            pass
+            self.react = _FakeStage()
+            self.extract = _FakeStage()
 
         def __call__(self, **kwargs):
             return dspy.Prediction(
@@ -1291,3 +1298,36 @@ def test_react_scaffolding_fields_do_not_fail_coercion(monkeypatch) -> None:
     coerced = _coerce(raw, ProposedTransition)
     assert not isinstance(coerced, _CoerceFailure), getattr(coerced, "errors", None)
     assert coerced.observation == {"status": "confirmed"}
+
+
+def test_react_stages_get_separate_token_budgets(monkeypatch) -> None:
+    """ReAct's two stages are structurally different: tool selection emits
+    three short fields, final extraction emits the whole transition contract.
+    One shared ceiling serves neither -- a model that starts repeating during
+    selection burns the entire budget and returns empty text, which surfaces
+    as an unparseable response rather than the protocol failure it is.
+    Raising the shared ceiling buys proportionally more repetition."""
+    import dspy
+
+    seen: dict[str, int] = {}
+
+    class _FakeStage:
+        lm = None
+
+    class _FakeReAct:
+        def __init__(self, signature, tools, max_iters):
+            self.react = _FakeStage()
+            self.extract = _FakeStage()
+
+        def __call__(self, **kwargs):
+            seen["select"] = self.react.lm.kwargs["max_tokens"]
+            seen["extract"] = self.extract.lm.kwargs["max_tokens"]
+            return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
+
+    monkeypatch.setattr(dspy, "ReAct", _FakeReAct)
+    predict = build_agentic_tool_world_predictor(
+        model="test-model", api_key="dummy-key", select_max_tokens=512, extract_max_tokens=2048
+    )
+    predict(instruction="probe", context=_reservation_context())
+
+    assert seen == {"select": 512, "extract": 2048}

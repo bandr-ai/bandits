@@ -103,9 +103,16 @@ def outcome_taxonomy(
     }
 
     if proposal.output_invalid:
+        # Persist the unprojected prediction and per-stage LM records here
+        # specifically: this is the branch where there is no parsed proposal
+        # to inspect, so without them a failure leaves nothing but an error
+        # string, and "the model looped" cannot be told from "the response
+        # was truncated just short of valid."
         return {
             "outcome": "output_invalid",
             "output_invalid_errors": list(proposal.output_invalid_errors),
+            "raw_prediction": trace.raw_prediction,
+            "lm_history": [dict(entry) for entry in trace.lm_history],
             **grounding_summary,
         }
 
@@ -279,6 +286,23 @@ def run_one(
     }
 
 
+def _global_lm_history(limit: int = 12) -> list[dict[str, Any]]:
+    """Per-stage LM records from dspy's global history, for the crash path.
+
+    A failure inside predict() leaves no AWMExecutionTrace, so the records
+    cannot come from the trace the way they do on the output_invalid path.
+    Best-effort: diagnostics must never mask the original exception.
+    """
+    try:
+        from dspy.clients.base_lm import GLOBAL_HISTORY
+
+        from bandits.diagnose.agentic import _summarize_lm_entry
+
+        return [_summarize_lm_entry(entry, "unknown") for entry in list(GLOBAL_HISTORY)[-limit:]]
+    except Exception:  # noqa: BLE001 -- never mask the real failure
+        return []
+
+
 def run(
     *,
     tau_root: Path,
@@ -292,6 +316,10 @@ def run(
     fact_grounded_transition_id: str,
     output_dir: Path,
     max_tokens: int = 6000,
+    select_max_tokens: int = 800,
+    extract_max_tokens: int = 3000,
+    cases: tuple[str, ...] = (),
+    resume: bool = True,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -330,7 +358,11 @@ def run(
         print(f"    [call {call.index}] {call.tool}{detail}{summary}", flush=True)
 
     predict = build_agentic_tool_world_predictor(
-        model=model, max_tokens=max_tokens, on_grounding_call=_report_grounding_call
+        model=model,
+        max_tokens=max_tokens,
+        select_max_tokens=select_max_tokens,
+        extract_max_tokens=extract_max_tokens,
+        on_grounding_call=_report_grounding_call,
     )
 
     def _control_extra_fields(control: GroundingTransition) -> tuple[StateField, ...]:
@@ -371,11 +403,42 @@ def run(
         ),
     )
 
+    if cases:
+        wanted = {c.upper() for c in cases}
+        planned = tuple(row for row in planned if row[0][0].upper() in wanted)
+        if not planned:
+            raise SystemExit(f"no cases matched {sorted(wanted)} (expected some of A, B, C)")
+
     checkpoint_path = output_dir / "smoke.raw.jsonl"
-    results: list[dict[str, Any]] = []
+    # Resume rather than truncate: a case costs a real (paid) call, so a
+    # rerun aimed at one case must not discard the others' completed results.
+    # Reruns of a case already present replace that case's row, keeping the
+    # newest result per label.
+    previous: dict[str, dict[str, Any]] = {}
+    if resume and checkpoint_path.exists():
+        for line in checkpoint_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("label"):
+                previous[row["label"]] = row
+    replaced = {label for label, _t, _e in planned}
+    results: list[dict[str, Any]] = [
+        row for label, row in previous.items() if label not in replaced
+    ]
+    if results:
+        print(f"[resume] keeping {len(results)} prior result(s): "
+              f"{', '.join(sorted(r['label'] for r in results))}", flush=True)
+
     # Checkpoint each real (paid) call as it completes, not after all three:
     # an exception on C must not lose A and B's already-paid-for results.
     with checkpoint_path.open("w") as checkpoint_file:
+        for kept in results:
+            checkpoint_file.write(json.dumps(kept, default=str) + "\n")
+        checkpoint_file.flush()
         for label, transition, extra_fields in planned:
             print(f"[start] {label} {transition.transition_id}", flush=True)
             try:
@@ -389,10 +452,17 @@ def run(
                     extra_state_fields=extra_fields,
                 )
             except Exception as exc:  # noqa: BLE001 -- must not lose prior checkpoints
+                # A crash inside predict() (an adapter parse failure, a
+                # protocol failure) raises before any trace exists, so the
+                # per-stage records have to come from dspy's own global
+                # history here. This is the branch A hit: without it the only
+                # artifact was an error string, and the LM records are what
+                # separate a repetition loop from a near-miss truncation.
                 result = {
                     "label": label,
                     "transition_id": transition.transition_id,
                     "unexpected_error": f"{type(exc).__name__}: {exc}",
+                    "lm_history": _global_lm_history(),
                 }
                 results.append(result)
                 checkpoint_file.write(json.dumps(result, default=str) + "\n")
@@ -450,6 +520,16 @@ def main() -> None:
     # output_invalid row, which is a parser failure recorded as if it were
     # an epistemic result.
     parser.add_argument("--max-tokens", type=int, default=6000)
+    # Budgeted per ReAct stage. Tool selection emits three short fields;
+    # a large ceiling there lets a repetition loop run longer rather than
+    # producing a valid selection.
+    parser.add_argument("--select-max-tokens", type=int, default=800)
+    parser.add_argument("--extract-max-tokens", type=int, default=3000)
+    parser.add_argument(
+        "--case", action="append", dest="cases", default=None,
+        help="run only these cases (A, B, C); repeatable. Others are kept from the checkpoint.",
+    )
+    parser.add_argument("--no-resume", action="store_true", help="discard prior checkpoint rows")
     args = parser.parse_args()
 
     run(
@@ -464,6 +544,10 @@ def main() -> None:
         fact_grounded_transition_id=args.fact_grounded_transition_id,
         output_dir=args.output_dir,
         max_tokens=args.max_tokens,
+        select_max_tokens=args.select_max_tokens,
+        extract_max_tokens=args.extract_max_tokens,
+        cases=tuple(args.cases) if args.cases else (),
+        resume=not args.no_resume,
     )
 
 
