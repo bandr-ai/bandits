@@ -100,6 +100,7 @@ def outcome_taxonomy(
         "exhausted_budget": trace.exhausted_budget,
         "budget_rejection_attempted": trace.budget_rejection_attempted,
         "rejected_unsupported_claim_paths": list(trace.rejected_unsupported_claim_paths),
+        "controller_error": trace.controller_error,
     }
 
     if proposal.output_invalid:
@@ -113,6 +114,8 @@ def outcome_taxonomy(
             "output_invalid_errors": list(proposal.output_invalid_errors),
             "raw_prediction": trace.raw_prediction,
             "lm_history": [dict(entry) for entry in trace.lm_history],
+            "trajectory": trace.trajectory,
+            "controller_error": trace.controller_error,
             **grounding_summary,
         }
 
@@ -287,21 +290,30 @@ def run_one(
     }
 
 
-def _global_lm_history(limit: int = 12) -> list[dict[str, Any]]:
-    """Per-stage LM records from dspy's global history, for the crash path.
+def _crash_diagnostics(observed: list[AWMToolCall]) -> dict[str, Any]:
+    """What a crashing case can still report.
 
-    A failure inside predict() leaves no AWMExecutionTrace, so the records
-    cannot come from the trace the way they do on the output_invalid path.
-    Best-effort: diagnostics must never mask the original exception.
+    Earlier this scraped dspy's GLOBAL_HISTORY, which is process-wide and
+    never cleared: case C's saved rows then included case B's calls, every
+    stage labelled "unknown". Diagnostics that attribute one experiment's
+    calls to another are worse than none, so this reports only what THIS
+    case observed -- the grounding calls the progress observer recorded,
+    which the console already printed but the saved row was dropping.
     """
-    try:
-        from dspy.clients.base_lm import GLOBAL_HISTORY
-
-        from bandits.diagnose.agentic import _summarize_lm_entry
-
-        return [_summarize_lm_entry(entry, "unknown") for entry in list(GLOBAL_HISTORY)[-limit:]]
-    except Exception:  # noqa: BLE001 -- never mask the real failure
-        return []
+    return {
+        "grounding_calls_observed": [
+            {
+                "index": call.index,
+                "tool": call.tool,
+                "arguments": call.arguments,
+                "result_summary": call.result_summary,
+                "entity": list(call.entity) if call.entity else None,
+                "error": call.error,
+            }
+            for call in observed
+        ],
+        "grounding_call_count": len(observed),
+    }
 
 
 def run(
@@ -349,7 +361,13 @@ def run(
     # calls and several grounding calls, so a run that printed only on
     # completion sat silent for minutes with no way to tell a slow call from
     # a hung one, or to see which tool the AWM actually reached for.
+    # Also retained per-case: a crash inside predict() leaves no trace
+    # object, so without this the saved row lost the grounding calls the
+    # console had already printed.
+    observed_calls: list[AWMToolCall] = []
+
     def _report_grounding_call(call: AWMToolCall) -> None:
+        observed_calls.append(call)
         detail = ""
         if call.entity is not None:
             detail = f" {call.entity[0]}:{call.entity[1]}"
@@ -442,6 +460,7 @@ def run(
         checkpoint_file.flush()
         for label, transition, extra_fields in planned:
             print(f"[start] {label} {transition.transition_id}", flush=True)
+            observed_calls.clear()
             try:
                 result = run_one(
                     transition,
@@ -463,7 +482,7 @@ def run(
                     "label": label,
                     "transition_id": transition.transition_id,
                     "unexpected_error": f"{type(exc).__name__}: {exc}",
-                    "lm_history": _global_lm_history(),
+                    **_crash_diagnostics(observed_calls),
                 }
                 results.append(result)
                 checkpoint_file.write(json.dumps(result, default=str) + "\n")
@@ -521,9 +540,10 @@ def main() -> None:
     # output_invalid row, which is a parser failure recorded as if it were
     # an epistemic result.
     parser.add_argument("--max-tokens", type=int, default=6000)
-    # Budgeted per ReAct stage. Tool selection emits three short fields;
-    # a large ceiling there lets a repetition loop run longer rather than
-    # producing a valid selection.
+    # Budgeted per ReAct stage. Selection is not uniformly short: the
+    # ordinary tool-picking steps land near 300 tokens, but the step that
+    # decides to finish deliberates first and needs several times that.
+    # Sized for the finish step, since truncating it loses the whole run.
     parser.add_argument("--select-max-tokens", type=int, default=800)
     parser.add_argument("--extract-max-tokens", type=int, default=3000)
     parser.add_argument(
