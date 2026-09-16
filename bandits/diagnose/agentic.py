@@ -38,6 +38,7 @@ from bandits.diagnose.models import (
     GroundingKind,
     GroundingTransition,
     Partition,
+    PrefixStep,
     ScenarioState,
     SuccessShape,
     SupportLevel,
@@ -222,6 +223,14 @@ class AWMRuntimeContext(Contract):
     action_content: Any = None
     current_state: ScenarioState = ScenarioState()
     history_text: str = ""
+    history_before: tuple[PrefixStep, ...] = ()
+    """The same prefix `history_text` renders, kept structured.
+
+    `history_text` flattens every replayed tool observation into prose, so the
+    AWM can read a recorded payload that the claim auditor has no typed view
+    of -- the authority asymmetry. Keeping the steps lets read_world_state
+    surface those observations as first-class, provenance-tagged state, so a
+    fact the model can see is a fact the auditor can recognize."""
     offered_tool_schemas: tuple[dict[str, Any], ...] = ()
     fit_index: tuple[GroundingTransition, ...] = ()
     """Always fit-partition only (Partition.FIT) -- constructed by the caller
@@ -353,6 +362,75 @@ def _linked_entities(
     return linked
 
 
+_ENTITY_ID_KEYS = {"user": "user_id", "reservation": "reservation_id"}
+"""Which payload key identifies the entity a recorded tool observation is
+about. A prior observation is attributed by the id its OWN payload carries,
+not by the call's arguments -- the corpus records `arguments=None` on replayed
+tool steps, and one episode's history routinely holds several reservations
+(five, in the pinned family's cancel case). Attributing by position or by the
+conversation's subject would let one reservation's payment amount license a
+claim about another."""
+
+
+class _PriorField(Contract):
+    """One field from one recorded tool observation replayed before this action."""
+
+    value: Any = None
+    span_id: str | None = None
+    tool: str = ""
+    conflicting_values: tuple[Any, ...] = ()
+    """Other values earlier observations gave this same path. Non-empty means
+    the history disagrees with itself, and the field is reported as a conflict
+    rather than silently resolved to the latest -- a silently-picked value is
+    indistinguishable from a verified one downstream."""
+
+
+def _prior_observation_fields(
+    context: AWMRuntimeContext, entity_kind: str, entity_id: str
+) -> dict[str, _PriorField]:
+    """Fields recorded by tool observations replayed BEFORE the current action,
+    scoped to one entity.
+
+    These are part of the reconstructed state, not a separate knowledge
+    source: the environment observed them in this very episode. Surfacing
+    them through read_world_state is what closes the authority asymmetry --
+    otherwise the AWM can read a fact in the rendered history that the claim
+    auditor cannot recognize, so using it looks like fabrication and ignoring
+    it forces an abstention on a recoverable answer.
+
+    Only ``history_before`` is read, so nothing at or after the current action
+    can leak in. Scenario/lineage isolation is inherited: history_before
+    belongs to this transition's own prefix, which is exactly the material the
+    candidate itself was shown.
+    """
+    id_key = _ENTITY_ID_KEYS.get(entity_kind)
+    if not id_key:
+        return {}
+    found: dict[str, _PriorField] = {}
+    for step in context.history_before:
+        if step.role != "tool" or step.error or not isinstance(step.content, dict):
+            continue
+        if step.content.get(id_key) != entity_id:
+            continue
+        for path, value in _flatten_paths(step.content).items():
+            existing = found.get(path)
+            if existing is None:
+                found[path] = _PriorField(
+                    value=value, span_id=step.span_id, tool=step.tool_name or ""
+                )
+            elif existing.value != value:
+                # Later observation disagrees with an earlier one. Keep the
+                # newer value but record the disagreement: a field the history
+                # contradicts itself about is not a verified fact.
+                found[path] = _PriorField(
+                    value=value,
+                    span_id=step.span_id,
+                    tool=step.tool_name or "",
+                    conflicting_values=(*existing.conflicting_values, existing.value),
+                )
+    return found
+
+
 def make_read_world_state(
     context: AWMRuntimeContext, *, audit: list[AWMToolCall]
 ) -> Callable[[str, str], dict[str, Any]]:
@@ -419,13 +497,42 @@ def make_read_world_state(
                     canonical_values[field.path] = field.value
                     state_paths_read.append(field.path)
 
+        # Committed scenario state is authoritative; a prior recorded
+        # observation fills only what state does not already carry. State is
+        # this rollout's own committed view, while an observation is a
+        # snapshot from earlier in the episode that a later mutation may
+        # already have superseded -- the same precedence read_world_state
+        # already takes over search_transitions results.
+        provenance: dict[str, str] = dict.fromkeys(fields, "scenario_state")
+        conflicts: dict[str, list[Any]] = {}
+        if tool_prefix:
+            prior = _prior_observation_fields(context, entity_kind, entity_id)
+            for path, prior_field in prior.items():
+                if path in fields:
+                    continue
+                if prior_field.conflicting_values:
+                    # The history disagrees with itself about this path.
+                    # Reported as an explicit conflict rather than resolved to
+                    # the newest value: a silently-picked value is
+                    # indistinguishable downstream from a verified one.
+                    conflicts[path] = [*prior_field.conflicting_values, prior_field.value]
+                    continue
+                fields[path] = prior_field.value
+                provenance[path] = "prior_recorded_observation"
+                canonical = f"{tool_prefix}.{entity_id}.{path}"
+                canonical_values[canonical] = prior_field.value
+                state_paths_read.append(canonical)
+
         found = bool(fields)
         audit.append(
             AWMToolCall(
                 index=index,
                 tool="read_world_state",
                 arguments={"entity_kind": entity_kind, "entity_id": entity_id},
-                result_summary=f"found={found}, {len(fields)} field(s)",
+                result_summary=(
+                    f"found={found}, {len(fields)} field(s)"
+                    + (f", {len(conflicts)} conflicting" if conflicts else "")
+                ),
                 state_paths_read=tuple(state_paths_read),
                 state_values_read=canonical_values,
                 entity=(entity_kind, entity_id),
@@ -438,6 +545,18 @@ def make_read_world_state(
             # "unknown," not "confirmed empty."
             "completeness": "partial" if found else "unknown",
             "fields": fields,
+            # Per-field origin, so "the environment committed this" is never
+            # confused with "the environment observed this earlier in the
+            # episode." completeness stays "partial" regardless: prior
+            # observations filling gaps does not make the reconstruction
+            # complete, and upgrading it would teach the AWM to read silence
+            # as a confirmed absence.
+            "provenance": provenance,
+            # Paths whose replayed observations disagree with each other.
+            # Deliberately not merged into `fields`: the AWM is told the
+            # history is inconsistent here rather than handed one arbitrary
+            # side of the disagreement as if it were established.
+            "conflicts": {path: list(values) for path, values in conflicts.items()},
         }
 
     return read_world_state

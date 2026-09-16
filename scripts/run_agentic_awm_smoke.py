@@ -220,6 +220,7 @@ def build_context(
         action_content=transition.action_content,
         current_state=state,
         history_text=history_text,
+        history_before=transition.history_before,
         offered_tool_schemas=tool_schemas,
         fit_index=fit_index,
         family_id=transition.family_id,
