@@ -30,6 +30,7 @@ it never had a chance to see.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from typing import Any, ForwardRef, Protocol
 
@@ -144,6 +145,16 @@ class AWMExecutionTrace(Contract):
     usage, finish reason), captured from dspy's own history. The signal that
     distinguishes an empty `text` with a long `reasoning_content` (a
     repetition loop) from a genuinely truncated near-complete answer."""
+    trajectory: dict[str, Any] = {}
+    """The controller's own per-iteration log (thought / tool_name /
+    tool_args / observation). The audit trail remains the authority on what
+    was actually called; this records what the model *said* it wanted,
+    including selections that named no valid tool."""
+    controller_error: str | None = None
+    """Set when tool selection or final extraction failed. A selection
+    failure does not end the episode -- extraction still runs on the
+    grounding already gathered -- so this is how a run that finished on a
+    degraded path is told apart from a clean one."""
     rejected_unsupported_claim_paths: tuple[str, ...] = ()
     """Set by step_agentic_tool_world when it abstained a proposal because a
     committed mutation/event claim was insufficiently grounded
@@ -1002,7 +1013,9 @@ def render_agentic_state_summary(context: AWMRuntimeContext) -> str:
     )
 
 
-def _summarize_lm_entry(entry: dict[str, Any], stage: str) -> dict[str, Any]:
+def _summarize_lm_entry(
+    entry: dict[str, Any], stage: str, max_tokens: int | None = None
+) -> dict[str, Any]:
     """One dspy history record, reduced to what diagnosing a protocol failure
     needs. Deliberately not the whole record: `messages` carries the full
     rendered prompt (the corpus history, every tool result so far) and would
@@ -1030,7 +1043,7 @@ def _summarize_lm_entry(entry: dict[str, Any], stage: str) -> dict[str, Any]:
         "reasoning_len": len(reasoning),
         "text_head": text[:400],
         "reasoning_tail": reasoning[-600:],
-        "max_tokens": (entry.get("kwargs") or {}).get("max_tokens"),
+        "max_tokens": max_tokens,
         "completion_tokens": usage.get("completion_tokens"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "cost": entry.get("cost"),
@@ -1048,11 +1061,104 @@ def _recent_lm_history(*stage_lms: Any) -> tuple[dict[str, Any], ...]:
     records: list[dict[str, Any]] = []
     for stage, lm in stage_lms:
         try:
+            # The configured ceiling comes from the LM's own kwargs: dspy's
+            # history records per-call kwargs, which do not carry it, so
+            # reading it from the entry reports null for every record and
+            # hides exactly which stage hit its cap.
+            budget = (getattr(lm, "kwargs", {}) or {}).get("max_tokens")
             for entry in getattr(lm, "history", []) or []:
-                records.append(_summarize_lm_entry(entry, stage))
+                records.append(_summarize_lm_entry(entry, stage, budget))
         except Exception:  # noqa: BLE001 -- diagnostics never fail the run
             continue
     return tuple(records)
+
+
+def _render_trajectory(trajectory: dict[str, Any]) -> str:
+    """The loop's own log, rendered for the model.
+
+    A plain readable transcript rather than a typed field: the trajectory is
+    heterogeneous (thoughts, tool names, argument dicts, arbitrary tool
+    payloads), and giving it a schema would force every tool's return shape
+    into one contract for no benefit to the model reading it.
+    """
+    if not trajectory:
+        return "(nothing yet)"
+    lines = []
+    for key, value in trajectory.items():
+        rendered = json.dumps(value, default=str) if isinstance(value, (dict, list)) else str(value)
+        lines.append(f"{key}: {rendered}")
+    return "\n".join(lines)
+
+
+def _coerce_tool_args(raw: Any) -> dict[str, Any]:
+    """Tool arguments as a dict, whatever the model emitted.
+
+    Models return this field as a dict, as a JSON string, or as nothing.
+    A non-dict is treated as no arguments rather than raising: the call then
+    fails on its own missing-argument error, which goes back to the model as
+    an observation it can act on, instead of ending the episode.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _build_select_signature(transition_signature: type, tools: Sequence[Callable[..., Any]]) -> type:
+    """The tool-selection stage: pick one tool, or finish.
+
+    Its instructions name the tools explicitly, including `finish`, since
+    this stage's entire job is choosing among them -- and failing to emit
+    `finish` in the expected shape is exactly what lost episodes here.
+    """
+    import dspy
+
+    catalogue = "\n".join(
+        f"- {tool.__name__}: {(tool.__doc__ or '').strip().splitlines()[0] if tool.__doc__ else ''}"
+        for tool in tools
+    )
+
+    class _Select(dspy.Signature):
+        state_summary: str = dspy.InputField()
+        history: str = dspy.InputField()
+        action: str = dspy.InputField()
+        trajectory: str = dspy.InputField(desc="what you have already done this episode")
+        next_thought: str = dspy.OutputField(desc="one or two sentences, not an essay")
+        next_tool_name: str = dspy.OutputField(desc="exactly one tool name, or 'finish'")
+        next_tool_args: dict = dspy.OutputField(desc="arguments for that tool; {} for finish")
+
+    _Select.__doc__ = (
+        f"{transition_signature.__doc__}\n\n"
+        "You are gathering grounding before answering. Choose ONE tool to call next:\n"
+        f"{catalogue}\n- finish: stop gathering and produce the answer.\n\n"
+        "Keep next_thought to one or two sentences. When you have enough "
+        "grounding -- or when further calls would add nothing -- set "
+        "next_tool_name to 'finish' and next_tool_args to {}. Do not explain "
+        "at length before finishing; the answer itself is produced separately."
+    )
+    return _Select
+
+
+def _build_extract_signature(transition_signature: type) -> type:
+    """The extraction stage: the full transition contract, given the
+    trajectory. Built from the transition signature's own output fields so
+    the contract stays defined in exactly one place."""
+    import dspy
+
+    fields = {
+        "state_summary": (str, dspy.InputField()),
+        "history": (str, dspy.InputField()),
+        "action": (str, dspy.InputField()),
+        "trajectory": (str, dspy.InputField(desc="the grounding you gathered")),
+    }
+    for name, field in transition_signature.output_fields.items():
+        fields[name] = (field.annotation, dspy.OutputField(desc=field.json_schema_extra.get("desc", "")))
+    return dspy.Signature(fields, transition_signature.__doc__)
 
 
 def build_agentic_tool_world_predictor(
@@ -1131,50 +1237,81 @@ def build_agentic_tool_world_predictor(
             context, max_calls=max_grounding_calls, on_call=on_grounding_call
         )
         _AgenticTransition.__doc__ = instruction
-        react = dspy.ReAct(_AgenticTransition, tools=tools, max_iters=max_iters)
-        # ReAct runs two structurally different stages against one LM, and a
-        # single budget serves neither. Tool selection emits three short
-        # fields (next_thought/next_tool_name/next_tool_args) and needs only
-        # a few hundred tokens; giving it thousands lets a model that starts
-        # repeating itself burn the whole budget and return empty `text`,
-        # which surfaces as an unparseable response rather than as the
-        # protocol failure it is. Final extraction emits the full transition
-        # contract and needs room. Budgeting them apart bounds the failure
-        # instead of enlarging it -- raising a single shared ceiling buys
-        # proportionally more repetition, not a valid answer.
-        react.react.lm = language_model.copy(max_tokens=select_max_tokens)
-        react.extract.lm = language_model.copy(max_tokens=extract_max_tokens)
-        # dspy.ReAct.forward wraps every tool call in a bare `except Exception`
-        # and turns it into an observation string fed back to the model --
-        # BudgetExceeded raised inside a tool never reaches this frame. Two
-        # separate, non-equivalent signals are read back afterward instead:
-        # `exhausted_budget` (len(audit) == max_calls -- the model used its
-        # full allowance, which also happens on a clean finish right after
-        # the last call) and `budget_rejection_attempted` (rejections is
-        # non-empty -- a call was actually refused for being over budget,
-        # regardless of whether the model then produced a final answer
-        # anyway). Conflating the two would misreport ordinary budget-exact
-        # completion as exhaustion.
-        with dspy.context(lm=language_model):
-            raw = react(
-                state_summary=render_agentic_state_summary(context),
-                history=context.history_text,
-                action=render_agentic_action(context),
-            )
-        # dspy.ReAct returns its own scaffolding fields (`trajectory`, the
-        # loop's tool-call log, and `reasoning`) alongside the signature's
-        # declared outputs. ProposedTransition forbids extra fields, so
-        # passing the Prediction through untouched fails _coerce with
-        # "trajectory: Extra inputs are not permitted" -- recorded as
-        # output_invalid, which reads as a model/prompt failure when it is
-        # really this adapter seam. dspy.Predict has no such fields, so
-        # world.py's fixed-RAG path never hit it.
+
+        # A small controlled loop rather than stock dspy.ReAct. Three
+        # behaviours ReAct does not offer, each one observed losing a paid
+        # episode on this model:
         #
-        # The trajectory is not discarded as data: every grounding call is
-        # already captured structurally in `audit` (the trace below), which
-        # is what claim attribution reads. Only the untyped duplicate is
-        # dropped here, keeping ProposedTransition's strictness -- which is
-        # what stops a model from smuggling in undeclared fields -- intact.
+        #  - ReAct.forward catches ValueError around tool selection, but the
+        #    adapter raises AdapterParseError, which propagates and kills the
+        #    episode outright. Here an unparseable selection ends the
+        #    gathering loop and still runs extraction, so grounding already
+        #    paid for is not thrown away at the last step.
+        #  - the selection and extraction stages are separately budgeted and
+        #    separately labelled, so which stage hit its ceiling is readable
+        #    afterward instead of inferred.
+        #  - tool errors (BudgetExceeded included) become observations fed
+        #    back to the model, matching ReAct, but the audit trail stays the
+        #    authority on what was actually called.
+        select_lm = language_model.copy(max_tokens=select_max_tokens)
+        extract_lm = language_model.copy(max_tokens=extract_max_tokens)
+        select_signature = _build_select_signature(_AgenticTransition, tools)
+        extract_signature = _build_extract_signature(_AgenticTransition)
+        select = dspy.Predict(select_signature)
+        extract = dspy.Predict(extract_signature)
+        by_name = {tool.__name__: tool for tool in tools}
+
+        input_args = {
+            "state_summary": render_agentic_state_summary(context),
+            "history": context.history_text,
+            "action": render_agentic_action(context),
+        }
+        trajectory: dict[str, Any] = {}
+        controller_error: str | None = None
+
+        for idx in range(max_iters):
+            try:
+                with dspy.context(lm=select_lm):
+                    step = select(trajectory=_render_trajectory(trajectory), **input_args)
+            except Exception as exc:  # noqa: BLE001 -- see comment above
+                # Selection failed (unparseable, truncated, context
+                # exceeded). The episode is NOT abandoned: whatever grounding
+                # already succeeded still feeds extraction below.
+                controller_error = f"{type(exc).__name__}: {exc}"
+                break
+
+            tool_name = (getattr(step, "next_tool_name", "") or "").strip()
+            arguments = _coerce_tool_args(getattr(step, "next_tool_args", None))
+            trajectory[f"thought_{idx}"] = getattr(step, "next_thought", "")
+            trajectory[f"tool_name_{idx}"] = tool_name
+            trajectory[f"tool_args_{idx}"] = arguments
+
+            if tool_name == "finish" or not tool_name:
+                break
+            if tool_name not in by_name:
+                trajectory[f"observation_{idx}"] = (
+                    f"Unknown tool {tool_name!r}. Available: "
+                    f"{', '.join(sorted(by_name))}, finish."
+                )
+                continue
+            try:
+                trajectory[f"observation_{idx}"] = by_name[tool_name](**arguments)
+            except Exception as exc:  # noqa: BLE001 -- tool errors inform the model
+                trajectory[f"observation_{idx}"] = f"Execution error in {tool_name}: {exc}"
+
+        # Extraction always runs, even after a failed selection: grounding
+        # calls are the expensive part and they have already been made.
+        try:
+            with dspy.context(lm=extract_lm):
+                raw = extract(trajectory=_render_trajectory(trajectory), **input_args)
+        except Exception as exc:  # noqa: BLE001 -- reported, never raised
+            raw = None
+            controller_error = (
+                f"{controller_error}; extraction: {type(exc).__name__}: {exc}"
+                if controller_error
+                else f"extraction: {type(exc).__name__}: {exc}"
+            )
+
         declared = set(_AgenticTransition.output_fields)
         raw_prediction = raw.toDict() if hasattr(raw, "toDict") else None
         if raw_prediction is not None:
@@ -1184,7 +1321,9 @@ def build_agentic_tool_world_predictor(
             exhausted_budget=len(audit) >= max_grounding_calls,
             budget_rejection_attempted=bool(rejections),
             raw_prediction=raw_prediction,
-            lm_history=_recent_lm_history(("select", react.react.lm), ("extract", react.extract.lm)),
+            lm_history=_recent_lm_history(("select", select_lm), ("extract", extract_lm)),
+            trajectory=dict(trajectory),
+            controller_error=controller_error,
         )
         return raw, trace
 

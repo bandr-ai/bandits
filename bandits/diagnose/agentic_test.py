@@ -1249,91 +1249,114 @@ def test_react_can_build_its_fallback_signature() -> None:
         pass
 
 
-def test_react_scaffolding_fields_do_not_fail_coercion(monkeypatch) -> None:
-    """dspy.ReAct returns `trajectory` and `reasoning` alongside the declared
-    outputs. ProposedTransition forbids extra fields, so passing the
-    Prediction through untouched fails _coerce with "trajectory: Extra inputs
-    are not permitted" -- recorded as output_invalid, which reads as a
-    model/prompt failure when it is really an adapter seam. dspy.Predict has
-    no such fields, so world.py's fixed-RAG path never hit it, and the real
-    smoke run lost all three cases to it.
+def test_selection_failure_still_runs_extraction(monkeypatch) -> None:
+    """The defect that lost paid episodes. dspy.ReAct.forward catches
+    ValueError around tool selection, but the adapter raises
+    AdapterParseError, which propagates and kills the episode -- discarding
+    grounding calls that already succeeded and were already paid for.
 
-    Drives the real predictor with ReAct stubbed to return a ReAct-shaped
-    Prediction, so the stripping under test is the predictor's own, not the
-    test's.
+    The controlled loop ends the gathering loop on an unparseable selection
+    and still runs extraction on whatever was gathered.
     """
     import dspy
 
-    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    calls = {"select": 0, "extract": 0}
 
-    class _FakeStage:
-        """Stands in for ReAct's `react`/`extract` sub-predictors, which the
-        predictor gives separate token budgets."""
-
-        lm = None
-
-    class _FakeReAct:
-        def __init__(self, signature, tools, max_iters):
-            self.react = _FakeStage()
-            self.extract = _FakeStage()
+    class _Select:
+        def __init__(self, signature):
+            pass
 
         def __call__(self, **kwargs):
+            calls["select"] += 1
+            if calls["select"] == 1:
+                return dspy.Prediction(
+                    next_thought="grounding first",
+                    next_tool_name="read_world_state",
+                    next_tool_args={"entity_kind": "reservation", "entity_id": "Q69X3R"},
+                )
+            raise ValueError("Adapter JSONAdapter failed to parse the LM response")
+
+    class _Extract:
+        def __init__(self, signature):
+            pass
+
+        def __call__(self, **kwargs):
+            calls["extract"] += 1
             return dspy.Prediction(
-                observation={"status": "confirmed"},
-                call_outcomes=[],
-                state_delta=[],
-                events=[],
-                terminal=False,
-                support="high",
-                evidence_ids=[],
-                abstain=False,
-                abstain_reason="",
-                # ReAct's own scaffolding -- what broke the real smoke run.
-                trajectory={"thought_0": "checking", "tool_name_0": "read_world_state"},
-                reasoning="I read the reservation.",
+                observation={"status": "confirmed"}, abstain=False, abstain_reason=""
             )
 
-    monkeypatch.setattr(dspy, "ReAct", _FakeReAct)
-    raw, _trace = predict(instruction="probe", context=_reservation_context())
+    def _fake_predict(signature):
+        fields = getattr(signature, "output_fields", {})
+        return _Select(signature) if "next_tool_name" in fields else _Extract(signature)
 
-    from bandits.diagnose.world import ProposedTransition, _coerce, _CoerceFailure
+    monkeypatch.setattr(dspy, "Predict", _fake_predict)
+    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    raw, trace = predict(instruction="probe", context=_reservation_context())
 
-    coerced = _coerce(raw, ProposedTransition)
-    assert not isinstance(coerced, _CoerceFailure), getattr(coerced, "errors", None)
-    assert coerced.observation == {"status": "confirmed"}
+    # Extraction ran despite the selection failure, and the grounding call
+    # made before it survives in the audit trail.
+    assert calls["extract"] == 1
+    assert raw is not None
+    assert trace.controller_error is not None
+    assert [c.tool for c in trace.grounding_calls] == ["read_world_state"]
 
 
-def test_react_stages_get_separate_token_budgets(monkeypatch) -> None:
-    """ReAct's two stages are structurally different: tool selection emits
-    three short fields, final extraction emits the whole transition contract.
-    One shared ceiling serves neither -- a model that starts repeating during
-    selection burns the entire budget and returns empty text, which surfaces
-    as an unparseable response rather than the protocol failure it is.
-    Raising the shared ceiling buys proportionally more repetition."""
+def test_controller_stages_get_separate_token_budgets(monkeypatch) -> None:
+    """Selection and extraction are structurally different stages. One shared
+    ceiling serves neither, and a model that starts repeating during
+    selection would otherwise burn the whole budget."""
     import dspy
 
     seen: dict[str, int] = {}
 
-    class _FakeStage:
-        lm = None
-
-    class _FakeReAct:
-        def __init__(self, signature, tools, max_iters):
-            self.react = _FakeStage()
-            self.extract = _FakeStage()
+    class _Stage:
+        def __init__(self, signature):
+            self.is_select = "next_tool_name" in getattr(signature, "output_fields", {})
 
         def __call__(self, **kwargs):
-            seen["select"] = self.react.lm.kwargs["max_tokens"]
-            seen["extract"] = self.extract.lm.kwargs["max_tokens"]
+            lm = dspy.settings.lm
+            seen["select" if self.is_select else "extract"] = lm.kwargs["max_tokens"]
+            if self.is_select:
+                return dspy.Prediction(next_thought="done", next_tool_name="finish", next_tool_args={})
             return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
 
-    monkeypatch.setattr(dspy, "ReAct", _FakeReAct)
+    monkeypatch.setattr(dspy, "Predict", _Stage)
     predict = build_agentic_tool_world_predictor(
         model="test-model", api_key="dummy-key", select_max_tokens=512, extract_max_tokens=2048
     )
     predict(instruction="probe", context=_reservation_context())
 
     assert seen == {"select": 512, "extract": 2048}
+
+
+def test_unknown_tool_name_is_an_observation_not_a_crash(monkeypatch) -> None:
+    """A model naming a tool that does not exist gets told so and can
+    recover, rather than ending the episode."""
+    import dspy
+
+    names: list[str] = []
+
+    class _Stage:
+        def __init__(self, signature):
+            self.is_select = "next_tool_name" in getattr(signature, "output_fields", {})
+
+        def __call__(self, **kwargs):
+            if not self.is_select:
+                return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
+            names.append("x")
+            if len(names) == 1:
+                return dspy.Prediction(
+                    next_thought="guessing", next_tool_name="no_such_tool", next_tool_args={}
+                )
+            return dspy.Prediction(next_thought="done", next_tool_name="finish", next_tool_args={})
+
+    monkeypatch.setattr(dspy, "Predict", _Stage)
+    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    _raw, trace = predict(instruction="probe", context=_reservation_context())
+
+    assert trace.controller_error is None
+    assert "Unknown tool" in str(trace.trajectory.get("observation_0"))
 
 
 # --- prior recorded observations folded into read_world_state -------------
