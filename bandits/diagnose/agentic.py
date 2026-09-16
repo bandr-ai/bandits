@@ -710,7 +710,12 @@ class BudgetExceeded(GroundingToolError):
 
 
 def with_budget(
-    tool: Callable[..., Any], *, audit: list[AWMToolCall], max_calls: int, rejections: list[int]
+    tool: Callable[..., Any],
+    *,
+    audit: list[AWMToolCall],
+    max_calls: int,
+    rejections: list[int],
+    on_call: Callable[[AWMToolCall], None] | None = None,
 ) -> Callable[..., Any]:
     """Wraps a tool so exceeding the shared per-episode call budget refuses
     the call, rather than letting the AWM keep spending calls (and tokens)
@@ -737,7 +742,17 @@ def with_budget(
         if len(audit) >= max_calls:
             rejections.append(1)
             raise BudgetExceeded(f"grounding-call budget of {max_calls} exhausted")
-        return tool(*args, **kwargs)
+        result = tool(*args, **kwargs)
+        # Fired after the tool has appended its own AWMToolCall, so the
+        # observer sees the recorded call, not a reconstruction. Purely a
+        # progress hook: an observer that raises must never turn a successful
+        # grounding call into a failed one, so it is called defensively.
+        if on_call is not None and audit:
+            try:
+                on_call(audit[-1])
+            except Exception:  # noqa: BLE001 -- a progress hook cannot fail the run
+                pass
+        return result
 
     wrapped.__name__ = getattr(tool, "__name__", "tool")
     wrapped.__doc__ = getattr(tool, "__doc__", None)
@@ -745,7 +760,10 @@ def with_budget(
 
 
 def build_grounding_tools(
-    context: AWMRuntimeContext, *, max_calls: int = MAX_GROUNDING_CALLS_DEFAULT
+    context: AWMRuntimeContext,
+    *,
+    max_calls: int = MAX_GROUNDING_CALLS_DEFAULT,
+    on_call: Callable[[AWMToolCall], None] | None = None,
 ) -> tuple[list[Callable[..., Any]], list[AWMToolCall], list[int]]:
     """The four read-only tools, each budget-wrapped and sharing one audit log.
 
@@ -763,7 +781,10 @@ def build_grounding_tools(
         make_inspect_grounding_history(context, audit=audit),
     ]
     budgeted = [
-        with_budget(tool, audit=audit, max_calls=max_calls, rejections=rejections) for tool in tools
+        with_budget(
+            tool, audit=audit, max_calls=max_calls, rejections=rejections, on_call=on_call
+        )
+        for tool in tools
     ]
     for original, wrapped in zip(tools, budgeted, strict=True):
         wrapped.__name__ = original.__name__
@@ -856,6 +877,7 @@ def build_agentic_tool_world_predictor(
     max_tokens: int = 6000,
     max_grounding_calls: int = MAX_GROUNDING_CALLS_DEFAULT,
     max_iters: int = 8,
+    on_grounding_call: Callable[[AWMToolCall], None] | None = None,
 ) -> AgenticToolWorldPredictor:
     """A dspy.ReAct-driven tool world: same output contract as the fixed-RAG
     predictor (world.py's build_tool_world_predictor), but the model gathers
@@ -918,7 +940,9 @@ def build_agentic_tool_world_predictor(
     _AgenticTransition.model_rebuild(force=True)
 
     def predict(*, instruction: str, context: AWMRuntimeContext) -> tuple[Any, AWMExecutionTrace]:
-        tools, audit, rejections = build_grounding_tools(context, max_calls=max_grounding_calls)
+        tools, audit, rejections = build_grounding_tools(
+            context, max_calls=max_grounding_calls, on_call=on_grounding_call
+        )
         _AgenticTransition.__doc__ = instruction
         react = dspy.ReAct(_AgenticTransition, tools=tools, max_iters=max_iters)
         # dspy.ReAct.forward wraps every tool call in a bare `except Exception`
@@ -938,6 +962,23 @@ def build_agentic_tool_world_predictor(
                 history=context.history_text,
                 action=render_agentic_action(context),
             )
+        # dspy.ReAct returns its own scaffolding fields (`trajectory`, the
+        # loop's tool-call log, and `reasoning`) alongside the signature's
+        # declared outputs. ProposedTransition forbids extra fields, so
+        # passing the Prediction through untouched fails _coerce with
+        # "trajectory: Extra inputs are not permitted" -- recorded as
+        # output_invalid, which reads as a model/prompt failure when it is
+        # really this adapter seam. dspy.Predict has no such fields, so
+        # world.py's fixed-RAG path never hit it.
+        #
+        # The trajectory is not discarded as data: every grounding call is
+        # already captured structurally in `audit` (the trace below), which
+        # is what claim attribution reads. Only the untyped duplicate is
+        # dropped here, keeping ProposedTransition's strictness -- which is
+        # what stops a model from smuggling in undeclared fields -- intact.
+        declared = set(_AgenticTransition.output_fields)
+        if hasattr(raw, "toDict"):
+            raw = {k: v for k, v in raw.toDict().items() if k in declared}
         trace = AWMExecutionTrace(
             grounding_calls=tuple(audit),
             exhausted_budget=len(audit) >= max_grounding_calls,

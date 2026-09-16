@@ -35,6 +35,7 @@ from bandits.diagnose.agentic import (
     AGENTIC_TOOL_WORLD_INSTRUCTION,
     AWMExecutionTrace,
     AWMRuntimeContext,
+    AWMToolCall,
     build_agentic_tool_world_predictor,
     step_agentic_tool_world,
 )
@@ -290,6 +291,7 @@ def run(
     unsupported_lookup_transition_id: str,
     fact_grounded_transition_id: str,
     output_dir: Path,
+    max_tokens: int = 6000,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -314,7 +316,22 @@ def run(
     }
     (output_dir / "smoke.manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
-    predict = build_agentic_tool_world_predictor(model=model)
+    # Live progress. Each case is a ReAct loop making up to max_iters model
+    # calls and several grounding calls, so a run that printed only on
+    # completion sat silent for minutes with no way to tell a slow call from
+    # a hung one, or to see which tool the AWM actually reached for.
+    def _report_grounding_call(call: AWMToolCall) -> None:
+        detail = ""
+        if call.entity is not None:
+            detail = f" {call.entity[0]}:{call.entity[1]}"
+        elif call.arguments:
+            detail = " " + ", ".join(f"{k}={v!r}" for k, v in list(call.arguments.items())[:2])
+        summary = f" -> {call.result_summary}" if call.result_summary else ""
+        print(f"    [call {call.index}] {call.tool}{detail}{summary}", flush=True)
+
+    predict = build_agentic_tool_world_predictor(
+        model=model, max_tokens=max_tokens, on_grounding_call=_report_grounding_call
+    )
 
     def _control_extra_fields(control: GroundingTransition) -> tuple[StateField, ...]:
         recorded = next((o for o in control.observations if o.role == "tool"), None)
@@ -360,6 +377,7 @@ def run(
     # an exception on C must not lose A and B's already-paid-for results.
     with checkpoint_path.open("w") as checkpoint_file:
         for label, transition, extra_fields in planned:
+            print(f"[start] {label} {transition.transition_id}", flush=True)
             try:
                 result = run_one(
                     transition,
@@ -379,13 +397,13 @@ def run(
                 results.append(result)
                 checkpoint_file.write(json.dumps(result, default=str) + "\n")
                 checkpoint_file.flush()
-                print(f"[unexpected-error] {label} {transition.transition_id}: {exc}")
+                print(f"[unexpected-error] {label} {transition.transition_id}: {exc}", flush=True)
                 continue
 
             results.append(result)
             checkpoint_file.write(json.dumps(result, default=str) + "\n")
             checkpoint_file.flush()
-            print(f"[done] {label} {transition.transition_id}")
+            print(f"[done] {label} {transition.transition_id}", flush=True)
 
     report = {
         "model": model,
@@ -428,6 +446,10 @@ def main() -> None:
     parser.add_argument("--unsupported-lookup-transition-id", required=True)
     parser.add_argument("--fact-grounded-transition-id", required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("work/awm-agentic"))
+    # Raise when responses truncate: a truncated response parses into an
+    # output_invalid row, which is a parser failure recorded as if it were
+    # an epistemic result.
+    parser.add_argument("--max-tokens", type=int, default=6000)
     args = parser.parse_args()
 
     run(
@@ -441,6 +463,7 @@ def main() -> None:
         unsupported_lookup_transition_id=args.unsupported_lookup_transition_id,
         fact_grounded_transition_id=args.fact_grounded_transition_id,
         output_dir=args.output_dir,
+        max_tokens=args.max_tokens,
     )
 
 
