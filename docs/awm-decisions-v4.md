@@ -14,7 +14,8 @@ work without running it; everything below is measured, not asserted.
 | S9 | Record what the green suite did not cover | D68–D74; I8 held open, I31–I34 opened |
 | S10 | User ratifies v4 and sets Q13–Q15 | Explicit projections; legacy ids pinned; input validation is a Gate 0 blocker |
 | S11 | Close I31, I33, D72, I32, I34 in that order | 919 passed, 0 failed; each closed by an executed check |
-| S12 | First real-model fidelity run (`scripts/run_awm_fidelity.py`, DeepSeek V4 Flash) against the pinned tau2 family; ten defects found and fixed as they blocked interpretation | 932 passed, 0 failed; one held-out transition scored correctly end to end (`field_accuracy=1.0`) |
+| S12 | First real-model fidelity runs (`scripts/run_awm_fidelity.py`, DeepSeek V4 Flash) against the pinned tau2 family: one transition, then ten stratified; ten scorer defects found and fixed as they blocked interpretation | 932 passed, 0 failed; one cancellation scored 36/36 fields; the ten-transition run found the scorer's entity-blind support/abstention check (E39), documented as provisional, not yet fixed |
+| S13 | Fix I39 narrowly: per-call, batch-safe, tool-independent-entity grounding for single-call `get_user_details`/`get_reservation_details` reads (D79 resolves Q21); zero-model-call rescore against the real S12 artifact | 946 passed, 0 failed; 32/32 focused; real rescore matches predicted outcome exactly and reproduces byte-identical on a second run; I39 closed narrowly, agentic AWM-centered runtime left as separate unscoped future work |
 
 ## Evidence
 
@@ -341,6 +342,44 @@ deliberately empty under the batch form. `predicted_delta` now reads
 `validation.committed` — the validator's own flattened, accepted result — so `delta_correct`
 compares the same representation for both the batch and aggregate encodings.
 
+### D79. Resolves Q21: identifiability is assessed at scoring time, from evaluation demand read out of the recorded result. **Decided**
+
+Q21 asked whether a transition's "identifiability classification" (E39's provisional
+`grounding` taxonomy) should be a compile-time property of the transition, like
+`delta_ground_truth_status`, or a scoring-time property of what a specific query's retrieval
+actually returned — since the same transition could be identifiable under one retrieval
+configuration and not another.
+
+**Decided: scoring-time, in two parts, computed by `bandits/diagnose/grounding.py`'s
+`assess_grounding`.**
+
+- **Evaluation demand** comes from the recorded result: for held-out fidelity scoring, the
+  transition's actual `GroundingObservation.content` is flattened into field paths
+  (`required_fact_paths`). This is safe only because those values are read to determine
+  *what the prediction would have needed to know*, never shown to the predictor being
+  scored — the same non-leakage boundary `score_transition_fidelity` already holds for
+  `recorded` generally. Runtime (no recorded answer to peek at, per the earlier
+  AWM-centered-runtime discussion this issue is deliberately not building) needs a
+  tool-contract-derived demand instead; out of scope here.
+- **Identifiability** is assessed against the actual pre-action inputs a given call would
+  see — `state_before` plus whatever was actually retrieved for that query — not stored on
+  `GroundingTransition` itself. The same transition run through a different retrieval
+  configuration, or scored earlier/later in a trace where more or less state had accumulated,
+  can legitimately get a different verdict; hard-coding one verdict onto the transition would
+  hide that dependency rather than measure it.
+
+This does not extend to writes, batches, or tools outside `grounding.py`'s reviewed
+`ENTITY_TOOLS` mapping (`get_user_details`, `get_reservation_details`) — those report
+`GroundingKind.UNAVAILABLE` and are scored by the prior `SupportLevel`-based rule, unchanged.
+Extending the taxonomy to mutations (where `DERIVABLE_FROM_STATE` is reserved but not yet
+emitted) and to the agentic AWM-centered runtime's own grounding-tool calls
+(`read_world_state`/`search_transitions`/etc.) is separate, unscoped future work — see I39's
+closing note in `awm-issues.md`.
+
+**Verification.** See I39's closing note in `awm-issues.md` for the executed test/rescore
+commands and results (946 passed full suite; 32/32 focused; real-artifact rescore matches the
+predicted outcome exactly; rescore is reproducibly byte-identical on a second run).
+
 ## Issues opened
 
 - **I31** (P0): incomplete and zero-outcome batches accepted; execution fabricated from
@@ -492,11 +531,102 @@ listed in their entries. Full suite: **932 passed, 0 failed** (`uv run pytest -q
 targeted subset). I35-I38 closed by the same executed checks (D74's rule).
 
 Held open, deliberately not attempted this session: a reviewed tau2 entity-path
-canonicalizer (D77 named the alternative and rejected inventing one unreviewed), user-policy
-output-invalid taxonomy (`ProposedUserTurn` still collapses a failed parse into abstention --
-noted inline in `step_user_policy`, out of scope for the tool-world work this session did),
-and the ten-transition stratified run itself (Experiment 1 proper) -- this session verified
-the plumbing on one transition per your explicit request to fix before scaling.
+canonicalizer (D77 named the alternative and rejected inventing one unreviewed), and
+user-policy output-invalid taxonomy (`ProposedUserTurn` still collapses a failed parse into
+abstention -- noted inline in `step_user_policy`, out of scope for the tool-world work this
+session did).
+
+### E39. The ten-transition stratified run mostly tested record materialization, which no retrieved evidence in this family can support.
+
+Ran (same DeepSeek model, same `.raw.jsonl`/manifest checkpointing, resumed from the cached
+E37/E38 result): 10 held-out transitions, stratified across `cancel_reservation` (1, cached),
+`get_reservation_details` (3), `get_user_details` (3), `transfer_to_human_agents` (3).
+
+Raw counts: `field_accuracy=1.0` and `status_accuracy=1.0` in the aggregate report, but both
+are computed over denominators far smaller than "10" suggests --
+
+```text
+fields compared at all         : 1 transition  (the cached cancellation, 36/36 correct)
+status compared (non-abstain,
+  non-output-invalid)          : 4 transitions (1 cancel + 3 transfers, all fieldless)
+output_invalid                 : 4 transitions (all get_reservation_details/get_user_details)
+abstained                      : 2 transitions (both get_reservation_details/get_user_details)
+```
+
+Inspecting the four `output_invalid` rows' raw model responses (not just the aggregate rate)
+found they are not garbled output: each is `abstain=true` with a coherent, correct-sounding
+reason ("No evidence for user emma_kim_9957; cannot ground the tool's output"), paired with a
+`call_outcomes` entry stating `executed=false, observation=null` -- the model trying to be
+maximally structured about *why* it declined. `ProposedTransition.abstention_proposes_nothing`
+rejects any non-empty `call_outcomes` alongside `abstain=true`, with no exception for an
+all-null/not-executed placeholder, so `_coerce` correctly (per D75) classifies these as
+`output_invalid` rather than salvaging them -- but the *underlying model behavior* was a
+reasonable abstention, misshaped by the contract, not noise.
+
+Inspecting the two clean-abstention rows (`get_reservation_details` for `Q69X3R` and
+`get_user_details` for `raj_sanchez_7340`) and the four output-invalid rows' `expected_observation`
+against what was actually retrieved: every one of these six read transitions asked the AWM to
+reproduce a specific entity's private record -- e.g. `get_user_details("emma_kim_9957")`
+expected Emma Kim's exact name/address/email/DOB/payment methods, none of which appear
+anywhere in `state_before` or in the retrieved examples (which were `get_user_details` calls
+for *other* users). No amount of behavioral pattern-matching over other users' records can
+recover Emma's specific values; declining was the only honest answer available. `support_level()`
+(`retrieve.py`) awards `"high"`/`"medium"` support from `exact_tool` matches -- the retrieved
+example called the *same tool* -- without checking whether the retrieved example concerns the
+*same entity* the transition under test asks about. `abstain_correct`/`wrong_abstention_rate`
+inherit that blindness: a correct "I don't have this specific record" reads as a wrong
+abstention because generic same-tool evidence existed, even though no evidence about *this*
+entity existed.
+
+By contrast, the cached `cancel_reservation` transition is a different task shape entirely:
+`state_before` already held the target reservation's full details from an earlier
+`get_reservation_details` call *in the same trace*, so scoring it required transforming known
+state under a recorded action, not materializing an unknown record. That is the transition
+that scored 36/36 -- it is not representative of what the other nine transitions asked for,
+and averaging it into one `field_accuracy=1.0` headline is misleading on its own.
+
+The `transfer_to_human_agents` rows (3/3 "valid," `status_correct=true`) carry almost no
+evidentiary weight: this tool's transitions have no observation fields to diff at all
+(`fields=()` for all three) -- passing tells us only that the model predicted the right
+coarse success/error shape for a call with no payload, not that any fact was reproduced
+correctly.
+
+One `max_tokens=4000` truncation warning fired during the run, log-order-attributable to the
+5th call (`transition-233d53079e5b`'s `get_reservation_details` invocation) with high
+confidence, but the persisted final response for that transition is short and well-formed --
+not visibly truncated. Whether an earlier internal completion attempt was the one that hit
+the limit, and whether DSPy retried before the value that was actually saved, cannot be
+established from what the runner persists today (only the final `dspy.Prediction`, not
+provider/DSPy attempt history). Recorded as unconfirmed rather than asserted either way.
+
+### Provisional direction from E39 — not yet a ratified decision
+
+Two structurally different things are currently conflated under one `support_level()`/
+`abstain_correct` calculation, and likely need to stay separate rather than be merged into a
+single "entity match" fix:
+
+```text
+grounding =
+    exact_entity_fact        (the specific record/value is in state_before or a retrieved
+                               example that names this exact entity)
+  | derivable_from_state      (the expected result is a transformation of an already-known
+                               entity's state under a recorded-shape action -- the
+                               cancellation case)
+  | behavioral_analogy        (same tool, different entity -- teaches output SHAPE/semantics,
+                               never a specific field VALUE)
+  | unsupported
+```
+
+Only the first two can license a fidelity claim about specific field values. `behavioral_analogy`
+can support scoring transition *semantics* (does the tool's shape/error/effect pattern look
+right) but must not be read as grounds to expect, or to score against, an exact reproduced
+value -- which is what today's `exact_tool`-only support check effectively does.
+
+This is deliberately left provisional. Before it becomes a D-series decision: an explicit
+identifiability classification per transition (can the expected result actually be derived
+from what the AWM was given, independent of what it produced) is needed first, and
+`abstain_correct`/`wrong_abstention_rate` should be conditioned on that classification rather
+than on retrieval support alone. Not implemented or re-run this session.
 
 ## Open questions
 
@@ -509,13 +639,35 @@ the plumbing on one transition per your explicit request to fix before scaling.
   `tool-call SFT` row)?
 - **Q18.** The smoke test pins counts from one family. Does Gate 0 extend it to the other
   15 mined families, or is one family's fidelity to the artifact sufficient?
-- **Q19.** Delta ground truth is `unavailable`/`not_applicable` for 100% of the pinned
-  family (D77/E36). Is a reviewed tau2 entity-path canonicalizer (mapping
-  `cancel_reservation.X.status` and `get_reservation_details.X.status` to one canonical
-  `reservation.X.status`) worth building before the ten-transition run, or does the
-  fidelity report simply carry `model_output_invalid_rate=0.0
-  /delta_ground_truth_coverage=0.0` as an honest, standing limitation?
+- **Q19 (updated post-E39).** Delta ground truth was `unavailable`/`not_applicable` for
+  100% of both the single-transition and ten-transition runs (D77/E36). A reviewed tau2
+  entity-path canonicalizer remains unbuilt and unreviewed (D26/D27 fail-closed rule); the
+  report carries `delta_ground_truth_coverage=0.0` as an honest, standing limitation rather
+  than a guessed canonicalization. Still open: is this worth building at all before the
+  identifiability work in E39's provisional direction, given delta fidelity and
+  record-materialization identifiability may turn out to need overlapping machinery
+  (both are, at root, "does the AWM's input actually determine this entity's specific
+  field values")?
 - **Q20.** `ProposedUserTurn`/`step_user_policy` still has no `output_invalid` distinction
   (D75 covers only the tool-world side). Does the user-policy half need the same taxonomy
   before Experiment 6 (user-policy fidelity) runs, given 189/371 of this family's
   transitions are user replies?
+- **Q21 (from E39). RESOLVED by D79.** Identifiability is assessed at scoring time
+  (`bandits/diagnose/grounding.py::assess_grounding`), from `state_before` plus whatever was
+  actually retrieved for that call's query; evaluation demand comes from the recorded
+  result's field paths. See D79 for the full resolution and I39's closing note in
+  `awm-issues.md` for the executed verification.
+- **Q22 (from E39).** `abstention_proposes_nothing` (the `ProposedTransition` validator
+  under D75) rejects an abstention that carries an all-empty/`executed=false` placeholder
+  `call_outcomes` entry, even though it asserts no content. Four of ten real transitions hit
+  this exact shape. Is the fix a narrower validator rule (only reject `call_outcomes` entries
+  that assert actual content: non-null observation, non-empty deltas/events), a prompt
+  change (tell the model `abstain=true` requires `call_outcomes=[]`), or both? Deliberately
+  not decided or implemented this session -- see E39's note that fixing this reclassifies
+  four `output_invalid` rows as clean abstentions but does not, by itself, make the AWM able
+  to answer the underlying lookups.
+- **Q23 (from E39).** The `max_tokens=4000` truncation warning during the ten-transition run
+  is attributable to one call by log order but not confirmed against the actual persisted
+  response, which shows no visible truncation. Is it worth persisting DSPy/provider attempt
+  history (not just the final `dspy.Prediction`) in the runner's checkpoint so future
+  truncation attribution is exact rather than inferred from log ordering?

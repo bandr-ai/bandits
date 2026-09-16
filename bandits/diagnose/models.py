@@ -879,6 +879,117 @@ class SupportPolicy(Contract):
         return self
 
 
+class EntityRef(Contract):
+    """A domain entity identified independently of which tool named it.
+
+    ``get_reservation_details(Q69X3R)`` and ``cancel_reservation(Q69X3R)``
+    must resolve to the same ``reservation:Q69X3R`` -- tool-namespacing the
+    key (``f"{tool}.{id}"``) breaks that identity and silently reproduces the
+    cross-tool state-path problem ``inferred_state_delta`` already hit
+    (I38/D77). The tool describes an operation; it is never part of what
+    entity a call refers to.
+    """
+
+    kind: str
+    id: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.id}"
+
+
+class GroundingKind(str, Enum):
+    """Reporting summary of a ``CallGroundingAssessment``. Never the scoring input.
+
+    Two independent questions collapse into one label here only for display:
+    whether a call's exact required values are identifiable, and whether its
+    behavior (shape/success/error semantics) is evidenced at all. A
+    same-tool-different-entity retrieval hit proves the second without ever
+    proving the first (I39) -- scoring code must read the two booleans on
+    ``CallGroundingAssessment`` directly, not branch on this enum.
+    """
+
+    EXACT_ENTITY_FACT = "exact_entity_fact"
+    """The exact record is already known -- read from state_before or from
+    retrieved evidence about this same entity. A record-materialization read
+    (get_user_details, get_reservation_details) reports this record; it does
+    not derive it."""
+    DERIVABLE_FROM_STATE = "derivable_from_state"
+    """Reserved for a mutation whose post-state is a transformation of known
+    pre-state plus supported behavior (e.g. cancellation). Not emitted by the
+    current record-materialization classifier, which covers only reads."""
+    BEHAVIORAL_ANALOGY = "behavioral_analogy"
+    """behavior_supported only -- same tool, different entity. Cannot license a
+    field-value fidelity claim, only a shape/status claim."""
+    UNSUPPORTED = "unsupported"
+    """Neither dimension is evidenced."""
+    UNAVAILABLE = "unavailable"
+    """This call's tool/shape is outside what the classifier covers (writes,
+    search, transfer, booking, ...) or it is part of a mixed-grounding batch.
+    Distinct from UNSUPPORTED: this is "we did not assess it," not "we
+    assessed it and found nothing." Never used for abstention calibration."""
+
+
+class CallGroundingAssessment(Contract):
+    """What one tool call's required facts and behavior are backed by.
+
+    Grounding is a per-call question, not a per-transition one (D39/D53/D70):
+    a batch pairing a known-entity call with an unknown-entity call must not
+    let one call's evidence license a claim about the other. ``call_id``
+    correlates back to the ``ActionCall`` and to the recorded
+    ``GroundingObservation.tool_call_id`` that answered it.
+    """
+
+    call_id: str | None = None
+    tool: str
+    target_entities: tuple[EntityRef, ...] = ()
+    required_fact_paths: tuple[str, ...] = ()
+    """Field paths this call's recorded result actually populated. Only
+    meaningful for held-out fidelity scoring, where the recorded result is
+    known to derive demand from -- never shown to the predictor being scored."""
+    identifiable_fact_paths: tuple[str, ...] = ()
+    missing_fact_paths: tuple[str, ...] = ()
+    exact_fact_evidence_ids: tuple[str, ...] = ()
+    behavioral_evidence_ids: tuple[str, ...] = ()
+    values_identifiable: bool = False
+    """True only if every required fact path was identifiable from state_before
+    or from retrieved evidence about the *same* target entity."""
+    behavior_supported: bool = False
+    """True if retrieval found evidence of how this tool behaves, regardless
+    of which entity it concerned."""
+    kind: GroundingKind = GroundingKind.UNAVAILABLE
+
+
+class GroundingAssessment(Contract):
+    """Per-call grounding for one transition's action.
+
+    Deliberately not reduced to one transition-level verdict: a batch mixing
+    an identifiable call with an unidentifiable one has no single correct
+    abstain/answer label, and collapsing to one would either license the
+    unidentifiable call or wrongly penalize the identifiable one.
+    """
+
+    calls: tuple[CallGroundingAssessment, ...] = ()
+
+    @property
+    def single_call(self) -> CallGroundingAssessment | None:
+        return self.calls[0] if len(self.calls) == 1 else None
+
+    @property
+    def values_identifiable(self) -> bool | None:
+        """None for any batch, or when the one call was never assessed.
+
+        Proposal-wide abstention cannot be scored from per-call grounding for
+        a batch: two calls both being unidentifiable does not make a whole-
+        transition abstention "correct" in any sense the runtime's
+        all-or-nothing abstain flag can represent. Restricted to single-call
+        transitions until an explicit per-call unresolved status exists."""
+        if len(self.calls) != 1:
+            return None
+        call = self.calls[0]
+        return None if call.kind is GroundingKind.UNAVAILABLE else call.values_identifiable
+
+
 class RolloutStep(Contract):
     """One candidate action and the environment's response to it.
 
