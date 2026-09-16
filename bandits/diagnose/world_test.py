@@ -170,6 +170,35 @@ def test_an_abstaining_proposal_cannot_also_propose_changes() -> None:
         ProposedTransition(abstain=True, state_delta=(StateDelta(path="a.b", new_value=1),))
 
 
+def test_an_abstaining_proposal_may_report_the_call_unexecuted() -> None:
+    """The contract asks for one call_outcomes entry per call id in ACTION, so
+    a model that abstains still fills in the batch's shape. An entry reporting
+    the call as unexecuted -- no observation, no deltas, no events -- proposes
+    nothing, and rejecting it scored a correct abstention as output_invalid.
+
+    Observed on the real corpus: the AWM correctly abstained on an entity with
+    no state and no retrieval match, and the answer was thrown away by this
+    rule rather than by anything it claimed.
+    """
+    proposal = ProposedTransition(
+        abstain=True,
+        abstain_reason="no record for this reservation",
+        call_outcomes=(ProposedCallOutcome(call_id="c1", executed=False, observation=None),),
+    )
+    assert proposal.abstain is True
+    assert proposal.call_outcomes[0].executed is False
+
+
+def test_an_abstaining_proposal_cannot_claim_a_call_executed() -> None:
+    """Claiming a call ran is itself a claim about the world, so it is still a
+    change even with empty deltas -- the loosening above must not reach it."""
+    with pytest.raises(ValidationError, match="cannot also propose changes"):
+        ProposedTransition(
+            abstain=True,
+            call_outcomes=(ProposedCallOutcome(call_id="c1", executed=True, observation={"a": 1}),),
+        )
+
+
 def test_abstention_is_rejected_by_the_validator_not_committed() -> None:
     outcome = validate_transition(
         ProposedTransition(abstain=True),
