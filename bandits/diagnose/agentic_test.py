@@ -17,6 +17,7 @@ from bandits.diagnose.agentic import (
     AWMRuntimeContext,
     AWMToolCall,
     BudgetExceeded,
+    assess_proposal_claims,
     build_agentic_tool_world_predictor,
     build_grounding_tools,
     make_inspect_grounding_history,
@@ -28,9 +29,11 @@ from bandits.diagnose.agentic import (
 )
 from bandits.diagnose.models import (
     ActionCall,
+    GroundingKind,
     GroundingObservation,
     GroundingTransition,
     Partition,
+    PrefixStep,
     ScenarioState,
     StateField,
     SupportLevel,
@@ -1331,3 +1334,147 @@ def test_react_stages_get_separate_token_budgets(monkeypatch) -> None:
     predict(instruction="probe", context=_reservation_context())
 
     assert seen == {"select": 512, "extract": 2048}
+
+
+# --- prior recorded observations folded into read_world_state -------------
+
+
+def _prefix(role, content=None, tool=None, span=None, error=False):
+    return PrefixStep(role=role, content=content, tool_name=tool, span_id=span, error=error)
+
+
+def _ledger_context(**overrides):
+    base = dict(
+        candidate_calls=(
+            ActionCall(call_id="a", tool="cancel_reservation", arguments={"reservation_id": "Q69X3R"}),
+        ),
+        current_state=ScenarioState(
+            fields=(
+                StateField(path="get_reservation_details.Q69X3R.status", value=None, origin=WorldOrigin.RECORDED),
+                StateField(path="get_reservation_details.Q69X3R.reservation_id", value="Q69X3R", origin=WorldOrigin.RECORDED),
+            )
+        ),
+        history_before=(
+            _prefix("tool", {"reservation_id": "Q69X3R", "payment_history": [{"amount": 430}]},
+                    tool="get_reservation_details", span="span-12"),
+        ),
+    )
+    base.update(overrides)
+    return AWMRuntimeContext(**base)
+
+
+def _read(context, kind="reservation", entity="Q69X3R", max_calls=4):
+    tools, audit, _rej = build_grounding_tools(context, max_calls=max_calls)
+    read = next(t for t in tools if t.__name__ == "read_world_state")
+    return read(kind, entity), audit
+
+
+def test_prior_observation_fills_gaps_with_provenance() -> None:
+    """The authority asymmetry: a recorded tool observation was visible to the
+    AWM in rendered history but invisible to the claim auditor, so using it
+    looked like fabrication and ignoring it forced abstention on a recoverable
+    answer. Folded into read_world_state, the fact becomes first-class and
+    provenance-tagged."""
+    result, _audit = _read(_ledger_context())
+
+    assert result["fields"]["payment_history[0].amount"] == 430
+    assert result["provenance"]["payment_history[0].amount"] == "prior_recorded_observation"
+    assert result["provenance"]["status"] == "scenario_state"
+    # Prior observations filling gaps never upgrades completeness -- silence
+    # must not become a confirmed absence.
+    assert result["completeness"] == "partial"
+
+
+def test_committed_state_overrides_prior_observation() -> None:
+    """State is this rollout's committed view; an observation is an earlier
+    snapshot a later mutation may already have superseded."""
+    context = _ledger_context(
+        current_state=ScenarioState(
+            fields=(StateField(path="get_reservation_details.Q69X3R.status", value="confirmed", origin=WorldOrigin.RECORDED),)
+        ),
+        history_before=(
+            _prefix("tool", {"reservation_id": "Q69X3R", "status": "pending"},
+                    tool="get_reservation_details", span="span-2"),
+        ),
+    )
+    result, _audit = _read(context)
+    assert result["fields"]["status"] == "confirmed"
+    assert result["provenance"]["status"] == "scenario_state"
+
+
+def test_conflicting_prior_observations_are_reported_not_resolved() -> None:
+    """Two replayed observations disagree about one path. Picking the newer
+    silently would be indistinguishable downstream from a verified fact."""
+    context = _ledger_context(
+        current_state=ScenarioState(),
+        history_before=(
+            _prefix("tool", {"reservation_id": "Q69X3R", "cabin": "economy"},
+                    tool="get_reservation_details", span="span-2"),
+            _prefix("tool", {"reservation_id": "Q69X3R", "cabin": "business"},
+                    tool="get_reservation_details", span="span-6"),
+        ),
+    )
+    result, _audit = _read(context)
+    assert "cabin" not in result["fields"]
+    assert result["conflicts"]["cabin"] == ["economy", "business"]
+
+
+def test_prior_observations_are_scoped_to_their_own_entity() -> None:
+    """One episode's history routinely holds several reservations. Another
+    reservation's payment amount must never license a claim about this one."""
+    context = _ledger_context(
+        current_state=ScenarioState(),
+        history_before=(
+            _prefix("tool", {"reservation_id": "OTHER1", "payment_history": [{"amount": 12531}]},
+                    tool="get_reservation_details", span="span-2"),
+            _prefix("tool", {"reservation_id": "Q69X3R", "payment_history": [{"amount": 430}]},
+                    tool="get_reservation_details", span="span-12"),
+        ),
+    )
+    result, _audit = _read(context)
+    assert result["fields"]["payment_history[0].amount"] == 430
+
+
+def test_errored_prior_observations_are_ignored() -> None:
+    """A failed tool call observed nothing; its payload is an error, not state."""
+    context = _ledger_context(
+        current_state=ScenarioState(),
+        history_before=(
+            _prefix("tool", {"reservation_id": "Q69X3R", "cabin": "economy"},
+                    tool="get_reservation_details", span="span-2", error=True),
+        ),
+    )
+    result, _audit = _read(context)
+    assert result["fields"] == {}
+
+
+def test_prior_observation_fields_reach_the_audit_trail() -> None:
+    """Claim attribution reads state_values_read, so a merged field that never
+    reaches the audit trail is invisible to the auditor -- the asymmetry
+    reappearing one layer down."""
+    _result, audit = _read(_ledger_context())
+    canonical = "get_reservation_details.Q69X3R.payment_history[0].amount"
+    assert audit[0].state_values_read[canonical] == 430
+    assert canonical in audit[0].state_paths_read
+    # Folded in, not charged as a separate grounding call.
+    assert len(audit) == 1
+
+
+def test_ledger_grounds_the_known_amount_but_not_the_refund() -> None:
+    """The decision this was built for. The ledger makes the recorded +430 an
+    EXACT_ENTITY_FACT, so the AWM can officially see it -- while the proposed
+    -430 refund, a value no tool ever emitted for this entity, stays
+    UNSUPPORTED. The AWM may reason toward the refund; the checker does not
+    yet accept it."""
+    from bandits.diagnose.world import ProposedTransition
+
+    context = _ledger_context()
+    _result, audit = _read(context)
+    trace = AWMExecutionTrace(grounding_calls=tuple(audit))
+    proposal = ProposedTransition(
+        observation={"payment_history": [{"amount": 430}, {"amount": -430}]},
+        support=SupportLevel.HIGH,
+    )
+    by_path = {c.path: c.kind for c in assess_proposal_claims(proposal, context=context, trace=trace)}
+    assert by_path["payment_history[0].amount"] is GroundingKind.EXACT_ENTITY_FACT
+    assert by_path["payment_history[1].amount"] is GroundingKind.UNSUPPORTED
