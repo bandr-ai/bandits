@@ -17,6 +17,7 @@ from bandits.diagnose.agentic import (
     AWMRuntimeContext,
     AWMToolCall,
     BudgetExceeded,
+    build_agentic_tool_world_predictor,
     build_grounding_tools,
     make_inspect_grounding_history,
     make_inspect_tool_contract,
@@ -1220,3 +1221,26 @@ def test_batch_nulling_is_scoped_to_the_offending_call() -> None:
     assert by_id["a"].observation["status"] is None
     # The grounded call keeps its value -- it shares a path name, not a claim.
     assert by_id["b"].observation["status"] == "confirmed"
+
+
+def test_react_can_build_its_fallback_signature() -> None:
+    """dspy.ReAct rebuilds a fallback signature from the original signature's
+    fields. agentic.py uses `from __future__ import annotations`, so those
+    fields carry annotation *strings*, and make_signature rejects a ForwardRef
+    outright ("Field types must be types"). dspy.Predict tolerates it, which
+    is why nothing else in the suite caught this -- the smoke runner failed on
+    all three transitions before reaching a single model call.
+
+    Drives the real builder and the real predict() path, stopping at the
+    network boundary: anything raised before that (ValueError from
+    make_signature) is the regression; a provider/auth error means signature
+    construction succeeded.
+    """
+    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    try:
+        predict(instruction="probe", context=_reservation_context())
+    except ValueError as exc:  # pragma: no cover -- the regression itself
+        if "Field types must be types" in str(exc):
+            raise AssertionError(f"ReAct could not build its fallback signature: {exc}") from exc
+    except Exception:  # noqa: BLE001 -- reaching the provider is the success case
+        pass

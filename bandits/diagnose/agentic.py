@@ -31,7 +31,7 @@ it never had a chance to see.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from typing import Any, ForwardRef, Protocol
 
 from bandits.diagnose.models import (
     ActionCall,
@@ -900,6 +900,22 @@ def build_agentic_tool_world_predictor(
         evidence_ids: list[str] = dspy.OutputField()
         abstain: bool = dspy.OutputField()
         abstain_reason: str = dspy.OutputField()
+
+    # This module uses `from __future__ import annotations`, so the field
+    # annotations above are stored as strings. dspy.Predict tolerates that,
+    # but dspy.ReAct rebuilds a fallback signature from `signature.*_fields`
+    # and hands each stored annotation back to make_signature(), which
+    # rejects a ForwardRef outright ("Field types must be types"). Resolving
+    # them once here, against this function's locals (where
+    # ProposedCallOutcome/StateDelta are imported), makes the fields carry
+    # real types before ReAct ever copies them.
+    for _field_name, _field in _AgenticTransition.model_fields.items():
+        if isinstance(_field.annotation, ForwardRef):
+            _field.annotation = eval(  # noqa: S307 -- our own annotation strings
+                _field.annotation.__forward_arg__,
+                {**globals(), "ProposedCallOutcome": ProposedCallOutcome, "StateDelta": StateDelta},
+            )
+    _AgenticTransition.model_rebuild(force=True)
 
     def predict(*, instruction: str, context: AWMRuntimeContext) -> tuple[Any, AWMExecutionTrace]:
         tools, audit, rejections = build_grounding_tools(context, max_calls=max_grounding_calls)
