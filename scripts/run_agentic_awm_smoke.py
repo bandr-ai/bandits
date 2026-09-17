@@ -148,10 +148,24 @@ def outcome_taxonomy(
             grounded = trace.entities_grounded()
             abstain_correct = bool(target_entities) and not (target_entities & grounded)
         return {
-            "outcome": "abstained",
+            "outcome": "unsupported_transition",
             "abstain_reason": proposal.abstain_reason,
+            # Kept, not replaced by the risk/coverage axes below: it is the
+            # only field separating an abstention on a genuinely ungroundable
+            # case from an over-cautious one on an answerable case. Both are
+            # coverage failures; only the second is a defect.
             "abstain_correct": abstain_correct,
             "claim_level_rejection": claim_level_rejection,
+            # Risk/coverage axes. An abstention is a safe non-fabrication AND
+            # a coverage failure at once, and reporting only the first reads
+            # as an ordinary pass -- which it is not. No transition was
+            # produced, so no rollout can continue from here and the
+            # candidate was never exercised: it must stay out of any pass@k
+            # denominator rather than counting as a candidate failure.
+            "safe_nonfabrication": True,
+            "environment_coverage": False,
+            "transition_executed": False,
+            "candidate_scored": False,
             **grounding_summary,
         }
 
@@ -159,12 +173,27 @@ def outcome_taxonomy(
         return {
             "outcome": "validator_rejected",
             "validator_rejections": list(validation.rejections) if validation else [],
+            # The AWM produced a transition; the validator refused to commit
+            # it. Coverage succeeded, the proposal did not.
+            "safe_nonfabrication": True,
+            "environment_coverage": True,
+            "transition_executed": False,
+            "candidate_scored": False,
             **grounding_summary,
         }
 
     recorded = _recorded_observation(transition)
     if recorded is None:
-        return {"outcome": "accepted", "scorable": False, "reason": "no recorded observation", **grounding_summary}
+        return {
+            "outcome": "accepted",
+            "scorable": False,
+            "reason": "no recorded observation",
+            "safe_nonfabrication": True,
+            "environment_coverage": True,
+            "transition_executed": True,
+            "candidate_scored": False,
+            **grounding_summary,
+        }
 
     pairs, unmatched = _correlate_observations(transition, validation.committed_observations)
     if unmatched or not pairs:
@@ -172,6 +201,10 @@ def outcome_taxonomy(
             "outcome": "accepted",
             "scorable": False,
             "unmatched_call_observations": list(unmatched),
+            "safe_nonfabrication": True,
+            "environment_coverage": True,
+            "transition_executed": True,
+            "candidate_scored": False,
             **grounding_summary,
         }
 
@@ -186,6 +219,13 @@ def outcome_taxonomy(
     return {
         "outcome": "accepted",
         "scorable": True,
+        # The only branch where the environment actually executed the
+        # transition AND the candidate's action was scored against a recorded
+        # answer -- the numerator of both coverage and fidelity.
+        "safe_nonfabrication": True,
+        "environment_coverage": True,
+        "transition_executed": True,
+        "candidate_scored": True,
         "status_correct": status_correct,
         "field_count": len(fields),
         "fields_correct": correct,
@@ -287,6 +327,48 @@ def run_one(
             (o.content for o in transition.observations if o.role == "tool"), None
         ),
         "outcome": taxonomy,
+    }
+
+
+def _risk_coverage(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Coverage and fidelity as separate axes.
+
+    A simulator at perfect fidelity over 5% of actions is not a usable
+    environment, and one number cannot show both. Coverage is the share of
+    candidate actions the environment could actually execute; fidelity is
+    correctness on the executed ones only. Cases the environment could not
+    execute are excluded from the fidelity denominator rather than counted
+    as failures: the candidate was never exercised there, so scoring it
+    would make candidate numbers a function of corpus completeness.
+    """
+    scored = [r for r in results if isinstance(r.get("outcome"), dict)]
+    outcomes = [r["outcome"] for r in scored]
+    executed = [o for o in outcomes if o.get("transition_executed")]
+    accuracies = [
+        o["field_accuracy"] for o in executed if o.get("field_accuracy") is not None
+    ]
+    fabrications = [o for o in outcomes if o.get("safe_nonfabrication") is False]
+    return {
+        "cases": len(outcomes),
+        "environment_coverage": (
+            sum(1 for o in outcomes if o.get("environment_coverage")) / len(outcomes)
+            if outcomes
+            else None
+        ),
+        "transitions_executed": len(executed),
+        # Over executed transitions only.
+        "mean_field_accuracy": (sum(accuracies) / len(accuracies)) if accuracies else None,
+        "fabrication_rate": (len(fabrications) / len(outcomes)) if outcomes else None,
+        "safe_failures": sum(
+            1
+            for o in outcomes
+            if o.get("safe_nonfabrication") and not o.get("environment_coverage")
+        ),
+        "claim_level_rejections": sum(1 for o in outcomes if o.get("claim_level_rejection")),
+        # Cases that crashed before producing any outcome are coverage
+        # failures too, and counting them only as "errors" would flatter the
+        # coverage number.
+        "harness_failures": sum(1 for r in results if "unexpected_error" in r),
     }
 
 
@@ -414,7 +496,7 @@ def run(
     # prediction from evidence it had to gather itself.
     planned = (
         ("A_known_state_mutation", by_id[known_state_transition_id], ()),
-        ("B_unsupported_lookup", by_id[unsupported_lookup_transition_id], ()),
+        ("B_unsupported_safety_control", by_id[unsupported_lookup_transition_id], ()),
         (
             "C_target_injected_control",
             by_id[fact_grounded_transition_id],
@@ -518,6 +600,7 @@ def run(
         ],
         "provider_errors": [r for r in results if "provider_error" in r],
         "unexpected_errors": [r for r in results if "unexpected_error" in r],
+        "risk_coverage": _risk_coverage(results),
     }
     (output_dir / "smoke.report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
     print(json.dumps(report, indent=2, sort_keys=True))
