@@ -31,7 +31,7 @@ from bandits.verify.models import (
 )
 from tests.tasksets import task_set_by_first_word
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 

@@ -22,7 +22,7 @@ from bandits.verify import (
 from bandits.verify.execute import execute_verifier
 from tests.tasksets import task_set_by_first_word
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 
@@ -270,7 +270,7 @@ def test_competing_values_for_one_field_are_both_drafted(tmp_path) -> None:
 
 def test_two_tools_reporting_one_key_are_drafted_as_different_checks() -> None:
     """`status` from a lookup and `status` from an override are not one field."""
-    fixtures = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures"
     analysis = analyze_corpus(load_corpus(fixtures / "traces.support.otlp.jsonl", "otlp"))
     task_set = task_set_by_first_word(
         analysis,

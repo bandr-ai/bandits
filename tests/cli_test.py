@@ -41,9 +41,9 @@ def plain(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
-FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.otlp.jsonl"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "traces.otlp.jsonl"
 SUPPORT_FIXTURE = (
-    Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
+    Path(__file__).resolve().parent / "fixtures" / "traces.support.otlp.jsonl"
 )
 
 
@@ -307,7 +307,7 @@ def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
 
 
 CODING_FIXTURE = (
-    Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.coding.otlp.jsonl"
+    Path(__file__).resolve().parent / "fixtures" / "traces.coding.otlp.jsonl"
 )
 
 
@@ -344,7 +344,7 @@ _BLANK_ANSWERS = "\n" * 60
 """Enough blank answers to walk any draft's interview to completion."""
 
 SUPPORT_FIXTURE = (
-    Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "traces.support.otlp.jsonl"
+    Path(__file__).resolve().parent / "fixtures" / "traces.support.otlp.jsonl"
 )
 
 
