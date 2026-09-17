@@ -12,6 +12,8 @@ from bandits.verify.propose import (
     FamilyVerifier,
     ProposalError,
     RejectedCheck,
+    TraceScore,
+    VerifierScores,
     apply_verifier,
     compile_check,
     decide_check,
@@ -159,9 +161,8 @@ def test_sandbox_check_cannot_mutate_the_shared_turn() -> None:
     fn = compile_check('def check(turn):\n    turn["next_state"] = "poisoned"\n    return False')
     turn = {"next_state": "original"}
     assert fn(dict(turn)) is False  # sanity: the function itself does mutate its argument
-    results, errors, error_keys = run_check(fn, [{"trace_id": "t", "index": 0, "next_state": "original"}])
+    results, errors = run_check(fn, [{"trace_id": "t", "index": 0, "next_state": "original"}])
     assert errors == 0
-    assert error_keys == frozenset()
     assert results[("t", 0)] is False
 
 
@@ -600,3 +601,104 @@ def test_apply_verifier_does_not_pass_a_turn_every_check_raised_on() -> None:
     assert by["a"].unresolved == (0,)
     assert by["a"].flagged == ()
     assert not by["a"].passes
+
+
+def _bare_check(check_id: str, code: str, *, decision: str = "accepted") -> FamilyCheck:
+    stats = CheckStats(turns=1, fired=0, fired_scored=0, fired_negative=0, fired_positive=0, negatives=0)
+    return FamilyCheck(
+        check_id=check_id,
+        name=check_id,
+        hypothesis="h",
+        code=code,
+        code_digest="d",
+        stats=stats,
+        survived=False,
+        reason="n/a",
+        decision=decision,
+    )
+
+
+def test_an_abstaining_check_does_not_confirm_a_turn_clean() -> None:
+    """A check returning None is declining to have an opinion, not
+    confirming nothing was wrong -- one accepted check that always abstains,
+    with the judge failing too, must leave the turn unresolved rather than
+    reading as a clean pass with score 1.0."""
+    turn = _turn("a", 0, "3 passed")
+    run = TurnJudgeRun(
+        corpus_id="c",
+        archetype=Archetype.CODING,
+        model="m",
+        prompt_digest="p",
+        trace_ids=("a",),
+        verdicts=(
+            TurnVerdict(trace_id="a", index=0, action_span_id="a-m0", observed=True, score=None),
+        ),
+        signals=(),
+    )
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(_bare_check("abstains-000", "def check(turn):\n    return None\n"),),
+    )
+    scores = apply_verifier(verifier, [turn], {}, run, verifier_id="v", judge_run_id="j")
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes
+    assert by["a"].score is None
+
+
+def test_a_successful_check_does_not_mask_another_checks_failure() -> None:
+    """Checks are OR'd: a turn is confirmed clean only if *every* applied
+    check resolves to an actual boolean. One check returning False while a
+    second raises proves nothing -- the one that raised might have fired."""
+    turn = _turn("a", 0, "3 passed")
+    run = _judge_run([turn])
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(
+            _bare_check("clean-000", "def check(turn):\n    return False\n"),
+            _bare_check("broken-001", "def check(turn):\n    return 1 / 0\n"),
+        ),
+    )
+    scores = apply_verifier(
+        verifier, [turn], {}, run, verifier_id="v", judge_run_id="j", include_judge=False
+    )
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes
+
+
+def test_score_is_undefined_when_unresolved_turns_remain() -> None:
+    """Counting an unresolved turn as clean in the score's denominator would
+    report a rate over turns nothing actually rated."""
+    score = TraceScore(trace_id="a", turns=1, observed=1, flagged=(), unresolved=(0,))
+    assert score.score is None
+    assert not score.passes
+
+
+def test_save_verifier_scores_summary_reports_unresolved_counts(tmp_path) -> None:
+    scores = VerifierScores(
+        verifier_id="v",
+        judge_run_id="j",
+        include_judge=True,
+        checks_applied=(),
+        scores=(
+            TraceScore(trace_id="a", turns=1, observed=1, flagged=(), unresolved=(0,)),
+            TraceScore(trace_id="b", turns=1, observed=1, flagged=()),
+        ),
+    )
+    envelope = save_verifier_scores(scores, DerivedStore(tmp_path))
+    assert envelope.summary["unresolved_traces"] == 1
+    assert envelope.summary["unresolved_turns"] == 1
+    assert envelope.summary["passing"] == 1
