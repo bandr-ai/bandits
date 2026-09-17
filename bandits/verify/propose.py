@@ -456,17 +456,18 @@ def run_check(
     turns: Sequence[dict[str, Any]],
     *,
     seconds: float = 1.0,
-) -> tuple[dict[tuple[str, int], bool | None], int, frozenset[tuple[str, int]]]:
+) -> tuple[dict[tuple[str, int], bool | None], int]:
     """Run one compiled check over turn dicts. Exceptions count, never propagate.
 
-    The third value names which turns raised, as opposed to legitimately
-    returning ``None`` -- both land in ``results`` as ``None``, and a caller
-    deciding whether a turn has real coverage from this check needs to tell
-    the two apart.
+    A turn's result is ``None`` whether the check legitimately abstained or
+    raised -- a caller deciding whether a turn was *confirmed* clean should
+    not treat either as confirmation (see ``apply_verifier``); only ``errors``
+    (the count, for ``CheckStats``) distinguishes exceptions from a clean
+    ``return None``, and no caller currently needs to know which specific
+    turns they were.
     """
     results: dict[tuple[str, int], bool | None] = {}
     errors = 0
-    error_keys: set[tuple[str, int]] = set()
 
     def _alarm(signum, frame):  # noqa: ANN001
         raise _Timeout()
@@ -487,7 +488,6 @@ def run_check(
                 results[key] = None if value is None else bool(value)
             except (_Timeout, Exception):  # noqa: BLE001
                 errors += 1
-                error_keys.add(key)
                 results[key] = None
             finally:
                 if old is not None:
@@ -495,7 +495,7 @@ def run_check(
     finally:
         if old is not None:
             signal_mod.signal(signal_mod.SIGALRM, old)
-    return results, errors, frozenset(error_keys)
+    return results, errors
 
 
 # ----------------------------------------------------------------- scoring
@@ -551,7 +551,7 @@ def evaluate_check(
             fired_positive=0,
             negatives=sum(1 for v in verdicts.values() if v.score == -1),
         ), str(exc)
-    results, errors, _error_keys = run_check(fn, turns)
+    results, errors = run_check(fn, turns)
     fired = fired_scored = fired_negative = fired_positive = 0
     sample: list[tuple[str, int]] = []
     missed: list[tuple[str, int]] = []
@@ -1021,11 +1021,14 @@ class TraceScore(Contract):
     observed: int
     flagged: tuple[FlaggedTurn, ...] = ()
     unresolved: tuple[int, ...] = ()
-    """Observed turn indices no check could evaluate (every applied check
-    errored on it) and the judge did not resolve (excluded, or it produced
-    no score) -- turns with zero signal from any source, as opposed to zero
-    signal *because nothing was wrong*. Never also in ``flagged``: a turn
-    with a real flag has real evidence, whatever else about it failed."""
+    """Observed turn indices with no confirmed-clean signal from any source:
+    not every applied check resolved to an actual boolean (one erroring or
+    abstaining is enough — checks are OR'd, so a False from one check proves
+    nothing about a turn another check couldn't evaluate), and the judge did
+    not resolve it either (excluded, or produced no score). Zero signal, as
+    opposed to zero signal *because nothing was wrong*. Never also in
+    ``flagged``: a turn with a real flag has real evidence, whatever else
+    about it failed."""
 
     @property
     def passes(self) -> bool:
@@ -1033,7 +1036,12 @@ class TraceScore(Contract):
 
     @property
     def score(self) -> float | None:
-        if not self.observed:
+        """None, not a number, when a turn's clean status is unconfirmed.
+
+        Counting an unresolved turn as clean in the denominator would report
+        a rate over turns this verifier did not actually rate.
+        """
+        if not self.observed or self.unresolved:
             return None
         return max(0.0, 1.0 - len(self.flagged) / self.observed)
 
@@ -1077,20 +1085,26 @@ def apply_verifier(
     applied = tuple(checks if checks is not None else verifier.accepted())
     payload = turn_payload([t for t in turns if t.observed], tasks, {}, with_judge=False)
     flags: dict[tuple[str, int], list[str]] = {}
-    covered: set[tuple[str, int]] = set()
-    """Turns at least one applied check actually ran on without raising --
-    distinct from ``flags``, which is only the turns something found wrong.
-    A turn a check evaluated and returned False or None for is real
-    evidence of nothing being wrong; a turn every check raised on is not."""
+    indefinite: set[tuple[str, int]] = set()
+    """Turns where some applied check did not return an actual boolean --
+    whether it raised or legitimately abstained with ``None``, both mean
+    that check contributed nothing. Scoring by checks is an OR across all of
+    them: a turn is only confirmed clean by the checks if *every one*
+    resolved it to False (or True, which is already a flag) -- one check
+    returning False while another is indefinite proves nothing, because the
+    indefinite one might have been the one that would have fired.
+    """
+    any_check_compiled = False
     for check in applied:
         try:
             fn = compile_check(check.code)
         except RejectedCheck:
             continue
-        results, _errors, error_keys = run_check(fn, payload)
+        any_check_compiled = True
+        results, _errors = run_check(fn, payload)
         for key, value in results.items():
-            if key not in error_keys:
-                covered.add(key)
+            if value is None:
+                indefinite.add(key)
             if value:
                 flags.setdefault(key, []).append(check.check_id)
     judge_by_key = {(v.trace_id, v.index): v for v in judge_run.verdicts}
@@ -1100,12 +1114,14 @@ def apply_verifier(
                 flags.setdefault((verdict.trace_id, verdict.index), []).append("judge")
 
     def has_signal(key: tuple[str, int]) -> bool:
-        """A judge score or a check that ran without raising: either is
-        real evidence a turn was clean, not merely evidence nothing looked."""
+        """A real judge score, or every applied check resolving to an actual
+        boolean: either is confirmation a turn was clean, not merely
+        evidence that something looked and shrugged."""
         judged = include_judge and (verdict := judge_by_key.get(key)) is not None and (
             verdict.score is not None
         )
-        return judged or key in covered
+        checked = any_check_compiled and key not in indefinite
+        return judged or checked
 
     by_trace: dict[str, list[Turn]] = {}
     for turn in turns:
@@ -1182,6 +1198,8 @@ def save_verifier_scores(scores: VerifierScores, store: DerivedStore) -> Derived
             "traces": len(scores.scores),
             "passing": sum(1 for s in scores.scores if s.passes),
             "flagged_turns": sum(len(s.flagged) for s in scores.scores),
+            "unresolved_traces": sum(1 for s in scores.scores if s.unresolved),
+            "unresolved_turns": sum(len(s.unresolved) for s in scores.scores),
         },
     )
 

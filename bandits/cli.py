@@ -824,13 +824,20 @@ def score_traces_command(
         f"checks applied:     {applied_display or '(none)'}{' + judge' if include_judge else ''}"
     )
     console.print(f"passing:            {envelope.summary['passing']} of {len(scores.scores)}")
-    table = Table("trace", "turns", "observed", "flagged", "score", "passes")
+    if envelope.summary["unresolved_traces"]:
+        console.print(
+            f"[yellow]unresolved:[/yellow]         {envelope.summary['unresolved_traces']} "
+            f"trace(s), {envelope.summary['unresolved_turns']} turn(s) with no confirmed-clean "
+            "signal from any source — not a pass, not a flag"
+        )
+    table = Table("trace", "turns", "observed", "flagged", "unresolved", "score", "passes")
     for item in sorted(scores.scores, key=lambda s: (s.score is None, -(s.score or 0)))[:40]:
         table.add_row(
             item.trace_id[:20],
             str(item.turns),
             str(item.observed),
             str(len(item.flagged)),
+            str(len(item.unresolved)),
             "n/a" if item.score is None else f"{item.score:.2f}",
             "yes" if item.passes else "no",
         )
