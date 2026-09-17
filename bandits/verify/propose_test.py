@@ -7,6 +7,9 @@ import pytest
 from bandits.store import DerivedStore
 from bandits.verify.nextstate import Archetype, TurnJudgeRun, TurnVerdict, signal_for
 from bandits.verify.propose import (
+    CheckStats,
+    FamilyCheck,
+    FamilyVerifier,
     ProposalError,
     RejectedCheck,
     apply_verifier,
@@ -131,12 +134,34 @@ def test_decorators_and_annotations_are_rejected() -> None:
         compile_check("def check(turn: dict): return True")
 
 
+def test_try_except_is_rejected_not_run() -> None:
+    """SIGALRM interrupts by raising _Timeout() inside whatever is running;
+    a try/except inside the check's own body can catch that before it
+    reaches run_check's handler. `try: while True: pass / except: pass`
+    swallows the interrupt and loops forever, with the alarm already spent
+    -- rejection must come from the AST alone, same as the definition-time
+    default case, or this test hangs rather than fails."""
+    with pytest.raises(RejectedCheck):
+        compile_check(
+            "def check(turn):\n"
+            "    try:\n"
+            "        while True:\n"
+            "            pass\n"
+            "    except:\n"
+            "        pass\n"
+            "    return True\n"
+        )
+    with pytest.raises(RejectedCheck):
+        compile_check("def check(turn):\n    try:\n        return True\n    except Exception:\n        return False\n")
+
+
 def test_sandbox_check_cannot_mutate_the_shared_turn() -> None:
     fn = compile_check('def check(turn):\n    turn["next_state"] = "poisoned"\n    return False')
     turn = {"next_state": "original"}
     assert fn(dict(turn)) is False  # sanity: the function itself does mutate its argument
-    results, errors = run_check(fn, [{"trace_id": "t", "index": 0, "next_state": "original"}])
+    results, errors, error_keys = run_check(fn, [{"trace_id": "t", "index": 0, "next_state": "original"}])
     assert errors == 0
+    assert error_keys == frozenset()
     assert results[("t", 0)] is False
 
 
@@ -504,3 +529,74 @@ def test_apply_verifier_never_flags_an_unobserved_turn() -> None:
     assert by["a"].observed == 1
     assert by["a"].flagged == ()
     assert by["a"].passes
+
+
+def test_apply_verifier_does_not_pass_a_turn_the_judge_never_scored() -> None:
+    """A judge that failed to produce a score (transport failure, or an
+    unparseable reply that survived retry) is zero signal, not evidence the
+    turn was clean. Reading it as clean is the exact bug: one observed turn,
+    no checks, a failed judge, used to read as ``passes=True``."""
+    turn = _turn("a", 0, "3 passed")
+    run = TurnJudgeRun(
+        corpus_id="c",
+        archetype=Archetype.CODING,
+        model="m",
+        prompt_digest="p",
+        trace_ids=("a",),
+        verdicts=(
+            TurnVerdict(
+                trace_id="a", index=0, action_span_id="a-m0", observed=True, score=None
+            ),
+        ),
+        signals=(),
+    )
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(),
+    )
+    scores = apply_verifier(verifier, [turn], {}, run, verifier_id="v", judge_run_id="j")
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes
+
+
+def test_apply_verifier_does_not_pass_a_turn_every_check_raised_on() -> None:
+    """A check exception is zero signal too, not a quiet "did not fire". With
+    the judge excluded and one check that raises on the only observed turn,
+    that turn has no source of truth at all."""
+    turn = _turn("a", 0, "3 passed")
+    run = _judge_run([turn])
+    stats = CheckStats(turns=1, fired=0, fired_scored=0, fired_negative=0, fired_positive=0, negatives=0)
+    broken = FamilyCheck(
+        check_id="broken-000",
+        name="broken",
+        hypothesis="h",
+        code="def check(turn):\n    return 1 / 0\n",
+        code_digest="d",
+        stats=stats,
+        survived=False,
+        reason="raised",
+        decision="accepted",
+    )
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(broken,),
+    )
+    scores = apply_verifier(
+        verifier, [turn], {}, run, verifier_id="v", judge_run_id="j", include_judge=False
+    )
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes

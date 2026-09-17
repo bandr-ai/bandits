@@ -137,6 +137,25 @@ def build_nextstate_sft_export(
                 )
             )
             continue
+        if trace_score.unresolved:
+            # Zero signal on these turns, not evidence they were clean: no
+            # check ran on them without raising, and (if consulted) the
+            # judge produced no score. Labeling this "negative" would claim
+            # a failure nothing actually found; "positive" would claim a
+            # clean bill of health nothing actually gave it. Quarantined,
+            # not labeled either way.
+            unresolved.append(
+                RejectedTrace(
+                    trace_id=trace_score.trace_id,
+                    family_id=verifier.family_id,
+                    reasons=(
+                        f"{len(trace_score.unresolved)} turn(s) could not be scored: "
+                        "no check ran on them without raising, and the judge produced "
+                        "no score",
+                    ),
+                )
+            )
+            continue
         messages, defects, _warnings = build_transcript(trace)
         if defects:
             unresolved.append(
