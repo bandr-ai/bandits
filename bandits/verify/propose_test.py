@@ -92,6 +92,7 @@ def _judge_run(turns) -> TurnJudgeRun:
 
 GOOD = 'def check(turn):\n    """log says not found"""\n    s = turn["next_state"]\n    return None if s is None else ("not found" in s)\n'
 NOISY = "def check(turn):\n    return True\n"
+UNOBSERVED_CHECK = "def check(turn):\n    return not turn['observed']\n"
 
 
 def test_sandbox_rejects_imports_dunders_and_judge_reads() -> None:
@@ -444,10 +445,43 @@ def test_decide_and_apply(tmp_path) -> None:
     by = {s.trace_id: s for s in scores.scores}
     assert by["a"].turns == 4 and by["a"].observed == 3
     assert [f.index for f in by["a"].flagged] == [0, 2]
-    assert by["a"].flagged[0].by == ("nf",)
+    assert by["a"].flagged[0].by == (check_id,)
+    assert scores.checks_applied == (check_id,)
     assert by["a"].score == pytest.approx(1 - 2 / 3) and not by["a"].passes
 
     with_judge = apply_verifier(accepted, turns, {}, run, verifier_id="v", judge_run_id="j")
-    assert {s.trace_id: s for s in with_judge.scores}["a"].flagged[0].by == ("nf", "judge")
+    assert {s.trace_id: s for s in with_judge.scores}["a"].flagged[0].by == (check_id, "judge")
     envelope = save_verifier_scores(with_judge, DerivedStore(tmp_path))
     assert envelope.summary["passing"] == 0
+
+
+def test_apply_verifier_never_flags_an_unobserved_turn() -> None:
+    """A check that happens to be true of an unobserved turn -- the most
+    direct case, ``not turn["observed"]`` -- must not be allowed to flag the
+    final, reaction-less action: there is no reaction saying it was wrong."""
+    turns = [
+        _turn("a", 0, "3 passed"),
+        _turn("a", 1, None),  # unobserved: the episode's last action
+    ]
+    run = _judge_run(turns)
+    verifier = propose_verifier(
+        turns,
+        {},
+        run,
+        "judge-1",
+        family_id="fam",
+        rounds=1,
+        propose=lambda **kw: SimpleNamespace(
+            checks=[{"name": "unobserved", "hypothesis": "h", "code": UNOBSERVED_CHECK}]
+        ),
+    )
+    check_id = verifier.checks[0].check_id
+    accepted = decide_check(verifier, check_id, "accepted")
+
+    scores = apply_verifier(
+        accepted, turns, {}, run, verifier_id="v", judge_run_id="j", include_judge=False
+    )
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].observed == 1
+    assert by["a"].flagged == ()
+    assert by["a"].passes
