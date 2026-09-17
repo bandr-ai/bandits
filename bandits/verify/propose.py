@@ -968,7 +968,12 @@ def revise_check(
 class FlaggedTurn(Contract):
     index: int
     by: tuple[str, ...]
-    """Check names, and ``judge`` when the next-state judge scored it −1."""
+    """Check ids, and ``judge`` when the next-state judge scored it −1.
+
+    Ids, not names: a revision can give a child check the same ``name`` as the
+    check it revised, or as any other check in the family — ``check_id`` is
+    the only field this family guarantees unique.
+    """
 
 
 class TraceScore(Contract):
@@ -994,6 +999,8 @@ class VerifierScores(Contract):
     judge_run_id: str
     include_judge: bool
     checks_applied: tuple[str, ...]
+    """``check_id`` of every check that ran, not ``name`` — names are not
+    guaranteed unique across a family (a revision may reuse one)."""
     scores: tuple[TraceScore, ...]
 
 
@@ -1008,9 +1015,16 @@ def apply_verifier(
     include_judge: bool = True,
     checks: Sequence[FamilyCheck] | None = None,
 ) -> VerifierScores:
-    """Score every trace: a turn is flagged by any accepted check, or by the judge."""
+    """Score every trace: a turn is flagged by any accepted check, or by the judge.
+
+    Checks run only over observed turns. An unobserved turn — usually the
+    last of an episode — has no reaction to judge it by, and a predicate that
+    happens to fire on one (``return not turn["observed"]``, or anything else
+    true of a turn with nothing in it) must not be allowed to flag it: that
+    would score silence as if it were a failure the reaction actually showed.
+    """
     applied = tuple(checks if checks is not None else verifier.accepted())
-    payload = turn_payload(turns, tasks, {}, with_judge=False)
+    payload = turn_payload([t for t in turns if t.observed], tasks, {}, with_judge=False)
     flags: dict[tuple[str, int], list[str]] = {}
     for check in applied:
         try:
@@ -1020,7 +1034,7 @@ def apply_verifier(
         results, _ = run_check(fn, payload)
         for key, value in results.items():
             if value:
-                flags.setdefault(key, []).append(check.name)
+                flags.setdefault(key, []).append(check.check_id)
     if include_judge:
         for verdict in judge_run.verdicts:
             if verdict.score == -1:
@@ -1048,7 +1062,7 @@ def apply_verifier(
         verifier_id=verifier_id,
         judge_run_id=judge_run_id,
         include_judge=include_judge,
-        checks_applied=tuple(c.name for c in applied),
+        checks_applied=tuple(c.check_id for c in applied),
         scores=tuple(scores),
     )
 
