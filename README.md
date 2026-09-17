@@ -8,7 +8,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv)](https://docs.astral.sh/uv/)
 
-Bandits turns real agent runs into SFT data, eval cases, and tested success checks without hiding missing evidence.
+Bandits turns real agent runs into labeled SFT data and reusable success checks, scored by what a trace's reactions actually show, without hiding missing evidence.
 
 [Why Bandits?](#why-bandits) · [Quickstart](#quickstart) · [Workflow](#workflow) · [Trust model](#trust-is-a-data-model) · [CLI](#cli-reference)
 
@@ -18,16 +18,12 @@ Bandits turns real agent runs into SFT data, eval cases, and tested success chec
 
 Agent traces already contain the work: the request, the decisions, the tool calls, and the result. Bandits turns that history into a chain of evidence, from raw runs to reviewed eval and training data.
 
-<div align="center">
-  <img src="docs/images/bandits-workflow.webp" alt="Bandits evidence pipeline: OTLP, chat JSON, and Claude Code traces are normalized into an immutable corpus and content-addressed store; analysis extracts tasks, evidence, and families; verifiers cycle through drafting, replay, labeling, and validation before human review gates held-out eval, fit SFT, and unresolved outputs." width="100%" />
-</div>
-
 ## Why Bandits?
 
 - **Keep the truth.** Normalize OTLP, chat JSON, and Claude Code traces without inventing missing results or dropping malformed records.
-- **Know why a run passed.** Keep observed state, external results, model judgments, human labels, and self-reports separate.
-- **Test the judge.** Measure verifiers on held-out labels and try to game them before they can authorize a dataset.
-- **Trace every row.** Follow an export back through its verifier, task family, analysis, and original corpus.
+- **Judge by reaction, not claim.** Score each turn by what happened right after it — the tool result, the execution log, the user's next message — never the agent's own summary of what it did. Full write-up and measured numbers: [`docs/next-state-verifier.md`](docs/next-state-verifier.md).
+- **Turn a judge into a free check.** An RLM proposes deterministic predicates from the judge's verdicts, re-executes every one over the whole family, and keeps only what actually agrees with it — so scoring a new trace costs no model call.
+- **Trace every row.** Follow an exported SFT row back through the checks that fired on it, the judge run, the verifier, and the original corpus, and know whether a human ever reviewed those checks or not.
 
 ## Quickstart
 
@@ -63,107 +59,68 @@ The input format is always explicit. Bandits does not guess and risk accepting a
 
 ## Workflow
 
-Use this when success needs to be explainable, measured, and tied to an owner decision.
+Use this to build a verifier that reads what happened after an action, not what the agent claims about it.
 
 ```bash
-# 1. Extract candidate tasks and outcome evidence.
+# 1. Group traces into families first, if you want family-scoped checks
+#    (skip this and the whole corpus is treated as one family, which is
+#    what a benchmark split usually is).
 uv run bandits analyze <corpus-id> --tasks
-
-# 2. Discover task families by reading requests, then materialize them
-#    into a task set with lineage-safe fit/held-out splits.
 uv run bandits mine-rlm <analysis-id>
 uv run bandits materialize-rlm-taskset <clustering-run-id>
-uv run bandits families <task-set-id>
 
-# 3. Draft checks for one family and run them over historical fit traces.
-uv run bandits draft-verifier <task-set-id> --family <family-id>
+# 2. Score every observed turn by its reaction -- the tool result, the
+#    execution log, the user's next message -- never the agent's own claim.
+#    The archetype (support, coding, computer-use, generic) changes only
+#    what counts as a bad reaction in this kind of trace.
+uv run bandits judge-turns <corpus-id> --archetype computer-use \
+  --task-set <task-set-id> --family <family-id>
 
-# 4. Label disagreements first, where one decision is most informative.
-uv run bandits label <verifier-draft-id> --labeler "your-name"
+# 3. Have an RLM propose cheap check(turn) predicates from the judge's
+#    verdicts, re-execute every one over the whole family in a sandbox, and
+#    keep only what fires often enough and agrees with the judge.
+uv run bandits propose-verifier <judge-run-id> --family <family-id>
 
-# 5. Measure agreement and actively probe the checks for gameability.
-uv run bandits validate-verifier <verifier-draft-id> --labels <label-set-id>
+# 4. Accept or reject each proposed check. One prompt each; resumable.
+uv run bandits review-checks <family-verifier-id>
 
-# 6. Review the measured checks in your own words, then promote what you accepted.
-uv run bandits interview-review <verifier-draft-id> \
-  --validation <validation-id> --round 2
+# 5. Apply the accepted checks, plus the judge, to every trace: pass/fail
+#    and a score per trace.
+uv run bandits score-traces <family-verifier-id>
 
-uv run bandits review-verifier <verifier-draft-id> \
-  --validation <validation-id> \
-  --verifier <verifier-id> \
-  --interview <interview-id>
-
-# 7. Export held-out evals or successful fit demonstrations.
-uv run bandits export <task-set-id> --format eval \
-  --verifier <reviewed-verifier-id> --output eval.jsonl
-
-uv run bandits export <task-set-id> --format sft \
-  --verifier <reviewed-verifier-id> --output sft.jsonl
+# 6. Export scored traces as labeled positive/negative SFT rows.
+uv run bandits export-nextstate <verifier-scores-id> --output sft.jsonl
 ```
 
-Every export also writes a sibling `<name>.unresolved.jsonl`. Ineligible or unscorable traces are quarantined with reasons instead of vanishing from the dataset.
+Every export also writes a sibling `<name>.unresolved.jsonl`. A trace missing from the corpus, with no observed turns, with a transcript that cannot be rebuilt, or with a turn no check or the judge could actually confirm either way, is quarantined with a reason instead of vanishing or being labeled by a guess.
 
-An SFT export additionally writes `<name>.composition.json`: a versioned report describing the partition offered and the rows selected, broken down by task family, source, generating model, tool, and lineage, with message and character distributions and the duplicate groups it collapsed. Every gate in the exporter judges one trace at a time, so none of them can see that most of what passed came from a single lineage or a single tool.
+`score-traces --survivors` applies every check that cleared the automatic precision bar, including ones `review-checks` never saw — useful for a quick look, but the export carries `all_checks_reviewed: false` on every row it produces, so a dataset built this way can never be mistaken for one a human actually reviewed.
 
-Sampling caps act on what that report shows. They are unset by default, and a row a cap removes is quarantined naming the cap that removed it:
+Full write-up and measured numbers (where this works, where it doesn't yet, and why): [`docs/next-state-verifier.md`](docs/next-state-verifier.md).
+
+### A quicker path: direct LLM review
+
+For a dataset straight from raw traces, with an LLM reviewing each candidate directly rather than the turn-by-turn pipeline above:
 
 ```bash
-uv run bandits export <task-set-id> --format sft \
-  --verifier <reviewed-verifier-id> --output sft.jsonl \
-  --max-rows-per-lineage 3 --max-rows-per-family 200
+uv run bandits build-sft <corpus-id> --output work/direct-dataset
 ```
 
-> [!NOTE]
-> Message and character counts are tokenizer-independent approximations of what a row costs. No tokenizer is configured anywhere in this pipeline, and nothing in the report may be read as a token count.
-
-> [!NOTE]
-> SFT defaults to the `fit` partition; eval defaults to `held_out`. Passing `--split all` is allowed but recorded as an overlap warning in the export manifest.
+Writes `sft.jsonl`, `review.jsonl` (borderline candidates), `rejected.jsonl`, and a selection report. Independent of the workflow above — it does not use `judge-turns` or any verifier artifact.
 
 ### Duplicates and the held-out split
 
-The fit/held-out split moves whole groups, so a declared retry chain never straddles it. Lineage ids are read from the source and never inferred, so a source that declares no lineage at all leaves every trace its own.
+`materialize-rlm-taskset` moves whole groups when it splits a family, so a declared retry chain never straddles fit and held-out. Lineage ids are read from the source and never inferred, so a source that declares no lineage at all leaves every trace its own.
 
 Two traces of the same normalized request are joined as well, and the two rules compose rather than one falling back to the other: two runs of one request from different sessions are held together despite carrying different lineage ids, and a group joined by lineage on one edge and by an identical request on another moves whole. Normalization changes case and separators only; it preserves identifiers and every other value, so `refund order 7741` and `refund order 8802` remain distinct.
 
-Without this, a verifier drafted from a fit trace can be measured against a held-out trace carrying the same answer, and held-out agreement reports memorisation as generalisation — which is the number the promotion gate treats as its central evidence.
-
-Whole groups move, so the realized held-out share is whatever complete groups come nearest the requested fraction. A family with only one independent group reports that it has no held-out side rather than taking one, because a verifier there can be drafted but never validated.
+Whole groups move, so the realized held-out share is whatever complete groups come nearest the requested fraction. `judge-turns`, `propose-verifier` and `score-traces` do not currently read this split — nothing in the active pipeline draws on it yet — but `families <task-set-id>` shows it, and it exists so a future calibration step (comparing checks against labels independent of what they were proposed from) has a leak-safe boundary to measure across instead of inventing one after the fact.
 
 ### What produced a grouping
 
 A task set records the arm that produced it — the trace view the miner read — along with the model that proposed the families and the id of the clustering run it was materialized from. Families carry no coherence figure and no similarity threshold: nothing measured a distance, and a plausible number in those fields would be fabricated geometry in an artifact whose whole claim is that it used none. Each family's representative is its lexically first member, which is a real trace chosen by a rule that cannot be mistaken for a centrality claim.
 
 A materialized task set also records what this path cannot claim: the miner named a family and placed its members in one context, so membership was never checked by an independent pass.
-### Ranking drafted checks against outcomes
-
-Drafting proposes checks from values observed across a family's fit traces, and measures every candidate over those traces by executing it. The draft carries the results: success support, failure rejection, false positives, scorable coverage, and unknown count.
-
-```bash
-uv run bandits draft-verifier <task-set-id> --family <family-id> --labels <label-set-id>
-```
-
-Without labels there is nothing to contrast against, so candidates stay ordered by evidence authority and are marked as the frequency-based hypotheses they are — a value can be common because failures dominate the corpus, and `status == pending` is a perfectly frequent terminal state in a corpus that mostly failed.
-
-With labels, candidates are ranked by how far they separate labeled success from labeled failure, after evidence authority and before coverage. Two effects follow:
-
-- a check whose value appears only among failures is not put forward as the check that establishes success;
-- an invariant that fails on failed runs is no longer retired by them. Unlabeled, one counterexample retires a proposed invariant; labeled, only a counterexample among successes can, because a relation that fails on a failed run is the relation working.
-
-Where the evidence supports it, a conjunction is proposed alongside — never instead of — the checks it was built from, so validation can compare them. Conjunction is never inferred from co-occurrence: the pair must reject a labeled failure the first check accepts while keeping every labeled success it keeps, and the draft records that reason. Two checks on one field are refused, since they could never both hold.
-
-A recorded score is classified as a trusted evaluator's only where the source names the evaluator. An anonymous number on a span is evidence read off a trace and ranks as one — otherwise it would outrank the human label that would have had to settle a disagreement with it.
-
-### Tasks without deterministic outcome state
-
-For conversational or otherwise unstructured work, a sampled model judge can add rubric evidence:
-
-```bash
-uv run bandits judge <task-set-id> \
-  --family <family-id> \
-  --criterion "The response resolves the user's request accurately"
-```
-
-Sample disagreement is treated as uncertainty worth labeling. Model judgment remains lower-trust evidence and does not bypass the verifier lifecycle.
 
 ## Trust is a data model
 
@@ -178,41 +135,32 @@ Bandits keeps source evidence immutable and stores every interpretation beside i
 └── derived/
     ├── analysis-…/
     ├── taskset-…/
-    ├── verifier-draft-…/
-    ├── validation-…/
-    ├── reviewed-verifier-…/
-    └── export-…/
+    ├── turn_judge_run-…/
+    ├── family_verifier-…/
+    ├── verifier_scores-…/
+    └── nextstate_sft_export-…/
 ```
 
-That separation matters: changing an analysis policy or correcting a verifier creates a new artifact; it never rewrites what the source trace recorded.
+That separation matters: revising a check or re-running the judge creates a new artifact; it never rewrites what the source trace recorded, and every downstream artifact names the exact id of what it was built from.
 
-Verifier status also carries a concrete meaning:
+A check's `decision` carries a concrete meaning, set only by `review-checks`:
 
-| Status | What it establishes |
+| Decision | What it means |
 | --- | --- |
-| `suggested` | A plausible check specification exists |
-| `executable` | The check can run against recorded evidence |
-| `calibrated` | It has been measured against historical labels |
-| `reviewed` | It cleared promotion checks and has explicit human acceptance |
-| `rejected` | Evidence contradicted the verifier or exposed unacceptable gaming |
+| `pending` | Proposed and automatically evaluated; no human has looked at it |
+| `accepted` | A reviewer confirmed it |
+| `rejected` | A reviewer refused it |
+| `revised` | A reviewer sent it back with feedback; a new pending check was queued from it, linked by `parent_check_id` |
 
-A verifier is promoted on the strength of a review, not a threshold. `interview-review` shows one reviewer what the checks did — per-split agreement, how the disagreements split into false positives and false negatives, how much was scorable, which attacks were attempted and whether any were even possible — and records what they decided and why. `review-verifier` then promotes only what that review accepted, proving it named this verifier and this validation, that every check carries a standing accept, and that no revision has changed the verifier since. A revised or combined verifier returns through validation and review rather than inheriting the old decision.
+`score-traces` applies only `accepted` checks by default. `--survivors` widens that to every check that cleared the automatic precision bar regardless of decision — including ones still `pending`, but never ones a reviewer actively `rejected` or `revised` — and the resulting export is marked `all_checks_reviewed: false` so it can never be mistaken for a dataset a human actually reviewed. Review itself hasn't yet been run against the numbers in `docs/next-state-verifier.md`; `--survivors` stood in for it there, and that's stated, not hidden.
 
 ## Dataset contracts
 
-Verifier-gated eval rows contain the instruction, complete grader specification, and full artifact lineage. SFT rows use chat-completions-shaped `messages`, including correctly paired assistant `tool_calls` and `tool` results.
+Every SFT row, from either exporter, uses chat-completions-shaped `messages`, with assistant `tool_calls` correctly paired to `tool` results and never batched into one turn just because they share a parent span. Rebuilding that transcript is refused, not guessed at, when a trace's own record can't support it — a tool result with no announced call, a call with no recorded result, no recorded user instruction, or user turns that don't run forward through the trajectory all quarantine the row into `<name>.unresolved.jsonl` with the reason.
 
-Demonstration selection additionally rejects or quarantines trajectories with properties such as:
+`export-nextstate` additionally carries: `label` (`positive`/`negative`, from whether the trace passed scoring), `flagged_turns` and `flagged_by` (which check id, or the judge, fired on each one — empty for a positive row), `checks_applied`, `all_checks_reviewed`, and the full `corpus_id` / `family_id` / `verifier_id` / `scores_id` / `judge_run_id` lineage. A trace with any turn no check or the judge could actually confirm is quarantined rather than labeled either way — see `unresolved` in the workflow section above.
 
-- missing actions, results, or generating-model metadata;
-- recorded tool errors or recovery paths;
-- repeated identical tool actions;
-- unusually long trajectories relative to their task family;
-- verifier inputs that are unavailable;
-- near-duplicates of already selected examples;
-- rows beyond a configured family, lineage, or per-row size cap.
-
-These are demonstration-quality gates, not claims that a successful outcome alone makes behavior worth imitating.
+`build-sft` additionally rejects a candidate for: recorded tool errors or recovery paths, repeated identical tool actions, an episode long relative to its own step count, or no recorded generating model — demonstration-quality gates, not claims that a successful outcome alone makes behavior worth imitating.
 
 ## CLI reference
 
@@ -224,20 +172,13 @@ These are demonstration-quality gates, not claims that a successful outcome alon
 | `mine-rlm` | Discover task families by reading raw user requests, with no embedding geometry |
 | `audit-rlm` | Advisory: challenge each discovered family in a fresh adversarial context. Changes nothing |
 | `materialize-rlm-taskset` / `families` | Turn a clustering run into a task set with lineage-safe fit/held-out splits, and read it back |
-| `rlm-session` / `rlm-families` | Watch a running mining session; read its families as reviewable cards |
-| `draft-verifier` | Propose deterministic checks, rank them against labeled outcomes, and replay them on history |
-| `interview-verifier` | Refine a draft through a bounded owner interview |
-| `interview-review` | Review a draft in free text; a model reads the reply, you confirm it |
-| `label` | Label disagreements and the remaining family runs |
-| `validate-verifier` | Measure fit/held-out agreement and probe gameability |
-| `interview-review` | Review a draft's checks in free text, read by a model, confirmed by you |
-| `review-verifier` | Promote a calibrated verifier a review round accepted |
-| `judge-turns` | Score every turn by what happened next (+1 / 0 / −1), per archetype |
-| `propose-verifier` | Have the RLM propose checks over a family's turns; re-execute and keep survivors |
-| `review-checks` | Accept or reject each proposed check, one prompt each, resumable |
-| `score-traces` | Flag turns with the accepted checks and the judge; pass/score per trace |
-| `judge` | Sample a rubric judge for unstructured outcomes |
-| `export` | Write verifier-gated eval or SFT JSONL plus quarantine and composition report |
+| `rlm-session` / `rlm-families` | Watch a running mining or audit session; read its families as reviewable cards |
+| `judge-turns` | Score every observed turn by its reaction — the tool result, the execution log, the user's next message — never the agent's claim |
+| `propose-verifier` | Have an RLM propose `check(turn)` predicates from the judge's verdicts; re-execute every one in a sandbox and keep survivors |
+| `review-checks` | Accept, reject, or revise each proposed check, one prompt each, resumable |
+| `score-traces` | Apply the accepted checks and the judge to every trace: flags, an unresolved list, and pass/score per trace |
+| `export-nextstate` | Write scored traces as labeled positive/negative SFT rows, plus a quarantine file |
+| `build-sft` | A quicker, independent path: LLM-reviewed SFT rows straight from raw traces, no verifier artifact |
 
 Run `uv run bandits <command> --help` for every option.
 
@@ -272,7 +213,7 @@ uv sync --extra audit
 The test suite injects a predictor instead of calling one, so neither the extra
 nor a credential is needed to run it.
 
-The test suite exercises ingestion fidelity, redaction, content-addressed storage, task mining, verifier execution and validation, model-judge behavior, and both verifier-gated export formats.
+The test suite exercises ingestion fidelity, redaction, content-addressed storage, RLM task-family mining, the next-state judge and its RLM-proposed checks, and both export paths.
 
 ## Project map
 
@@ -280,8 +221,8 @@ The test suite exercises ingestion fidelity, redaction, content-addressed storag
 bandits/
 ├── ingest/      # OTLP, chat JSON, and Claude Code adapters
 ├── analyze/     # task extraction, evidence, and RLM family discovery
-├── verify/      # draft, execute, interview, validate, review, and judge
-├── export/      # verifier-gated SFT and portable eval JSONL
+├── verify/      # turns, the next-state judge, RLM-proposed checks, and their review
+├── export/      # next-state SFT export, and the direct LLM-reviewed exporter
 ├── traces.py    # immutable canonical trace contracts
 ├── store.py     # content-addressed corpus and derived-artifact storage
 ├── redact.py    # deterministic redaction policies
