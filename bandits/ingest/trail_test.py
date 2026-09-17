@@ -128,6 +128,34 @@ def test_trail_malformed_file_is_an_issue_not_a_trace(tmp_path: Path) -> None:
     assert corpus.issues[0].kind == "malformed_json"
 
 
+def test_a_top_level_json_array_is_quarantined_not_raised(tmp_path: Path) -> None:
+    """A well-formed JSON document that isn't the object this adapter expects
+    must not crash the directory read; ``payload.get(...)`` on a list raises
+    ``AttributeError`` if this isn't checked first."""
+    (tmp_path / "array.json").write_text(json.dumps(["not", "an", "object"]))
+    _write_trace(tmp_path)
+
+    corpus = load_trail(tmp_path)
+
+    assert len(corpus.traces) == 1
+    assert any(issue.kind == "malformed_record" for issue in corpus.issues)
+
+
+def test_a_span_missing_its_id_is_quarantined_not_raised(tmp_path: Path) -> None:
+    """A malformed span tree -- here, a child with no ``span_id`` -- must
+    quarantine only this file, not abort every other file in the directory."""
+    broken_child = _span("child", "x", "LLM", "2025-01-01T00:00:01Z", {})
+    del broken_child["span_id"]
+    root = _span("root", "main", None, "2025-01-01T00:00:00Z", {}, children=[broken_child])
+    (tmp_path / "broken.json").write_text(json.dumps({"trace_id": "broken", "spans": [root]}))
+    _write_trace(tmp_path)
+
+    corpus = load_trail(tmp_path)
+
+    assert len(corpus.traces) == 1
+    assert any(issue.kind == "malformed_span" for issue in corpus.issues)
+
+
 def test_trail_tool_calls_render_into_output(tmp_path: Path) -> None:
     llm = _span(
         "llm-1",

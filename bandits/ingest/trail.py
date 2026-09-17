@@ -228,10 +228,33 @@ def _load_file(path: Path, ruleset: RedactionRuleset) -> tuple[Trace | None, lis
         issues.append(TraceIssue(kind="malformed_json", detail=str(exc), location=str(path)))
         return None, issues, source.ruleset
 
+    if not isinstance(payload, dict):
+        issues.append(
+            TraceIssue(
+                kind="malformed_record",
+                detail=f"trace file is a {type(payload).__name__}, not an object",
+                location=str(path),
+            )
+        )
+        return None, issues, source.ruleset
+
     spans: list[Span] = []
     task: list[str] = []
-    for root in payload.get("spans") or []:
-        _walk(root, spans, task, issues)
+    try:
+        for root in payload.get("spans") or []:
+            _walk(root, spans, task, issues)
+    except (AttributeError, KeyError, TypeError) as exc:
+        # A malformed span tree -- a non-object root or child, a span with no
+        # `span_id` -- must quarantine this one file, not abort every other
+        # file the directory ingest was about to read.
+        issues.append(
+            TraceIssue(
+                kind="malformed_span",
+                detail=f"{type(exc).__name__}: {exc}",
+                location=str(path),
+            )
+        )
+        return None, issues, source.ruleset
     if not spans:
         issues.append(
             TraceIssue(kind="empty_trace", detail="no LLM, TOOL or step spans", location=str(path))

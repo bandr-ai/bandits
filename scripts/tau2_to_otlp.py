@@ -195,6 +195,32 @@ def convert(corpus: dict, flatten: bool) -> tuple[list[dict], dict[str, dict]]:
             emitted += 1
             ordinal += 1
 
+        if pending:
+            # The conversation ended on a customer message with nothing after
+            # it to carry it -- no assistant or tool record left to `attach()`
+            # onto. A trailing thank-you, correction or complaint is evidence
+            # about the preceding action, so it is not dropped: one more
+            # record holds only `gen_ai.input.messages`, letting `_user_turns`
+            # anchor it to the real last span. It has no `gen_ai.completion`,
+            # so it renders as an unobserved turn with nothing following it --
+            # invisible to scoring and to transcript export, present only for
+            # `_user_turns` to read.
+            records.append(
+                attach(
+                    {
+                        "trace_id": trace_id,
+                        "span_id": f"{trace_id}:s{emitted + 1}",
+                        "parent_span_id": root_id,
+                        "name": metadata.get("tau2_model") or "assistant",
+                        "start_time": _stamp(ordinal),
+                        "end_time": _stamp(ordinal),
+                        "attributes": {"gen_ai.operation.name": "chat"},
+                    }
+                )
+            )
+            emitted += 1
+            ordinal += 1
+
         labels[trace_id] = {
             "reward": metadata["tau2_reward"],
             "success": metadata["tau2_success"],

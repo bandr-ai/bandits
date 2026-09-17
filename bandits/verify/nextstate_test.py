@@ -137,6 +137,32 @@ def test_judge_failure_is_recorded_not_raised() -> None:
     assert verdict.failure.startswith("unparseable")
 
 
+def test_a_transport_failure_is_not_hidden_by_a_later_unparseable_vote() -> None:
+    """A single overwritten ``failure`` variable let whichever vote failed
+    last decide the recorded reason -- a transport failure followed by an
+    unparseable reply reported "unparseable", so ``judge_turns``' retry pass
+    (which only fires on a ``transport`` failure) never recovered the vote
+    the transport actually lost."""
+    replies = iter([RuntimeError("429"), "no box here", "HINT: none\n\\boxed{+1}"])
+
+    def flaky(*args):
+        item = next(replies)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+    verdict = judge_turn(None, turn, Archetype.GENERIC, predict=flaky, model="m", votes=3)
+    assert verdict.score == 1 and verdict.votes == (1,)
+    assert verdict.failure.startswith("transport")
+
+
 def test_judge_turns_counts_signals_and_round_trips(tmp_path) -> None:
     def predict(model, prompt, temperature):
         return "assumed a path\n\\boxed{-1}" if "not found" in prompt else "\\boxed{+1}"

@@ -814,6 +814,7 @@ def score_traces_command(
         judge_run_id=verifier.judge_run_id,
         include_judge=include_judge,
         checks=checks,
+        via_survivors=survivors,
     )
     envelope = save_verifier_scores(scores, store)
     names_by_id = {c.check_id: c.name for c in verifier.checks}
