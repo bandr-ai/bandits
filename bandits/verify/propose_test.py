@@ -702,3 +702,80 @@ def test_save_verifier_scores_summary_reports_unresolved_counts(tmp_path) -> Non
     assert envelope.summary["unresolved_traces"] == 1
     assert envelope.summary["unresolved_turns"] == 1
     assert envelope.summary["passing"] == 1
+
+
+def test_a_clean_check_does_not_mask_a_judge_transport_failure() -> None:
+    """Flagging is an OR across the judge and every check, so confirming
+    clean is the matching AND: a check returning False proves nothing about
+    a judge that never actually produced a score for this turn."""
+    turn = _turn("a", 0, "3 passed")
+    run = TurnJudgeRun(
+        corpus_id="c",
+        archetype=Archetype.CODING,
+        model="m",
+        prompt_digest="p",
+        trace_ids=("a",),
+        verdicts=(
+            TurnVerdict(trace_id="a", index=0, action_span_id="a-m0", observed=True, score=None),
+        ),
+        signals=(),
+    )
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(_bare_check("clean-000", "def check(turn):\n    return False\n"),),
+    )
+    scores = apply_verifier(verifier, [turn], {}, run, verifier_id="v", judge_run_id="j")
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes
+
+
+def test_a_clean_judge_does_not_mask_an_abstaining_check() -> None:
+    """A judge score of +1 proves nothing about a check that was also
+    applied and never actually resolved this turn."""
+    turn = _turn("a", 0, "3 passed")
+    run = _judge_run([turn])
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(_bare_check("abstains-000", "def check(turn):\n    return None\n"),),
+    )
+    scores = apply_verifier(verifier, [turn], {}, run, verifier_id="v", judge_run_id="j")
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes
+
+
+def test_a_clean_judge_does_not_mask_a_check_that_failed_to_compile() -> None:
+    """A check the sandbox rejects never ran on any turn -- it does not
+    disappear from the OR that flags a turn, so a judge score of +1 cannot
+    stand in for it either. The whole run is unresolved, not just the turns
+    the rejected check would have looked at, since it would have looked at
+    all of them."""
+    turn = _turn("a", 0, "3 passed")
+    run = _judge_run([turn])
+    verifier = FamilyVerifier(
+        family_id="fam",
+        archetype=Archetype.CODING,
+        corpus_id="c",
+        judge_run_id="j",
+        model="m",
+        prompt_digest="p",
+        checks=(_bare_check("rejected-000", "def check(turn):\n    return turn.__class__\n"),),
+    )
+    scores = apply_verifier(verifier, [turn], {}, run, verifier_id="v", judge_run_id="j")
+    by = {s.trace_id: s for s in scores.scores}
+    assert by["a"].unresolved == (0,)
+    assert by["a"].flagged == ()
+    assert not by["a"].passes

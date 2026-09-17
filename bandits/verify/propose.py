@@ -1094,13 +1094,19 @@ def apply_verifier(
     returning False while another is indefinite proves nothing, because the
     indefinite one might have been the one that would have fired.
     """
-    any_check_compiled = False
+    all_checks_compiled = True
+    """False if any applied check failed to compile. That check never ran on
+    any turn at all -- it does not disappear from the OR that flags a turn,
+    so it must not disappear from confirming one clean either. A single
+    rejected check invalidates check-based confirmation for the whole run,
+    not just the turns it would have looked at (it would have looked at
+    every one)."""
     for check in applied:
         try:
             fn = compile_check(check.code)
         except RejectedCheck:
+            all_checks_compiled = False
             continue
-        any_check_compiled = True
         results, _errors = run_check(fn, payload)
         for key, value in results.items():
             if value is None:
@@ -1114,14 +1120,23 @@ def apply_verifier(
                 flags.setdefault((verdict.trace_id, verdict.index), []).append("judge")
 
     def has_signal(key: tuple[str, int]) -> bool:
-        """A real judge score, or every applied check resolving to an actual
-        boolean: either is confirmation a turn was clean, not merely
-        evidence that something looked and shrugged."""
-        judged = include_judge and (verdict := judge_by_key.get(key)) is not None and (
-            verdict.score is not None
+        """Confirmed clean only if every *enabled* detector resolved.
+
+        Flagging is an OR across the judge and every applied check, so
+        confirming a turn clean is the matching AND: the judge, when
+        consulted, produced a real score, AND every applied check, when any
+        were applied, compiled and returned an actual boolean. One resolved
+        source can never stand in for a different one that was also in play
+        and never weighed in -- a check saying False while the judge's
+        transport failed proves nothing about what the judge would have
+        said, and a judge score of +1 proves nothing about a check that
+        abstained or never compiled.
+        """
+        judge_ok = not include_judge or (
+            (verdict := judge_by_key.get(key)) is not None and verdict.score is not None
         )
-        checked = any_check_compiled and key not in indefinite
-        return judged or checked
+        checks_ok = not applied or (all_checks_compiled and key not in indefinite)
+        return judge_ok and checks_ok
 
     by_trace: dict[str, list[Turn]] = {}
     for turn in turns:
