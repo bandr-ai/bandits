@@ -81,18 +81,19 @@ def test_flagged_trace_becomes_a_negative_row_with_reasons() -> None:
         "do the thing",
         [_span("m1", SpanKind.MODEL, "gpt", "boom"), _span("m2", SpanKind.MODEL, "gpt", "ok")],
     )
-    verifier = _verifier([_check("has-error", "accepted")])
+    check = _check("has-error", "accepted")
+    verifier = _verifier([check])
     scores = VerifierScores(
         verifier_id="fv-1",
         judge_run_id="judge-1",
         include_judge=True,
-        checks_applied=("has-error",),
+        checks_applied=(check.check_id,),
         scores=(
             TraceScore(
                 trace_id="t1",
                 turns=1,
                 observed=1,
-                flagged=(FlaggedTurn(index=0, by=("has-error",)),),
+                flagged=(FlaggedTurn(index=0, by=(check.check_id,)),),
             ),
         ),
     )
@@ -101,18 +102,56 @@ def test_flagged_trace_becomes_a_negative_row_with_reasons() -> None:
     row = bundle.rows[0]
     assert row.label == "negative"
     assert row.flagged_turns == (0,)
-    assert row.flagged_by == {"0": ("has-error",)}
+    assert row.flagged_by == {"0": (check.check_id,)}
     assert row.all_checks_reviewed is True
 
 
-def test_unreviewed_check_is_flagged_on_every_row() -> None:
-    trace = _trace("t1", "do the thing", [_span("m1", SpanKind.MODEL, "gpt", "done")])
-    verifier = _verifier([_check("survivor-only", "pending")])
+def test_a_pending_check_sharing_a_name_with_an_accepted_one_is_not_reviewed() -> None:
+    """Names are not unique across a family (a revision can repeat one) --
+    only ``check_id`` may be trusted to tell an accepted check from a pending
+    or rejected one that happens to share its name."""
+    accepted = _check("same-name", "accepted")
+    pending = FamilyCheck(
+        check_id="same-name-001",
+        name="same-name",
+        hypothesis="h",
+        code="def check(turn): return False",
+        code_digest="d",
+        stats=accepted.stats,
+        survived=True,
+        reason="ok",
+        decision="pending",
+    )
+    trace = _trace("t1", "do the thing", [_span("m1", SpanKind.MODEL, "gpt", "boom")])
+    verifier = _verifier([accepted, pending])
     scores = VerifierScores(
         verifier_id="fv-1",
         judge_run_id="judge-1",
         include_judge=False,
-        checks_applied=("survivor-only",),
+        checks_applied=(pending.check_id,),
+        scores=(
+            TraceScore(
+                trace_id="t1",
+                turns=1,
+                observed=1,
+                flagged=(FlaggedTurn(index=0, by=(pending.check_id,)),),
+            ),
+        ),
+    )
+    bundle = build_nextstate_sft_export([trace], verifier, "fv-1", scores, "scores-1")
+    assert bundle.all_checks_reviewed is False
+    assert bundle.rows[0].all_checks_reviewed is False
+
+
+def test_unreviewed_check_is_flagged_on_every_row() -> None:
+    trace = _trace("t1", "do the thing", [_span("m1", SpanKind.MODEL, "gpt", "done")])
+    check = _check("survivor-only", "pending")
+    verifier = _verifier([check])
+    scores = VerifierScores(
+        verifier_id="fv-1",
+        judge_run_id="judge-1",
+        include_judge=False,
+        checks_applied=(check.check_id,),
         scores=(TraceScore(trace_id="t1", turns=1, observed=1, flagged=()),),
     )
     bundle = build_nextstate_sft_export([trace], verifier, "fv-1", scores, "scores-1")
