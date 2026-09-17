@@ -222,3 +222,26 @@ def test_no_observed_turns_is_quarantined_not_scored() -> None:
     bundle = build_nextstate_sft_export([trace], verifier, "fv-1", scores, "scores-1")
     assert bundle.rows == ()
     assert bundle.unresolved[0].reasons == ("no observed turns; the verifier scored nothing",)
+
+
+def test_a_trace_with_unresolved_turns_is_quarantined_not_labeled_positive() -> None:
+    """A turn no check or judge could actually evaluate is zero signal, not
+    a clean bill of health -- labeling it "positive" (or "negative") would
+    claim a verdict nothing produced. Reproduces the export-path version of
+    the bug: an unflagged trace with an unresolved turn must not silently
+    pass through as a positive SFT row."""
+    trace = _trace("t1", "do the thing", [_span("m1", SpanKind.MODEL, "gpt", "done")])
+    verifier = _verifier()
+    scores = VerifierScores(
+        verifier_id="fv-1",
+        judge_run_id="judge-1",
+        include_judge=True,
+        checks_applied=(),
+        scores=(
+            TraceScore(trace_id="t1", turns=1, observed=1, flagged=(), unresolved=(0,)),
+        ),
+    )
+    bundle = build_nextstate_sft_export([trace], verifier, "fv-1", scores, "scores-1")
+    assert bundle.rows == ()
+    assert bundle.positive == 0 and bundle.negative == 0
+    assert "could not be scored" in bundle.unresolved[0].reasons[0]

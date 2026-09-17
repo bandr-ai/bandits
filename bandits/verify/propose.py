@@ -366,6 +366,16 @@ def _check_ast(code: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             raise RejectedCheck("imports are not allowed")
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            # run_check's SIGALRM timeout works by raising _Timeout() inside
+            # whatever is executing when the alarm fires. A `try/except`
+            # inside the check's own body can catch that exception before it
+            # reaches run_check's handler -- `try: while True: pass / except:
+            # pass` swallows the interrupt and loops forever, with the alarm
+            # already spent. Disallowed outright: nothing a check needs to do
+            # (a boolean predicate over a turn dict) requires exception
+            # handling of its own.
+            raise RejectedCheck("a check may not use try/except")
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             raise RejectedCheck(f"dunder attribute {node.attr!r}")
         if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
@@ -446,10 +456,17 @@ def run_check(
     turns: Sequence[dict[str, Any]],
     *,
     seconds: float = 1.0,
-) -> tuple[dict[tuple[str, int], bool | None], int]:
-    """Run one compiled check over turn dicts. Exceptions count, never propagate."""
+) -> tuple[dict[tuple[str, int], bool | None], int, frozenset[tuple[str, int]]]:
+    """Run one compiled check over turn dicts. Exceptions count, never propagate.
+
+    The third value names which turns raised, as opposed to legitimately
+    returning ``None`` -- both land in ``results`` as ``None``, and a caller
+    deciding whether a turn has real coverage from this check needs to tell
+    the two apart.
+    """
     results: dict[tuple[str, int], bool | None] = {}
     errors = 0
+    error_keys: set[tuple[str, int]] = set()
 
     def _alarm(signum, frame):  # noqa: ANN001
         raise _Timeout()
@@ -470,6 +487,7 @@ def run_check(
                 results[key] = None if value is None else bool(value)
             except (_Timeout, Exception):  # noqa: BLE001
                 errors += 1
+                error_keys.add(key)
                 results[key] = None
             finally:
                 if old is not None:
@@ -477,7 +495,7 @@ def run_check(
     finally:
         if old is not None:
             signal_mod.signal(signal_mod.SIGALRM, old)
-    return results, errors
+    return results, errors, frozenset(error_keys)
 
 
 # ----------------------------------------------------------------- scoring
@@ -533,7 +551,7 @@ def evaluate_check(
             fired_positive=0,
             negatives=sum(1 for v in verdicts.values() if v.score == -1),
         ), str(exc)
-    results, errors = run_check(fn, turns)
+    results, errors, _error_keys = run_check(fn, turns)
     fired = fired_scored = fired_negative = fired_positive = 0
     sample: list[tuple[str, int]] = []
     missed: list[tuple[str, int]] = []
@@ -1002,10 +1020,16 @@ class TraceScore(Contract):
     turns: int
     observed: int
     flagged: tuple[FlaggedTurn, ...] = ()
+    unresolved: tuple[int, ...] = ()
+    """Observed turn indices no check could evaluate (every applied check
+    errored on it) and the judge did not resolve (excluded, or it produced
+    no score) -- turns with zero signal from any source, as opposed to zero
+    signal *because nothing was wrong*. Never also in ``flagged``: a turn
+    with a real flag has real evidence, whatever else about it failed."""
 
     @property
     def passes(self) -> bool:
-        return self.observed > 0 and not self.flagged
+        return self.observed > 0 and not self.flagged and not self.unresolved
 
     @property
     def score(self) -> float | None:
@@ -1053,19 +1077,35 @@ def apply_verifier(
     applied = tuple(checks if checks is not None else verifier.accepted())
     payload = turn_payload([t for t in turns if t.observed], tasks, {}, with_judge=False)
     flags: dict[tuple[str, int], list[str]] = {}
+    covered: set[tuple[str, int]] = set()
+    """Turns at least one applied check actually ran on without raising --
+    distinct from ``flags``, which is only the turns something found wrong.
+    A turn a check evaluated and returned False or None for is real
+    evidence of nothing being wrong; a turn every check raised on is not."""
     for check in applied:
         try:
             fn = compile_check(check.code)
         except RejectedCheck:
             continue
-        results, _ = run_check(fn, payload)
+        results, _errors, error_keys = run_check(fn, payload)
         for key, value in results.items():
+            if key not in error_keys:
+                covered.add(key)
             if value:
                 flags.setdefault(key, []).append(check.check_id)
+    judge_by_key = {(v.trace_id, v.index): v for v in judge_run.verdicts}
     if include_judge:
         for verdict in judge_run.verdicts:
             if verdict.score == -1:
                 flags.setdefault((verdict.trace_id, verdict.index), []).append("judge")
+
+    def has_signal(key: tuple[str, int]) -> bool:
+        """A judge score or a check that ran without raising: either is
+        real evidence a turn was clean, not merely evidence nothing looked."""
+        judged = include_judge and (verdict := judge_by_key.get(key)) is not None and (
+            verdict.score is not None
+        )
+        return judged or key in covered
 
     by_trace: dict[str, list[Turn]] = {}
     for turn in turns:
@@ -1077,12 +1117,20 @@ def apply_verifier(
             for t in own
             if (trace_id, t.index) in flags
         )
+        unresolved = tuple(
+            t.index
+            for t in own
+            if t.observed
+            and (trace_id, t.index) not in flags
+            and not has_signal((trace_id, t.index))
+        )
         scores.append(
             TraceScore(
                 trace_id=trace_id,
                 turns=len(own),
                 observed=sum(1 for t in own if t.observed),
                 flagged=flagged,
+                unresolved=unresolved,
             )
         )
     return VerifierScores(
