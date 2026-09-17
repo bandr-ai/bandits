@@ -13,3 +13,4 @@ out/
 .env
 .bandits/
 work/
+datasets/
