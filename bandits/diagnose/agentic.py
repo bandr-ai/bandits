@@ -1170,6 +1170,7 @@ def build_agentic_tool_world_predictor(
     extract_max_tokens: int = 3000,
     max_grounding_calls: int = MAX_GROUNDING_CALLS_DEFAULT,
     max_iters: int = 8,
+    max_select_retries: int = 1,
     on_grounding_call: Callable[[AWMToolCall], None] | None = None,
 ) -> AgenticToolWorldPredictor:
     """A dspy.ReAct-driven tool world: same output contract as the fixed-RAG
@@ -1268,6 +1269,7 @@ def build_agentic_tool_world_predictor(
         }
         trajectory: dict[str, Any] = {}
         controller_error: str | None = None
+        consecutive_failures = 0
 
         for idx in range(max_iters):
             try:
@@ -1277,9 +1279,21 @@ def build_agentic_tool_world_predictor(
                 # Selection failed (unparseable, truncated, context
                 # exceeded). The episode is NOT abandoned: whatever grounding
                 # already succeeded still feeds extraction below.
+                #
+                # Retried once, then given up on. A reasoning model that
+                # deliberates past the selection ceiling fails the same way
+                # every attempt -- the prompt and trajectory are identical and
+                # the temperature is 0 -- so further attempts buy nothing and
+                # each costs a full-ceiling call. Observed: three consecutive
+                # 800-token failures before the loop ended, all reasoning
+                # toward the same finish it never emitted.
+                consecutive_failures += 1
                 controller_error = f"{type(exc).__name__}: {exc}"
-                break
+                if consecutive_failures > max_select_retries:
+                    break
+                continue
 
+            consecutive_failures = 0
             tool_name = (getattr(step, "next_tool_name", "") or "").strip()
             arguments = _coerce_tool_args(getattr(step, "next_tool_args", None))
             trajectory[f"thought_{idx}"] = getattr(step, "next_thought", "")
