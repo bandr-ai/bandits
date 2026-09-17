@@ -761,7 +761,10 @@ def score_traces_command(
         True, "--judge/--no-judge", help="Also flag turns the judge scored -1."
     ),
     survivors: bool = typer.Option(
-        False, "--survivors", help="Apply every surviving check, not only accepted ones."
+        False,
+        "--survivors",
+        help="Apply every check that cleared the automatic bar and was not "
+        "human-rejected or revised, not only accepted ones.",
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -780,7 +783,15 @@ def score_traces_command(
     traces = _corpus_traces(verifier.corpus_id, project, run.trace_ids)
     turns = [turn for trace in traces for turn in extract_turns(trace)]
     tasks = {trace.trace_id: trace.task for trace in traces}
-    checks = tuple(c for c in verifier.checks if c.survived) if survivors else None
+    checks = (
+        tuple(
+            c
+            for c in verifier.checks
+            if c.survived and c.decision not in ("rejected", "revised")
+        )
+        if survivors
+        else None
+    )
     scores = apply_verifier(
         verifier,
         turns,
@@ -792,9 +803,11 @@ def score_traces_command(
         checks=checks,
     )
     envelope = save_verifier_scores(scores, store)
+    names_by_id = {c.check_id: c.name for c in verifier.checks}
+    applied_display = ", ".join(names_by_id.get(cid, cid) for cid in scores.checks_applied)
     console.print(f"verifier_scores_id: {envelope.artifact_id}")
     console.print(
-        f"checks applied:     {', '.join(scores.checks_applied) or '(none)'}{' + judge' if include_judge else ''}"
+        f"checks applied:     {applied_display or '(none)'}{' + judge' if include_judge else ''}"
     )
     console.print(f"passing:            {envelope.summary['passing']} of {len(scores.scores)}")
     table = Table("trace", "turns", "observed", "flagged", "score", "passes")

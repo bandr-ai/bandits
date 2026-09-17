@@ -41,6 +41,8 @@ class NextStateSFTExample(Contract):
     scores_id: str
     judge_run_id: str
     checks_applied: tuple[str, ...]
+    """``check_id`` of every check that ran, not ``name`` (names may repeat
+    across a family after a revision)."""
     all_checks_reviewed: bool
     """False when any applied check was not a human-accepted ``FamilyCheck``
     (e.g. this export drew from ``--survivors``). Carried onto the row so a
@@ -53,7 +55,7 @@ class NextStateSFTExample(Contract):
     score: float | None
     flagged_turns: tuple[int, ...]
     flagged_by: dict[str, tuple[str, ...]]
-    """Turn index (as a string, for JSON) -> check names (and/or ``judge``)
+    """Turn index (as a string, for JSON) -> check_id(s) (and/or ``judge``)
     that flagged it. Empty for a positive row."""
 
     def jsonl_row(self) -> dict[str, Any]:
@@ -80,8 +82,13 @@ class NextStateSFTBundle(Contract):
 
 
 def _all_checks_reviewed(verifier: FamilyVerifier, checks_applied: Sequence[str]) -> bool:
-    accepted_names = {c.name for c in verifier.checks if c.decision == "accepted"}
-    return all(name in accepted_names for name in checks_applied)
+    """``checks_applied`` carries ``check_id``, never ``name``: a revision can
+    give a child check the same ``name`` as the check it revised (or as any
+    other check in the family), so matching by name would let an unreviewed
+    check masquerade as the accepted one it happens to share a name with.
+    """
+    accepted_ids = {c.check_id for c in verifier.checks if c.decision == "accepted"}
+    return all(check_id in accepted_ids for check_id in checks_applied)
 
 
 def compute_example_id(scores_id: str, trace_id: str) -> str:
