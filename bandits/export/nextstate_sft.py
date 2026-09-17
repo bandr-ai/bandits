@@ -81,14 +81,24 @@ class NextStateSFTBundle(Contract):
         return self
 
 
-def _all_checks_reviewed(verifier: FamilyVerifier, checks_applied: Sequence[str]) -> bool:
-    """``checks_applied`` carries ``check_id``, never ``name``: a revision can
-    give a child check the same ``name`` as the check it revised (or as any
-    other check in the family), so matching by name would let an unreviewed
-    check masquerade as the accepted one it happens to share a name with.
+def _all_checks_reviewed(verifier: FamilyVerifier, scores: VerifierScores) -> bool:
+    """False whenever scoring drew from ``--survivors``, regardless of which
+    (or how many) check ids ended up in ``checks_applied``. Survivor mode
+    with zero eligible checks, or with a set that happens to match every
+    accepted id, must still read as unreviewed -- the guarantee is about how
+    the checks were selected, not what the resulting id set looks like.
+
+    Otherwise, every applied id must belong to a check a human actually
+    accepted. ``checks_applied`` carries ``check_id``, never ``name``: a
+    revision can give a child check the same ``name`` as the check it
+    revised (or as any other check in the family), so matching by name would
+    let an unreviewed check masquerade as the accepted one it happens to
+    share a name with.
     """
+    if scores.via_survivors:
+        return False
     accepted_ids = {c.check_id for c in verifier.checks if c.decision == "accepted"}
-    return all(check_id in accepted_ids for check_id in checks_applied)
+    return all(check_id in accepted_ids for check_id in scores.checks_applied)
 
 
 def compute_example_id(scores_id: str, trace_id: str) -> str:
@@ -104,7 +114,7 @@ def build_nextstate_sft_export(
     scores_id: str,
 ) -> NextStateSFTBundle:
     by_id = {trace.trace_id: trace for trace in traces}
-    reviewed = _all_checks_reviewed(verifier, scores.checks_applied)
+    reviewed = _all_checks_reviewed(verifier, scores)
     rows: list[NextStateSFTExample] = []
     unresolved: list[RejectedTrace] = []
     for trace_score in scores.scores:

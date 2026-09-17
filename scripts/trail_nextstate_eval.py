@@ -82,7 +82,15 @@ def prf(predicted: set, truth: set, universe: set) -> dict:
     tp = len(predicted & truth)
     precision = tp / len(predicted) if predicted else None
     recall = tp / len(truth) if truth else None
-    f1 = None if not precision or not recall else 2 * precision * recall / (precision + recall)
+    # `None` means undefined (an empty denominator set), never a computed
+    # 0.0 -- disjoint but non-empty predicted/truth sets give real 0.0
+    # precision and recall, and F1 there is 0.0, not undefined.
+    if precision is None or recall is None:
+        f1 = None
+    elif precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
     return {
         "predicted": len(predicted),
         "truth": len(truth),

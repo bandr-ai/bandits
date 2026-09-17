@@ -326,20 +326,28 @@ def judge_turn(
     scores: list[int] = []
     hints: list[str] = []
     responses: list[str] = []
-    failure: str | None = None
+    failures: list[str] = []
     for _ in range(votes):
         try:
             reply = predict(model, prompt, temperature)
         except Exception as exc:  # noqa: BLE001 - one bad call must not lose the run
-            failure = f"transport: {exc}"
+            failures.append(f"transport: {exc}")
             continue
         responses.append(reply)
         score, hint = parse_verdict(reply)
         if score is None:
-            failure = "unparseable: no boxed score"
+            failures.append("unparseable: no boxed score")
             continue
         scores.append(score)
         hints.append(hint)
+    # A transport failure must survive even when a later vote in the same
+    # turn fails a different way (an unparseable reply): judge_turns' retry
+    # pass looks for `failure.startswith("transport")` to recover exactly
+    # this case, and a single overwritten `failure` variable let a later,
+    # unrelated failure hide the one that mattered.
+    failure = next((f for f in failures if f.startswith("transport")), None) or (
+        failures[-1] if failures else None
+    )
     if not scores:
         return TurnVerdict(**base, response="\n---\n".join(responses)[-4000:], failure=failure)
     final = _majority(scores)

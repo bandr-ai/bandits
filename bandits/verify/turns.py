@@ -93,7 +93,10 @@ class Turn(Contract):
         for reaction in self.reactions:
             flag = " [ERROR]" if reaction.error else ""
             lines.append(f"[{reaction.kind}:{reaction.name}]{flag} {_clip(reaction.text, per)}")
-        return "\n".join(lines)
+        # `per`'s 200-char floor is there so a turn with many reactions does
+        # not reduce every one of them to nothing; it means the per-reaction
+        # clips alone do not bound the total. This does.
+        return _clip("\n".join(lines), limit)
 
     def as_dict(self, *, task: str | None = None) -> dict[str, Any]:
         """The turn as plain data, for a predicate or a prompt to read."""
