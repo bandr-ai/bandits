@@ -1501,3 +1501,35 @@ def test_ledger_grounds_the_known_amount_but_not_the_refund() -> None:
     by_path = {c.path: c.kind for c in assess_proposal_claims(proposal, context=context, trace=trace)}
     assert by_path["payment_history[0].amount"] is GroundingKind.EXACT_ENTITY_FACT
     assert by_path["payment_history[1].amount"] is GroundingKind.UNSUPPORTED
+
+
+def test_repeated_selection_failures_stop_early(monkeypatch) -> None:
+    """A reasoning model that deliberates past the selection ceiling fails
+    identically every attempt -- same prompt, same trajectory, temperature 0.
+    Observed: three consecutive full-ceiling failures before the loop gave up,
+    each one paid for. One retry, then extraction runs on what was gathered."""
+    import dspy
+
+    attempts = {"select": 0, "extract": 0}
+
+    class _Stage:
+        def __init__(self, signature):
+            self.is_select = "next_tool_name" in getattr(signature, "output_fields", {})
+
+        def __call__(self, **kwargs):
+            if not self.is_select:
+                attempts["extract"] += 1
+                return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
+            attempts["select"] += 1
+            raise ValueError("Adapter JSONAdapter failed to parse the LM response")
+
+    monkeypatch.setattr(dspy, "Predict", _Stage)
+    predict = build_agentic_tool_world_predictor(
+        model="test-model", api_key="dummy-key", max_iters=8, max_select_retries=1
+    )
+    _raw, trace = predict(instruction="probe", context=_reservation_context())
+
+    # One initial attempt plus one retry -- not max_iters attempts.
+    assert attempts["select"] == 2
+    assert attempts["extract"] == 1
+    assert trace.controller_error is not None
