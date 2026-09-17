@@ -112,6 +112,25 @@ def test_sandbox_rejects_imports_dunders_and_judge_reads() -> None:
         compile_check("while True:\n    pass\ndef check(turn): return False")
 
 
+def test_a_default_evaluated_at_definition_time_is_rejected_not_run() -> None:
+    """A default is an expression exec() evaluates before run_check's alarm
+    exists to bound it. Rejection must come from the AST alone -- if this
+    test ever reaches the actual exec(), it hangs rather than fails."""
+    with pytest.raises(RejectedCheck):
+        compile_check("def check(turn, x=sum(range(10**10))): return True")
+    with pytest.raises(RejectedCheck):
+        compile_check("def check(turn, *, x=sum(range(10**10))): return True")
+
+
+def test_decorators_and_annotations_are_rejected() -> None:
+    with pytest.raises(RejectedCheck):
+        compile_check("@staticmethod\ndef check(turn): return True")
+    with pytest.raises(RejectedCheck):
+        compile_check("def check(turn) -> bool: return True")
+    with pytest.raises(RejectedCheck):
+        compile_check("def check(turn: dict): return True")
+
+
 def test_sandbox_check_cannot_mutate_the_shared_turn() -> None:
     fn = compile_check('def check(turn):\n    turn["next_state"] = "poisoned"\n    return False')
     turn = {"next_state": "original"}
