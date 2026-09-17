@@ -338,6 +338,27 @@ def _check_ast(code: str) -> None:
     # kill it, and would otherwise hang the process forever.
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
+            # A default, an annotation, or a decorator is evaluated as an
+            # expression by compile_check's exec(), before this function has
+            # returned and before run_check's per-call alarm exists to bound
+            # it -- `def check(turn, x=sum(range(10**10))): ...` hangs the
+            # process right here, with every builtin this sandbox grants.
+            if node.decorator_list:
+                raise RejectedCheck("a check function may not use decorators")
+            if node.returns is not None:
+                raise RejectedCheck("a check function may not use a return annotation")
+            args = node.args
+            parameters = (
+                *args.posonlyargs,
+                *args.args,
+                *args.kwonlyargs,
+                *((args.vararg,) if args.vararg else ()),
+                *((args.kwarg,) if args.kwarg else ()),
+            )
+            if any(arg.annotation is not None for arg in parameters):
+                raise RejectedCheck("a check function's parameters may not use annotations")
+            if args.defaults or any(default is not None for default in args.kw_defaults):
+                raise RejectedCheck("a check function's parameters may not use default values")
             continue
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
             continue
@@ -1001,6 +1022,11 @@ class VerifierScores(Contract):
     checks_applied: tuple[str, ...]
     """``check_id`` of every check that ran, not ``name`` — names are not
     guaranteed unique across a family (a revision may reuse one)."""
+    via_survivors: bool = False
+    """True when scoring drew from every automatic survivor rather than only
+    accepted checks (``score-traces --survivors``). Recorded independently of
+    ``checks_applied`` so an export can't infer "reviewed" from an empty or
+    coincidentally-all-accepted set of ids scored in survivor mode."""
     scores: tuple[TraceScore, ...]
 
 
@@ -1014,6 +1040,7 @@ def apply_verifier(
     judge_run_id: str,
     include_judge: bool = True,
     checks: Sequence[FamilyCheck] | None = None,
+    via_survivors: bool = False,
 ) -> VerifierScores:
     """Score every trace: a turn is flagged by any accepted check, or by the judge.
 
@@ -1063,6 +1090,7 @@ def apply_verifier(
         judge_run_id=judge_run_id,
         include_judge=include_judge,
         checks_applied=tuple(c.check_id for c in applied),
+        via_survivors=via_survivors,
         scores=tuple(scores),
     )
 

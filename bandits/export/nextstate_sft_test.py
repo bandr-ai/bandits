@@ -159,6 +159,41 @@ def test_unreviewed_check_is_flagged_on_every_row() -> None:
     assert bundle.rows[0].all_checks_reviewed is False
 
 
+def test_survivor_mode_with_zero_or_all_accepted_checks_is_still_unreviewed() -> None:
+    """``all_checks_reviewed`` must come from how the checks were selected,
+    not from what the resulting id set looks like. Survivor-mode scoring with
+    no eligible checks (an empty ``checks_applied``) or with a set that
+    happens to match every accepted id must still read as unreviewed --
+    otherwise it is indistinguishable from a genuinely human-reviewed run."""
+    accepted = _check("only-check", "accepted")
+    verifier = _verifier([accepted])
+    trace = _trace("t1", "do the thing", [_span("m1", SpanKind.MODEL, "gpt", "done")])
+
+    empty_survivors = VerifierScores(
+        verifier_id="fv-1",
+        judge_run_id="judge-1",
+        include_judge=False,
+        checks_applied=(),
+        via_survivors=True,
+        scores=(TraceScore(trace_id="t1", turns=1, observed=1, flagged=()),),
+    )
+    bundle = build_nextstate_sft_export([trace], verifier, "fv-1", empty_survivors, "scores-1")
+    assert bundle.all_checks_reviewed is False
+
+    all_accepted_survivors = VerifierScores(
+        verifier_id="fv-1",
+        judge_run_id="judge-1",
+        include_judge=False,
+        checks_applied=(accepted.check_id,),
+        via_survivors=True,
+        scores=(TraceScore(trace_id="t1", turns=1, observed=1, flagged=()),),
+    )
+    bundle = build_nextstate_sft_export(
+        [trace], verifier, "fv-1", all_accepted_survivors, "scores-1"
+    )
+    assert bundle.all_checks_reviewed is False
+
+
 def test_trace_missing_from_the_corpus_is_quarantined() -> None:
     verifier = _verifier()
     scores = VerifierScores(

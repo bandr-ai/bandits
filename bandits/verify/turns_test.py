@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, UserTurn
-from bandits.verify.turns import extract_turns, render_action
+from bandits.verify.turns import Reaction, Turn, extract_turns, render_action
 
 _T = datetime(2025, 1, 1, tzinfo=UTC)
 
@@ -96,3 +96,22 @@ def test_as_dict_exposes_what_a_predicate_may_read() -> None:
         "errored",
     }
     assert row["reactions"] == [{"kind": "tool", "name": "x", "text": "y", "error": False}]
+
+
+def test_next_state_enforces_its_limit_as_a_total_not_a_per_reaction_floor() -> None:
+    """``per``'s 200-char floor keeps many reactions from being reduced to
+    nothing individually, but that alone does not bound the joined total --
+    ten 200-char reactions blew a 1200-char limit past 2000 characters."""
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=tuple(
+            Reaction(span_id=f"r{i}", kind="tool", name="e", text="x" * 200) for i in range(10)
+        ),
+    )
+    # `_clip`'s own "...[N chars omitted]..." marker adds a little past
+    # `limit`, same as everywhere else it's used -- the bug was scaling with
+    # reaction count (~2099 chars here before the fix), not that marker.
+    assert len(turn.next_state(limit=1200)) < 1300
