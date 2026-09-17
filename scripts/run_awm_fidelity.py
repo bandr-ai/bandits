@@ -56,7 +56,7 @@ def load_family(
 ) -> tuple[dict[str, Any], tuple[GroundingTransition, ...], dict[str, tuple[dict[str, Any], ...]]]:
     """Real tau2 traces for one mined family, compiled to transitions.
 
-    Mirrors bandits/diagnose/tau_smoke_test.py's loading pattern exactly, since
+    Mirrors tests/diagnose/tau_smoke_test.py's loading pattern exactly, since
     that is the only place this real artifact has been read correctly before.
     Also keeps trace_id -> per-trace tool schemas, since GroundingTransition
     itself carries none.

@@ -5,7 +5,7 @@ from pathlib import Path
 from bandits.ingest.chat_json import load_chat_json
 from bandits.traces import SpanKind
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 FIXTURE = FIXTURES / "traces.chat.jsonl"
 MULTI_TURN = FIXTURES / "traces.multiturn.chat.json"
 

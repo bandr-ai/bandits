@@ -703,7 +703,7 @@ def test_step_count_gate_quarantines_a_long_episode(export_case) -> None:
     assert any("family quality limit" in reason for reason in rejected["good-1"])
 
 
-FIXTURES = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 SUPPORT_FIXTURE = FIXTURES / "traces.support.otlp.jsonl"
 MULTI_TURN_FIXTURE = FIXTURES / "traces.multiturn.chat.json"
 MULTI_TURN_SESSION = FIXTURES / "session.multiturn.jsonl"

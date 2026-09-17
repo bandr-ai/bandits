@@ -29,7 +29,7 @@ from bandits.verify.models import (
     VerifierSpec,
 )
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 def _replies(*values: str):

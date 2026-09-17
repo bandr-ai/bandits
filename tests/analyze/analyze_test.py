@@ -18,7 +18,7 @@ from bandits.ingest import load_corpus
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, ToolSchema, Trace, TraceCorpus, TraceIssue
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 @pytest.fixture
