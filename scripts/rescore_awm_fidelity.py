@@ -100,7 +100,7 @@ def rescore(*, tau_root: Path, input_path: Path, output: Path) -> None:
         mismatched = {
             key
             for key in reconstructed_rendered
-            if key in saved_rendered and saved_rendered[key] != reconstructed_rendered[key]
+            if key not in saved_rendered or saved_rendered[key] != reconstructed_rendered[key]
         }
         if mismatched:
             raise SystemExit(

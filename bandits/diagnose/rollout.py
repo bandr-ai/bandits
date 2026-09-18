@@ -191,9 +191,19 @@ def run_rollout(
     repeats = 0
     previous_key = ""
 
+    # Imported here, not at module scope: candidates.py imports CandidateAction
+    # from this module, so a top-level import would close the cycle.
+    from bandits.diagnose.candidates import parse_action
+
     while len(steps) < budget.max_steps:
         raw = candidate(view=view, history=history)
-        action = raw if isinstance(raw, CandidateAction) else CandidateAction()
+        # A raw reply is parsed, never blanked. Replacing it with an empty
+        # CandidateAction turned a candidate that answered in JSON, or in a
+        # provider's own object, into a candidate that said nothing -- and a
+        # silent action is scored as a plain message, so a real tool call (or
+        # a refusal that had to be read) vanished from the record instead of
+        # reaching the tool world and being counted.
+        action = parse_action(raw, offered=_offered_tool_names(view))
 
         if action.done:
             if action.content:

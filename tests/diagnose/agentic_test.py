@@ -39,6 +39,7 @@ from bandits.diagnose.models import (
     SupportLevel,
     WorldOrigin,
 )
+from bandits.diagnose.retrieve import RetrievedExample
 from bandits.diagnose.world import (
     ProposedCallOutcome,
     ProposedTransition,
@@ -290,6 +291,62 @@ def test_search_transitions_caps_result_count() -> None:
     audit: list[AWMToolCall] = []
     tool = make_search_transitions(context, audit=audit)
     result = tool(tool="get_user_details", query="", limit=1000)
+
+    assert len(result["results"]) <= agentic_module.MAX_SEARCH_RESULTS
+
+
+def test_search_transitions_caps_result_count_when_errors_are_requested(monkeypatch) -> None:
+    """include_errors runs a second, wider retrieval and merges it in.
+
+    The slice used to apply only to the appended tail, so a full first page
+    plus fresh error cases returned up to twice the cap -- the budget a caller
+    set was silently doubled by asking for error evidence.
+
+    retrieve() reserves a result slot for an error case whenever the index
+    holds one, so the merge branch is not reachable through it today. The
+    ranking is patched here to reach the merge directly: the cap is a property
+    of this function, and it should not depend on a guarantee made elsewhere.
+    """
+    from bandits.diagnose import agentic as agentic_module
+
+    # Eight clean results: enough to fill the first page, few enough that the
+    # broader window (MAX_SEARCH_RESULTS * 4) still reaches the error cases.
+    clean = tuple(
+        _transition(f"t{i}", "get_user_details", {"user_id": f"u{i}"}, {"name": f"U{i}"})
+        for i in range(8)
+    )
+    errored = tuple(
+        GroundingTransition(
+            transition_id=f"e{i}",
+            trace_id="airline-2",
+            family_id="f",
+            turn_index=0,
+            action_span_id=f"span-e{i}",
+            action_calls=(ActionCall(tool="get_user_details", arguments={"user_id": f"e{i}"}),),
+            observations=(
+                GroundingObservation(role="tool", content={"error": "not found"}, error=True),
+            ),
+        )
+        for i in range(8)
+    )
+
+    def _ranking(query, index, *, limit):
+        """Clean results first, error cases only past the cap."""
+        ordered = [
+            RetrievedExample(transition=item, score=1.0, reasons=("tool_match",))
+            for item in clean
+        ] + [
+            RetrievedExample(transition=item, score=0.5, reasons=("tool_match", "error_case"))
+            for item in errored
+        ]
+        return tuple(ordered[:limit])
+
+    monkeypatch.setattr(agentic_module, "retrieve", _ranking)
+    context = _context(fit_index=clean + errored)
+    audit: list[AWMToolCall] = []
+    tool = make_search_transitions(context, audit=audit)
+
+    result = tool(tool="get_user_details", query="", include_errors=True, limit=1000)
 
     assert len(result["results"]) <= agentic_module.MAX_SEARCH_RESULTS
 
@@ -1226,7 +1283,7 @@ def test_batch_nulling_is_scoped_to_the_offending_call() -> None:
     assert by_id["b"].observation["status"] == "confirmed"
 
 
-def test_react_can_build_its_fallback_signature() -> None:
+def test_react_can_build_its_fallback_signature(monkeypatch) -> None:
     """dspy.ReAct rebuilds a fallback signature from the original signature's
     fields. agentic.py uses `from __future__ import annotations`, so those
     fields carry annotation *strings*, and make_signature rejects a ForwardRef
@@ -1234,19 +1291,26 @@ def test_react_can_build_its_fallback_signature() -> None:
     is why nothing else in the suite caught this -- the smoke runner failed on
     all three transitions before reaching a single model call.
 
-    Drives the real builder and the real predict() path, stopping at the
-    network boundary: anything raised before that (ValueError from
-    make_signature) is the regression; a provider/auth error means signature
-    construction succeeded.
+    Drives the real builder and predict path with an offline stage stub. Any
+    signature-construction ValueError remains visible without reaching a
+    provider or hiding unrelated exceptions.
     """
+    import dspy
+
+    class _Stage:
+        def __init__(self, signature):
+            self.is_select = "next_tool_name" in getattr(signature, "output_fields", {})
+
+        def __call__(self, **kwargs):
+            if self.is_select:
+                return dspy.Prediction(
+                    next_thought="done", next_tool_name="finish", next_tool_args={}
+                )
+            return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
+
+    monkeypatch.setattr(dspy, "Predict", _Stage)
     predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
-    try:
-        predict(instruction="probe", context=_reservation_context())
-    except ValueError as exc:  # pragma: no cover -- the regression itself
-        if "Field types must be types" in str(exc):
-            raise AssertionError(f"ReAct could not build its fallback signature: {exc}") from exc
-    except Exception:  # noqa: BLE001 -- reaching the provider is the success case
-        pass
+    predict(instruction="probe", context=_reservation_context())
 
 
 def test_selection_failure_still_runs_extraction(monkeypatch) -> None:

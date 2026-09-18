@@ -647,3 +647,41 @@ def test_a_valid_argument_under_a_rich_schema_still_reaches_the_world() -> None:
 
     result = _run(scenario, candidate=candidate)
     assert result.terminated_by is not TerminationReason.INVALID_CANDIDATE_ACTION
+
+
+# --- a raw reply is parsed, never blanked --------------------------------
+
+
+def test_a_json_reply_is_recorded_as_the_call_it_named() -> None:
+    """A candidate that answers in JSON used to be replaced by an empty
+    action, so a real tool call became silence: no call reached the AWM, the
+    step was scored as a plain message, and nothing recorded that the
+    candidate had acted at all."""
+    replies = iter(
+        [
+            '{"calls": [{"tool": "cancel_reservation", "arguments": {"reservation_id": "ABC"}}]}',
+            CandidateAction(done=True),
+        ]
+    )
+
+    def candidate(**_):
+        return next(replies)
+
+    result = _run(candidate=candidate)
+
+    assert [call.tool for step in result.steps for call in step.calls] == ["cancel_reservation"]
+
+
+def test_a_raw_text_reply_is_kept_as_the_message_it_was() -> None:
+    """The communication half is scored from what the candidate said. An
+    erased reply makes every communication requirement unmeetable."""
+
+    def candidate(**_):
+        return "I have cancelled the reservation for you."
+
+    result = _run(candidate=candidate)
+
+    assert any(
+        step.action_content == "I have cancelled the reservation for you."
+        for step in result.steps
+    )

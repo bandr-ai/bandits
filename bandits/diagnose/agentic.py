@@ -345,7 +345,9 @@ def make_inspect_tool_contract(
 
 
 def _linked_entities(
-    already_read: set[tuple[str, str]], state: ScenarioState
+    already_read: set[tuple[str, str]],
+    state: ScenarioState,
+    audit: Sequence[AWMToolCall] = (),
 ) -> set[tuple[str, str]]:
     """Entities reachable by an actual relationship from an entity already
     read this episode -- e.g. a reservation's own ``user_id`` field, once the
@@ -370,6 +372,13 @@ def _linked_entities(
             linked_kind = relationship_args.get(leaf)
             if linked_kind and isinstance(field.value, str) and field.value:
                 linked.add((linked_kind, field.value))
+        for call in audit:
+            if call.tool != "read_world_state" or call.entity != (kind, entity_id):
+                continue
+            for path, value in call.state_values_read.items():
+                linked_kind = relationship_args.get(path.rsplit(".", 1)[-1])
+                if linked_kind and isinstance(value, str) and value:
+                    linked.add((linked_kind, value))
     return linked
 
 
@@ -468,7 +477,9 @@ def make_read_world_state(
             for c in audit
             if c.tool == "read_world_state" and not c.error
         }
-        allowed = named | already_read | _linked_entities(already_read, context.current_state)
+        allowed = named | already_read | _linked_entities(
+            already_read, context.current_state, audit
+        )
         if (entity_kind, entity_id) not in allowed:
             audit.append(
                 AWMToolCall(
@@ -662,9 +673,13 @@ def make_search_transitions(
                 # ranking didn't surface any within the cap -- the AWM asked
                 # for it explicitly.
                 broader = retrieve(retrieval_query, context.fit_index, limit=MAX_SEARCH_RESULTS * 4)
-                found = tuple(found) + tuple(
-                    e for e in broader if "error_case" in e.reasons and e not in found
-                )[: capped_limit]
+                # Slice the combined result, not just the appended tail: with
+                # `found` already at the cap, slicing only the generator let
+                # the call return up to twice MAX_SEARCH_RESULTS.
+                found = (
+                    tuple(found)
+                    + tuple(e for e in broader if "error_case" in e.reasons and e not in found)
+                )[:capped_limit]
 
         results = []
         exact_entity_evidence_ids: list[str] = []
@@ -686,28 +701,29 @@ def make_search_transitions(
         observed_tool_values: dict[str, set[Any]] = {}
         for example in found:
             matched = bool(entity_id) and _matches_entity(example, tool, entity_id)
-            rendered = _render_example(example)
+            rendered = _render_example(example, tool=tool)
             rendered["entity_matched"] = matched
             results.append(rendered)
             example_entity_id = _example_entity_id(example, tool)
-            if isinstance(rendered.get("observation"), dict):
-                for path, value in _flatten_paths(rendered["observation"]).items():
+            rendered_observations = rendered.get("observations", ())
+            for observation in rendered_observations:
+                if not isinstance(observation, dict):
+                    continue
+                for path, value in _flatten_paths(observation).items():
                     observed_tool_values.setdefault(path, set()).add(_hashable(value))
             if matched:
                 exact_entity_evidence_ids.append(example.transition.transition_id)
-                if isinstance(rendered.get("observation"), dict) and example_entity_id:
+                if example_entity_id:
                     canonical_prefix = f"{tool}.{example_entity_id}."
-                    for sub_path, value in _flatten_paths(rendered["observation"]).items():
-                        path = f"{canonical_prefix}{sub_path}"
-                        if path in exact_entity_values and exact_entity_values[path] != value:
-                            # Two matched examples disagree on this field --
-                            # a conflicting snapshot is not evidence, it is
-                            # ambiguity, and must not silently pick whichever
-                            # was seen last (grounding.py's I39 fix applies
-                            # the same rule to its own retrieval).
-                            conflicting_exact_entity_paths.add(path)
-                        else:
-                            exact_entity_values[path] = value
+                    for observation in rendered_observations:
+                        if not isinstance(observation, dict):
+                            continue
+                        for sub_path, value in _flatten_paths(observation).items():
+                            path = f"{canonical_prefix}{sub_path}"
+                            if path in exact_entity_values and exact_entity_values[path] != value:
+                                conflicting_exact_entity_paths.add(path)
+                            else:
+                                exact_entity_values[path] = value
         for path in conflicting_exact_entity_paths:
             exact_entity_values.pop(path, None)
 
@@ -730,8 +746,11 @@ def make_search_transitions(
                 observed_tool_values={
                     path: tuple(values) for path, values in observed_tool_values.items()
                 },
-                entity=(_KIND_BY_STATE_TOOL[tool], entity_id)
-                if entity_id and tool in _KIND_BY_STATE_TOOL
+                entity=(
+                    ("user" if _SEARCH_ENTITY_ARGS.get(tool) == "user_id" else "reservation"),
+                    entity_id,
+                )
+                if entity_id and tool in _SEARCH_ENTITY_ARGS
                 else None,
             )
         )
@@ -777,15 +796,32 @@ def _flatten_paths(payload: Any, prefix: str = "") -> dict[str, Any]:
     return found
 
 
-def _render_example(example: RetrievedExample) -> dict[str, Any]:
+def _render_example(example: RetrievedExample, *, tool: str | None = None) -> dict[str, Any]:
     transition = example.transition
-    observation = next((o for o in transition.observations if o.role == "tool"), None)
+    calls = [call for call in transition.action_calls if tool is None or call.tool == tool]
+    call_ids = {call.call_id for call in calls if call.call_id}
+    observations = [
+        observation
+        for observation in transition.observations
+        if observation.role == "tool" and observation.tool_call_id in call_ids
+    ]
+    if not observations and len(calls) == 1:
+        same_tool = [
+            observation
+            for observation in transition.observations
+            if observation.role == "tool"
+            and (observation.tool_name == calls[0].tool or observation.tool_name is None)
+        ]
+        if len(same_tool) == 1:
+            observations = same_tool
+    rendered_observations = [observation.content for observation in observations]
     return {
         "transition_id": transition.transition_id,
-        "tool": transition.action_tool,
-        "arguments": [dict(c.arguments) for c in transition.action_calls],
-        "observation": observation.content if observation else None,
-        "error": bool(observation and observation.error),
+        "tool": tool or transition.action_tool,
+        "arguments": [dict(call.arguments) for call in calls],
+        "observation": rendered_observations[0] if len(rendered_observations) == 1 else None,
+        "observations": rendered_observations,
+        "error": any(observation.error for observation in observations),
         "reasons": list(example.reasons),
     }
 
@@ -1559,15 +1595,19 @@ def assess_proposal_claims(
                 # DERIVABLE_FROM_STATE, since there is no pre-state value to
                 # derive it from.
                 event_path = f"events[{event_index}].{field_name}"
-                claim = _classify(call_id, tool, event_path, field_value)
-                if claim.kind is GroundingKind.DERIVABLE_FROM_STATE:
-                    # An event field coincidentally matched a known path name
-                    # (unlikely but not impossible) -- still not licensed as
-                    # a mutation, since events are new facts, not deltas.
-                    claim = ClaimGrounding(
-                        call_id=call_id, path=event_path, predicted_value=field_value,
-                        kind=GroundingKind.UNSUPPORTED,
-                    )
+                semantic = _classify(call_id, tool, field_name, field_value)
+                kind = semantic.kind
+                if kind is GroundingKind.BEHAVIORAL_ANALOGY and _tool_has_observed_this_value(
+                    tool, field_name, field_value
+                ):
+                    kind = GroundingKind.DERIVABLE_FROM_STATE
+                claim = ClaimGrounding(
+                    call_id=call_id,
+                    path=event_path,
+                    predicted_value=field_value,
+                    kind=kind,
+                    evidence_ids=semantic.evidence_ids,
+                )
                 found.append(claim)
         return found
 

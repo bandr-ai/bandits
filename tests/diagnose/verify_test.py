@@ -512,6 +512,17 @@ def test_a_declared_db_basis_cannot_be_silently_dropped() -> None:
     )
 
 
+def test_a_declared_communication_basis_cannot_be_silently_dropped() -> None:
+    assert (
+        compose_overall(
+            ComponentResult(status=ResultStatus.PASS),
+            ComponentResult(status=ResultStatus.NOT_APPLICABLE),
+            reward_basis=("DB", "COMMUNICATE"),
+        )
+        is ResultStatus.UNKNOWN
+    )
+
+
 def test_nothing_scored_is_unknown_not_a_pass() -> None:
     assert (
         compose_overall(

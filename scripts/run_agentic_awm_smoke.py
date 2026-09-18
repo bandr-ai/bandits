@@ -343,22 +343,24 @@ def _risk_coverage(results: list[dict[str, Any]]) -> dict[str, Any]:
     """
     scored = [r for r in results if isinstance(r.get("outcome"), dict)]
     outcomes = [r["outcome"] for r in scored]
+    harness_failures = sum(1 for r in results if "unexpected_error" in r)
+    cases = len(outcomes) + harness_failures
     executed = [o for o in outcomes if o.get("transition_executed")]
     accuracies = [
         o["field_accuracy"] for o in executed if o.get("field_accuracy") is not None
     ]
     fabrications = [o for o in outcomes if o.get("safe_nonfabrication") is False]
     return {
-        "cases": len(outcomes),
+        "cases": cases,
         "environment_coverage": (
-            sum(1 for o in outcomes if o.get("environment_coverage")) / len(outcomes)
-            if outcomes
+            sum(1 for o in outcomes if o.get("environment_coverage")) / cases
+            if cases
             else None
         ),
         "transitions_executed": len(executed),
         # Over executed transitions only.
         "mean_field_accuracy": (sum(accuracies) / len(accuracies)) if accuracies else None,
-        "fabrication_rate": (len(fabrications) / len(outcomes)) if outcomes else None,
+        "fabrication_rate": (len(fabrications) / cases) if cases else None,
         "safe_failures": sum(
             1
             for o in outcomes
@@ -368,7 +370,7 @@ def _risk_coverage(results: list[dict[str, Any]]) -> dict[str, Any]:
         # Cases that crashed before producing any outcome are coverage
         # failures too, and counting them only as "errors" would flatter the
         # coverage number.
-        "harness_failures": sum(1 for r in results if "unexpected_error" in r),
+        "harness_failures": harness_failures,
     }
 
 
@@ -410,9 +412,9 @@ def run(
     unsupported_lookup_transition_id: str,
     fact_grounded_transition_id: str,
     output_dir: Path,
-    max_tokens: int = 6000,
-    select_max_tokens: int = 800,
-    extract_max_tokens: int = 3000,
+    max_tokens: int = 8192,
+    select_max_tokens: int = 4096,
+    extract_max_tokens: int = 8192,
     cases: tuple[str, ...] = (),
     resume: bool = True,
 ) -> None:
@@ -431,6 +433,9 @@ def run(
         "task_set_id": task_set_id,
         "family_id": family_id,
         "markers": list(markers),
+        "max_tokens": max_tokens,
+        "select_max_tokens": select_max_tokens,
+        "extract_max_tokens": extract_max_tokens,
         "transitions": {
             "known_state": known_state_transition_id,
             "unsupported_lookup": unsupported_lookup_transition_id,
@@ -484,7 +489,7 @@ def run(
                 path=f"{prefix}{path}",
                 value=value,
                 origin=WorldOrigin.RECORDED,
-                revealed_by_span_id=recorded.span_id or control.action_span_id,
+                revealed_by_span_id=recorded.span_id,
             )
             for path, value in _flatten_paths(recorded.content).items()
         )
@@ -622,13 +627,13 @@ def main() -> None:
     # Raise when responses truncate: a truncated response parses into an
     # output_invalid row, which is a parser failure recorded as if it were
     # an epistemic result.
-    parser.add_argument("--max-tokens", type=int, default=6000)
+    parser.add_argument("--max-tokens", type=int, default=8192)
     # Budgeted per ReAct stage. Selection is not uniformly short: the
     # ordinary tool-picking steps land near 300 tokens, but the step that
     # decides to finish deliberates first and needs several times that.
     # Sized for the finish step, since truncating it loses the whole run.
-    parser.add_argument("--select-max-tokens", type=int, default=800)
-    parser.add_argument("--extract-max-tokens", type=int, default=3000)
+    parser.add_argument("--select-max-tokens", type=int, default=4096)
+    parser.add_argument("--extract-max-tokens", type=int, default=8192)
     parser.add_argument(
         "--case", action="append", dest="cases", default=None,
         help="run only these cases (A, B, C); repeatable. Others are kept from the checkpoint.",

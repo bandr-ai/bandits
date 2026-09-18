@@ -107,12 +107,49 @@ def _behavioral_evidence(
 
 def classify(
     transition: GroundingTransition, *, fit_index: tuple[GroundingTransition, ...]
+) -> list[dict[str, Any]]:
+    """Classify every call/result pair; never collapse a batch to its first call."""
+    rows = []
+    for call in transition.action_calls:
+        recorded = next(
+            (
+                observation
+                for observation in transition.observations
+                if observation.role == "tool"
+                and observation.tool_call_id == call.call_id
+            ),
+            None,
+        )
+        if recorded is None and len(transition.action_calls) == 1:
+            candidates = [
+                observation
+                for observation in transition.observations
+                if observation.role == "tool"
+                and (
+                    observation.tool_name == call.tool
+                    or observation.tool_name is None
+                )
+            ]
+            recorded = candidates[0] if len(candidates) == 1 else None
+        rows.append(
+            _classify_call(
+                transition,
+                call=call,
+                recorded=recorded,
+                fit_index=fit_index,
+            )
+        )
+    return rows
+
+
+def _classify_call(
+    transition: GroundingTransition, *, call, recorded, fit_index
 ) -> dict[str, Any]:
-    recorded = next((o for o in transition.observations if o.role == "tool"), None)
-    tool = transition.action_calls[0].tool if transition.action_calls else ""
+    tool = call.tool
     asserted = _flatten_paths(recorded.content) if recorded and recorded.content is not None else {}
 
-    entities = _target_entities(transition)
+    one_call = transition.replace(action_calls=(call,))
+    entities = _target_entities(one_call)
     available: dict[str, Any] = {}
     for entity in entities:
         available.update(_available_values(transition, entity))
@@ -157,6 +194,7 @@ def classify(
 
     return {
         "transition_id": transition.transition_id,
+        "call_id": call.call_id,
         "tool": tool,
         "verdict": verdict,
         "is_write": is_write,
@@ -204,7 +242,7 @@ def run(
     markers: tuple[str, ...],
     output: Path | None,
 ) -> None:
-    _family, transitions, _schemas = load_family(
+    family, transitions, _schemas = load_family(
         tau_root, corpus_id=corpus_id, task_set_id=task_set_id, family_id=family_id, markers=markers
     )
     # Only transitions the tool world is ever asked to simulate: an action
@@ -216,7 +254,13 @@ def run(
         for t in transitions
         if t.action_calls and any(o.role == "tool" for o in t.observations)
     )
-    rows = [classify(t, fit_index=transitions) for t in auditable]
+    fit_ids = set(family["fit_trace_ids"])
+    fit_index = tuple(t for t in transitions if t.trace_id in fit_ids)
+    rows = [
+        row
+        for transition in auditable
+        for row in classify(transition, fit_index=fit_index)
+    ]
 
     totals = {EXACT: 0, TRANSFORM: 0, BEHAVIOR_ONLY: 0, UNSUPPORTED: 0}
     for row in rows:

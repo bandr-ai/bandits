@@ -514,8 +514,9 @@ rollout state/transcript-/                                  -> Result + world_or
 
 `rollout_claims` materializes the claim names that reviewed checks already consume, while retaining
 field-level `recorded | executable | simulated` origin. It does not write simulated claims back as
-`Evidence`, `Span`, or `TraceCorpus`. `execute_verifier(spec, evidence)` remains the replay-compatible
-entry point; its operator logic is factored behind the common interface rather than duplicated.
+`Evidence`, `Span`, or `TraceCorpus`. Current accepted RLM `FamilyCheck`
+predicates guard simulated reactions, while the sealed success contract scores
+task completion; historical judge verdicts never transfer to simulated ids.
 
 Where expected outcomes differ per task, a reviewed `VerifierBinding` resolves placeholders from the
 scenario's sealed success contract into a concrete `VerifierSpec`. Neither the candidate nor AWM can
@@ -610,6 +611,11 @@ does not react, reaction-only scoring is near chance. TraceWorld still needs sta
 evidence.
 
 ### Trace and task-family plane
+
+> Historical baseline snapshot from before the diagnose implementation and
+> the next-state verifier replacement. The authoritative current status is the
+> "Diagnose vertical slice" section below; these rows are retained only to show
+> the gap the build plan started from.
 
 | Capability | Status | Current evidence |
 |---|---|---|

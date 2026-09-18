@@ -244,17 +244,32 @@ def reconstruct_state(
     the ledger has to agree with the last thing the episode observed.
     """
     fields: dict[str, StateField] = {}
-    last_call: tuple[str, dict[str, Any]] | None = None
+    # Every call the current action submitted, not just the most recent one.
+    # Keeping only `last_call` mis-prefixed batches: for
+    # [get_reservation_details(A), get_reservation_details(B)] the result for
+    # A was namespaced under B (the second call had overwritten it), and the
+    # result for B then found nothing at all and fell back to the bare tool
+    # name. Both outcomes record a StateField whose value belongs to a
+    # different entity, which is exactly the collapse `_entity_prefix` exists
+    # to prevent -- and `_delta` already refuses to guess here.
+    pending: list[tuple[str, dict[str, Any], str | None]] = []
 
     for span in trace.spans:
         if span.kind is SpanKind.MODEL:
             tool, arguments, _ = _render_action(span)
             if tool:
-                last_call = (tool, arguments)
+                pending.append((tool, arguments, str(span.arguments.get("tool_call_id") or "") or None))
         elif span.status is not SpanStatus.ERROR:
             # An error reports what did *not* happen. Reading state out of it
             # would invent the very fact the failure denies.
-            call_tool, call_args = last_call or (span.name, {})
+            call = _correlated_call(span, pending)
+            if call is None:
+                # No call can be identified for this result. Skipping it keeps
+                # the path unknown, which reconstruct_state already treats as
+                # "not reconstructed" -- strictly better than attributing the
+                # value to whichever entity happened to be guessed.
+                continue
+            call_tool, call_args = call
             prefix = _entity_prefix(call_tool, call_args)
             for path, value in _state_paths(_json_value(span.output)).items():
                 full = f"{prefix}.{path}"
@@ -264,11 +279,35 @@ def reconstruct_state(
                     origin=WorldOrigin.RECORDED,
                     revealed_by_span_id=span.span_id,
                 )
-            last_call = None
         if through_span_id is not None and span.span_id == through_span_id:
             break
 
     return ScenarioState(fields=tuple(fields.values()))
+
+
+def _correlated_call(
+    result: Span, pending: Sequence[tuple[str, dict[str, Any], str | None]]
+) -> tuple[str, dict[str, Any]] | None:
+    """The call this result answers, by id first and by an unambiguous tool
+    match second -- the same rule ``_delta`` applies, for the same reason.
+
+    Returns None when neither resolves it, so the caller can skip the result
+    rather than prefix it with a guess.
+    """
+    tool_call_id = str(result.arguments.get("tool_call_id") or "") or None
+    if tool_call_id:
+        for tool, arguments, call_id in pending:
+            if call_id and call_id == tool_call_id:
+                return (tool, arguments)
+    same_tool = [(tool, args) for tool, args, _ in pending if tool == result.name]
+    if len(same_tool) == 1:
+        return same_tool[0]
+    if not pending and result.name:
+        # No action span recorded a call at all (a bare recorded reaction).
+        # The tool's own name is the only prefix available, and it is what
+        # this function has always used for that shape.
+        return (result.name, {})
+    return None
 
 
 def _action_runs(trace: Trace) -> list[tuple[list[Span], list[Span]]]:
@@ -345,7 +384,12 @@ def extract_transitions(
         first = action[0]
         calls = _calls_of(action)
         content = next(
-            (span.output for span in action if span.name in SPEAKER_SPAN_NAMES and span.output),
+            (
+                rendered
+                for span in action
+                for rendered in (_render_action(span)[2],)
+                if rendered
+            ),
             None,
         )
 

@@ -274,12 +274,20 @@ class _RecordingPredictor:
 
 
 def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+        return _jsonable(value.model_dump(mode="json"))
     if hasattr(value, "toDict"):
-        return value.toDict()
+        return _jsonable(value.toDict())
     if hasattr(value, "__dict__"):
-        return {k: v for k, v in vars(value).items() if not k.startswith("_")}
+        return {
+            k: _jsonable(v) for k, v in vars(value).items() if not k.startswith("_")
+        }
     return str(value)
 
 
