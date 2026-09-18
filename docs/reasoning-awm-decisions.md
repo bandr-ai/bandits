@@ -5,7 +5,7 @@ records *why each choice was made*, what was rejected, and what evidence in the 
 codebase forced the choice. Every entry is written so a later reader can overturn it by
 producing contrary evidence, not by preferring a different taste.
 
-Scope of this record: the **diagnose phase only** (plan §"Current implementation target").
+Scope of this record: the **emulate phase only** (plan §"Current implementation target").
 Milestones 4, 7, 8 and the ADWM experiment are out of scope and are not decided here.
 
 Status legend for each decision: **Decided** (act on it), **Provisional** (acting on it,
@@ -122,7 +122,7 @@ Naming settled now, before any code exists: `GroundingTransition` (the record),
 
 ## 2. Corpus and scope decisions
 
-### D5. Diagnose targets the **tau2 airline** corpus, not the local SWE-bench one. **Decided**
+### D5. Emulate targets the **tau2 airline** corpus, not the local SWE-bench one. **Decided**
 
 E7 and E8 force this.
 
@@ -136,7 +136,7 @@ tau2 airline is the opposite: 13 declared tools with parameter schemas, structur
 results, a written system policy, real user turns, a frozen task set, and ground-truth
 labels. It is the only asset in this repository on which AWM fidelity is measurable at all.
 
-**Decision.** Diagnose phase runs on tau2. SWE-bench stays as the negative control that
+**Decision.** Emulate phase runs on tau2. SWE-bench stays as the negative control that
 demonstrates the boundary, and is not simulated.
 
 **Cost accepted:** tau2's user side is an LLM simulator, so "user reply" transitions are
@@ -173,7 +173,7 @@ set, labels, and partial verifier work.
 the same converted source and compare contracts. Matching ids permit direct reuse. An id
 mismatch is expected when the ingest contract changed (E17): record a field-level migration
 delta, produce a new corpus/analysis/task set, and re-mine under current code. Never mutate
-artifacts or chase the historical hash by suppressing newly represented fields. Diagnose
+artifacts or chase the historical hash by suppressing newly represented fields. Emulate
 must bind wholly to either the frozen legacy graph or the newly migrated graph, never mix
 parent ids across them.
 
@@ -186,7 +186,7 @@ would detach scenarios from the parent graph that gives their lineage meaning.
 
 ### D8. Do **not** block on PR #44. Define `GroundingTransition` independently, adapting from `Turn` when it lands. **Decided**
 
-The plan says "if it lands, diagnose should reuse it". E6 says it has not landed, is
+The plan says "if it lands, emulate should reuse it". E6 says it has not landed, is
 3622 lines, and is another person's work. E5 says its `Turn` is lossy in a way that matters.
 
 **The specific problem.** `Turn` clips the action to 1600 chars and each reaction to 1200
@@ -328,7 +328,7 @@ change those expected values. Historical validation binds the same template inde
 for each labeled task; promotion applies to the template plus binding rules, not to one
 reservation's constants.
 
-**Blocking consequence.** E7 says no verifier has been promoted yet. Diagnose cannot report
+**Blocking consequence.** E7 says no verifier has been promoted yet. Emulate cannot report
 pass@k until one exists for 451ae91f975c. See Q2.
 
 ---
@@ -373,15 +373,15 @@ weight training is gated on a *measured* residual, and the plan is explicit that
 training is an optimization, not a missing functional requirement. Nothing in the current
 evidence justifies training a model before knowing whether a prompt can do it.
 
-### D18. Declare `gepa` directly under a new `diagnose` extra; do not rely on the transitive pull. **Decided**
+### D18. Declare `gepa` directly under a new `emulate` extra; do not rely on the transitive pull. **Decided**
 
 E10: it is installed only because `dspy[deno]` happens to require `gepa[dspy]==0.1.4`.
 Importing it directly while it is transitive means a dspy upgrade that drops or bumps it
 breaks this code with no declared reason.
 
-**Decision.** Add it explicitly under a new `diagnose` optional extra. The core install's
+**Decision.** Add it explicitly under a new `emulate` optional extra. The core install's
 three-runtime-dependency property (E11) is preserved, while neither audit users nor
-diagnose users acquire the other's machinery accidentally.
+emulate users acquire the other's machinery accidentally.
 
 ### D19. AWM calls follow the `_Predictor` Protocol + injection idiom. **Decided**
 
@@ -554,7 +554,7 @@ reported separately and never averaged.
 
 ## Question resolutions
 
-These answers are now part of the diagnose implementation boundary.
+These answers are now part of the emulate implementation boundary.
 
 **Q1. tau2 source data — resolved.** Both exports and the complete legacy project store are
 present (E15/E16). Audit the frozen graph, compare current re-ingestion at field level, and
@@ -591,8 +591,8 @@ state. Authentic future user text is never replayed after candidate divergence. 
 publish a tool-only/stop-at-user metric as a diagnostic, never as full-rollout pass@k.
 Every full pass@k is conditioned on both the tool-AWM version and user-policy version.
 
-**Q7. Extra placement for `gepa`/`dspy` — resolved.** Add a new `diagnose` optional extra.
-Diagnosis should not imply installation of the RLM audit REPL/sandbox, and users of the
+**Q7. Extra placement for `gepa`/`dspy` — resolved.** Add a new `emulate` optional extra.
+Emulation should not imply installation of the RLM audit REPL/sandbox, and users of the
 audit feature should not acquire the AWM stack accidentally. Declare every imported
 dependency directly; do not rely on GEPA arriving transitively through DSPy.
 

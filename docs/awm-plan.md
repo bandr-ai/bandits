@@ -51,9 +51,9 @@ World-model weight training is also optional. The default AWM is an existing cap
 with trace retrieval, a GEPA-optimized environment prompt, strict transition contracts, external
 state, support estimation, and abstention.
 
-## Current implementation target: `bandits/diagnose`
+## Current implementation target: `bandits/emulate`
 
-The immediate project is diagnosis only. It does not build the complete destination architecture in
+The immediate project is emulation only. It does not build the complete destination architecture in
 this document.
 
 ```text
@@ -79,7 +79,7 @@ tau2 source -> project-store corpus + task families + reviewed verifier
 
 For this phase, the grounded AWM **is the synthetic interactive environment**. There is no separate
 CRM/ERP/Slack replica, executable connector runtime, universal enterprise state schema, or automatic
-environment generator. Those are future options only if diagnosis demonstrates that prompt-and-RAG
+environment generator. Those are future options only if emulation demonstrates that prompt-and-RAG
 simulation is insufficient or that subsequent OPD/RL needs stronger state guarantees.
 
 The three scenario classes are:
@@ -98,14 +98,14 @@ Deduplicate equivalent prefixes and cap per-trace/per-family sampling so long tr
 families do not dominate the evaluation. Each cut point remains bound to the same trace lineage and
 held-out partition as its source.
 
-This is environment simulation. In the diagnose phase the simulator is generative and trace-grounded
+This is environment simulation. In the emulate phase the simulator is generative and trace-grounded
 rather than an executable clone: it repeatedly predicts the next observation after each candidate
 action, appends that observation to the simulated session, and lets the candidate act again.
 
-### What Bandits already supplies to diagnose
+### What Bandits already supplies to emulate
 
 Bandits already stores the trace spans containing model actions, tool results, user turns, task
-context, toolsets when declared, lineage, families, outcome evidence, and reviewed verifiers. Diagnose
+context, toolsets when declared, lineage, families, outcome evidence, and reviewed verifiers. Emulate
 must consume those artifacts rather than re-ingest or reinterpret the source independently.
 
 The phrase `action/reaction extraction` means only a deterministic view over that existing corpus:
@@ -117,14 +117,14 @@ one recorded model action
 ```
 
 It is not a new trace-mining system. Open PR #44 implements a useful *judge projection* as `Turn`,
-but clips actions/reactions and renders structured results to strings. Diagnose therefore reuses only
+but clips actions/reactions and renders structured results to strings. Emulate therefore reuses only
 its span-boundary rule if a lossless hook lands. AWM grounding uses a separate lossless
 `GroundingTransition` view over the original spans; clipping happens only while rendering a prompt.
 
 The tau2 source is present under `work/tau/`, including the original 15.7 MB export, converted
 160-trace corpus, mappings, labels, and the 40-trace reserved test partition. The original project
 store also survives under `work/tau/run/proj/.bandits/`: it contains the frozen corpus, analysis,
-task set, labels, target-family draft/run, and interviews, but no reviewed verifier. Diagnose first
+task set, labels, target-family draft/run, and interviews, but no reviewed verifier. Emulate first
 audits that artifact graph and then either reuses it or performs an explicit migration.
 
 The phrase `fit transitions` means the action/reaction examples belonging to the existing fit-side
@@ -278,7 +278,7 @@ Every field carries provenance such as `observed`, `derived`, `inferred`, `owner
 
 ### Phase 6: Build TraceWorld's transition runtime
 
-For the diagnose MVP, retrieval is evidence for the AWM, not a transition engine or policy. Every
+For the emulate MVP, retrieval is evidence for the AWM, not a transition engine or policy. Every
 candidate action follows the same main path:
 
 ```text
@@ -321,7 +321,7 @@ entities, account for preceding state changes, preserve cross-turn consistency, 
 from several traces.
 
 Directly returning an empirical observation is only an optional optimization for a separately proven
-deterministic, state-equivalent case. It is not the default diagnose architecture. Similarity must be
+deterministic, state-equivalent case. It is not the default emulate architecture. Similarity must be
 effect-aware so actions with similar language but different mutations are not treated as
 interchangeable. Predictions with little relevant evidence are the lowest-authority path and must be
 reported or abstained separately.
@@ -371,7 +371,7 @@ misnamed:
 
 PR #44's `FamilyVerifier` is not a `VerifierSpec`. Its predicates flag bad `Turn`s, and its trace
 “pass” means only “at least one observed turn and no flag”; the fractional score is the unflagged-turn
-rate. Diagnose never treats either as task completion or reward. For tau2, accepted predicates are
+rate. Emulate never treats either as task completion or reward. For tau2, accepted predicates are
 debug/recovery diagnostics over a rendered rollout view. Terminal success comes from the external
 state/event ledger through a reviewed state-based `VerifierSpec` and the rollout-claim adapter.
 
@@ -504,7 +504,7 @@ Scores initial/final state, event deltas, invariants, and trajectory evidence. I
 environment: a verifier judges consequences but does not generate the next observation.
 
 The existing executor accepts `Evidence` extracted from recorded spans, so it cannot directly score
-a simulated rollout. Diagnose adds a provenance-safe adapter:
+a simulated rollout. Emulate adds a provenance-safe adapter:
 
 ```text
 recorded Evidence -------\
@@ -612,9 +612,9 @@ evidence.
 
 ### Trace and task-family plane
 
-> Historical baseline snapshot from before the diagnose implementation and
+> Historical baseline snapshot from before the emulate implementation and
 > the next-state verifier replacement. The authoritative current status is the
-> "Diagnose vertical slice" section below; these rows are retained only to show
+> "Emulate vertical slice" section below; these rows are retained only to show
 > the gap the build plan started from.
 
 | Capability | Status | Current evidence |
@@ -672,7 +672,7 @@ evidence.
 
 ## Build plan
 
-### Diagnose vertical slice: what is actually built now
+### Emulate vertical slice: what is actually built now
 
 This sequence supersedes the broad destination milestones below for the current work. It targets
 one tau2 family (`family-451ae91f975c`) and does not build connectors, an executable SaaS clone, a
@@ -720,7 +720,7 @@ selection.
 The minimal package is deliberately small:
 
 ```text
-bandits/diagnose/
+bandits/emulate/
   models.py       # tagged success contracts, tool effects, scenarios, state, rollout/report contracts
   compile.py      # lossless transitions + start/middle/end cases + marker transforms
   retrieve.py     # fit-only, lineage-filtered evidence retrieval

@@ -16,7 +16,7 @@ audit = [
     # or a REPL sandbox; their tests inject a predictor instead.
     "dspy[deno]>=3.3.1",
 ]
-diagnose = [
+emulate = [
     # Prompt optimization and schema-checked trace-grounded world simulation.
     "dspy[deno]>=3.3.1",
     "jsonschema>=4.23",

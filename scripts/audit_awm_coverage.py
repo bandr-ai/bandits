@@ -35,12 +35,12 @@ from typing import Any
 
 from run_awm_fidelity import excluded_trace_ids_for, load_family
 
-from bandits.diagnose.agentic import (
+from bandits.emulate.agentic import (
     AWMRuntimeContext,
     _flatten_paths,
     _prior_observation_fields,
 )
-from bandits.diagnose.models import GroundingTransition
+from bandits.emulate.models import GroundingTransition
 
 DEFAULT_TAU_ROOT = Path("work/tau/run/proj/.bandits")
 DEFAULT_CORPUS_ID = "corpus-ee3b33086ef177d7"

@@ -201,7 +201,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
-diagnose = [
+emulate = [
     { name = "dspy", extra = ["deno"] },
     { name = "jsonschema" },
 ]
@@ -209,8 +209,8 @@ diagnose = [
 [package.metadata]
 requires-dist = [
     { name = "dspy", extras = ["deno"], marker = "extra == 'audit'", specifier = ">=3.3.1" },
-    { name = "dspy", extras = ["deno"], marker = "extra == 'diagnose'", specifier = ">=3.3.1" },
-    { name = "jsonschema", marker = "extra == 'diagnose'", specifier = ">=4.23" },
+    { name = "dspy", extras = ["deno"], marker = "extra == 'emulate'", specifier = ">=3.3.1" },
+    { name = "jsonschema", marker = "extra == 'emulate'", specifier = ">=4.23" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
@@ -218,7 +218,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["audit", "diagnose", "dev"]
+provides-extras = ["audit", "emulate", "dev"]
 
 [[package]]
 name = "boto3"

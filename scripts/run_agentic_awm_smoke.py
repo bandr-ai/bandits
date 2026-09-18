@@ -31,7 +31,7 @@ from typing import Any
 
 from run_awm_fidelity import excluded_trace_ids_for, load_family, render_history
 
-from bandits.diagnose.agentic import (
+from bandits.emulate.agentic import (
     AGENTIC_TOOL_WORLD_INSTRUCTION,
     AWMExecutionTrace,
     AWMRuntimeContext,
@@ -39,20 +39,20 @@ from bandits.diagnose.agentic import (
     build_agentic_tool_world_predictor,
     step_agentic_tool_world,
 )
-from bandits.diagnose.fidelity import (
+from bandits.emulate.fidelity import (
     _correlate_observations,
     _looks_like_error,
     _recorded_observation,
     compare_observation,
 )
-from bandits.diagnose.models import (
+from bandits.emulate.models import (
     GroundingTransition,
     ScenarioState,
     StateField,
     WorldOrigin,
 )
-from bandits.diagnose.retrieve import build_index
-from bandits.diagnose.world import (
+from bandits.emulate.retrieve import build_index
+from bandits.emulate.world import (
     ProposedTransition,
     ValidationOutcome,
     WorldModelError,
@@ -477,7 +477,7 @@ def run(
         entity_id = target_call.arguments.get("user_id") or target_call.arguments.get("reservation_id")
         if not (recorded and entity_id):
             return ()
-        from bandits.diagnose.grounding import _flatten_paths
+        from bandits.emulate.grounding import _flatten_paths
 
         prefix = f"{target_call.tool}.{entity_id}."
         # revealed_by_span_id must cite the span that actually produced this

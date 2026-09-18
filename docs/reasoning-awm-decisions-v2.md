@@ -19,7 +19,7 @@ Numbering continues: decisions D27+, evidence E17+.
 |---|---|---|
 | S1 | Confirm grounding-loop description | Accurate; three corrections → D27, D28, D29 |
 | S2 | Measure tau2 error-transition density | E17/E18 — the finding that reshapes Gate 2 |
-| S3 | Write `bandits/diagnose/models.py` + tests | Shipped; 36 tests, suite green |
+| S3 | Write `bandits/emulate/models.py` + tests | Shipped; 36 tests, suite green |
 | S4 | Decisions taken while writing models | D30–D33 |
 | S5 | Refusal-state seeding question | D34 |
 | S6 | Check tau2 `initial_state` availability | E20 — 0/50; D34 revised to its fallback |
@@ -40,7 +40,7 @@ Numbering continues: decisions D27+, evidence E17+.
 Yes. Retrieval supplies enterprise facts, the external ledger supplies cross-turn
 consistency, GEPA supplies instructions, fidelity evaluation proves the grounding works,
 and no weights are trained. The pipeline (existing artifacts → cut points + lossless
-transitions → grounding index) is right, and `/diagnose` consuming rather than re-extracting
+transitions → grounding index) is right, and `/emulate` consuming rather than re-extracting
 is right.
 
 Three corrections follow, one of them serious.
@@ -76,7 +76,7 @@ cancellation** — the whole point of those tasks is that the guardrail is the a
 the API's. Treating a written policy as evidence about tool behavior would build a
 simulator that refuses on the tool's behalf, and a candidate that improperly calls
 `cancel_reservation` would be *rescued by the environment* instead of failing the verifier.
-That inverts what the diagnosis is measuring.
+That inverts what the emulation is measuring.
 
 **Decision, in three parts:**
 
@@ -122,7 +122,7 @@ cleanly separated.
 
 ## 2. Decisions taken while writing `models.py`
 
-Shipped: [bandits/diagnose/models.py](../bandits/diagnose/models.py) and its tests. 36
+Shipped: [bandits/emulate/models.py](../bandits/emulate/models.py) and its tests. 36
 tests, full suite green, ruff clean, no credential needed in CI.
 
 ### D30. `CandidateView` is a type, not a dict returned by a method. **Decided**
@@ -273,7 +273,7 @@ divergence rather than an arbitrary default.
 
 ## 5. Compiling, and what the real corpus corrected
 
-Shipped: [bandits/diagnose/compile.py](../bandits/diagnose/compile.py) and its tests.
+Shipped: [bandits/emulate/compile.py](../bandits/emulate/compile.py) and its tests.
 73 tests in the package, full suite green, no credential needed.
 
 Measured on `corpus-ee3b33086ef177d7`, family `family-451ae91f975c` (36 traces):
@@ -336,7 +336,7 @@ will, and that is precisely the "compare ingest-contract versions and migrate" c
 than the "force reproduction of the old hash" case. The legacy artifact is preserved
 unchanged as provenance.
 
-Until re-ingestion, any diagnose command reading the legacy corpus must pass markers
+Until re-ingestion, any emulate command reading the legacy corpus must pass markers
 explicitly, and should warn when a corpus declares none but its text contains a known one.
 
 ---
@@ -400,7 +400,7 @@ cancellations commits two effects rather than one.
 
 ## 7. The rollout-to-verifier join
 
-Shipped: [bandits/diagnose/verify.py](../bandits/diagnose/verify.py) and its tests.
+Shipped: [bandits/emulate/verify.py](../bandits/emulate/verify.py) and its tests.
 103 tests in the package, full suite green.
 
 The load-bearing test is `test_reviewed_verifier_executes_against_rollout_claims`: a real
@@ -423,7 +423,7 @@ unknown rather than a communication-only pass.
 
 ## 8. Retrieval, and the coverage table that settles D27
 
-Shipped: [bandits/diagnose/retrieve.py](../bandits/diagnose/retrieve.py) and its tests.
+Shipped: [bandits/emulate/retrieve.py](../bandits/emulate/retrieve.py) and its tests.
 120 tests in the package, full suite green.
 
 **E26.** Built the fit-side index for `family-451ae91f975c` — 371 transitions, 294 after

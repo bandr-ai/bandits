@@ -8,7 +8,7 @@ post-implementation audit in `awm-issues.md`.
 
 | # | What | Outcome |
 |---|---|---|
-| S1 | Audit the implemented diagnose modules | I1–I29 recorded in `awm-issues.md` |
+| S1 | Audit the implemented emulate modules | I1–I29 recorded in `awm-issues.md` |
 | S2 | Establish repair order | Tests first; metric correctness; per-call world semantics; real DSPy GEPA; orchestration |
 | S3 | Add numerical-core regression tests | Seven intended failures reproduced before implementation changes |
 | S4 | Repair first numerical-core batch | Fidelity lists/abstention, split-safe critiques, task-level reports fixed |
@@ -148,7 +148,7 @@ does not declare an output schema.
 ### D63. Declared outputs use standards-compliant JSON Schema validation. **Decided**
 
 `ToolSchema.output_schema` preserves `output_schema` and `outputSchema` declarations from
-direct and OpenAI-wrapped tool contracts, including valid boolean JSON Schemas. The diagnose extra directly declares
+direct and OpenAI-wrapped tool contracts, including valid boolean JSON Schemas. The emulate extra directly declares
 `jsonschema`. Invalid outputs and invalid schemas reject the transition before commit;
 missing declarations produce a per-call `unavailable` status and are never described as
 validated. An invalid result remains marked `invalid` on its rejected rollout step so the
