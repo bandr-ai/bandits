@@ -25,6 +25,7 @@ real failure.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -99,12 +100,29 @@ def _digest(*parts: str) -> str:
 
 
 def _history_text(history: Sequence[dict[str, Any]], limit: int = 4000) -> str:
-    rendered = "\n".join(f"{row.get('role')}: {row.get('content')}" for row in history)
-    return rendered[-limit:]
+    lines = []
+    for row in history:
+        content = row.get("content")
+        calls = row.get("calls") or ()
+        parts = [str(content)] if content is not None else []
+        parts.extend(str(call) for call in calls)
+        lines.append(f"{row.get('role')}: {' '.join(parts) if parts else 'None'}")
+    return "\n".join(lines)[-limit:]
 
 
 def _action_key(action: CandidateAction) -> str:
-    return "|".join(f"{call.tool}:{sorted(call.arguments.items())}" for call in action.calls)
+    """A repeat-detection key that a message-only turn also has.
+
+    Keyed on calls when there are any, otherwise on the message itself: a
+    candidate repeating one sentence forever is as stuck as one repeating a
+    call, and returning "" for it meant only max_steps stopped the rollout,
+    at the cost of a full step budget of model and user-policy calls.
+    """
+    if action.calls:
+        return "|".join(
+            f"{call.tool}:{sorted(call.arguments.items())}" for call in action.calls
+        )
+    return f"message:{(action.content or '').strip()}" if action.content else ""
 
 
 def _offered_tool_names(view: CandidateView) -> frozenset[str]:
@@ -268,7 +286,20 @@ def run_rollout(
             )
 
         steps.append(step)
-        history.append({"role": "assistant", "content": action.content, "tool": step.action_tool})
+        history.append(
+            {
+                "role": "assistant",
+                "content": action.content,
+                "tool": step.action_tool,
+                # The calls are what the following observation answers. Without
+                # them the AWM is asked to predict a tool result from a
+                # transcript in which no tool call is visible.
+                "calls": tuple(
+                    f"{call.tool}({json.dumps(call.arguments, sort_keys=True, default=str)})"
+                    for call in action.calls
+                ),
+            }
+        )
         if step.observation is not None:
             history.append(
                 {

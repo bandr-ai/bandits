@@ -409,14 +409,35 @@ def render_profile(profile: HiddenUserProfile) -> str:
     )
 
 
+_ENTITY_ARGUMENT_NAMES = ("reservation_id", "user_id", "flight_number", "id")
+
+
 def _entity_ids_named(arguments: Mapping[str, Any]) -> set[str]:
     """The entity ids a call actually named.
 
-    Strings only. Integer arguments are counts and flags in this family
+    Selected by argument name, not by taking every string the call carried.
+    Integer arguments are counts and flags in this family
     (``total_baggages``, ``nonfree_baggages``), never entity ids, and admitting
     them is what let the scoping check below be satisfied by a stray ``"1"``.
+    Admitting every *string* leaves the same hole one step narrower: a
+    non-identifier argument whose value collides with another entity's id --
+    ``cabin="XYZ"`` against reservation ``XYZ`` -- would authorize a write to
+    it. These names are ``compile._entity_prefix``'s, so this accepts exactly
+    the entity segments compilation can produce.
+
+    String-only is deliberate and mirrored: ``_entity_prefix`` applies the
+    same ``isinstance(value, str)`` filter, so an integer-valued id compiles
+    to an unprefixed path with no entity segment for this to match. The two
+    must broaden together -- widening only the validator would make it demand
+    a segment compilation never wrote. The name tuple and this extraction are
+    duplicated across the two modules today; nothing mechanically prevents
+    them drifting, and they belong in one shared helper.
     """
-    return {value for value in arguments.values() if isinstance(value, str) and value}
+    return {
+        value
+        for name in _ENTITY_ARGUMENT_NAMES
+        if isinstance((value := arguments.get(name)), str) and value
+    }
 
 
 def _path_entity(path: str) -> str | None:
