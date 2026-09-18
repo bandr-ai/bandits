@@ -901,3 +901,124 @@ def test_a_proposal_that_states_nothing_at_all_is_still_refused() -> None:
 
     assert not outcome.accepted
     assert any("no proposed outcome" in r for r in outcome.rejections)
+
+
+def test_non_identifier_arguments_do_not_authorize_a_delta() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(
+                StateDelta(
+                    path="update_reservation_baggages.XYZ1.total_baggages",
+                    new_value=1,
+                ),
+            ),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(
+            ActionCall(
+                tool="update_reservation_baggages",
+                arguments={
+                    "reservation_id": "ABC",
+                    "total_baggages": 1,
+                    "nonfree_baggages": 0,
+                },
+            ),
+        ),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("names no entity" in reason for reason in outcome.rejections)
+
+
+def test_entity_id_must_match_a_whole_path_segment() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(StateDelta(path="reservations.XYZ1.status", new_value="cancelled"),),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(ActionCall(tool="cancel_reservation", arguments={"reservation_id": "1"}),),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("names no entity" in reason for reason in outcome.rejections)
+
+
+def test_entity_id_matching_a_field_segment_does_not_authorize_a_delta() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(StateDelta(path="reservations.XYZ.status", new_value="cancelled"),),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(
+            ActionCall(tool="cancel_reservation", arguments={"reservation_id": "status"}),
+        ),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("names no entity" in reason for reason in outcome.rejections)
+
+
+def test_entity_scoped_call_cannot_mutate_a_short_unscoped_path() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(StateDelta(path="reservation.status", new_value="cancelled"),),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(ActionCall(tool="cancel_reservation", arguments={"reservation_id": "ABC"}),),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("names no entity" in reason for reason in outcome.rejections)
+
+
+def test_non_entity_call_may_mutate_a_short_path() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(StateDelta(path="manifest.version", new_value="1.9"),),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(ActionCall(tool="edit_manifest", arguments={"version": "1.9"}),),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert outcome.accepted
+
+
+def test_per_call_delta_uses_only_that_calls_entity_identifier() -> None:
+    outcome = validate_transition(
+        ProposedTransition(
+            call_outcomes=(
+                ProposedCallOutcome(
+                    call_id="a",
+                    state_delta=(
+                        StateDelta(
+                            path="update_reservation_baggages.XYZ1.total_baggages",
+                            new_value=1,
+                        ),
+                    ),
+                    evidence_ids=("t1",),
+                ),
+            ),
+            support=SupportLevel.HIGH,
+        ),
+        calls=(
+            ActionCall(
+                call_id="a",
+                tool="update_reservation_baggages",
+                arguments={"reservation_id": "ABC", "total_baggages": 1},
+            ),
+        ),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("call a referred to" in reason for reason in outcome.rejections)
