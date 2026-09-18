@@ -434,6 +434,14 @@ def test_gate_rejects_low_supported_coverage_and_wrong_abstention() -> None:
     assert any("wrong_abstention_rate" in failure for failure in failures)
 
 
+def test_a_policy_that_names_no_metric_is_not_a_policy_that_passed() -> None:
+    """Returning True for an empty mapping made "no bar" indistinguishable
+    from "every bar cleared" for any caller that did not check first."""
+    passed, failures = gate(FidelityReport(), thresholds={})
+    assert not passed
+    assert failures
+
+
 def test_disclosure_uses_structured_fact_ids_when_available() -> None:
     profile = HiddenUserProfile(
         known_facts={"reservation_id": "ABC"},

@@ -41,8 +41,22 @@ PUBLISHABLE_FIDELITY_METRICS = frozenset(
         "supported_coverage",
         "wrong_abstention_rate",
         "validation_rejection_rate",
+        # The two the environment's whole claim rests on. An unbounded
+        # invention rate means the simulator may be rescuing or condemning the
+        # candidate on the tool's behalf, and an unbounded disclosure rate
+        # means the user policy may be handing over the scenario -- either one
+        # changes the difficulty the capability number is supposedly measuring.
+        # `gate` already checks both; omitting them here meant a publishable
+        # campaign was never required to name a bar for them.
+        "invention_rate",
+        "premature_disclosure_rate",
     }
 )
+"""Metrics a publishable campaign must name a threshold for.
+
+``delta_accuracy`` is deliberately absent: it is computed over supported
+transitions only, so it is read beside ``supported_coverage`` rather than
+gated on its own."""
 
 
 class CampaignSpec(Contract):

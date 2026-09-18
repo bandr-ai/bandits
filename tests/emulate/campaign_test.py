@@ -3,6 +3,7 @@
 import pytest
 
 from bandits.emulate.campaign import (
+    PUBLISHABLE_FIDELITY_METRICS,
     CampaignBlocked,
     CampaignResult,
     CampaignSpec,
@@ -92,6 +93,41 @@ def test_failed_fidelity_blocks_before_any_candidate_runs() -> None:
             fidelity_thresholds={"status_accuracy": 1.0},
         )
     assert calls == []
+
+
+def test_a_publishable_campaign_must_bound_invention_and_disclosure() -> None:
+    """The two metrics the environment's whole claim rests on.
+
+    An unbounded invention rate means the simulator may be rescuing or
+    condemning the candidate on the tool's behalf; an unbounded disclosure rate
+    means the user policy may be handing over the scenario. Either one changes
+    the difficulty the capability number is supposed to be measuring, so a
+    publishable policy that never names a bar for them is not publishable.
+    """
+    assert "invention_rate" in PUBLISHABLE_FIDELITY_METRICS
+    assert "premature_disclosure_rate" in PUBLISHABLE_FIDELITY_METRICS
+
+    spec = _spec().replace(mode="publishable", reference_id="ref", control_id="ctl")
+    with pytest.raises(CampaignBlocked, match="omits required metrics") as raised:
+        run_campaign(
+            spec,
+            scenarios=(),
+            index=(),
+            candidates={},
+            bindings={},
+            tool_world=lambda **_: None,
+            user_policy=lambda **_: None,
+            fidelity=FidelityReport(split="held_out"),
+            fidelity_thresholds={
+                "status_accuracy": 1.0,
+                "field_accuracy": 1.0,
+                "supported_coverage": 1.0,
+                "wrong_abstention_rate": 0.0,
+                "validation_rejection_rate": 0.0,
+            },
+        )
+    assert "invention_rate" in str(raised.value)
+    assert "premature_disclosure_rate" in str(raised.value)
 
 
 def test_campaign_artifact_round_trips_without_dropping_failures(tmp_path) -> None:

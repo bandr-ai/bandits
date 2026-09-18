@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from typing import Any, Literal, Protocol
 
@@ -409,6 +409,42 @@ def render_profile(profile: HiddenUserProfile) -> str:
     )
 
 
+def _entity_ids_named(arguments: Mapping[str, Any]) -> set[str]:
+    """The entity ids a call actually named.
+
+    Strings only. Integer arguments are counts and flags in this family
+    (``total_baggages``, ``nonfree_baggages``), never entity ids, and admitting
+    them is what let the scoping check below be satisfied by a stray ``"1"``.
+    """
+    return {value for value in arguments.values() if isinstance(value, str) and value}
+
+
+def _path_entity(path: str) -> str | None:
+    """The entity segment of a ``<tool>.<entity_id>.<field>`` delta path.
+
+    ``None`` when the path does not carry one, which is itself a rejection:
+    a delta that does not name an entity cannot be scoped to the call.
+    """
+    parts = path.split(".")
+    return parts[1] if len(parts) >= 3 and parts[1] else None
+
+
+def _scoping_rejection(path: str, named: set[str]) -> bool:
+    """Whether this delta escapes the entities its action referred to.
+
+    Exact match on the entity segment, not substring containment over the whole
+    path. Containment meant any argument value that happened to appear anywhere
+    in the path satisfied the rule, so a call carrying a small integer scoped to
+    nothing at all -- and this rule is the only thing standing between a call
+    about reservation A and a mutation of reservation B when no reviewed
+    ``mutates_paths`` catalog is supplied.
+    """
+    if not named:
+        return False
+    entity = _path_entity(path)
+    return entity is None or entity not in named
+
+
 def validate_transition(
     proposal: ProposedTransition,
     *,
@@ -510,13 +546,9 @@ def validate_transition(
             call = call_by_id.get(call_outcome.call_id)
             if call is None:
                 continue
-            named_by_call = {
-                str(value)
-                for value in call.arguments.values()
-                if isinstance(value, (str, int))
-            }
+            named_by_call = _entity_ids_named(call.arguments)
             for delta in call_outcome.state_delta:
-                if named_by_call and not any(token in delta.path for token in named_by_call):
+                if _scoping_rejection(delta.path, named_by_call):
                     rejections.append(
                         f"{delta.path} names no entity call {call_outcome.call_id} referred to"
                     )
@@ -630,10 +662,7 @@ def validate_transition(
                     )
 
     named = {
-        str(value)
-        for call in calls
-        for value in call.arguments.values()
-        if isinstance(value, (str, int))
+        entity_id for call in calls for entity_id in _entity_ids_named(call.arguments)
     }
     for delta in normalized.state_delta:
         known = state.get(delta.path)
@@ -642,7 +671,7 @@ def validate_transition(
             rejections.append(
                 f"{delta.path} is {known.value!r} in the ledger, not {delta.old_value!r}"
             )
-        if named and not any(token in delta.path for token in named):
+        if _scoping_rejection(delta.path, named):
             # A call about reservation A must not quietly mutate reservation B.
             rejections.append(f"{delta.path} names no entity this action referred to")
 

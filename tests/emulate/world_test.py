@@ -335,6 +335,68 @@ def test_a_call_about_one_entity_cannot_mutate_another() -> None:
     assert any("names no entity" in r for r in outcome.rejections)
 
 
+def test_an_integer_argument_does_not_scope_a_mutation_to_another_entity() -> None:
+    """The scoping check must not be satisfiable by a stray count.
+
+    Matching argument values as substrings of the whole path meant any call
+    carrying a small integer scoped to nothing: "1" occurs in almost every
+    path, so a call about reservation ABC could mutate reservation XYZ1 while
+    the rule reported itself satisfied.
+    """
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(
+                StateDelta(path="cancel_reservation.XYZ1.status", new_value="cancelled"),
+            ),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(
+            ActionCall(
+                tool="update_reservation_baggages",
+                arguments={
+                    "reservation_id": "ABC",
+                    "total_baggages": 1,
+                    "nonfree_baggages": 0,
+                },
+            ),
+        ),
+        state=ScenarioState(),
+        step_index=0,
+    )
+    assert not outcome.accepted
+    assert any("names no entity" in r for r in outcome.rejections)
+
+
+def test_the_entity_a_call_named_may_still_be_mutated() -> None:
+    """The tightened check must not reject the legitimate case.
+
+    The path's tool prefix is the read tool that surfaces the entity, not the
+    mutating tool, so only the entity segment is compared.
+    """
+    outcome = validate_transition(
+        ProposedTransition(
+            state_delta=(
+                StateDelta(
+                    path="get_reservation_details.ABC.total_baggages", new_value=1
+                ),
+            ),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t1",),
+        ),
+        calls=(
+            ActionCall(
+                tool="update_reservation_baggages",
+                arguments={"reservation_id": "ABC", "total_baggages": 1},
+            ),
+        ),
+        state=ScenarioState(),
+        step_index=0,
+        allowed_evidence_ids=("t1",),
+    )
+    assert outcome.accepted
+
+
 def test_a_stale_old_value_means_the_model_reasoned_from_another_world() -> None:
     outcome = validate_transition(
         ProposedTransition(

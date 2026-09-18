@@ -379,6 +379,46 @@ def test_the_step_limit_stops_a_candidate_that_never_finishes() -> None:
     assert result.overall is ResultStatus.FAIL
 
 
+def test_a_budget_failure_after_simulated_steps_still_discloses_simulation() -> None:
+    """The failure population is where the simulator is most likely at fault.
+
+    A step-limit loss reached through committed simulated transitions rests on
+    the AWM as much as any pass does. Reporting it as unconditioned hid the
+    disclosure on exactly the rollouts that most needed it.
+    """
+    calls = {"n": 0}
+
+    def wandering(**_):
+        calls["n"] += 1
+        return CandidateAction(
+            calls=(
+                ActionCall(
+                    tool="cancel_reservation", arguments={"reservation_id": "ABC"}
+                ),
+            ),
+            content=f"attempt {calls['n']}",
+        )
+
+    def committing_world(**_):
+        return ProposedTransition(
+            observation={"status": "cancelled"},
+            state_delta=(
+                StateDelta(path="cancel_reservation.ABC.status", new_value="cancelled"),
+            ),
+            support=SupportLevel.HIGH,
+            evidence_ids=("t0",),
+        )
+
+    result = _run(
+        candidate=wandering,
+        tool_world=committing_world,
+        budget=Budget(max_steps=3, max_repeats=99),
+    )
+    assert result.terminated_by is TerminationReason.STEP_LIMIT
+    assert result.overall is ResultStatus.FAIL
+    assert result.simulation_conditioned
+
+
 # --- the user policy ----------------------------------------------------
 
 
