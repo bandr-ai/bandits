@@ -20,9 +20,9 @@ from typing import Any
 
 from run_awm_fidelity import build_query, excluded_trace_ids_for, load_family, render_history
 
-from bandits.diagnose.fidelity import TransitionFidelity, build_report, score_transition_fidelity
-from bandits.diagnose.retrieve import build_index, retrieve
-from bandits.diagnose.world import (
+from bandits.emulate.fidelity import TransitionFidelity, build_report, score_transition_fidelity
+from bandits.emulate.retrieve import build_index, retrieve
+from bandits.emulate.world import (
     TOOL_WORLD_INSTRUCTION,
     ToolWorldPredictor,
     render_action,

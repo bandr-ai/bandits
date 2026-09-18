@@ -1,12 +1,12 @@
-# AWM / diagnose issue register
+# AWM / emulate issue register
 
 Status: post-verification. Most audit fixes are applied; statuses below are set by
 executed checks, not by implementation (D74). New issues I31-I34 are recorded in
 `awm-decisions-v4.md`.
 
-## What diagnose must do
+## What emulate must do
 
-`diagnose` decides whether a candidate model already possesses the capabilities shown in
+`emulate` decides whether a candidate model already possesses the capabilities shown in
 an enterprise's traces, and whether those capabilities survive interaction.
 
 It has two evaluation paths:
@@ -74,12 +74,12 @@ The modules are not wired into one reproducible command that loads artifacts, bu
 fit index, runs fidelity gates, evaluates candidates and controls, builds reports, and
 saves lineage/versioned outputs.
 
-**Resolution:** `bandits/diagnose/campaign.py` provides the supported Python execution
+**Resolution:** `bandits/emulate/campaign.py` provides the supported Python execution
 surface. Every input version and partition is explicit, and every attempted rollout,
 including invalid and abstained ones, is persisted. A CLI is convenience work and is
 deliberately deferred (D65), not a validity blocker.
 
-### I2. Static/off-policy diagnosis is not implemented — **FIXED**
+### I2. Static/off-policy emulation is not implemented — **FIXED**
 
 `StaticReport` exists, but there is no evaluator for the start/middle/end next-action
 probes. This omits the cheapest answer to “does the base capability exist at all?”
@@ -145,7 +145,7 @@ invalid schemas, invalid outputs, and cross-call verifier matches are rejected. 
 output schemas remain explicit as `unavailable`, while invalid results remain `invalid` on
 the rejected persisted step.
 
-**Verification run (v4/S7-S9).** The focused tests, the diagnose suite, and the full
+**Verification run (v4/S7-S9).** The focused tests, the emulate suite, and the full
 repository suite were executed: 897 passed, 1 failed. Verified and holding: output-schema
 validation including boolean schemas, `unavailable`/`invalid` statuses, validator-owned
 `_call_id` provenance, spoofed-event rejection, and the cross-call verifier-matching block.
@@ -283,7 +283,7 @@ only those claims, then aggregate per rollout and report stratum.
 There is no single artifact binding scenario set, partitions, prompts, candidate settings,
 support policy, verifier, rollouts, fidelity gate, cost, and final report.
 
-**Fix:** define a content-addressed `DiagnosisCampaign` manifest and append-only result
+**Fix:** define a content-addressed `EmulationCampaign` manifest and append-only result
 store; make retries idempotent and preserve failed/abstained attempts.
 
 ### I24. No explicit cost/rate/error-budget enforcement
@@ -399,7 +399,7 @@ other users entirely). The model correctly declined on all six; the scorer read 
 `support_level()` treated as sufficient grounding for an exact record it could not possibly
 determine.
 
-**What shipped.** `bandits/diagnose/grounding.py` (new) plus `CallGroundingAssessment`/
+**What shipped.** `bandits/emulate/grounding.py` (new) plus `CallGroundingAssessment`/
 `GroundingAssessment`/`EntityRef`/`GroundingKind` in `models.py`. Per Q21's resolution (D79,
 below), grounding is assessed at scoring time from the transition's actual `state_before` and
 retrieved evidence, using evaluation demand read from the recorded result's field paths.
@@ -438,13 +438,13 @@ Deliberately narrow, per review of an over-general first draft:
 **Verification executed this session (v4/S13).**
 
 ```text
-uv run pytest bandits/diagnose/grounding_test.py bandits/diagnose/fidelity_test.py -q
+uv run pytest bandits/emulate/grounding_test.py bandits/emulate/fidelity_test.py -q
   → 32 passed, 0 failed  (14 grounding, 18 fidelity)
 
 uv run pytest -q   (full default testpaths: tests/ + bandits/)
   → 946 passed, 0 failed
 
-ruff check bandits/diagnose/ scripts/rescore_awm_fidelity.py
+ruff check bandits/emulate/ scripts/rescore_awm_fidelity.py
   → all checks passed
 
 git diff --check

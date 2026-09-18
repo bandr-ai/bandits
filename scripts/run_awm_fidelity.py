@@ -18,16 +18,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from bandits.diagnose.compile import extract_transitions
-from bandits.diagnose.fidelity import (
+from bandits.emulate.compile import extract_transitions
+from bandits.emulate.fidelity import (
     TransitionFidelity,
     _recorded_observation,
     build_report,
     score_transition_fidelity,
 )
-from bandits.diagnose.models import GroundingTransition, Partition, SuccessShape
-from bandits.diagnose.retrieve import RetrievalQuery, build_index, coverage_by_tool, retrieve
-from bandits.diagnose.world import (
+from bandits.emulate.models import GroundingTransition, Partition, SuccessShape
+from bandits.emulate.retrieve import RetrievalQuery, build_index, coverage_by_tool, retrieve
+from bandits.emulate.world import (
     TOOL_WORLD_INSTRUCTION,
     ToolWorldPredictor,
     WorldModelError,
@@ -56,7 +56,7 @@ def load_family(
 ) -> tuple[dict[str, Any], tuple[GroundingTransition, ...], dict[str, tuple[dict[str, Any], ...]]]:
     """Real tau2 traces for one mined family, compiled to transitions.
 
-    Mirrors tests/diagnose/tau_smoke_test.py's loading pattern exactly, since
+    Mirrors tests/emulate/tau_smoke_test.py's loading pattern exactly, since
     that is the only place this real artifact has been read correctly before.
     Also keeps trace_id -> per-trace tool schemas, since GroundingTransition
     itself carries none.
@@ -137,7 +137,7 @@ def dataset_report(family: dict[str, Any], transitions: tuple[GroundingTransitio
 
 
 def render_history(transition: GroundingTransition, *, limit: int = 4000) -> str:
-    """Same two-step render bandits/diagnose/rollout.py uses for scenario.prefix."""
+    """Same two-step render bandits/emulate/rollout.py uses for scenario.prefix."""
     rows = [
         {"role": step.role, "content": step.content, "tool": step.tool_name}
         for step in transition.history_before

@@ -22,7 +22,7 @@ work without running it; everything below is measured, not asserted.
 ### E27. The suite is green except for one export test, and that test is the tip of four leak sites.
 
 Executed: `uv run pytest -q` → **897 passed, 1 failed**. Focused external-validation
-set (107 tests) passed; `bandits/diagnose` (227 tests) passed; ruff clean.
+set (107 tests) passed; `bandits/emulate` (227 tests) passed; ruff clean.
 
 The failure is `bandits/export/export_test.py::test_start_context_reaches_the_exported_row`.
 Adding `ToolSchema.output_schema` (D63) made every exported tool carry
@@ -36,7 +36,7 @@ enters their payloads:
 bandits/export/sft.py:658      -> SFT training rows
 bandits/export/eval.py:121     -> held-out eval cases
 bandits/analyze/tasks.py:72    -> `available_tools` Evidence, hashed into the analysis id
-bandits/diagnose/compile.py:481 -> scenario offered_tools
+bandits/emulate/compile.py:481 -> scenario offered_tools
 ```
 
 Only the first is test-pinned. The other three changed shape silently.
@@ -99,8 +99,8 @@ argument is not a deterministic failure, contrary to D62's intent.
 
 ### E32. No test touches the real tau2 artifact.
 
-The only occurrence of `corpus-ee3b33086ef177d7` under `bandits/diagnose/` is a
-docstring in `compile_test.py:40` recording D36's provenance. Every diagnose test runs
+The only occurrence of `corpus-ee3b33086ef177d7` under `bandits/emulate/` is a
+docstring in `compile_test.py:40` recording D36's provenance. Every emulate test runs
 on fixtures. D36 said a fixture is a claim about the data and an unverified claim is as
 wrong as unverified code — that rule is currently satisfied by comment, not by a test.
 
@@ -350,7 +350,7 @@ Q21 asked whether a transition's "identifiability classification" (E39's provisi
 actually returned — since the same transition could be identifiable under one retrieval
 configuration and not another.
 
-**Decided: scoring-time, in two parts, computed by `bandits/diagnose/grounding.py`'s
+**Decided: scoring-time, in two parts, computed by `bandits/emulate/grounding.py`'s
 `assess_grounding`.**
 
 - **Evaluation demand** comes from the recorded result: for held-out fidelity scoring, the
@@ -478,7 +478,7 @@ forward.
 
 ### I34 closed — the real artifact is pinned
 
-`bandits/diagnose/tau_smoke_test.py` runs against the stored corpus and reproduces v2's
+`bandits/emulate/tau_smoke_test.py` runs against the stored corpus and reproduces v2's
 measurements exactly: **371 transitions, all observed, 14 batched, calls-per-action
 `{0:189, 1:168, 2:10, 4:4}`**, 189 user-role reactions, and E26's zero-error finding
 across the family. It also asserts the live facts behind D38 (the corpus still declares
@@ -653,7 +653,7 @@ than on retrieval support alone. Not implemented or re-run this session.
   before Experiment 6 (user-policy fidelity) runs, given 189/371 of this family's
   transitions are user replies?
 - **Q21 (from E39). RESOLVED by D79.** Identifiability is assessed at scoring time
-  (`bandits/diagnose/grounding.py::assess_grounding`), from `state_before` plus whatever was
+  (`bandits/emulate/grounding.py::assess_grounding`), from `state_before` plus whatever was
   actually retrieved for that call's query; evaluation demand comes from the recorded
   result's field paths. See D79 for the full resolution and I39's closing note in
   `awm-issues.md` for the executed verification.
