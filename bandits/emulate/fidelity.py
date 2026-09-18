@@ -884,7 +884,16 @@ def gate(report: FidelityReport, *, thresholds: dict[str, float]) -> tuple[bool,
     Thresholds are supplied rather than defaulted: no measurement exists yet to
     justify a particular bar, and inventing one here would make an unreviewed
     number look like a reviewed one.
+
+    A policy that names nothing is refused rather than passed. Which metrics a
+    given caller must name is that caller's decision -- ``run_campaign`` holds
+    the publishable set -- but "no bar at all" is never a bar that was cleared,
+    and returning ``True`` for it made this function's own default answer a
+    pass.
     """
+    if not thresholds:
+        return (False, ("no fidelity thresholds were supplied",))
+
     failures: list[str] = []
 
     def check(name: str, value: float | None, minimum: float | None, higher_is_better=True) -> None:

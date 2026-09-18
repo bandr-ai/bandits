@@ -486,7 +486,13 @@ def _score(
             process_result=not_applicable,
             communication_result=not_applicable,
             overall=ResultStatus.FAIL,
-            simulation_conditioned=False,
+            # Not False. A step-limit or action-loop failure arrives after
+            # arbitrarily many committed simulated transitions, and those are
+            # exactly the failures the simulator is most likely to have caused.
+            # Hardcoding False here claimed the whole failure population rested
+            # on recorded state, and suppressed the disclosure on any candidate
+            # whose rollouts all ran out of budget.
+            simulation_conditioned=is_simulation_conditioned(claims),
             **_versions(versions),
         )
 
