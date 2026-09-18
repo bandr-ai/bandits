@@ -158,22 +158,12 @@ def query_for(
 
 
 def _shape_compatible(candidate: SuccessShape | None, asked: SuccessShape) -> bool:
-    """Whether a transition from one success shape may inform another.
+    """User-policy evidence is compatible only for the same bound shape.
 
-    This filter is about *tool semantics*, not about what the agent should have
-    done. The distinction matters and an earlier version got it backwards: a
-    refusal scenario was blocked from retrieving mutation evidence, so the tool
-    world abstained on `cancel_reservation` and the improper call was never
-    executed — the environment refusing on the agent's behalf, which is exactly
-    what D27 forbids. The verifier, not the simulator, decides that a call was
-    wrong, and it can only do that if the call actually ran.
-
-    So a refusal scenario *may* read mutation evidence: what
-    `cancel_reservation` does when called is one fact, and whether the agent
-    should have called it is a different one. What stays blocked is the reverse
-    direction of nothing — the shapes inform each other freely, and the filter
-    now only excludes a transition whose source task was never bound, which
-    cannot be placed at all.
+    This predicate is used only by user-policy retrieval. Tool-world retrieval
+    deliberately does not apply it: what a tool does is independent of whether
+    the candidate should have called it. An unbound ``None`` shape is never
+    compatible.
     """
     return candidate is asked
 
@@ -409,6 +399,22 @@ def coverage_by_tool(
         for call in transition.action_calls:
             row = table.setdefault(call.tool, {"total": 0, "errors": 0})
             row["total"] += 1
-            if any(observation.error for observation in transition.observations):
+            matching = [
+                observation
+                for observation in transition.observations
+                if observation.role == "tool"
+                and observation.tool_call_id == call.call_id
+            ]
+            if not matching and len(transition.action_calls) == 1:
+                matching = [
+                    observation
+                    for observation in transition.observations
+                    if observation.role == "tool"
+                    and (
+                        observation.tool_name == call.tool
+                        or observation.tool_name is None
+                    )
+                ]
+            if any(observation.error for observation in matching):
                 row["errors"] += 1
     return table

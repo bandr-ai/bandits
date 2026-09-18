@@ -1064,8 +1064,7 @@ class RolloutResult(Contract):
 
     The three component results are never averaged. ``overall`` fails closed:
     a required component that could not be scored makes the whole verdict
-    unknown, exactly as a single unknown check makes ``execute_verifier``
-    return an unknown aggregate.
+    unknown, matching the fail-closed composition used throughout verification.
     """
 
     schema_version: int = 1

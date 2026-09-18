@@ -195,28 +195,45 @@ def partition_rollouts(
     the second return value rather than disappearing.
     """
     scorable: list[RolloutResult] = []
-    report = AbstentionReport(total=len(rollouts))
+    # Accumulated locally and assembled once at the end: AbstentionReport is a
+    # frozen Contract, so `report.abstained += 1` raises. Only the dict fields
+    # tolerated in-place mutation, which is why a rollout set that happened to
+    # be entirely scorable ran clean and the crash stayed hidden -- the first
+    # abstention, invalid transition or unknown verdict took the whole
+    # aggregation down, and campaigns report abstention rates by design.
+    abstained = 0
+    invalid = 0
+    verifier_unknown = 0
+    by_reason: dict[str, int] = {}
+    by_tool: dict[str, int] = {}
 
     for rollout in rollouts:
         reason = rollout.terminated_by
-        report.by_reason[reason.value] = report.by_reason.get(reason.value, 0) + 1
+        by_reason[reason.value] = by_reason.get(reason.value, 0) + 1
 
         if reason in (TerminationReason.AWM_ABSTAINED, TerminationReason.UNSUPPORTED_ACTION):
-            report.abstained += 1
+            abstained += 1
             for step in rollout.steps:
                 if step.abstained:
                     for call in step.calls:
-                        report.by_tool[call.tool] = report.by_tool.get(call.tool, 0) + 1
+                        by_tool[call.tool] = by_tool.get(call.tool, 0) + 1
             continue
         if reason is TerminationReason.INVALID_TRANSITION:
-            report.invalid += 1
+            invalid += 1
             continue
         if rollout.overall is ResultStatus.UNKNOWN:
-            report.verifier_unknown += 1
+            verifier_unknown += 1
             continue
         scorable.append(rollout)
 
-    return scorable, report
+    return scorable, AbstentionReport(
+        total=len(rollouts),
+        abstained=abstained,
+        invalid=invalid,
+        verifier_unknown=verifier_unknown,
+        by_reason=by_reason,
+        by_tool=by_tool,
+    )
 
 
 def _rates(rollouts: Sequence[RolloutResult]) -> dict[str, float]:

@@ -536,7 +536,18 @@ def validate_transition(
         # result as the proposal's own observation/delta/events. D70 draws the
         # line at silence -- a proposal that claims nothing at all cannot have
         # its execution inferred from the fact that a call was submitted.
-        if not (proposal.observation or proposal.state_delta or proposal.events):
+        #
+        # Silence is `observation is None`, never a falsy payload. A tool that
+        # honestly answers false, 0, "", [] or {} has stated an outcome, and
+        # testing the payload for truth rejected it as if nothing had been
+        # said -- a boolean-returning tool could pass its own declared output
+        # schema and still be refused here. `None` stays the sentinel because
+        # that is the field's own default: the value a proposal carries when
+        # it never filled the field in.
+        stated_an_outcome = (
+            proposal.observation is not None or proposal.state_delta or proposal.events
+        )
+        if not stated_an_outcome:
             rejections.append(
                 f"submitted calls have no proposed outcome: "
                 f"{sorted(call.call_id for call in calls if call.call_id)!r}"

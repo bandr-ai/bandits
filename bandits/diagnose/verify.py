@@ -1,23 +1,13 @@
-"""Score a rollout with the verifier semantics history was scored by.
+"""Score a rollout from its sealed success contract and committed evidence.
 
-``execute_verifier`` reads ``Evidence`` built by ``analyze/outcomes.py`` from
-recorded spans. A rollout has no spans — it has a state ledger, an event log and
-a simulated transcript — so nothing joined the two planes, and the capability
-number the whole exercise exists to produce was unreachable.
+Absence is unknown rather than failure, and ambiguous tool-qualified fields are
+never guessed. Current RLM ``FamilyCheck`` predicates are applied separately by
+the campaign as reaction-level failure guards; historical judge verdicts never
+travel onto simulated rollout ids.
 
-This module is the join, and it deliberately does not re-implement scoring. The
-verifier's operator semantics — absence is unknown rather than failure, one
-unknown check makes the whole verifier unknown, a bare key two tools both
-answered refuses rather than guessing — are the reviewed, tested, human-promoted
-part of this system. A second executor would re-derive them and drift, and a
-historical score and a rollout score would stop being comparable, which is the
-only property that makes the rollout number mean anything.
-
-So a rollout is rendered into the same claims the analyzer emits, and the same
-``execute_verifier`` runs. What travels alongside each claim is its
-``WorldOrigin``: the verdict is *simulation-conditioned* exactly when some claim
-behind it came from the simulator, and that is decided per claim rather than
-per campaign.
+A rollout is rendered into auditable claims carrying ``WorldOrigin``. The
+verdict is simulation-conditioned exactly when some claim behind it came from
+the simulator, decided per claim rather than per campaign.
 
 The sealed contract is checked separately from the deterministic verifier,
 because its three components have different authorities and must never be
@@ -139,7 +129,7 @@ def rollout_claims(
 def claims_to_evidence(
     claims: Iterable[VerifierInputClaim], *, trace_id: str
 ) -> tuple[Evidence, ...]:
-    """Claims as ``Evidence``, so ``execute_verifier`` runs unmodified.
+    """Claims as legacy-shaped ``Evidence`` rows for audit/export compatibility.
 
     ``provenance`` is ``derived`` on every row, never ``observed``: nothing here
     was read off a real span, and a simulated observation must never be
@@ -552,8 +542,8 @@ def compose_overall(
 ) -> ResultStatus:
     """Fail closed, never average.
 
-    Mirrors ``execute_verifier``: any failing required component fails the
-    whole verdict, any unknown one makes it unknown, and a pass requires that
+    Any failing required component fails the whole verdict, any unknown one
+    makes it unknown, and a pass requires that
     something was actually scored. ``reward_basis`` names the components the
     source itself considered required, so a half it declared cannot be quietly
     dropped by a binding that failed to score it.
@@ -562,6 +552,11 @@ def compose_overall(
     if "DB" in reward_basis and operational.status is ResultStatus.NOT_APPLICABLE:
         # The source says the database half carries this task, so a binding
         # that produced no operational claim has not scored it.
+        return ResultStatus.UNKNOWN
+    if (
+        "COMMUNICATE" in reward_basis
+        and communication.status is ResultStatus.NOT_APPLICABLE
+    ):
         return ResultStatus.UNKNOWN
     if any(component.status is ResultStatus.FAIL for component in required):
         return ResultStatus.FAIL

@@ -612,3 +612,52 @@ def test_compiled_scenario_state_passes_the_recorded_only_invariant() -> None:
     scenarios = compile_scenarios(_trace(), family=_family(), contract=_contract())
     for scenario in scenarios:
         assert all(f.origin is WorldOrigin.RECORDED for f in scenario.initial_state.fields)
+
+
+# --- a batch's results belong to their own calls ------------------------
+
+
+def _batch_trace(**updates) -> Trace:
+    """One action submitting two calls of the same tool, then both results."""
+    return _trace(
+        spans=(
+            _model("s1", tool="get_reservation_details", arguments={"reservation_id": "AAA"}),
+            _model("s2", tool="get_reservation_details", arguments={"reservation_id": "BBB"}),
+            _tool("s3", "get_reservation_details", {"reservation_id": "AAA", "status": "confirmed"}),
+            _tool("s4", "get_reservation_details", {"reservation_id": "BBB", "status": "cancelled"}),
+        ),
+        **updates,
+    )
+
+
+def test_a_batched_result_is_never_attributed_to_another_call() -> None:
+    """Tracking only the most recent call mis-prefixed both results: the one
+    for AAA landed under BBB (the second call had overwritten it), and the one
+    for BBB found no call at all and fell back to the bare tool name. Either
+    way a StateField carried another reservation's value.
+
+    Two calls name the same tool here, so neither result can be resolved
+    unambiguously and both are skipped. An unknown path is the honest answer;
+    a guessed one is the collapse `_entity_prefix` exists to prevent.
+    """
+    state = reconstruct_state(_batch_trace(), "s4")
+    paths = {f.path for f in state.fields}
+
+    # Before the fix this produced, verbatim:
+    #   get_reservation_details.BBB.status        = confirmed   <- AAA's value
+    #   get_reservation_details.BBB.reservation_id = AAA        <- AAA's value
+    #   get_reservation_details.status             = cancelled  <- no entity
+    # Every row is wrong: two carry AAA's data under BBB, and two lost their
+    # entity entirely.
+    assert state.get("get_reservation_details.BBB.status") is None
+    assert state.get("get_reservation_details.BBB.reservation_id") is None
+    assert not any(p.startswith("get_reservation_details.status") for p in paths)
+    assert not any(p.startswith("get_reservation_details.reservation_id") for p in paths)
+
+
+def test_a_single_call_still_prefixes_its_own_result() -> None:
+    """The unambiguous case must keep working: one call of a tool resolves by
+    tool name even without a tool_call_id, exactly as `_delta` allows."""
+    state = reconstruct_state(_trace(), "s3")
+
+    assert state.get("get_reservation_details.3RK2T9.status").value == "confirmed"

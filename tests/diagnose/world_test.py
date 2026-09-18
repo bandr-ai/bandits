@@ -792,3 +792,50 @@ def test_a_single_call_claiming_nothing_at_all_is_refused() -> None:
     )
     assert not outcome.accepted
     assert outcome.executed_call_ids == ()
+
+
+# --- silence is a missing outcome, never a falsy one ---------------------
+
+
+@pytest.mark.parametrize(
+    ("observation", "schema"),
+    [
+        (False, {"type": "boolean"}),
+        (0, {"type": "integer"}),
+        ("", {"type": "string"}),
+        ([], {"type": "array"}),
+        ({}, {"type": "object"}),
+    ],
+)
+def test_a_falsy_result_is_an_answer_not_silence(observation, schema) -> None:
+    """A tool that honestly returns false/0/""/[]/{} has stated an outcome.
+
+    Testing the payload for truth rejected these as "no proposed outcome",
+    so a boolean-returning tool could satisfy its own declared output schema
+    and still be refused. D70's rule is about silence, and silence is a field
+    the proposal never filled in.
+    """
+    outcome = validate_transition(
+        ProposedTransition(observation=observation, support=SupportLevel.LOW),
+        calls=(ActionCall(call_id="c1", tool="is_eligible", arguments={"user_id": "U1"}),),
+        state=ScenarioState(),
+        step_index=0,
+        tool_schemas=({"name": "is_eligible", "output_schema": schema},),
+    )
+
+    assert outcome.accepted, outcome.rejections
+    assert outcome.committed_observations == {"c1": observation}
+
+
+def test_a_proposal_that_states_nothing_at_all_is_still_refused() -> None:
+    """The rule the falsy fix must not weaken: an omitted call may be the
+    forbidden one, so execution is never inferred from submission alone."""
+    outcome = validate_transition(
+        ProposedTransition(support=SupportLevel.LOW),
+        calls=(ActionCall(call_id="c1", tool="is_eligible", arguments={"user_id": "U1"}),),
+        state=ScenarioState(),
+        step_index=0,
+    )
+
+    assert not outcome.accepted
+    assert any("no proposed outcome" in r for r in outcome.rejections)

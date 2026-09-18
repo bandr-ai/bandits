@@ -26,6 +26,7 @@ from bandits.diagnose.models import (
     ToolEffect,
     ToolEffectCatalog,
     ToolEffectEntry,
+    VerifierBinding,
 )
 from bandits.diagnose.rollout import CandidateAction
 from bandits.diagnose.world import ProposedTransition, StateDelta
@@ -46,17 +47,32 @@ def _spec() -> CampaignSpec:
             reviewed_by="reviewer",
             calibration_report_id="fidelity",
         ),
+        mode="development",
+    )
+
+
+def _binding(scenario: Scenario) -> VerifierBinding:
+    return VerifierBinding(
+        binding_id="binding-1",
+        scenario_id=scenario.scenario_id,
+        contract_id=scenario.success_contract.contract_id,
+        shape=scenario.success_contract.shape,
+        template_id="family-checks",
+        required_reward_basis=scenario.success_contract.reward_basis,
     )
 
 
 def test_failed_fidelity_blocks_before_any_candidate_runs() -> None:
     calls = []
 
-    def factory():
+    def factory(_seed):
         calls.append(1)
         raise AssertionError("candidate must not be constructed")
 
     fidelity = FidelityReport(
+        awm_version="awm",
+        user_policy_version="user",
+        retrieval_index_version="index",
         transitions=(
             TransitionFidelity(
                 transition_id="bad", trace_id="bad", status_correct=False
@@ -69,7 +85,7 @@ def test_failed_fidelity_blocks_before_any_candidate_runs() -> None:
             scenarios=(),
             index=(),
             candidates={"candidate": factory},
-            binding_ids={},
+            bindings={},
             tool_world=lambda **_: None,
             user_policy=lambda **_: None,
             fidelity=fidelity,
@@ -156,7 +172,7 @@ def test_fake_campaign_persists_output_validation_and_event_provenance(tmp_path)
         for number in range(3)
     )
 
-    def candidate_factory():
+    def candidate_factory(_seed):
         calls = {"count": 0}
 
         def candidate(**_):
@@ -202,6 +218,9 @@ def test_fake_campaign_persists_output_validation_and_event_provenance(tmp_path)
         ),
     )
     fidelity = FidelityReport(
+        awm_version="awm",
+        user_policy_version="user",
+        retrieval_index_version="index",
         transitions=(
             TransitionFidelity(
                 transition_id="fidelity-1",
@@ -215,7 +234,7 @@ def test_fake_campaign_persists_output_validation_and_event_provenance(tmp_path)
         scenarios=(scenario,),
         index=index,
         candidates={"candidate": candidate_factory},
-        binding_ids={"scenario-1": "binding-1"},
+        bindings={"scenario-1": _binding(scenario)},
         tool_world=tool_world,
         user_policy=lambda **_: None,
         fidelity=fidelity,
