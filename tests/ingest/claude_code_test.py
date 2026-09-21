@@ -5,7 +5,7 @@ from pathlib import Path
 from bandits.ingest.claude_code import load_claude_code
 from bandits.traces import SpanKind
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 MULTI_TURN = FIXTURES / "session.multiturn.jsonl"
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from bandits.ingest.otlp import load_otlp
 from bandits.traces import SpanKind, SpanStatus
 
-FIXTURE = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "traces.otlp.jsonl"
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "traces.otlp.jsonl"
 
 
 def test_groups_spans_into_traces() -> None:
