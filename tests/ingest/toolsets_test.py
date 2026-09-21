@@ -36,6 +36,31 @@ def test_reads_an_anthropic_input_schema() -> None:
     assert tools[0].parameters == {"type": "object"}
 
 
+def test_reads_a_wrapped_output_schema() -> None:
+    tools = parse_toolset(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                    "outputSchema": {"type": "object", "required": ["status"]},
+                },
+            }
+        ]
+    )
+    assert tools is not None
+    assert tools[0].output_schema == {"type": "object", "required": ["status"]}
+
+
+def test_preserves_a_boolean_output_schema() -> None:
+    tools = parse_toolset(
+        [{"name": "never_returns", "parameters": {"type": "object"}, "outputSchema": False}]
+    )
+    assert tools is not None
+    assert tools[0].output_schema is False
+
+
 def test_a_bare_name_keeps_no_schema_rather_than_an_empty_one() -> None:
     """An undefined tool is not a tool with no parameters."""
     tools = parse_toolset(["Bash", "Read"])

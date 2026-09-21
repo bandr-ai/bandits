@@ -172,7 +172,7 @@ def build_nextstate_sft_export(
                 label="positive" if trace_score.passes else "negative",
                 messages=messages,
                 tools=(
-                    tuple(tool.model_dump(mode="json") for tool in trace.tools_available)
+                    tuple(tool.offered_projection() for tool in trace.tools_available)
                     if trace.tools_available is not None
                     else None
                 ),

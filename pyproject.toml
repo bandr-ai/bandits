@@ -16,6 +16,11 @@ audit = [
     # or a REPL sandbox; their tests inject a predictor instead.
     "dspy[deno]>=3.3.1",
 ]
+emulate = [
+    # Prompt optimization and schema-checked trace-grounded world simulation.
+    "dspy[deno]>=3.3.1",
+    "jsonschema>=4.23",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -45,8 +50,9 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "bandits"]
+testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
+source = ["bandits"]
 omit = ["*/*_test.py"]
