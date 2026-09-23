@@ -112,11 +112,42 @@ def test_votes_take_majority_and_tie_is_neutral() -> None:
         None, turn, Archetype.GENERIC, predict=lambda *a: next(replies), model="m", votes=3
     )
     assert verdict.score == -1 and verdict.votes == (-1, 1, -1) and verdict.hint == "a"
+    assert verdict.judge_votes == {"-1": 2 / 3, "0": 0.0, "1": 1 / 3}
     replies = iter(["\\boxed{-1}", "\\boxed{+1}"])
     verdict = judge_turn(
         None, turn, Archetype.GENERIC, predict=lambda *a: next(replies), model="m", votes=2
     )
     assert verdict.score == 0
+    assert verdict.judge_votes == {"-1": 0.5, "0": 0.0, "1": 0.5}
+
+
+def test_single_vote_is_dense_with_observed_zeros_on_the_other_labels() -> None:
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+    verdict = judge_turn(
+        None, turn, Archetype.GENERIC, predict=lambda *a: "\\boxed{+1}", model="m"
+    )
+    assert verdict.judge_votes == {"-1": 0.0, "0": 0.0, "1": 1.0}
+
+
+def test_judge_votes_is_none_when_unobserved_or_failed() -> None:
+    turn = Turn(trace_id="t", index=0, action_span_id="m", action="ACT")
+    verdict = judge_turn(None, turn, Archetype.GENERIC, predict=lambda *a: "\\boxed{+1}", model="m")
+    assert verdict.judge_votes is None
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+    verdict = judge_turn(None, turn, Archetype.GENERIC, predict=lambda *a: "no box", model="m")
+    assert verdict.judge_votes is None
 
 
 def test_judge_failure_is_recorded_not_raised() -> None:

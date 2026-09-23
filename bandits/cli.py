@@ -881,6 +881,70 @@ def export_nextstate_command(
     console.print(f"quarantine: {unresolved_path}")
 
 
+@app.command(name="decision-dataset")
+def decision_dataset_command(
+    judge_run_id: str,
+    task_set_id: str = typer.Option(
+        None,
+        "--task-set",
+        help="Split examples along this task set's own within-family fit/held-out "
+        "membership, so no family is split across the boundary. The task set must "
+        "have been built from the same corpus as the judge run, and every judged "
+        "trace must resolve to one of its families or it is quarantined. Omit to "
+        "put every example in within_family_fit.",
+    ),
+    minimum_valid_votes: int = typer.Option(
+        1, "--minimum-valid-votes", min=1, help="Quarantine a turn with fewer successful votes."
+    ),
+    output: Path = typer.Option(None, "--output", help="Write fit+held-out and quarantine JSONL."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Compile a turn-judge run's verdicts into a generic decision dataset."""
+    from bandits.decide.dataset import (
+        build_decision_dataset_from_corpus,
+        save_decision_dataset,
+        write_decision_dataset,
+    )
+    from bandits.verify.nextstate import load_turn_judge_run
+
+    store = _derived(project)
+    try:
+        run = load_turn_judge_run(judge_run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no turn judge run {judge_run_id!r}")
+        raise typer.Exit(code=1) from exc
+    task_set = _load_task_set(task_set_id, project) if task_set_id else None
+    traces = _corpus_traces(run.corpus_id, project, run.trace_ids)
+
+    try:
+        dataset = build_decision_dataset_from_corpus(
+            traces,
+            run,
+            judge_run_id,
+            task_set=task_set,
+            task_set_id=task_set_id,
+            minimum_valid_votes=minimum_valid_votes,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_decision_dataset(dataset, store)
+    console.print(f"decision_dataset_id:     {envelope.artifact_id}")
+    console.print(f"examples:                {dataset.counts.examples}")
+    console.print(f"within_family_fit:       {dataset.counts.within_family_fit}")
+    console.print(f"within_family_held_out:  {dataset.counts.within_family_held_out}")
+    console.print(f"quarantined:             {dataset.counts.quarantined}")
+    if not task_set_id:
+        console.print(
+            "[yellow]no --task-set given:[/yellow] every example was put in within_family_fit; "
+            "there is no held-out split to certify against"
+        )
+    if output is not None:
+        rows_path, quarantine_path = write_decision_dataset(dataset, output)
+        console.print(f"output:              {rows_path}")
+        console.print(f"quarantine:          {quarantine_path}")
+
+
 if __name__ == "__main__":
     app()
 
