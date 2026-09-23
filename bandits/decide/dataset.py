@@ -278,6 +278,41 @@ class DecisionDataset(Contract):
     quarantined: tuple[RejectedDecision, ...] = ()
     counts: DecisionDatasetCounts
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_v1_split_names(cls, data: Any) -> Any:
+        """A v1 payload (``schema_version: 1``, or missing it) names its
+        splits ``within_family_fit``/``within_family_held_out`` on both
+        ``examples[*].split`` and ``counts``. v2 renamed those to
+        ``train``/``dev`` (see ``_LEGACY_SPLIT_MAP``) without a migration
+        path, which made every already-saved v1 artifact fail to load under
+        v2's stricter split enum. Only rewrites the old names when they are
+        actually present; a v2 payload (or any non-dict input) passes
+        through untouched."""
+        if not isinstance(data, dict):
+            return data
+        if data.get("schema_version", 1) != 1:
+            return data
+        migrated = dict(data)
+        examples = migrated.get("examples")
+        if isinstance(examples, (list, tuple)):
+            migrated["examples"] = [
+                {**e, "split": _LEGACY_SPLIT_MAP.get(e.get("split"), e.get("split"))}
+                if isinstance(e, dict)
+                else e
+                for e in examples
+            ]
+        counts = migrated.get("counts")
+        if isinstance(counts, dict) and (
+            "within_family_fit" in counts or "within_family_held_out" in counts
+        ):
+            counts = dict(counts)
+            counts["train"] = counts.pop("within_family_fit", counts.get("train", 0))
+            counts["dev"] = counts.pop("within_family_held_out", counts.get("dev", 0))
+            migrated["counts"] = counts
+        migrated["schema_version"] = 2
+        return migrated
+
     @model_validator(mode="after")
     def counts_match_rows(self) -> DecisionDataset:
         by_split: dict[str, int] = {}
@@ -338,12 +373,36 @@ class DecisionDataset(Contract):
         return self
 
 
-def _vote_target(verdict: TurnVerdict) -> DecisionTarget:
+def _vote_shares(votes: tuple[int, ...]) -> dict[str, float]:
+    """Fraction of votes landing on each label, dense over -1/0/1 -- the
+    same computation as ``bandits.verify.nextstate._vote_shares``, kept
+    local rather than imported (that one is private to its own module).
+    Used to reconstruct ``judge_votes`` for a ``TurnVerdict`` that has
+    ``votes`` but no ``judge_votes`` -- an older record saved before that
+    field existed, or any producer that only ever set ``votes``."""
+    n = len(votes)
+    return {str(label): votes.count(label) / n for label in (-1, 0, 1)}
+
+
+def _judge_votes_or_reconstructed(verdict: TurnVerdict) -> dict[str, float] | None:
+    """``verdict.judge_votes`` when set; otherwise reconstructed from
+    ``verdict.votes`` when there are any to reconstruct from. A verdict with
+    neither (no votes were ever cast) has no distribution to report and
+    stays None -- the caller quarantines that case, it is not invented
+    here."""
+    if verdict.judge_votes is not None:
+        return verdict.judge_votes
+    if verdict.votes:
+        return _vote_shares(verdict.votes)
+    return None
+
+
+def _vote_target(judge_votes: dict[str, float]) -> DecisionTarget:
     """The judge's dense vote shares, remapped from score labels ("-1"/"0"/"1")
     to option names, as a soft target -- including a majority tie, which is
     itself the vote distribution and not collapsed toward any one option."""
     probabilities = {
-        _SCORE_TO_OPTION[int(label)]: share for label, share in verdict.judge_votes.items()
+        _SCORE_TO_OPTION[int(label)]: share for label, share in judge_votes.items()
     }
     for option in ACTION_OUTCOME_OPTIONS:
         probabilities.setdefault(option, 0.0)
@@ -481,7 +540,8 @@ def build_decision_dataset(
                 # to the judge at all, so there is nothing to report as failed.
                 previous_action = turn.action
                 continue
-            if verdict.score is None or verdict.judge_votes is None:
+            judge_votes = _judge_votes_or_reconstructed(verdict)
+            if verdict.score is None or judge_votes is None:
                 quarantined.append(
                     RejectedDecision(
                         trace_id=trace_id,
@@ -521,7 +581,7 @@ def build_decision_dataset(
                     question=ACTION_OUTCOME_QUESTION,
                     primitive="choice",
                     options=dict(ACTION_OUTCOME_OPTIONS),
-                    target=_vote_target(verdict),
+                    target=_vote_target(judge_votes),
                     label_source="judge_votes",
                     split=_family_split(task_set, family_id, trace_id),
                     lineage=DecisionLineage(

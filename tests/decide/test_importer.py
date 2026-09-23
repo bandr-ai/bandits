@@ -62,7 +62,18 @@ def test_empty_option_is_quarantined() -> None:
     dataset = import_jsonl(bad, source_file="demo.jsonl")
 
     assert dataset.counts.quarantined == 1
-    assert "empty option" in dataset.quarantined[0].reasons[0]
+    assert "empty or non-string option" in dataset.quarantined[0].reasons[0]
+
+
+def test_null_option_description_is_quarantined_not_stringified() -> None:
+    """A JSON null option description must not be coerced into the literal
+    text "None" and stored as if it were real content."""
+    bad = json.dumps({"question": "q", "options": {"a": None, "b": "y"}, "target": "b"})
+    dataset = import_jsonl(bad, source_file="demo.jsonl")
+
+    assert dataset.counts.examples == 0
+    assert dataset.counts.quarantined == 1
+    assert "empty or non-string option" in dataset.quarantined[0].reasons[0]
 
 
 def test_more_than_26_options_is_quarantined() -> None:
@@ -112,9 +123,10 @@ def test_dataset_id_intentionally_differs_across_a_rename() -> None:
 
 
 def test_split_assignment_never_separates_rows_sharing_a_group_id() -> None:
-    lines = [_row(group_id="g1") for _ in range(20)]
+    lines = [_row(question=f"q{i}", group_id="g1") for i in range(20)]
     dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
 
+    assert dataset.counts.examples == 20  # distinct content (different questions), all kept
     splits = {e.split for e in dataset.examples}
     assert len(splits) == 1
 
@@ -248,6 +260,17 @@ def test_jevbench_public_items_never_enter_train_dev_or_calibration() -> None:
     assert all(e.split == "test" for e in dataset.examples)
 
 
+def test_jevbench_split_field_coinciding_with_one_of_our_names_still_forces_test() -> None:
+    """A JevBench item whose own "split" field happens to spell one of our
+    four split names exactly (e.g. "train") must NOT be honored -- that
+    would let a JevBench-shaped file bypass this importer's test-only
+    guarantee entirely. Every JevBench item is unconditionally "test"."""
+    for coincidental_split in ("train", "dev", "calibration", "test"):
+        item = _real_jevbench_choice_item(id=f"item-{coincidental_split}", split=coincidental_split)
+        dataset = import_jevbench([item], source_file="jevbench.jsonl")
+        assert dataset.examples[0].split == "test"
+
+
 def test_jevbench_line_numbers_survive_a_preceding_skipped_item() -> None:
     """A non-choice item preceding a choice item must not shift the accepted
     item's recorded source_line -- it must still reflect that item's
@@ -283,15 +306,35 @@ def test_duplicate_explicit_id_quarantines_both_rows_not_just_one() -> None:
     assert all("used by more than one row" in q.reasons[0] for q in dataset.quarantined)
 
 
-def test_identical_rows_with_no_explicit_id_are_not_treated_as_duplicates() -> None:
+def test_identical_rows_with_no_explicit_id_are_deduplicated_not_quarantined() -> None:
     """Two rows with no supplied id that happen to have identical content
-    share an auto-derived record_id -- that is not a data-entry mistake
-    the way a duplicated *explicit* id is, and both rows are kept."""
+    (including the same target) are a harmless duplicate, not a data-entry
+    mistake -- they collapse to one row rather than producing two accepted
+    examples sharing one decision_id."""
     lines = [_row(group_id="g1") for _ in range(5)]
     dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
 
-    assert dataset.counts.examples == 5
+    assert dataset.counts.examples == 1
     assert dataset.counts.quarantined == 0
+    decision_ids = {e.decision_id for e in dataset.examples}
+    assert len(decision_ids) == 1
+
+
+def test_identical_content_with_conflicting_targets_quarantines_every_row() -> None:
+    """Same question+options+state, no explicit id, but a different target
+    per row -- the same decision_id would otherwise carry contradictory
+    labels. Every row in the conflicting group is quarantined."""
+    lines = [
+        _row(question="which fruit", target="a"),
+        _row(question="which fruit", target="b"),
+        _row(question="unrelated question"),  # untouched, different content
+    ]
+    dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
+
+    assert dataset.counts.examples == 1
+    assert dataset.examples[0].question == "unrelated question"
+    assert dataset.counts.quarantined == 2
+    assert all("conflicting targets" in q.reasons[0] for q in dataset.quarantined)
 
 
 def test_renaming_the_source_file_does_not_reshuffle_splits_or_ids() -> None:
