@@ -83,11 +83,22 @@ def _parse_target(raw: Any, options: dict[str, str], reasons: list[str]) -> Deci
 
 
 class _ParsedRow:
-    __slots__ = ("example", "rejection")
+    __slots__ = ("example", "rejection", "explicit_id")
 
-    def __init__(self, *, example: DecisionExample | None, rejection: RejectedDecision | None) -> None:
+    def __init__(
+        self,
+        *,
+        example: DecisionExample | None,
+        rejection: RejectedDecision | None,
+        explicit_id: str | None = None,
+    ) -> None:
         self.example = example
         self.rejection = rejection
+        self.explicit_id = explicit_id
+        """The row's own supplied ``id``, if any -- distinct from an
+        auto-derived content-hash record_id, which two unrelated identical
+        rows may legitimately share without that being a data-entry mistake
+        (see ``_resolve_duplicate_ids``, which only checks this field)."""
 
 
 def _parse_row(
@@ -160,7 +171,7 @@ def _parse_row(
         source=str(raw.get("source")) if raw.get("source") is not None else dataset_source,
         license=str(raw.get("license")) if raw.get("license") is not None else None,
     )
-    return _ParsedRow(example=example, rejection=None)
+    return _ParsedRow(example=example, rejection=None, explicit_id=str(raw.get("id")) if raw.get("id") else None)
 
 
 def _iter_lines(path_text: str, source_file: str) -> Iterator[tuple[int, dict[str, Any] | None, RejectedDecision | None]]:
@@ -183,6 +194,45 @@ def _iter_lines(path_text: str, source_file: str) -> Iterator[tuple[int, dict[st
             )
             continue
         yield line_number, row, None
+
+
+def _resolve_duplicate_ids(
+    examples_with_ids: list[tuple[DecisionExample, str | None]], quarantined: list[RejectedDecision]
+) -> tuple[list[DecisionExample], list[RejectedDecision]]:
+    """Two different rows that happen to supply the same *explicit* ``id``
+    would otherwise collide on ``decision_id`` (derived from that id alone)
+    and both be silently accepted as if they were one record. Quarantine
+    every row sharing a duplicated explicit id instead -- a collision here
+    almost always means a data-entry mistake, and accepting either row would
+    train or evaluate on it as though its id were unique.
+
+    Only *explicit* ids are checked here: two rows with no supplied id that
+    happen to have identical content (and thus the same auto-derived,
+    content-hash record_id) are not a data-entry mistake -- they are
+    legitimately identical rows and are both kept."""
+    explicit_ids = [explicit_id for _e, explicit_id in examples_with_ids if explicit_id is not None]
+    duplicated = {i for i in explicit_ids if explicit_ids.count(i) > 1}
+    if not duplicated:
+        return [e for e, _ in examples_with_ids], quarantined
+
+    kept: list[DecisionExample] = []
+    newly_quarantined: list[RejectedDecision] = list(quarantined)
+    for e, explicit_id in examples_with_ids:
+        if explicit_id in duplicated:
+            newly_quarantined.append(
+                RejectedDecision(
+                    trace_id=None,
+                    source_file=e.lineage.source_file,
+                    source_line=e.lineage.source_line,
+                    reasons=(
+                        f"id {explicit_id!r} is used by more than one row in this "
+                        "import; every explicit id must be unique",
+                    ),
+                )
+            )
+        else:
+            kept.append(e)
+    return kept, newly_quarantined
 
 
 def _resolve_group_conflicts(
@@ -251,7 +301,7 @@ def import_jsonl(
     Malformed lines are quarantined with their line number and reason, never
     coerced or silently dropped.
     """
-    examples: list[DecisionExample] = []
+    examples_with_ids: list[tuple[DecisionExample, str | None]] = []
     quarantined: list[RejectedDecision] = []
 
     for line_number, row, rejection in _iter_lines(path_text, source_file):
@@ -264,8 +314,9 @@ def import_jsonl(
             quarantined.append(parsed.rejection)
         else:
             assert parsed.example is not None
-            examples.append(parsed.example)
+            examples_with_ids.append((parsed.example, parsed.explicit_id))
 
+    examples, quarantined = _resolve_duplicate_ids(examples_with_ids, quarantined)
     examples, quarantined = _resolve_group_conflicts(examples, quarantined)
 
     by_split: dict[str, int] = {}
@@ -313,24 +364,41 @@ def import_jevbench(
     ``family`` when ``group`` is null (JevBench sets ``group`` on only some
     items).
 
+    Every item is evaluation-only: it lands in split ``"test"`` regardless
+    of its own ``split`` field (JevBench's own split names -- "public",
+    "hard_holdout", ... -- are an external benchmark's own partitioning, not
+    ours, and are never reinterpreted as one of ours), unless that field
+    already happens to spell one of our split names exactly. A JevBench item
+    must never enter train/dev/calibration, where it could be fit or tuned
+    against and stop being an honest external check.
+
     Only ``question.type == "choice"`` items are imported -- Noul and Score
     items are quarantined with a reason, since this dataset contract's
     ``primitive`` is choice-only (see ``DecisionExample.primitive``). Each
     item's own source and license are kept per row so redistribution stays
     honest.
     """
-    lines = []
+    # Every item -- accepted or skipped -- contributes exactly one line, so
+    # an accepted row's line number always equals its original position in
+    # `items`. A skipped item emits a blank placeholder line rather than
+    # being omitted: `_iter_lines` silently skips blank lines without
+    # affecting the line count, which is exactly what keeps later accepted
+    # rows aligned (omitting the line entirely would shift every later
+    # row's recorded source_line backward by the number of prior skips).
+    lines: list[str] = []
     quarantined_lines: list[tuple[int, str]] = []
     for index, item in enumerate(items, start=1):
         question = item.get("question")
         if not isinstance(question, dict) or question.get("type") != "choice":
             got = question.get("type") if isinstance(question, dict) else type(question).__name__
             quarantined_lines.append((index, f"not a choice item (question.type={got!r}), skipped"))
+            lines.append("")
             continue
 
         criteria = question.get("criteria")
         if not isinstance(criteria, dict) or not criteria:
             quarantined_lines.append((index, "question.criteria is missing or empty"))
+            lines.append("")
             continue
 
         labels = item.get("labels")
@@ -338,6 +406,19 @@ def import_jevbench(
             options = {option_id: criteria[option_id] for option_id in labels}
         else:
             options = dict(criteria)
+
+        jevbench_split = item.get("split")
+        if jevbench_split in _VALID_SPLITS:
+            # JevBench already used one of our split names for something else
+            # (unexpected, but not impossible for a future export) -- honor it.
+            resolved_split = jevbench_split
+        else:
+            # JevBench's own splits ("public", "hard_holdout", ...) are an
+            # external benchmark's partitioning, not ours. Every item is
+            # evaluation-only: it goes to "test" unless the caller passes an
+            # explicit override, never into train/dev/calibration where it
+            # could leak into what the model is fit or tuned against.
+            resolved_split = "test"
 
         provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
         row = {
@@ -347,7 +428,7 @@ def import_jevbench(
             "options": options,
             "target": item.get("expected"),
             "group_id": item.get("group") or item.get("family"),
-            "split": item.get("split") if item.get("split") in _VALID_SPLITS else None,
+            "split": resolved_split,
             "source": provenance.get("source", dataset_source),
             "license": provenance.get("license", default_license),
             "label_source": "jevbench",
@@ -385,6 +466,13 @@ def import_jevbench(
 
 
 def compute_import_dataset_id(dataset: DecisionDataset) -> str:
+    """Identifies this dataset as a whole. Unlike a single row's
+    ``decision_id``/``split`` (stable under a rename -- see
+    ``_row_identity_key``), this id legitimately changes if ``source_file``
+    changes: it hashes the full payload, and every example's
+    ``lineage.source_file`` is part of that payload. That is intentional --
+    the dataset-level id is provenance for "this exact file, imported", not
+    a claim that renaming a file produces the same dataset artifact."""
     digest = hashlib.sha256(dataset.model_dump_json().encode()).hexdigest()
     return f"decision-dataset-{digest[:16]}"
 

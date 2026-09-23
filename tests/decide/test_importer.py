@@ -87,7 +87,7 @@ def test_probabilities_not_summing_to_one_is_quarantined() -> None:
     assert dataset.counts.quarantined == 1
 
 
-def test_reimporting_identical_content_yields_the_same_dataset_id() -> None:
+def test_reimporting_identical_content_under_the_same_filename_yields_the_same_dataset_id() -> None:
     from bandits.decide.importer import compute_import_dataset_id
 
     text = "\n".join([_row(), _row(question="q2")])
@@ -95,6 +95,20 @@ def test_reimporting_identical_content_yields_the_same_dataset_id() -> None:
     second = import_jsonl(text, source_file="demo.jsonl")
 
     assert compute_import_dataset_id(first) == compute_import_dataset_id(second)
+
+
+def test_dataset_id_intentionally_differs_across_a_rename() -> None:
+    """See compute_import_dataset_id's docstring: the dataset-level id is
+    provenance for "this exact file", so it legitimately changes on rename,
+    unlike a row's own decision_id/split (see the rename-stability test
+    below)."""
+    from bandits.decide.importer import compute_import_dataset_id
+
+    text = "\n".join([_row(), _row(question="q2")])
+    original = import_jsonl(text, source_file="demo.jsonl")
+    renamed = import_jsonl(text, source_file="renamed/elsewhere.jsonl")
+
+    assert compute_import_dataset_id(original) != compute_import_dataset_id(renamed)
 
 
 def test_split_assignment_never_separates_rows_sharing_a_group_id() -> None:
@@ -219,11 +233,77 @@ def test_jevbench_importer_never_uses_labels_as_target() -> None:
     assert row.target.probabilities["track_order"] == 0.0
 
 
+def test_jevbench_public_items_never_enter_train_dev_or_calibration() -> None:
+    """A JevBench item's own split ("public") must never leak through as one
+    of ours -- every item is evaluation-only and lands in "test" regardless,
+    so it can never be trained or tuned against."""
+    items = [_real_jevbench_choice_item(id=f"item-{i}", split="public") for i in range(50)]
+    dataset = import_jevbench(items, source_file="jevbench.jsonl")
+
+    assert dataset.counts.examples == 50
+    assert dataset.counts.test == 50
+    assert dataset.counts.train == 0
+    assert dataset.counts.dev == 0
+    assert dataset.counts.calibration == 0
+    assert all(e.split == "test" for e in dataset.examples)
+
+
+def test_jevbench_line_numbers_survive_a_preceding_skipped_item() -> None:
+    """A non-choice item preceding a choice item must not shift the accepted
+    item's recorded source_line -- it must still reflect that item's
+    original position among the input items, not its position among
+    surviving rows."""
+    noul_item = _real_jevbench_choice_item(
+        id="hard-noul-00",
+        question={"type": "noul", "instructions": "is this spam?", "criteria": {"true": "spam", "false": "not spam"}},
+        expected="false",
+        labels=["true", "false"],
+    )
+    choice_item = _real_jevbench_choice_item(id="easy-intent-01")
+    dataset = import_jevbench([noul_item, choice_item], source_file="jevbench.jsonl")
+
+    assert dataset.counts.quarantined == 1
+    assert dataset.quarantined[0].source_line == 1  # the skipped noul item, at its true position
+    # the accepted choice item was JevBench item #2, and must be recorded as such,
+    # not as line 1 (which is where it would land if the skipped line were omitted)
+    assert dataset.examples[0].lineage.source_line == 2
+
+
+def test_duplicate_explicit_id_quarantines_both_rows_not_just_one() -> None:
+    lines = [
+        _row(question="q1", id="dup-id"),
+        _row(question="q2", id="dup-id"),
+        _row(question="q3", id="unique-id"),
+    ]
+    dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
+
+    assert dataset.counts.examples == 1
+    assert dataset.examples[0].question == "q3"
+    assert dataset.counts.quarantined == 2
+    assert all("used by more than one row" in q.reasons[0] for q in dataset.quarantined)
+
+
+def test_identical_rows_with_no_explicit_id_are_not_treated_as_duplicates() -> None:
+    """Two rows with no supplied id that happen to have identical content
+    share an auto-derived record_id -- that is not a data-entry mistake
+    the way a duplicated *explicit* id is, and both rows are kept."""
+    lines = [_row(group_id="g1") for _ in range(5)]
+    dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
+
+    assert dataset.counts.examples == 5
+    assert dataset.counts.quarantined == 0
+
+
 def test_renaming_the_source_file_does_not_reshuffle_splits_or_ids() -> None:
-    """Split and decision_id must come from row content, never the file path
-    or line number -- a rename or reordered file must reproduce identical
-    output. Uses rows without explicit split/group so they exercise the
-    hashed path, and reorders lines too."""
+    """A row's own split and decision_id must come from its content, never
+    the file path or line number -- a rename or reordered file must
+    reproduce identical *row-level* output. Uses rows without explicit
+    split/group so they exercise the hashed path, and reorders lines too.
+    (The dataset-level id, from compute_import_dataset_id, is allowed to
+    differ across a rename -- see that function's docstring -- since it
+    hashes source_file as part of the dataset's own provenance; only the
+    per-row identity that determines train/dev/calibration/test membership
+    is required to be rename-stable.)"""
     lines = [_row(question=f"q{i}") for i in range(10)]
     text = "\n".join(lines)
     reordered_text = "\n".join(reversed(lines))
