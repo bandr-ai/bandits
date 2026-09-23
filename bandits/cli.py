@@ -973,12 +973,21 @@ def decision_import_command(
         console.print(f"quarantine:          {quarantine_path}")
 
 
+_DECISION_SPLITS = ("train", "dev", "calibration", "test")
+
+
 @app.command(name="decision-score")
 def decision_score_command(
     dataset_id: str,
     model: str = typer.Option(..., "--model", help="Hugging Face model id, e.g. Qwen/Qwen3.5-4B."),
     revision: str = typer.Option(..., "--revision", help="Pinned model revision (commit SHA)."),
     split: str = typer.Option("dev", "--split", help="Which split to score: train/dev/calibration/test."),
+    allow_test: bool = typer.Option(
+        False,
+        "--allow-test",
+        help="Required to score the locked test split. The test split is meant to be "
+        "scored once, for the final report -- this flag exists so that never happens by accident.",
+    ),
     two_order: bool = typer.Option(
         False, "--two-order", help="Average two option orders per example (two forward passes)."
     ),
@@ -992,6 +1001,16 @@ def decision_score_command(
     from bandits.decide.dataset import load_decision_dataset
     from bandits.decide.hf_predictor import HFPredictor
     from bandits.decide.scorer import save_scorer_run, score_dataset
+
+    if split not in _DECISION_SPLITS:
+        console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
+        raise typer.Exit(code=1)
+    if split == "test" and not allow_test:
+        console.print(
+            "[red]error:[/red] scoring the test split requires --allow-test; "
+            "it is meant to be scored once, for the final report"
+        )
+        raise typer.Exit(code=1)
 
     store = _derived(project)
     try:

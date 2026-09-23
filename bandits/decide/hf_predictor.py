@@ -82,15 +82,14 @@ class HFPredictor:
                 f"requested letters do not map to distinct tokens: {letter_token_ids}"
             )
 
-        inputs = self._tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
+        # No padding: we tokenize and score exactly one prompt per call, so
+        # there is nothing to pad against, and `padding=True` on a batch of
+        # one raises on any tokenizer with no pad token configured (GPT-2,
+        # Llama, Mistral, ...). The final position is simply the last token.
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self._model(**inputs)
-        # attention_mask marks real (non-pad) tokens per row; the last 1 in
-        # each row is that row's true final position, regardless of whether
-        # the tokenizer pads left or right.
-        attention_mask = inputs["attention_mask"][0]
-        last_real_position = int(attention_mask.nonzero()[-1].item())
-        logits = outputs.logits[0, last_real_position, :].float()
+        logits = outputs.logits[0, -1, :].float()
 
         letter_logits = {letter: float(logits[token_id].item()) for letter, token_id in letter_token_ids.items()}
         full_vocab_logsumexp = float(torch.logsumexp(logits, dim=-1).item())

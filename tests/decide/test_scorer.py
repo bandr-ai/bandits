@@ -270,6 +270,21 @@ def test_scorer_run_artifact_round_trips() -> None:
     assert reloaded == run
 
 
+def test_scorer_run_id_is_independent_of_latency() -> None:
+    """Two runs identical in every input and prediction but with different
+    wall-clock latency must get the same content-addressed id -- otherwise
+    an exact rerun of the same scoring mints a new artifact every time."""
+    predictor = FakePredictor()
+    run = score_dataset(predictor, [_example()], mode="single_order")
+
+    payload = run.model_dump(mode="json")
+    payload["results"][0]["latency_seconds"] = payload["results"][0]["latency_seconds"] + 999.0
+    inflated_latency_run = ScorerRun.model_validate(payload)
+
+    assert compute_scorer_run_id(run) == compute_scorer_run_id(inflated_latency_run)
+    assert run != inflated_latency_run  # the objects do differ; only the id ignores it
+
+
 def test_scorer_does_not_depend_on_traces_or_judge_code() -> None:
     import bandits.decide.scorer as scorer_module
 

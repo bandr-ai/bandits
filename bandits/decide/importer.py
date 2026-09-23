@@ -120,9 +120,13 @@ def _parse_row(
         reasons.append("'options' must be a non-empty object of option id -> description")
         options = {}
     else:
-        empty_options = [k for k, v in options.items() if not str(k).strip() or not str(v).strip()]
+        empty_options = [
+            k
+            for k, v in options.items()
+            if not str(k).strip() or not isinstance(v, str) or not v.strip()
+        ]
         if empty_options:
-            reasons.append(f"empty option id or description: {empty_options}")
+            reasons.append(f"empty or non-string option id or description: {empty_options}")
         if len(options) < 2:
             reasons.append("needs at least 2 options")
         if len(options) > MAX_OPTIONS:
@@ -207,9 +211,10 @@ def _resolve_duplicate_ids(
     train or evaluate on it as though its id were unique.
 
     Only *explicit* ids are checked here: two rows with no supplied id that
-    happen to have identical content (and thus the same auto-derived,
-    content-hash record_id) are not a data-entry mistake -- they are
-    legitimately identical rows and are both kept."""
+    happen to have identical content share an auto-derived record_id, which
+    is handled separately by ``_resolve_duplicate_content`` (identical
+    content with identical targets is a harmless duplicate; identical
+    content with conflicting targets is not)."""
     explicit_ids = [explicit_id for _e, explicit_id in examples_with_ids if explicit_id is not None]
     duplicated = {i for i in explicit_ids if explicit_ids.count(i) > 1}
     if not duplicated:
@@ -232,6 +237,51 @@ def _resolve_duplicate_ids(
             )
         else:
             kept.append(e)
+    return kept, newly_quarantined
+
+
+def _resolve_duplicate_content(
+    examples: list[DecisionExample], quarantined: list[RejectedDecision]
+) -> tuple[list[DecisionExample], list[RejectedDecision]]:
+    """Rows with no explicit id share their ``decision_id`` when their
+    content (state+question+options) is identical, since that id is a hash
+    of content alone -- it says nothing about the target. Two such rows
+    with the *same* target are a harmless duplicate (keep the first, drop
+    the redundant copy so downstream decision_id-keyed consumers never see
+    two rows under one id). Two such rows with *different* targets are a
+    real conflict -- the same decision has been given contradictory labels
+    -- and every row sharing that decision_id is quarantined rather than
+    silently picking a winner."""
+    by_decision_id: dict[str, list[DecisionExample]] = {}
+    for e in examples:
+        by_decision_id.setdefault(e.decision_id, []).append(e)
+
+    kept: list[DecisionExample] = []
+    newly_quarantined: list[RejectedDecision] = list(quarantined)
+    for decision_id, group in by_decision_id.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        targets = {tuple(sorted(e.target.probabilities.items())) for e in group}
+        if len(targets) == 1:
+            # Identical content, identical target: a harmless duplicate.
+            # Keep the first occurrence only, so the decision_id stays
+            # unique among accepted rows.
+            kept.append(group[0])
+            continue
+        for e in group:
+            newly_quarantined.append(
+                RejectedDecision(
+                    trace_id=None,
+                    source_file=e.lineage.source_file,
+                    source_line=e.lineage.source_line,
+                    reasons=(
+                        f"decision_id {decision_id!r} (same state+question+options, no "
+                        "explicit id) is given conflicting targets by different rows in "
+                        "this import",
+                    ),
+                )
+            )
     return kept, newly_quarantined
 
 
@@ -317,6 +367,7 @@ def import_jsonl(
             examples_with_ids.append((parsed.example, parsed.explicit_id))
 
     examples, quarantined = _resolve_duplicate_ids(examples_with_ids, quarantined)
+    examples, quarantined = _resolve_duplicate_content(examples, quarantined)
     examples, quarantined = _resolve_group_conflicts(examples, quarantined)
 
     by_split: dict[str, int] = {}
@@ -364,13 +415,14 @@ def import_jevbench(
     ``family`` when ``group`` is null (JevBench sets ``group`` on only some
     items).
 
-    Every item is evaluation-only: it lands in split ``"test"`` regardless
-    of its own ``split`` field (JevBench's own split names -- "public",
-    "hard_holdout", ... -- are an external benchmark's own partitioning, not
-    ours, and are never reinterpreted as one of ours), unless that field
-    already happens to spell one of our split names exactly. A JevBench item
-    must never enter train/dev/calibration, where it could be fit or tuned
-    against and stop being an honest external check.
+    Every item is evaluation-only: it lands in split ``"test"``
+    unconditionally, regardless of its own ``split`` field -- even when that
+    field happens to spell one of our four split names exactly. JevBench's
+    own split names ("public", "hard_holdout", ...) are an external
+    benchmark's own partitioning, not ours, and are never reinterpreted as
+    one of ours. A JevBench item must never enter train/dev/calibration,
+    where it could be fit or tuned against and stop being an honest external
+    check.
 
     Only ``question.type == "choice"`` items are imported -- Noul and Score
     items are quarantined with a reason, since this dataset contract's
@@ -407,18 +459,18 @@ def import_jevbench(
         else:
             options = dict(criteria)
 
-        jevbench_split = item.get("split")
-        if jevbench_split in _VALID_SPLITS:
-            # JevBench already used one of our split names for something else
-            # (unexpected, but not impossible for a future export) -- honor it.
-            resolved_split = jevbench_split
-        else:
-            # JevBench's own splits ("public", "hard_holdout", ...) are an
-            # external benchmark's partitioning, not ours. Every item is
-            # evaluation-only: it goes to "test" unless the caller passes an
-            # explicit override, never into train/dev/calibration where it
-            # could leak into what the model is fit or tuned against.
-            resolved_split = "test"
+        # Every JevBench item is evaluation-only: it always lands in "test",
+        # unconditionally, regardless of what its own "split" field says.
+        # JevBench's own split names ("public", "hard_holdout", ...) are an
+        # external benchmark's partitioning, not ours, and are never
+        # reinterpreted as one of ours -- not even when a JevBench item
+        # happens to spell one of our four names exactly ("train", "dev",
+        # "calibration"). Honoring that coincidence was a real leak: nothing
+        # then stopped a JevBench-shaped file from writing `"split": "train"`
+        # and bypassing this importer's entire test-only guarantee. There is
+        # no override; a caller who genuinely needs one adds it explicitly
+        # after this function returns.
+        resolved_split = "test"
 
         provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
         row = {

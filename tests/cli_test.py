@@ -421,3 +421,45 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
     assert (output / "selection-report.json").exists()
+
+
+def test_decision_score_rejects_an_invalid_split(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "decision-score",
+            "decision-dataset-does-not-matter",
+            "--model",
+            "irrelevant/model",
+            "--revision",
+            "abc123",
+            "--split",
+            "bogus",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--split must be one of" in plain(result.stdout)
+
+
+def test_decision_score_refuses_the_test_split_without_allow_test(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "decision-score",
+            "decision-dataset-does-not-matter",
+            "--model",
+            "irrelevant/model",
+            "--revision",
+            "abc123",
+            "--split",
+            "test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--allow-test" in plain(result.stdout)

@@ -11,6 +11,7 @@ import torch, and imported lazily from there).
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from typing import Literal, Protocol
@@ -280,7 +281,16 @@ def score_dataset(
 
 
 def compute_scorer_run_id(run: ScorerRun) -> str:
-    digest = hashlib.sha256(run.model_dump_json().encode()).hexdigest()
+    """Content-addressed: two runs over the same model+revision+dataset+
+    split+prompt+predictions must get the same id even if their wall-clock
+    latency differs, so an exact rerun is recognized as the same logical
+    result rather than minted as a new artifact every time. ``latency_seconds``
+    is excluded from the hashed payload for exactly that reason -- it stays
+    in the stored payload (``save_scorer_run``), just not in identity."""
+    payload = run.model_dump(mode="json")
+    for result in payload["results"]:
+        result.pop("latency_seconds", None)
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return f"decision-scorer-run-{digest[:16]}"
 
 

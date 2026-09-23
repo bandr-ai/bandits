@@ -9,6 +9,7 @@ from bandits.analyze.models import TaskFamily, TaskSet
 from bandits.decide.dataset import (
     ACTION_OUTCOME_OPTIONS,
     ACTION_OUTCOME_QUESTION,
+    DecisionDataset,
     DecisionSchema,
     DecisionTarget,
     build_decision_dataset,
@@ -190,6 +191,54 @@ def test_failed_judgment_is_quarantined_not_turned_into_unclear() -> None:
     assert dataset.quarantined[0].turn_index == turns[0].index
     assert "unparseable" in dataset.quarantined[0].reasons[0]
     assert turns[0].index not in {r.lineage.turn_index for r in dataset.examples}
+
+
+def test_verdict_with_votes_but_no_judge_votes_is_reconstructed_not_quarantined() -> None:
+    """An older TurnVerdict (or any producer that only ever set ``votes``,
+    not the newer ``judge_votes`` field) must still compile: judge_votes is
+    reconstructed from votes rather than being treated as unusable."""
+    trace = _trace("a")
+    turns = [t for t in extract_turns(trace) if t.observed]
+    legacy = TurnVerdict(
+        trace_id="a",
+        index=turns[0].index,
+        action_span_id=turns[0].action_span_id,
+        observed=True,
+        score=1,
+        judge_votes=None,
+        votes=(1, 1, -1),
+    )
+    verdicts = [legacy] + [_verdict("a", t.index, t.action_span_id, votes=(1,)) for t in turns[1:]]
+    run = _run([trace], verdicts, votes=3)
+    dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
+
+    assert dataset.counts.quarantined == 0
+    row = next(r for r in dataset.examples if r.lineage.turn_index == turns[0].index)
+    assert row.target.probabilities["success"] == pytest.approx(2 / 3)
+    assert row.target.probabilities["failure"] == pytest.approx(1 / 3)
+
+
+def test_verdict_with_neither_judge_votes_nor_votes_stays_quarantined() -> None:
+    """A verdict with score set but no votes at all (neither judge_votes nor
+    votes) has nothing to reconstruct from and is still quarantined -- this
+    fix does not invent a distribution that was never observed."""
+    trace = _trace("a")
+    turns = [t for t in extract_turns(trace) if t.observed]
+    empty = TurnVerdict(
+        trace_id="a",
+        index=turns[0].index,
+        action_span_id=turns[0].action_span_id,
+        observed=True,
+        score=1,
+        judge_votes=None,
+        votes=(),
+    )
+    verdicts = [empty] + [_verdict("a", t.index, t.action_span_id, votes=(1,)) for t in turns[1:]]
+    run = _run([trace], verdicts)
+    dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
+
+    assert dataset.counts.quarantined == 1
+    assert dataset.quarantined[0].turn_index == turns[0].index
 
 
 def test_missing_trace_is_quarantined() -> None:
@@ -457,3 +506,78 @@ def test_dataset_round_trips(tmp_path) -> None:
     loaded = load_decision_dataset(envelope.artifact_id, store)
     assert loaded == dataset
     assert envelope.summary["examples"] == dataset.counts.examples
+
+
+def _v1_payload() -> dict:
+    """Shaped exactly like a dataset saved before schema v2 -- old split
+    names on both examples and counts, no schema_version field (matching
+    what an actual pre-migration save would have produced, since
+    schema_version was only added as part of v2)."""
+    options = {"success": "s", "unclear": "u", "failure": "f"}
+    return {
+        "producer": "action_outcome_judge_votes",
+        "source_artifact_ids": ["judge-run-1"],
+        "decision_schema": {"primitive": "choice", "options": options, "question": "q"},
+        "examples": [
+            {
+                "decision_id": "decision-1",
+                "family_id": "f1",
+                "state": "s1",
+                "question": "q",
+                "primitive": "choice",
+                "options": options,
+                "target": {"kind": "hard", "probabilities": {"success": 1.0, "unclear": 0.0, "failure": 0.0}},
+                "label_source": "judge_votes",
+                "split": "within_family_fit",
+                "lineage": {"source_kind": "action_outcome_judge_votes", "record_id": "a:0"},
+            },
+            {
+                "decision_id": "decision-2",
+                "family_id": "f1",
+                "state": "s2",
+                "question": "q",
+                "primitive": "choice",
+                "options": options,
+                "target": {"kind": "hard", "probabilities": {"success": 0.0, "unclear": 1.0, "failure": 0.0}},
+                "label_source": "judge_votes",
+                "split": "within_family_held_out",
+                "lineage": {"source_kind": "action_outcome_judge_votes", "record_id": "a:1"},
+            },
+        ],
+        "counts": {
+            "examples": 2,
+            "within_family_fit": 1,
+            "within_family_held_out": 1,
+            "quarantined": 0,
+            "votes_requested": 1,
+            "votes_valid_min": 1,
+            "votes_valid_max": 1,
+        },
+    }
+
+
+def test_v1_payload_migrates_split_names_and_loads() -> None:
+    dataset = DecisionDataset.model_validate(_v1_payload())
+
+    assert dataset.schema_version == 2
+    assert [e.split for e in dataset.examples] == ["train", "dev"]
+    assert dataset.counts.train == 1
+    assert dataset.counts.dev == 1
+
+
+def test_v1_payload_with_explicit_schema_version_one_also_migrates() -> None:
+    payload = {**_v1_payload(), "schema_version": 1}
+    dataset = DecisionDataset.model_validate(payload)
+
+    assert dataset.schema_version == 2
+    assert [e.split for e in dataset.examples] == ["train", "dev"]
+
+
+def test_v2_payload_is_not_touched_by_the_v1_migration() -> None:
+    trace = _trace("a")
+    verdicts = _all_observed_verdicts(trace)
+    run = _run([trace], verdicts)
+    dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
+
+    round_tripped = DecisionDataset.model_validate(dataset.model_dump(mode="json"))
+    assert round_tripped == dataset
