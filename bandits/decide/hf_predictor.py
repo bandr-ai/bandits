@@ -37,7 +37,7 @@ class HFPredictor:
         torch_dtype = getattr(torch, dtype)
         self._tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
         self._model = AutoModelForCausalLM.from_pretrained(
-            model_id, revision=revision, torch_dtype=torch_dtype
+            model_id, revision=revision, dtype=torch_dtype
         ).to(device)
         self._model.eval()
         self._torch = torch
