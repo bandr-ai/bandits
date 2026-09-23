@@ -72,8 +72,17 @@ class LogitPredictor(Protocol):
 class OptionScore(Contract):
     option_id: str
     probability: float
-    raw_logit: float
-    """From the single, non-reversed pass -- see ``DecisionScoreResult.mode``."""
+    """For "single_order": this option's softmax over the one pass's allowed
+    letters. For "two_order_average": the mean of both passes' softmax --
+    the actual number a caller acts on."""
+    raw_logit_pass1: float
+    """The first (non-reversed) pass's raw logit -- always present."""
+    raw_logit_pass2: float | None = None
+    """The second (reversed-order) pass's raw logit. Set only in
+    "two_order_average" mode. Recording both passes' raw logits (not just
+    pass 1) is what lets a later temperature-fit reconstruct the exact
+    averaged distribution this result reported, instead of only the
+    single-order one."""
 
 
 class DecisionScoreResult(Contract):
@@ -86,9 +95,12 @@ class DecisionScoreResult(Contract):
     softmax itself, which always sums to 1 by construction. Low mass means
     the model didn't want to answer with a letter code at all; see the
     cross-repo notes in dataset.py's module docstring. A diagnostic, never a
-    training signal. From the single (non-reversed) pass only."""
+    training signal. In "two_order_average" mode this is the mean of both
+    passes' mass, matching how ``scores[*].probability`` is also averaged."""
     mode: ScoreMode
     prompt_digest: str
+    """The first (non-reversed) pass's prompt digest. The reversed pass's
+    prompt differs only in option order, under the same template version."""
     latency_seconds: float
 
 
@@ -151,6 +163,20 @@ def _score_once(
     return probs_by_option, raw_by_option, mass, prompt_digest(prompt)
 
 
+def _check_prompt_length(
+    predictor: LogitPredictor, state: str, question: str, options: dict[str, str], max_prompt_tokens: int
+) -> int | None:
+    """Returns the token count if it is over the limit, else None. Checked
+    separately for each option order actually scored -- reversing the
+    option list can change the rendered prompt's length (different option
+    text lengths land in a different position relative to any per-token
+    overhead), so a two-order run must not check only the first order and
+    assume the second is also within budget."""
+    prompt, _ = build_prompt(state, question, options)
+    token_count = predictor.token_count(prompt)
+    return token_count if token_count > max_prompt_tokens else None
+
+
 def score_example(
     predictor: LogitPredictor,
     example: DecisionExample,
@@ -160,30 +186,52 @@ def score_example(
 ) -> DecisionScoreResult | RejectedScore:
     """Score one example. Overlength prompts are rejected, never truncated --
     truncation would silently change what the model is being asked."""
-    prompt_preview, _ = build_prompt(example.state, example.question, dict(example.options))
-    token_count = predictor.token_count(prompt_preview)
-    if token_count > max_prompt_tokens:
+    over_limit = _check_prompt_length(
+        predictor, example.state, example.question, dict(example.options), max_prompt_tokens
+    )
+    if over_limit is not None:
         return RejectedScore(
             decision_id=example.decision_id,
-            reasons=(f"prompt is {token_count} tokens, over the {max_prompt_tokens} limit",),
+            reasons=(f"prompt is {over_limit} tokens, over the {max_prompt_tokens} limit",),
         )
+    if mode == "two_order_average":
+        reversed_options = dict(reversed(example.options.items()))
+        reversed_over_limit = _check_prompt_length(
+            predictor, example.state, example.question, reversed_options, max_prompt_tokens
+        )
+        if reversed_over_limit is not None:
+            return RejectedScore(
+                decision_id=example.decision_id,
+                reasons=(
+                    f"reversed-order prompt is {reversed_over_limit} tokens, over the "
+                    f"{max_prompt_tokens} limit (first-order prompt was within budget)",
+                ),
+            )
 
     start = time.perf_counter()
     try:
         probs, raw_by_option, mass, digest = _score_once(predictor, example)
+        second_raw_by_option: dict[str, float] | None = None
+        second_mass: float | None = None
         if mode == "two_order_average":
-            second_probs, _, _, _ = _score_once(predictor, example, reverse=True)
+            second_probs, second_raw_by_option, second_mass, _ = _score_once(predictor, example, reverse=True)
             probs = {
                 option_id: (probs[option_id] + second_probs.get(option_id, 0.0)) / 2
                 for option_id in probs
             }
+            mass = (mass + second_mass) / 2
     except TokenizationError as exc:
         return RejectedScore(decision_id=example.decision_id, reasons=(str(exc),))
     latency = time.perf_counter() - start
     # latency covers both passes when mode == "two_order_average".
 
     scores = tuple(
-        OptionScore(option_id=option_id, probability=p, raw_logit=raw_by_option[option_id])
+        OptionScore(
+            option_id=option_id,
+            probability=p,
+            raw_logit_pass1=raw_by_option[option_id],
+            raw_logit_pass2=second_raw_by_option[option_id] if second_raw_by_option is not None else None,
+        )
         for option_id, p in probs.items()
     )
     chosen = max(scores, key=lambda s: s.probability)

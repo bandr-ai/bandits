@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from bandits.decide.scorer import LogitPrediction, TokenizationError
 
-_ANSWER_CUE = "Answer:"
-
 
 class HFPredictor:
     """One forward pass over a frozen (or LoRA-adapted) causal LM, never
@@ -47,27 +45,37 @@ class HFPredictor:
     def token_count(self, prompt: str) -> int:
         return len(self._tokenizer.encode(prompt))
 
-    def _letter_token_id(self, letter: str) -> int:
-        """The token id a letter takes on immediately after "Answer:" --
-        not just any encoding of the bare letter, since many tokenizers
-        encode " A" and "A" differently and only the former is what the
-        model will actually produce after the prompt's own cue. Raises
-        TokenizationError unless that encoding is exactly one token."""
-        probe = f"{_ANSWER_CUE} {letter}"
-        cue_ids = self._tokenizer.encode(_ANSWER_CUE, add_special_tokens=False)
-        probe_ids = self._tokenizer.encode(probe, add_special_tokens=False)
-        answer_ids = probe_ids[len(cue_ids) :]
+    def _letter_token_id(self, prompt: str, letter: str) -> int:
+        """The token id a letter takes on in the *actual rendered prompt*
+        (which already ends in the template's "Answer:" cue), not a letter
+        tokenized in isolation. Tokenizing "Answer:" and "Answer: A"
+        separately and assuming the former's ids are a prefix of the
+        latter's is not guaranteed for a BPE tokenizer -- adding text can
+        retokenize the boundary between them. Instead, tokenize the full
+        prompt with and without the letter appended and verify the shared
+        prefix explicitly: only if the first N ids are identical and exactly
+        one new id follows is that new id trusted as "the letter's token in
+        this exact context". Raises TokenizationError otherwise."""
+        base_ids = self._tokenizer.encode(prompt, add_special_tokens=False)
+        with_letter_ids = self._tokenizer.encode(f"{prompt} {letter}", add_special_tokens=False)
+        if with_letter_ids[: len(base_ids)] != base_ids:
+            raise TokenizationError(
+                f"appending option letter {letter!r} retokenized the prompt itself "
+                f"(not just added a token) for {self.model_id}@{self.revision}; "
+                "the letter cannot be read as a single token in this context"
+            )
+        answer_ids = with_letter_ids[len(base_ids) :]
         if len(answer_ids) != 1:
             raise TokenizationError(
-                f"option letter {letter!r} is not exactly one token after "
-                f"{_ANSWER_CUE!r} for {self.model_id}@{self.revision} "
+                f"option letter {letter!r} is not exactly one token in this prompt's "
+                f"answer context for {self.model_id}@{self.revision} "
                 f"(got {len(answer_ids)} tokens)"
             )
         return answer_ids[0]
 
     def predict(self, prompt: str, letters: list[str]) -> LogitPrediction:
         torch = self._torch
-        letter_token_ids = {letter: self._letter_token_id(letter) for letter in letters}
+        letter_token_ids = {letter: self._letter_token_id(prompt, letter) for letter in letters}
         distinct = set(letter_token_ids.values())
         if len(distinct) != len(letter_token_ids):
             raise TokenizationError(

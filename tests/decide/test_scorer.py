@@ -169,12 +169,46 @@ def test_overlength_prompt_is_rejected_not_truncated() -> None:
     assert "over the 10 limit" in result.reasons[0]
 
 
+def test_two_order_mode_checks_the_reversed_prompts_length_too() -> None:
+    """The first-order prompt can be within budget while the reversed-order
+    prompt (option text in a different position) is not -- both must be
+    checked, not just the first."""
+
+    class OrderSensitiveLengthPredictor(FakePredictor):
+        def token_count(self, prompt: str) -> int:
+            # Simulate an order-dependent length: whichever option TEXT is
+            # listed last costs far more (as if it triggered extra
+            # formatting). Letters are always A/B/C regardless of order, so
+            # this must key on the option text, not the letter.
+            last_option_line = prompt.splitlines()[-3]  # last "X. ..." line, before the blank + "Answer:"
+            return 5 if last_option_line.endswith("cherry") else 1000
+
+    options = {"a": "apple", "b": "banana", "c": "cherry"}
+    predictor = OrderSensitiveLengthPredictor()
+    result = score_example(
+        predictor, _example(options=options), mode="two_order_average", max_prompt_tokens=100
+    )
+    assert isinstance(result, RejectedScore)
+    assert "reversed-order prompt" in result.reasons[0]
+    assert "over the 100 limit" in result.reasons[0]
+
+
 def test_raw_logits_kept_unrounded() -> None:
     predictor = FakePredictor()
     result = score_example(predictor, _example())
     assert isinstance(result, DecisionScoreResult)
     for score in result.scores:
-        assert isinstance(score.raw_logit, float)
+        assert isinstance(score.raw_logit_pass1, float)
+        assert score.raw_logit_pass2 is None  # single_order mode never scores a second pass
+
+
+def test_two_order_mode_records_both_passes_raw_logits() -> None:
+    predictor = FakePredictor()
+    result = score_example(predictor, _example(), mode="two_order_average")
+    assert isinstance(result, DecisionScoreResult)
+    for score in result.scores:
+        assert isinstance(score.raw_logit_pass1, float)
+        assert isinstance(score.raw_logit_pass2, float)
 
 
 def test_generate_is_never_called() -> None:
