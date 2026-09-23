@@ -931,18 +931,94 @@ def decision_dataset_command(
     envelope = save_decision_dataset(dataset, store)
     console.print(f"decision_dataset_id:     {envelope.artifact_id}")
     console.print(f"examples:                {dataset.counts.examples}")
-    console.print(f"within_family_fit:       {dataset.counts.within_family_fit}")
-    console.print(f"within_family_held_out:  {dataset.counts.within_family_held_out}")
+    console.print(f"train:                   {dataset.counts.train}")
+    console.print(f"dev:                     {dataset.counts.dev}")
     console.print(f"quarantined:             {dataset.counts.quarantined}")
     if not task_set_id:
         console.print(
-            "[yellow]no --task-set given:[/yellow] every example was put in within_family_fit; "
-            "there is no held-out split to certify against"
+            "[yellow]no --task-set given:[/yellow] every example was put in train; "
+            "there is no dev split to certify against"
         )
     if output is not None:
         rows_path, quarantine_path = write_decision_dataset(dataset, output)
         console.print(f"output:              {rows_path}")
         console.print(f"quarantine:          {quarantine_path}")
+
+
+@app.command(name="decision-import")
+def decision_import_command(
+    path: Path = typer.Argument(..., help="JSONL file: one labeled decision per line."),
+    source: str = typer.Option(None, "--source", help="Dataset-level source name/URL, used when a row omits its own."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+    output: Path = typer.Option(None, "--output", help="Write examples and quarantine JSONL."),
+) -> None:
+    """Import a JSONL file of user-labeled decisions into a DecisionDataset."""
+    from bandits.decide.dataset import write_decision_dataset
+    from bandits.decide.importer import import_jsonl, save_imported_dataset
+
+    text = path.read_text(encoding="utf-8")
+    dataset = import_jsonl(text, source_file=str(path), dataset_source=source)
+    store = _derived(project)
+    envelope = save_imported_dataset(dataset, store, source_file=str(path))
+    console.print(f"decision_dataset_id: {envelope.artifact_id}")
+    console.print(f"examples:            {dataset.counts.examples}")
+    console.print(f"train:               {dataset.counts.train}")
+    console.print(f"dev:                 {dataset.counts.dev}")
+    console.print(f"calibration:         {dataset.counts.calibration}")
+    console.print(f"test:                {dataset.counts.test}")
+    console.print(f"quarantined:         {dataset.counts.quarantined}")
+    if output is not None:
+        rows_path, quarantine_path = write_decision_dataset(dataset, output)
+        console.print(f"output:              {rows_path}")
+        console.print(f"quarantine:          {quarantine_path}")
+
+
+@app.command(name="decision-score")
+def decision_score_command(
+    dataset_id: str,
+    model: str = typer.Option(..., "--model", help="Hugging Face model id, e.g. Qwen/Qwen3.5-4B."),
+    revision: str = typer.Option(..., "--revision", help="Pinned model revision (commit SHA)."),
+    split: str = typer.Option("dev", "--split", help="Which split to score: train/dev/calibration/test."),
+    two_order: bool = typer.Option(
+        False, "--two-order", help="Average two option orders per example (two forward passes)."
+    ),
+    device: str = typer.Option("cuda", "--device"),
+    dtype: str = typer.Option("bfloat16", "--dtype"),
+    max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Score a decision dataset's split with an untrained (frozen) model: one
+    forward pass per example, softmax over the option-letter logits."""
+    from bandits.decide.dataset import load_decision_dataset
+    from bandits.decide.hf_predictor import HFPredictor
+    from bandits.decide.scorer import save_scorer_run, score_dataset
+
+    store = _derived(project)
+    try:
+        dataset = load_decision_dataset(dataset_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    examples = [e for e in dataset.examples if e.split == split]
+    if not examples:
+        console.print(f"[yellow]no examples in split {split!r}[/yellow]")
+        raise typer.Exit(code=1)
+
+    predictor = HFPredictor(model, revision=revision, device=device, dtype=dtype)
+    mode = "two_order_average" if two_order else "single_order"
+    run = score_dataset(
+        predictor,
+        examples,
+        mode=mode,
+        max_prompt_tokens=max_prompt_tokens,
+        dataset_id=dataset_id,
+        split=split,
+    )
+    envelope = save_scorer_run(run, store)
+    console.print(f"scorer_run_id: {envelope.artifact_id}")
+    console.print(f"scored:        {len(run.results)}")
+    console.print(f"rejected:      {len(run.rejections)}")
 
 
 if __name__ == "__main__":

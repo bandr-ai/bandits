@@ -91,7 +91,7 @@ def test_action_outcome_row_carries_state_options_and_soft_target() -> None:
     assert row.primitive == "choice"
     assert set(row.options) == set(ACTION_OUTCOME_OPTIONS)
     assert row.label_source == "judge_votes"
-    assert row.split == "within_family_fit"
+    assert row.split == "train"
     assert abs(sum(row.target.probabilities.values()) - 1.0) < 1e-9
     assert row.judge.votes_requested == 1
     assert row.judge.votes_valid == 1
@@ -250,21 +250,21 @@ def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None
     )
 
     splits = {r.lineage.trace_id: r.split for r in dataset.examples}
-    assert splits["a"] == "within_family_fit"
-    assert splits["b"] == "within_family_held_out"
+    assert splits["a"] == "train"
+    assert splits["b"] == "dev"
     by_trace: dict[str, set[str]] = {}
     for row in dataset.examples:
         by_trace.setdefault(row.lineage.trace_id, set()).add(row.split)
     assert all(len(sides) == 1 for sides in by_trace.values())
 
 
-def test_no_task_set_defaults_every_example_to_within_family_fit() -> None:
+def test_no_task_set_defaults_every_example_to_train() -> None:
     trace = _trace("a")
     verdicts = _all_observed_verdicts(trace)
     run = _run([trace], verdicts)
     dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
 
-    assert all(r.split == "within_family_fit" for r in dataset.examples)
+    assert all(r.split == "train" for r in dataset.examples)
     assert dataset.source_task_set_id is None
 
 
@@ -363,7 +363,7 @@ def test_choice_needs_at_least_two_nonempty_options() -> None:
             options=options,
             target=DecisionTarget(kind="soft", probabilities=probabilities),
             label_source="judge_votes",
-            split="within_family_fit",
+            split="train",
             lineage=DecisionLineage(source_kind="k", record_id="r"),
         )
 
@@ -392,7 +392,7 @@ def test_dataset_rejects_a_row_that_does_not_match_its_shared_schema() -> None:
         options={"a": "x", "b": "y"},
         target=DecisionTarget(kind="soft", probabilities={"a": 1.0, "b": 0.0}),
         label_source="judge_votes",
-        split="within_family_fit",
+        split="train",
         lineage=DecisionLineage(source_kind="k", record_id="r"),
     )
     with pytest.raises(ValidationError, match="do not match decision_schema"):
@@ -405,8 +405,8 @@ def test_dataset_rejects_a_row_that_does_not_match_its_shared_schema() -> None:
             examples=(mismatched,),
             counts=DecisionDatasetCounts(
                 examples=1,
-                within_family_fit=1,
-                within_family_held_out=0,
+                train=1,
+                dev=0,
                 quarantined=0,
                 votes_requested=1,
                 votes_valid_min=1,
@@ -428,8 +428,8 @@ def test_dataset_rejects_a_wrong_examples_count() -> None:
             examples=(),
             counts=DecisionDatasetCounts(
                 examples=5,  # claims 5 rows while examples=() has none
-                within_family_fit=0,
-                within_family_held_out=0,
+                train=0,
+                dev=0,
                 quarantined=0,
                 votes_requested=1,
                 votes_valid_min=0,
