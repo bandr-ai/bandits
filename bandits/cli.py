@@ -1040,6 +1040,100 @@ def decision_score_command(
     console.print(f"rejected:      {len(run.rejections)}")
 
 
+@app.command(name="decision-train")
+def decision_train_command(
+    dataset_id: str,
+    model: str = typer.Option(..., "--model", help="Hugging Face base model id, e.g. Qwen/Qwen3.5-4B."),
+    revision: str = typer.Option(..., "--revision", help="Pinned base model revision (commit SHA)."),
+    seed: int = typer.Option(..., "--seed", help="Data-order and option-shuffle seed. Required, not defaulted, "
+    "so a reproducible run is a deliberate choice, not an accident."),
+    eval_every_steps: int = typer.Option(50, "--eval-every-steps", help="Score dev every N steps; 0 disables "
+    "interval evals and scores only a single final checkpoint."),
+    resume_from_step: int = typer.Option(0, "--resume-from-step", help="Skip this many already-completed steps "
+    "of the deterministic data order (see decision-train's own docs)."),
+    lora_rank: int = typer.Option(16, "--lora-rank"),
+    lora_alpha: int = typer.Option(32, "--lora-alpha"),
+    lora_dropout: float = typer.Option(0.05, "--lora-dropout"),
+    learning_rate: float = typer.Option(5e-5, "--learning-rate"),
+    effective_batch: int = typer.Option(8, "--effective-batch"),
+    epochs: int = typer.Option(1, "--epochs"),
+    max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
+    device: str = typer.Option("cuda", "--device"),
+    dtype: str = typer.Option("bfloat16", "--dtype"),
+    checkpoint_dir: Path = typer.Option(..., "--checkpoint-dir", help="Where LoRA adapter checkpoints are saved."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """LoRA SFT on a decision dataset's train split, evaluated against dev.
+    Named decision-train, never sft -- that word already means export
+    (build-sft/export-nextstate) elsewhere in Bandits."""
+    from bandits.decide.dataset import load_decision_dataset
+    from bandits.decide.hf_predictor import HFPredictor
+    from bandits.decide.hf_trainer import HFTrainer
+    from bandits.decide.trainer import build_training_config, save_training_run, train
+
+    store = _derived(project)
+    try:
+        dataset = load_decision_dataset(dataset_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
+        raise typer.Exit(code=1) from exc
+
+    train_examples = [e for e in dataset.examples if e.split == "train"]
+    dev_examples = [e for e in dataset.examples if e.split == "dev"]
+    if not train_examples:
+        console.print("[red]error:[/red] no examples in the train split")
+        raise typer.Exit(code=1)
+
+    config = build_training_config(
+        base_model_id=model,
+        base_revision=revision,
+        dataset_id=dataset_id,
+        seed=seed,
+        eval_every_steps=eval_every_steps,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        learning_rate=learning_rate,
+        effective_batch=effective_batch,
+        epochs=epochs,
+        max_prompt_tokens=max_prompt_tokens,
+        dtype=dtype,
+        device=device,
+    )
+    trainer = HFTrainer(
+        model,
+        revision=revision,
+        device=device,
+        dtype=dtype,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        learning_rate=learning_rate,
+    )
+
+    def dev_predictor_factory(adapter_path: str) -> HFPredictor:
+        return HFPredictor(model, revision=revision, device=device, dtype=dtype, adapter_path=adapter_path)
+
+    run = train(
+        trainer,
+        config,
+        train_examples=train_examples,
+        dev_examples=dev_examples,
+        dev_predictor_factory=dev_predictor_factory,
+        checkpoint_dir=str(checkpoint_dir),
+        resume_from_step=resume_from_step,
+    )
+    envelope = save_training_run(run, store)
+    console.print(f"training_run_id:     {envelope.artifact_id}")
+    console.print(f"steps_completed:      {run.steps_completed}")
+    console.print(f"checkpoints:          {len(run.checkpoints)}")
+    if run.best_checkpoint_step is not None:
+        best = next(c for c in run.checkpoints if c.step == run.best_checkpoint_step)
+        console.print(f"best_checkpoint_step: {best.step}")
+        console.print(f"best_dev_accuracy:    {best.dev_accuracy:.4f}")
+        console.print(f"best_adapter_path:    {best.adapter_path}")
+
+
 if __name__ == "__main__":
     app()
 
