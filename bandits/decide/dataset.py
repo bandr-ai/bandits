@@ -96,6 +96,10 @@ class DecisionLineage(Contract):
     action_span_id: str | None = None
     judge_run_id: str | None = None
     task_set_id: str | None = None
+    source_file: str | None = None
+    """For an imported row: the JSONL file it came from."""
+    source_line: int | None = None
+    """For an imported row: its 1-based line number in ``source_file``."""
 
 
 class DecisionJudgeInfo(Contract):
@@ -123,9 +127,26 @@ class DecisionJudgeInfo(Contract):
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+DecisionSplit = Literal["train", "dev", "calibration", "test"]
+
+_LEGACY_SPLIT_MAP: dict[str, DecisionSplit] = {
+    "within_family_fit": "train",
+    "within_family_held_out": "dev",
+}
+
+
 class DecisionExample(Contract):
     decision_id: str
     family_id: str
+    """Kept for the judge compiler and existing readers. ``group_id`` is the
+    schema-v2 name for the same idea (rows that must stay in one split); new
+    producers should set both to the same value, since family_id stays
+    required for now rather than breaking every existing row and test."""
+    group_id: str | None = None
+    """Rows sharing a ``group_id`` are kept in the same split and resampled
+    together by a grouped bootstrap. Optional so a producer with no natural
+    grouping (an arbitrary user JSONL row) is not forced to invent one. When
+    unset, ``family_id`` is used as the group for split-assignment purposes."""
     state: str
     question: str
     primitive: Literal["choice"]
@@ -136,20 +157,25 @@ class DecisionExample(Contract):
     options: dict[str, str]
     target: DecisionTarget
     label_source: str
-    split: Literal["within_family_fit", "within_family_held_out"]
-    """Named for what it actually is: each ``TaskFamily`` splits its own
-    member traces into fit/held-out (protecting duplicate/lineage groups),
-    not whole families. This is a held-out-episode split within a known
-    family, not a held-out-family (unseen task) split. See
-    ``build_decision_dataset``'s ``task_set`` handling."""
+    split: DecisionSplit
+    """train / dev / calibration / test. The judge compiler maps its own
+    fit -> train and held_out -> dev; see ``_family_split``. A row's split is
+    fixed at compile/import time and never redrawn afterward."""
     lineage: DecisionLineage
     judge: DecisionJudgeInfo | None = None
     """None for a non-judge label source (human, sealed outcome, synthetic)."""
+    source: str | None = None
+    """Where this row's content originally came from, e.g. a dataset name or
+    URL (not the file path -- that lives in ``lineage.source_file``)."""
+    license: str | None = None
+    """The redistribution license of the row's original content, when known."""
 
     @model_validator(mode="after")
     def shape_is_well_formed(self) -> DecisionExample:
         if len(self.options) < 2:
             raise ValueError("a choice example needs at least 2 options")
+        if len(self.options) > 26:
+            raise ValueError(f"a choice example supports at most 26 options, got {len(self.options)}")
         for option_id, description in self.options.items():
             if not option_id.strip():
                 raise ValueError("an option id must not be empty")
@@ -172,22 +198,37 @@ class DecisionExample(Contract):
 
 
 class RejectedDecision(Contract):
-    trace_id: str
+    """A row that could not become a ``DecisionExample``. Every rejection
+    points at where it came from: a judge-compiler row still names its
+    ``trace_id`` (and optional ``turn_index``); an imported row instead names
+    ``source_file`` + ``source_line``. At least one of those two pointers is
+    required -- a rejection with neither would be untraceable."""
+
+    trace_id: str | None = None
     turn_index: int | None = None
     family_id: str | None = None
+    source_file: str | None = None
+    source_line: int | None = None
     reasons: tuple[str, ...]
 
     @model_validator(mode="after")
     def has_reason(self) -> RejectedDecision:
         if not self.reasons:
             raise ValueError("a rejected decision must explain why")
+        if self.trace_id is None and self.source_file is None:
+            raise ValueError("a rejected decision needs a trace_id or a source_file to be traceable")
         return self
 
 
 class DecisionSchema(Contract):
     """What every example in this dataset shares in shape, for a trainer to
-    read once rather than re-deriving from every row. Checked against every
-    example by ``DecisionDataset.every_row_matches_its_schema``."""
+    read once rather than re-deriving from every row. A producer that shares
+    one question/options across all rows (the judge compiler) declares this
+    and every row is checked against it by
+    ``DecisionDataset.every_row_matches_its_schema``. A producer whose rows
+    each carry their own question/options (a user's own labeled dataset)
+    leaves this unset; the check is skipped entirely rather than forcing a
+    fake shared shape onto per-row data."""
 
     primitive: Literal["choice"]
     options: dict[str, str]
@@ -196,18 +237,31 @@ class DecisionSchema(Contract):
 
 class DecisionDatasetCounts(Contract):
     examples: int
-    within_family_fit: int
-    within_family_held_out: int
+    train: int
+    dev: int
+    calibration: int = 0
+    test: int = 0
     quarantined: int
-    votes_requested: int
-    votes_valid_min: int
-    votes_valid_max: int
+    votes_requested: int = 0
+    votes_valid_min: int = 0
+    votes_valid_max: int = 0
+    """Judge-only vote fields. Optional and default to 0 for a non-judge
+    producer (an imported user dataset has no votes to report)."""
+
+    @property
+    def within_family_fit(self) -> int:
+        """Backward-compatible alias for the judge compiler's old name."""
+        return self.train
+
+    @property
+    def within_family_held_out(self) -> int:
+        return self.dev
 
 
 class DecisionDataset(Contract):
-    schema_version: int = 1
+    schema_version: int = 2
     producer: str
-    """What compiled this dataset, e.g. "action_outcome_judge_votes"."""
+    """What compiled this dataset, e.g. "action_outcome_judge_votes" or "jsonl_import"."""
 
     source_artifact_ids: tuple[str, ...]
     """Every upstream artifact this dataset as a whole depends on."""
@@ -216,30 +270,101 @@ class DecisionDataset(Contract):
     """Convenience accessor for the common case; None for a non-judge producer."""
 
     source_task_set_id: str | None = None
-    decision_schema: DecisionSchema
+    decision_schema: DecisionSchema | None = None
+    """Set only by a producer whose rows all share one question/options (the
+    judge compiler). Left unset by a per-row producer (imported user data);
+    see ``DecisionSchema``."""
     examples: tuple[DecisionExample, ...]
     quarantined: tuple[RejectedDecision, ...] = ()
     counts: DecisionDatasetCounts
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_v1_split_names(cls, data: Any) -> Any:
+        """A v1 payload (``schema_version: 1``, or missing it) names its
+        splits ``within_family_fit``/``within_family_held_out`` on both
+        ``examples[*].split`` and ``counts``. v2 renamed those to
+        ``train``/``dev`` (see ``_LEGACY_SPLIT_MAP``) without a migration
+        path, which made every already-saved v1 artifact fail to load under
+        v2's stricter split enum. Only rewrites the old names when they are
+        actually present; a v2 payload (or any non-dict input) passes
+        through untouched."""
+        if not isinstance(data, dict):
+            return data
+        if data.get("schema_version", 1) != 1:
+            return data
+        migrated = dict(data)
+        examples = migrated.get("examples")
+        if isinstance(examples, (list, tuple)):
+            migrated["examples"] = [
+                {**e, "split": _LEGACY_SPLIT_MAP.get(e.get("split"), e.get("split"))}
+                if isinstance(e, dict)
+                else e
+                for e in examples
+            ]
+        counts = migrated.get("counts")
+        if isinstance(counts, dict) and (
+            "within_family_fit" in counts or "within_family_held_out" in counts
+        ):
+            counts = dict(counts)
+            counts["train"] = counts.pop("within_family_fit", counts.get("train", 0))
+            counts["dev"] = counts.pop("within_family_held_out", counts.get("dev", 0))
+            migrated["counts"] = counts
+        migrated["schema_version"] = 2
+        return migrated
+
     @model_validator(mode="after")
     def counts_match_rows(self) -> DecisionDataset:
-        fit = sum(1 for e in self.examples if e.split == "within_family_fit")
-        held_out = len(self.examples) - fit
+        by_split: dict[str, int] = {}
+        for e in self.examples:
+            by_split[e.split] = by_split.get(e.split, 0) + 1
         if self.counts.examples != len(self.examples):
             raise ValueError(
                 f"counts.examples ({self.counts.examples}) does not match "
                 f"len(examples) ({len(self.examples)})"
             )
-        if (fit, held_out, len(self.quarantined)) != (
-            self.counts.within_family_fit,
-            self.counts.within_family_held_out,
+        expected = (
+            by_split.get("train", 0),
+            by_split.get("dev", 0),
+            by_split.get("calibration", 0),
+            by_split.get("test", 0),
+            len(self.quarantined),
+        )
+        actual = (
+            self.counts.train,
+            self.counts.dev,
+            self.counts.calibration,
+            self.counts.test,
             self.counts.quarantined,
-        ):
+        )
+        if expected != actual:
             raise ValueError("counts do not match the rows they claim to summarize")
         return self
 
     @model_validator(mode="after")
+    def rows_sharing_a_group_stay_in_one_split(self) -> DecisionDataset:
+        """Only ``group_id`` is an inviolable split-grouping key. ``family_id``
+        is not: the judge compiler deliberately splits a family's own traces
+        across train/dev (fit/held-out), so enforcing this on family_id would
+        reject its normal output."""
+        split_by_group: dict[str, str] = {}
+        for e in self.examples:
+            if e.group_id is None:
+                continue
+            seen = split_by_group.get(e.group_id)
+            if seen is None:
+                split_by_group[e.group_id] = e.split
+            elif seen != e.split:
+                raise ValueError(
+                    f"group {e.group_id!r} appears in both split {seen!r} and {e.split!r}; "
+                    "rows sharing a group_id must stay in one split"
+                )
+        return self
+
+    @model_validator(mode="after")
     def every_row_matches_its_schema(self) -> DecisionDataset:
+        if self.decision_schema is None:
+            return self
         mismatched = [e.decision_id for e in self.examples if not e.matches_schema(self.decision_schema)]
         if mismatched:
             raise ValueError(
@@ -248,12 +373,36 @@ class DecisionDataset(Contract):
         return self
 
 
-def _vote_target(verdict: TurnVerdict) -> DecisionTarget:
+def _vote_shares(votes: tuple[int, ...]) -> dict[str, float]:
+    """Fraction of votes landing on each label, dense over -1/0/1 -- the
+    same computation as ``bandits.verify.nextstate._vote_shares``, kept
+    local rather than imported (that one is private to its own module).
+    Used to reconstruct ``judge_votes`` for a ``TurnVerdict`` that has
+    ``votes`` but no ``judge_votes`` -- an older record saved before that
+    field existed, or any producer that only ever set ``votes``."""
+    n = len(votes)
+    return {str(label): votes.count(label) / n for label in (-1, 0, 1)}
+
+
+def _judge_votes_or_reconstructed(verdict: TurnVerdict) -> dict[str, float] | None:
+    """``verdict.judge_votes`` when set; otherwise reconstructed from
+    ``verdict.votes`` when there are any to reconstruct from. A verdict with
+    neither (no votes were ever cast) has no distribution to report and
+    stays None -- the caller quarantines that case, it is not invented
+    here."""
+    if verdict.judge_votes is not None:
+        return verdict.judge_votes
+    if verdict.votes:
+        return _vote_shares(verdict.votes)
+    return None
+
+
+def _vote_target(judge_votes: dict[str, float]) -> DecisionTarget:
     """The judge's dense vote shares, remapped from score labels ("-1"/"0"/"1")
     to option names, as a soft target -- including a majority tie, which is
     itself the vote distribution and not collapsed toward any one option."""
     probabilities = {
-        _SCORE_TO_OPTION[int(label)]: share for label, share in verdict.judge_votes.items()
+        _SCORE_TO_OPTION[int(label)]: share for label, share in judge_votes.items()
     }
     for option in ACTION_OUTCOME_OPTIONS:
         probabilities.setdefault(option, 0.0)
@@ -391,7 +540,8 @@ def build_decision_dataset(
                 # to the judge at all, so there is nothing to report as failed.
                 previous_action = turn.action
                 continue
-            if verdict.score is None or verdict.judge_votes is None:
+            judge_votes = _judge_votes_or_reconstructed(verdict)
+            if verdict.score is None or judge_votes is None:
                 quarantined.append(
                     RejectedDecision(
                         trace_id=trace_id,
@@ -431,7 +581,7 @@ def build_decision_dataset(
                     question=ACTION_OUTCOME_QUESTION,
                     primitive="choice",
                     options=dict(ACTION_OUTCOME_OPTIONS),
-                    target=_vote_target(verdict),
+                    target=_vote_target(judge_votes),
                     label_source="judge_votes",
                     split=_family_split(task_set, family_id, trace_id),
                     lineage=DecisionLineage(
@@ -445,6 +595,7 @@ def build_decision_dataset(
                         turn_index=turn.index,
                         action_span_id=turn.action_span_id,
                     ),
+                    source="bandits_judge",
                     judge=DecisionJudgeInfo(
                         model=judge_run.model,
                         prompt_digest=judge_run.prompt_digest,
@@ -457,8 +608,8 @@ def build_decision_dataset(
             )
             previous_action = turn.action
 
-    fit = sum(1 for e in examples if e.split == "within_family_fit")
-    held_out = len(examples) - fit
+    train = sum(1 for e in examples if e.split == "train")
+    dev = len(examples) - train
     source_artifact_ids = (judge_run_id,) + ((task_set_id,) if task_set_id else ())
     return DecisionDataset(
         producer="action_outcome_judge_votes",
@@ -472,8 +623,8 @@ def build_decision_dataset(
         quarantined=tuple(quarantined),
         counts=DecisionDatasetCounts(
             examples=len(examples),
-            within_family_fit=fit,
-            within_family_held_out=held_out,
+            train=train,
+            dev=dev,
             quarantined=len(quarantined),
             votes_requested=judge_run.votes,
             votes_valid_min=min(votes_valid) if votes_valid else 0,
@@ -482,22 +633,22 @@ def build_decision_dataset(
     )
 
 
-def _family_split(
-    task_set: TaskSet | None, family_id: str, trace_id: str
-) -> Literal["within_family_fit", "within_family_held_out"]:
+def _family_split(task_set: TaskSet | None, family_id: str, trace_id: str) -> DecisionSplit:
     """A trace's split comes from its family's own fit/held-out membership,
     never a fresh random draw -- drawing one here could put two traces from
     the same family, or even a retry of the same episode, on opposite sides.
-    See ``DecisionExample.split`` for why this is a within-family split, not
-    an unseen-family one. Unplaced traces are quarantined by the caller
-    before this is reached, so the only remaining case without an explicit
-    task-set assignment is "no task set at all", which defaults to fit."""
+    Maps the task set's own fit -> train and held_out -> dev (see
+    ``DecisionExample.split``); this is a held-out-episode split within a
+    known family, not a held-out-family (unseen task) split. Unplaced traces
+    are quarantined by the caller before this is reached, so the only
+    remaining case without an explicit task-set assignment is "no task set at
+    all", which defaults to train."""
     if task_set is None:
-        return "within_family_fit"
+        return "train"
     family = task_set.family_by_id().get(family_id)
     if family is not None and trace_id in family.held_out_trace_ids:
-        return "within_family_held_out"
-    return "within_family_fit"
+        return "dev"
+    return "train"
 
 
 def build_decision_dataset_from_corpus(
@@ -535,8 +686,10 @@ def save_decision_dataset(dataset: DecisionDataset, store: DerivedStore) -> Deri
         payload=dataset.model_dump_json().encode(),
         summary={
             "examples": dataset.counts.examples,
-            "within_family_fit": dataset.counts.within_family_fit,
-            "within_family_held_out": dataset.counts.within_family_held_out,
+            "train": dataset.counts.train,
+            "dev": dataset.counts.dev,
+            "calibration": dataset.counts.calibration,
+            "test": dataset.counts.test,
             "quarantined": dataset.counts.quarantined,
         },
     )

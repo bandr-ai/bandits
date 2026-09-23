@@ -216,7 +216,7 @@ class TurnVerdict(Contract):
     """+1, 0 or −1. None when the turn was unobserved or the judge failed."""
 
     judge_votes: dict[str, float] | None = None
-    """Vote share for "-1", "0", "+1" among the votes actually cast. None
+    """Vote share for "-1", "0", "1" among the votes actually cast. None
     wherever ``score`` is None: an unobserved or failed turn has no votes to
     take a share of. This is disagreement among repeated calls to one judge,
     not a calibrated or ground-truth probability -- with one vote it is a
