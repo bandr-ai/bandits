@@ -22,8 +22,11 @@ uv sync --extra dev --extra train  # plus scoring and training a real model (GPU
 | --- | --- |
 | `jev dataset <judge-run>` | Turn a Bandits turn-judge run into a decision dataset (the verifier's vote shares become the labels) |
 | `jev import <file.jsonl>` | Import your own labeled decisions |
-| `jev score <dataset> --split dev` | Score a split with a frozen (untrained) model |
+| `jev score <dataset> --split dev` | Score a split with a frozen model, optionally with `--adapter` for a trained one |
 | `jev train <dataset>` | LoRA fine-tune on train; the best checkpoint is picked on dev |
+| `jev calibrate <scorer-run>` | Fit one temperature on the calibration split |
+| `jev import-predictions <file>` | Bring in another system's answers (e.g. real Jev) with its bill |
+| `jev report ...` | The scorecard: untrained vs trained vs calibrated vs Jev, with paired intervals |
 
 Run `uv run jev <command> --help` for options.
 
