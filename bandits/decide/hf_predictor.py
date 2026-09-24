@@ -77,10 +77,9 @@ class HFPredictor:
         """``adapter_path``, when given, loads a LoRA adapter (saved by
         ``HFTrainer.save_adapter``) on top of the pinned base model. This is
         how a trained checkpoint is scored through the exact same code path
-        as the frozen baseline -- ``HFTrainer`` uses this same class
-        internally for its own forward passes during training, so training
-        and post-training scoring can never silently diverge (see
-        ``hf_trainer.py``)."""
+        as the frozen baseline. ``HFTrainer`` scores dev through this class
+        too (``from_loaded``, wrapping its live model), and its loss reads
+        letters through the same ``encode_prompt``/``letter_token_id``."""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -100,6 +99,33 @@ class HFPredictor:
         self._model = model.to(device)
         self._model.eval()
         self._torch = torch
+
+    @classmethod
+    def from_loaded(
+        cls,
+        model,
+        tokenizer,
+        *,
+        model_id: str,
+        revision: str,
+        device: str,
+        dtype: str,
+        adapter_path: str | None = None,
+    ) -> HFPredictor:
+        """Wrap an already-loaded model, e.g. the trainer's live LoRA model,
+        so dev scoring doesn't load a second copy of the base weights."""
+        import torch
+
+        predictor = cls.__new__(cls)
+        predictor.model_id = model_id
+        predictor.revision = revision
+        predictor.device = device
+        predictor.dtype = dtype
+        predictor.adapter_path = adapter_path
+        predictor._tokenizer = tokenizer
+        predictor._model = model
+        predictor._torch = torch
+        return predictor
 
     def token_count(self, prompt: str) -> int:
         return len(self._tokenizer.encode(prompt))
@@ -122,6 +148,7 @@ class HFPredictor:
         # one raises on any tokenizer with no pad token configured (GPT-2,
         # Llama, Mistral, ...). The final position is simply the last token.
         inputs = encode_prompt(self._tokenizer, prompt, self.device, model_label=model_label)
+        self._model.eval()
         with torch.no_grad():
             outputs = self._model(**inputs)
         logits = outputs.logits[0, -1, :].float()
