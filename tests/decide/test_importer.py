@@ -337,6 +337,23 @@ def test_identical_content_with_conflicting_targets_quarantines_every_row() -> N
     assert all("conflicting targets" in q.reasons[0] for q in dataset.quarantined)
 
 
+def test_identical_content_in_different_splits_quarantines_every_row() -> None:
+    """Same content and target but one row in train and one in test is not
+    a harmless duplicate: keeping only the first would silently drop the
+    test row while its twin trains. Both rows are quarantined."""
+    lines = [
+        _row(split="train"),
+        _row(split="test"),
+        _row(question="unrelated question"),
+    ]
+    dataset = import_jsonl("\n".join(lines), source_file="demo.jsonl")
+
+    assert dataset.counts.examples == 1
+    assert dataset.examples[0].question == "unrelated question"
+    assert dataset.counts.quarantined == 2
+    assert all("conflicting split/group_id" in q.reasons[0] for q in dataset.quarantined)
+
+
 def test_renaming_the_source_file_does_not_reshuffle_splits_or_ids() -> None:
     """A row's own split and decision_id must come from its content, never
     the file path or line number -- a rename or reordered file must

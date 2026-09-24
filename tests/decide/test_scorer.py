@@ -14,9 +14,12 @@ from bandits.decide.scorer import (
     ScorerRun,
     TokenizationError,
     compute_scorer_run_id,
+    load_scorer_run,
+    save_scorer_run,
     score_dataset,
     score_example,
 )
+from bandits.store import DerivedStore
 
 
 def _example(options: dict[str, str] | None = None, target_option: str = "a") -> DecisionExample:
@@ -283,6 +286,22 @@ def test_scorer_run_id_is_independent_of_latency() -> None:
 
     assert compute_scorer_run_id(run) == compute_scorer_run_id(inflated_latency_run)
     assert run != inflated_latency_run  # the objects do differ; only the id ignores it
+
+
+def test_saving_an_exact_rerun_with_different_latency_returns_the_first_artifact(tmp_path) -> None:
+    """Same id, different stored latency: the store sees different bytes,
+    but it is the same logical result, so the save must not raise."""
+    store = DerivedStore(tmp_path)
+    run = score_dataset(FakePredictor(), [_example()], mode="single_order")
+    payload = run.model_dump(mode="json")
+    payload["results"][0]["latency_seconds"] += 999.0
+    rerun = ScorerRun.model_validate(payload)
+
+    first = save_scorer_run(run, store)
+    second = save_scorer_run(rerun, store)
+
+    assert second.artifact_id == first.artifact_id
+    assert load_scorer_run(first.artifact_id, store) == run
 
 
 def test_scorer_does_not_depend_on_traces_or_judge_code() -> None:
