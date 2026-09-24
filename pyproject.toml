@@ -23,8 +23,8 @@ emulate = [
 ]
 decide = [
     # Decision-model scoring, training and serving only. Lazy-imported so core
-    # stays at three dependencies and CI never needs a GPU or a model download;
-    # tests inject a fake tokenizer/model instead.
+    # stays at three dependencies. Its tests run a real tiny model on CPU in a
+    # separate CI job (quality.yml: decide) and are skipped without this extra.
     "torch>=2.2",
     "transformers>=4.44",
     "peft>=0.12",

@@ -16,7 +16,7 @@ import platform
 from importlib.metadata import version
 
 from bandits.decide.dataset import DecisionExample
-from bandits.decide.hf_predictor import HFPredictor, encode_prompt, letter_token_id
+from bandits.decide.hf_predictor import HFPredictor, encode_prompt, letter_token_ids
 from bandits.decide.prompt import build_prompt
 
 _TRAINING_STATE_FILE = "training_state.pt"
@@ -108,6 +108,11 @@ class HFTrainer:
         """Same count ``HFPredictor.token_count`` uses for its overlength check."""
         return len(self._tokenizer.encode(prompt))
 
+    def check_letters(self, prompt: str, letters) -> None:
+        """Raise ``TokenizationError`` if the scorer would reject this prompt's
+        letters, so training never learns from a row dev scoring can't read."""
+        letter_token_ids(self._tokenizer, prompt, letters, model_label=f"{self.model_id}@{self.revision}")
+
     def compute_loss(self, example: DecisionExample, *, option_order: dict[str, str] | None = None):
         """Cross-entropy over this example's option-letter logits at the
         answer position, target = the correct option's letter. ``option_order``
@@ -126,16 +131,13 @@ class HFTrainer:
         prompt, letters = build_prompt(example.state, example.question, options)
         model_label = f"{self.model_id}@{self.revision}"
 
-        letter_token_ids = {
-            letter: letter_token_id(self._tokenizer, prompt, letter, model_label=model_label)
-            for letter in letters.values()
-        }
+        letter_ids = letter_token_ids(self._tokenizer, prompt, letters.values(), model_label=model_label)
 
         inputs = encode_prompt(self._tokenizer, prompt, self.device, model_label=model_label)
         outputs = self._model(**inputs)
         logits = outputs.logits[0, -1, :].float()
 
-        candidate_ids = [letter_token_ids[letters[option_id]] for option_id in options]
+        candidate_ids = [letter_ids[letters[option_id]] for option_id in options]
         candidate_logits = logits[candidate_ids]
 
         target_probs = torch.tensor(
