@@ -5,9 +5,10 @@ import math
 
 import pytest
 
-from bandits.decide.dataset import DecisionExample, DecisionLineage, DecisionTarget
-from bandits.decide.prompt import MAX_OPTIONS, build_prompt
-from bandits.decide.scorer import (
+from bandits.store import DerivedStore
+from bandits_jev.dataset import DecisionExample, DecisionLineage, DecisionTarget
+from bandits_jev.prompt import MAX_OPTIONS, build_prompt
+from bandits_jev.scorer import (
     DecisionScoreResult,
     LogitPrediction,
     RejectedScore,
@@ -19,7 +20,6 @@ from bandits.decide.scorer import (
     score_dataset,
     score_example,
 )
-from bandits.store import DerivedStore
 
 
 def _example(options: dict[str, str] | None = None, target_option: str = "a") -> DecisionExample:
@@ -218,7 +218,7 @@ def test_generate_is_never_called() -> None:
     """Structural guarantee: the scorer module's source contains no call to
     `.generate(`, and the predictor protocol it depends on exposes no such
     method -- there is no code path through which it could be invoked."""
-    import bandits.decide.scorer as scorer_module
+    import bandits_jev.scorer as scorer_module
 
     source = inspect.getsource(scorer_module)
     assert ".generate(" not in source
@@ -305,7 +305,7 @@ def test_saving_an_exact_rerun_with_different_latency_returns_the_first_artifact
 
 
 def test_scorer_does_not_depend_on_traces_or_judge_code() -> None:
-    import bandits.decide.scorer as scorer_module
+    import bandits_jev.scorer as scorer_module
 
     source = inspect.getsource(scorer_module)
     assert "bandits.traces" not in source

@@ -1,16 +1,16 @@
 """A real ``LogitPredictor`` backed by a pinned Hugging Face model.
 
-One of two modules in ``bandits.decide`` allowed to import torch/transformers
+One of two modules in ``bandits_jev`` allowed to import torch/transformers
 (the other is ``hf_trainer.py``), and only inside function bodies --
 importing this module at all requires the ``decide`` extra, but *loading* it
-(importing ``bandits.decide.scorer`` or ``bandits.decide.dataset``) never
+(importing ``bandits_jev.scorer`` or ``bandits_jev.dataset``) never
 pulls torch in, since nothing else in the package imports this module at
 module scope.
 """
 
 from __future__ import annotations
 
-from bandits.decide.scorer import LogitPrediction, TokenizationError
+from bandits_jev.scorer import LogitPrediction, TokenizationError
 
 
 def letter_token_id(tokenizer, prompt: str, letter: str, *, model_label: str) -> int:

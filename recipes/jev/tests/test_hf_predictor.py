@@ -8,8 +8,8 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from bandits.decide.hf_predictor import encode_prompt
-from bandits.decide.scorer import TokenizationError
+from bandits_jev.hf_predictor import encode_prompt
+from bandits_jev.scorer import TokenizationError
 
 _MODEL_ID = "hf-internal-testing/tiny-random-gpt2"
 
