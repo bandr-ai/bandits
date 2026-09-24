@@ -161,13 +161,20 @@ def score_command(
     device: str = typer.Option("cuda", "--device"),
     dtype: str = typer.Option("bfloat16", "--dtype"),
     max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
+    adapter: Path = typer.Option(
+        None,
+        "--adapter",
+        help="A LoRA adapter directory (a decision-train checkpoint) to score on top of the base "
+        "model. Its digest is recorded in the run, so trained and untrained runs stay distinguishable.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Score a decision dataset's split with an untrained (frozen) model: one
-    forward pass per example, softmax over the option-letter logits."""
+    """Score a decision dataset's split with a frozen model -- the untrained
+    base, or the base plus a trained adapter: one forward pass per example,
+    softmax over the option-letter logits."""
     from bandits_jev.dataset import load_decision_dataset
     from bandits_jev.hf_predictor import HFPredictor
-    from bandits_jev.scorer import save_scorer_run, score_dataset
+    from bandits_jev.scorer import adapter_digest, save_scorer_run, score_dataset
 
     if split not in _DECISION_SPLITS:
         console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
@@ -191,7 +198,20 @@ def score_command(
         console.print(f"[yellow]no examples in split {split!r}[/yellow]")
         raise typer.Exit(code=1)
 
-    predictor = HFPredictor(model, revision=revision, device=device, dtype=dtype)
+    digest = None
+    if adapter is not None:
+        try:
+            digest = adapter_digest(adapter)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            console.print(f"[red]error:[/red] {adapter} is not a saved adapter: {exc}")
+            raise typer.Exit(code=1) from exc
+    predictor = HFPredictor(
+        model,
+        revision=revision,
+        device=device,
+        dtype=dtype,
+        adapter_path=str(adapter) if adapter is not None else None,
+    )
     mode = "two_order_average" if two_order else "single_order"
     run = score_dataset(
         predictor,
@@ -200,11 +220,158 @@ def score_command(
         max_prompt_tokens=max_prompt_tokens,
         dataset_id=dataset_id,
         split=split,
+        adapter_digest=digest,
     )
     envelope = save_scorer_run(run, store)
     console.print(f"scorer_run_id: {envelope.artifact_id}")
     console.print(f"scored:        {len(run.results)}")
     console.print(f"rejected:      {len(run.rejections)}")
+
+
+@app.command(name="import-predictions")
+def import_predictions_command(
+    path: Path = typer.Argument(..., help="JSONL: {decision_id, probabilities: {option_id: p}, latency_seconds?}."),
+    dataset_id: str = typer.Option(..., "--dataset", help="The decision dataset the predictions answer."),
+    name: str = typer.Option(..., "--name", help="Who produced them, e.g. jev."),
+    model: str = typer.Option(..., "--model", help="The producing model or API, as its provider names it."),
+    revision: str = typer.Option(..., "--revision", help="Model/API version, or the date it was called."),
+    split: str = typer.Option("test", "--split"),
+    cost_usd: float = typer.Option(None, "--cost-usd", help="The actual bill for producing these predictions."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Import another system's predictions (e.g. real Jev) as a scorer run,
+    so the evaluation report scores them with the same metrics. Items with no
+    valid prediction are recorded as rejections, never dropped."""
+    from bandits_jev.dataset import load_decision_dataset
+    from bandits_jev.scorer import import_predictions, save_scorer_run
+
+    if split not in _DECISION_SPLITS:
+        console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
+        raise typer.Exit(code=1)
+    store = _derived(project)
+    try:
+        dataset = load_decision_dataset(dataset_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
+        raise typer.Exit(code=1) from exc
+    examples = [e for e in dataset.examples if e.split == split]
+    try:
+        run = import_predictions(
+            path.read_text(encoding="utf-8"),
+            examples,
+            name=name,
+            model_id=model,
+            revision=revision,
+            dataset_id=dataset_id,
+            split=split,
+            cost_usd=cost_usd,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_scorer_run(run, store)
+    console.print(f"scorer_run_id: {envelope.artifact_id}")
+    console.print(f"scored:        {len(run.results)}")
+    console.print(f"rejected:      {len(run.rejections)}")
+
+
+@app.command(name="calibrate")
+def calibrate_command(
+    scorer_run_id: str = typer.Argument(..., help="A scorer run over the calibration split (trained model)."),
+    bins: int = typer.Option(10, "--bins", help="Fixed-width ECE bins."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Fit one temperature on a calibration-split scorer run's stored raw
+    logits. Refuses any other split."""
+    from bandits_jev.calibration import calibrate, save_calibration
+    from bandits_jev.dataset import load_decision_dataset
+    from bandits_jev.scorer import load_scorer_run
+
+    store = _derived(project)
+    try:
+        run = load_scorer_run(scorer_run_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no scorer run {scorer_run_id!r}")
+        raise typer.Exit(code=1) from exc
+    try:
+        if run.dataset_id is None:
+            raise ValueError("this scorer run does not record its dataset")
+        dataset = load_decision_dataset(run.dataset_id, store)
+        calibration = calibrate(
+            run,
+            scorer_run_id,
+            [e for e in dataset.examples if e.split == run.split],
+            n_bins=bins,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_calibration(calibration, store)
+    console.print(f"calibration_id: {envelope.artifact_id}")
+    console.print(f"temperature:    {calibration.temperature:.4f}")
+    if calibration.at_bound:
+        console.print("[yellow]warning:[/yellow] the fit hit the search bound; the range decided it, not the data")
+    console.print(f"rows:           {calibration.rows}")
+    console.print(f"nll:            {calibration.nll_before:.4f} -> {calibration.nll_after:.4f}")
+    console.print(f"brier:          {calibration.brier_before:.4f} -> {calibration.brier_after:.4f}")
+    console.print(f"ece:            {calibration.ece_before:.4f} -> {calibration.ece_after:.4f}")
+
+
+@app.command(name="report")
+def report_command(
+    untrained: str = typer.Option(..., "--untrained", help="Scorer run: base model, one option order."),
+    trained: str = typer.Option(..., "--trained", help="Scorer run: base + trained adapter."),
+    untrained_two_order: str = typer.Option(None, "--untrained-two-order", help="Scorer run: base model, two orders."),
+    calibration: str = typer.Option(None, "--calibration", help="`jev calibrate` result for the trained model."),
+    jev: str = typer.Option(None, "--jev", help="Imported Jev predictions run; the column shows 'not run' without it."),
+    external: list[str] = typer.Option(
+        [],
+        "--external",
+        help="UNTRAINED_RUN:TRAINED_RUN scored on a dataset the model never trained on. Repeatable.",
+    ),
+    draws: int = typer.Option(2000, "--draws", help="Bootstrap draws."),
+    seed: int = typer.Option(0, "--seed", help="Bootstrap seed."),
+    bins: int = typer.Option(10, "--bins", help="Fixed-width ECE / reliability bins."),
+    output: Path = typer.Option(..., "--output", help="Directory for report.json, report.md and charts."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Build the evaluation report from saved scorer runs and a calibration.
+    Scores nothing; the same artifacts always regenerate the same bytes."""
+    from bandits_jev.report import build_report, save_report, write_report
+
+    pairs = []
+    for item in external:
+        if item.count(":") != 1:
+            console.print(f"[red]error:[/red] --external must be UNTRAINED_RUN:TRAINED_RUN, got {item!r}")
+            raise typer.Exit(code=1)
+        pairs.append(tuple(item.split(":")))
+    store = _derived(project)
+    try:
+        report = build_report(
+            store,
+            untrained_run_id=untrained,
+            trained_run_id=trained,
+            untrained_two_order_run_id=untrained_two_order,
+            calibration_id=calibration,
+            jev_run_id=jev,
+            external=pairs,
+            draws=draws,
+            seed=seed,
+            n_bins=bins,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] missing artifact: {exc.filename or exc}")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_report(report, store)
+    written = write_report(report, output)
+    console.print(f"decision_report_id: {envelope.artifact_id}")
+    for path in written:
+        console.print(f"wrote:              {path}")
+    if report.test_usage is not None and any(not r.used_in_report for r in report.test_usage.runs):
+        console.print("[yellow]warning:[/yellow] the test split was scored by runs this report does not use")
 
 
 @app.command(name="train")
