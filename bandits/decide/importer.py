@@ -248,10 +248,10 @@ def _resolve_duplicate_content(
     of content alone -- it says nothing about the target. Two such rows
     with the *same* target are a harmless duplicate (keep the first, drop
     the redundant copy so downstream decision_id-keyed consumers never see
-    two rows under one id). Two such rows with *different* targets are a
-    real conflict -- the same decision has been given contradictory labels
-    -- and every row sharing that decision_id is quarantined rather than
-    silently picking a winner."""
+    two rows under one id). Two such rows with *different* targets, splits
+    or group_ids are a real conflict -- contradictory labels, or the same
+    decision placed on both sides of a split -- and every row sharing that
+    decision_id is quarantined rather than silently picking a winner."""
     by_decision_id: dict[str, list[DecisionExample]] = {}
     for e in examples:
         by_decision_id.setdefault(e.decision_id, []).append(e)
@@ -263,12 +263,16 @@ def _resolve_duplicate_content(
             kept.append(group[0])
             continue
         targets = {tuple(sorted(e.target.probabilities.items())) for e in group}
-        if len(targets) == 1:
-            # Identical content, identical target: a harmless duplicate.
-            # Keep the first occurrence only, so the decision_id stays
-            # unique among accepted rows.
+        placements = {(e.split, e.group_id) for e in group}
+        if len(targets) == 1 and len(placements) == 1:
+            # Identical content, target, split and group: a harmless
+            # duplicate. Keep the first occurrence only, so the decision_id
+            # stays unique among accepted rows.
             kept.append(group[0])
             continue
+        # Same content placed in different splits/groups would leak (e.g. a
+        # test row silently dropped while its twin stays in train).
+        conflict = "targets" if len(targets) > 1 else "split/group_id"
         for e in group:
             newly_quarantined.append(
                 RejectedDecision(
@@ -277,7 +281,7 @@ def _resolve_duplicate_content(
                     source_line=e.lineage.source_line,
                     reasons=(
                         f"decision_id {decision_id!r} (same state+question+options, no "
-                        "explicit id) is given conflicting targets by different rows in "
+                        f"explicit id) is given conflicting {conflict} by different rows in "
                         "this import",
                     ),
                 )
