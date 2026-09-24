@@ -18,9 +18,11 @@ import random
 from pathlib import Path
 from typing import Protocol
 
+from pydantic import Field
+
 from bandits.decide.dataset import DecisionExample
 from bandits.decide.prompt import PROMPT_VERSION, build_prompt, template_digest
-from bandits.decide.scorer import LogitPredictor, ScoreMode, score_dataset
+from bandits.decide.scorer import LogitPredictor, ScoreMode, TokenizationError, score_dataset
 from bandits.store import Contract, DerivedEnvelope, DerivedStore
 
 DEFAULT_LORA_RANK = 16
@@ -45,6 +47,8 @@ class Trainable(Protocol):
 
     def token_count(self, prompt: str) -> int: ...
 
+    def check_letters(self, prompt: str, letters) -> None: ...
+
     def train_step(
         self, examples: list[DecisionExample], *, option_orders: list[dict[str, str]] | None = None
     ) -> float: ...
@@ -59,9 +63,9 @@ class Trainable(Protocol):
 
 
 class LoRAConfig(Contract):
-    rank: int = DEFAULT_LORA_RANK
-    alpha: int = DEFAULT_LORA_ALPHA
-    dropout: float = DEFAULT_LORA_DROPOUT
+    rank: int = Field(DEFAULT_LORA_RANK, ge=1)
+    alpha: int = Field(DEFAULT_LORA_ALPHA, ge=1)
+    dropout: float = Field(DEFAULT_LORA_DROPOUT, ge=0.0, lt=1.0)
     target_modules: str = "all-linear"
 
 
@@ -72,15 +76,16 @@ class TrainingRunConfig(Contract):
     prompt_version: int
     template_digest: str
     lora: LoRAConfig
-    learning_rate: float = DEFAULT_LEARNING_RATE
-    warmup_ratio: float = DEFAULT_WARMUP_RATIO
+    learning_rate: float = Field(DEFAULT_LEARNING_RATE, gt=0.0)
+    warmup_ratio: float = Field(DEFAULT_WARMUP_RATIO, ge=0.0, lt=1.0)
     """Fraction of total steps spent warming up linearly to ``learning_rate``;
     linear decay to zero after that."""
-    effective_batch: int = DEFAULT_EFFECTIVE_BATCH
-    epochs: int = 1
+    effective_batch: int = Field(DEFAULT_EFFECTIVE_BATCH, ge=1)
+    epochs: int = Field(1, ge=1)
     seed: int
-    eval_every_steps: int
-    max_prompt_tokens: int = 8_000
+    eval_every_steps: int = Field(ge=0)
+    """0 = score only the final checkpoint."""
+    max_prompt_tokens: int = Field(8_000, ge=1)
     dtype: str = "bfloat16"
     device: str = "cuda"
 
@@ -116,8 +121,8 @@ class TrainingRun(Contract):
     final_train_loss: float
     steps_completed: int
     rejected_train: tuple[RejectedTrainExample, ...]
-    """Train rows never trained on (e.g. over ``max_prompt_tokens``); overlength
-    rows are rejected, never truncated."""
+    """Train rows never trained on: over ``max_prompt_tokens`` (rejected,
+    never truncated) or failing the letter-token contract."""
 
 
 class _Progress(Contract):
@@ -158,28 +163,32 @@ def build_data_order(
     return order
 
 
-def reject_overlength(
+def reject_unscorable(
     trainable: Trainable,
     order: list[tuple[DecisionExample, dict[str, str]]],
     *,
     max_prompt_tokens: int,
 ) -> tuple[list[tuple[DecisionExample, dict[str, str]]], list[RejectedTrainExample]]:
-    """Drop every data-order entry whose rendered prompt is over
-    ``max_prompt_tokens`` (same count and limit the scorer applies), and
-    record each rejected row once. Deterministic, so a resume re-derives
-    the same filtered order."""
+    """Drop every data-order entry the scorer would reject: prompt over
+    ``max_prompt_tokens`` (same count and limit), or option letters that
+    are not distinct single tokens. Each rejected row is recorded once.
+    Deterministic, so a resume re-derives the same filtered order."""
     kept: list[tuple[DecisionExample, dict[str, str]]] = []
     rejected: dict[str, RejectedTrainExample] = {}
     for example, options in order:
-        prompt, _letters = build_prompt(example.state, example.question, options)
+        prompt, letters = build_prompt(example.state, example.question, options)
+        reason = None
         tokens = trainable.token_count(prompt)
         if tokens > max_prompt_tokens:
+            reason = f"prompt is {tokens} tokens, over the {max_prompt_tokens}-token limit"
+        else:
+            try:
+                trainable.check_letters(prompt, list(letters.values()))
+            except TokenizationError as exc:
+                reason = str(exc)
+        if reason is not None:
             rejected.setdefault(
-                example.decision_id,
-                RejectedTrainExample(
-                    decision_id=example.decision_id,
-                    reasons=(f"prompt is {tokens} tokens, over the {max_prompt_tokens}-token limit",),
-                ),
+                example.decision_id, RejectedTrainExample(decision_id=example.decision_id, reasons=(reason,))
             )
             continue
         kept.append((example, options))
@@ -301,6 +310,19 @@ def _load_progress(checkpoint_dir: str, step: int, config: TrainingRunConfig) ->
     return progress
 
 
+def check_checkpoint_dir(checkpoint_dir: str, resume_from_step: int) -> None:
+    """Cheap pre-flight checks, callable before any model is loaded. A fresh
+    run must not write into a directory holding another run's checkpoints:
+    saving would silently overwrite their adapters and training state."""
+    if resume_from_step < 0:
+        raise ValueError(f"resume_from_step must be >= 0, got {resume_from_step}")
+    if resume_from_step == 0 and any(Path(checkpoint_dir).glob("step-*")):
+        raise ValueError(
+            f"{checkpoint_dir} already holds checkpoints; a fresh run would overwrite them. "
+            "Use a new --checkpoint-dir, or --resume-from-step to continue that run"
+        )
+
+
 def train(
     trainable: Trainable,
     config: TrainingRunConfig,
@@ -319,13 +341,14 @@ def train(
     exactly the remaining suffix, and weights, optimizer and scheduler pick
     up where they stopped.
     """
+    check_checkpoint_dir(checkpoint_dir, resume_from_step)
     if not train_examples:
         raise ValueError("cannot train on an empty train split")
     if not dev_examples:
         raise ValueError("cannot train without a dev split: checkpoints are selected by dev")
 
     order = build_data_order(train_examples, epochs=config.epochs, seed=config.seed)
-    order, rejected_train = reject_overlength(trainable, order, max_prompt_tokens=config.max_prompt_tokens)
+    order, rejected_train = reject_unscorable(trainable, order, max_prompt_tokens=config.max_prompt_tokens)
     if not order:
         raise ValueError("every train example was rejected; nothing to train on")
     batches = _batches(order, config.effective_batch)

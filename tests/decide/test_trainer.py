@@ -310,3 +310,63 @@ def test_training_run_round_trips_through_store(tmp_path) -> None:
     store = DerivedStore(tmp_path / "store")
     envelope = save_training_run(run, store)
     assert load_training_run(envelope.artifact_id, store) == run
+
+
+def test_fresh_run_refuses_a_checkpoint_dir_holding_another_runs_checkpoints(tmp_path) -> None:
+    """A fresh run into a used --checkpoint-dir would overwrite that run's
+    adapters and training state; it must refuse before training."""
+    _run(_config(), tmp_path / "checkpoints")
+    before = _adapter_weights(tmp_path / "checkpoints/step-3")
+    with pytest.raises(ValueError, match="already holds checkpoints"):
+        _run(_config(seed=99), tmp_path / "checkpoints")
+    assert _same_weights(before, _adapter_weights(tmp_path / "checkpoints/step-3"))
+
+
+def test_negative_resume_step_raises(tmp_path) -> None:
+    with pytest.raises(ValueError, match="resume_from_step must be >= 0"):
+        _run(_config(), tmp_path / "checkpoints", resume_from_step=-1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"effective_batch": 0},
+        {"epochs": 0},
+        {"eval_every_steps": -1},
+        {"learning_rate": 0.0},
+        {"warmup_ratio": 1.0},
+        {"lora_dropout": 1.0},
+        {"lora_rank": 0},
+        {"max_prompt_tokens": 0},
+    ],
+)
+def test_invalid_training_settings_fail_at_config_time(overrides) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _config(**overrides)
+
+
+def test_rows_failing_the_letter_contract_are_rejected_not_trained_on(tmp_path) -> None:
+    """A row the scorer would reject (letters not distinct tokens) must not
+    be trained on either. Real HFTrainer; only its letter check is made to
+    fail for one row, since the tiny tokenizer has no colliding letters."""
+    from bandits.decide.scorer import TokenizationError
+
+    class CollidingTrainer(HFTrainer):
+        def check_letters(self, prompt, letters) -> None:
+            if "collide" in prompt:
+                raise TokenizationError("requested letters do not map to distinct tokens")
+            super().check_letters(prompt, letters)
+
+    config = _config()
+    trainer = CollidingTrainer.from_config(config)
+    run = _run(
+        config,
+        tmp_path / "checkpoints",
+        trainer=trainer,
+        train_examples=[*_train_examples(), _example("train-collide", "collide", "a")],
+    )
+    assert [r.decision_id for r in run.rejected_train] == ["train-collide"]
+    assert "distinct tokens" in run.rejected_train[0].reasons[0]
+    assert run.steps_completed == 3

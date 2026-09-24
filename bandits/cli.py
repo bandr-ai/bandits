@@ -1068,9 +1068,16 @@ def decision_train_command(
     """LoRA SFT on a decision dataset's train split, evaluated against dev.
     Named decision-train, never sft -- that word already means export
     (build-sft/export-nextstate) elsewhere in Bandits."""
+    from pydantic import ValidationError
+
     from bandits.decide.dataset import load_decision_dataset
     from bandits.decide.hf_trainer import HFTrainer
-    from bandits.decide.trainer import build_training_config, save_training_run, train
+    from bandits.decide.trainer import (
+        build_training_config,
+        check_checkpoint_dir,
+        save_training_run,
+        train,
+    )
 
     store = _derived(project)
     try:
@@ -1088,23 +1095,32 @@ def decision_train_command(
         console.print("[red]error:[/red] no examples in the dev split; checkpoints are selected by dev")
         raise typer.Exit(code=1)
 
-    config = build_training_config(
-        base_model_id=model,
-        base_revision=revision,
-        dataset_id=dataset_id,
-        seed=seed,
-        eval_every_steps=eval_every_steps,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        learning_rate=learning_rate,
-        warmup_ratio=warmup_ratio,
-        effective_batch=effective_batch,
-        epochs=epochs,
-        max_prompt_tokens=max_prompt_tokens,
-        dtype=dtype,
-        device=device,
-    )
+    try:
+        config = build_training_config(
+            base_model_id=model,
+            base_revision=revision,
+            dataset_id=dataset_id,
+            seed=seed,
+            eval_every_steps=eval_every_steps,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+            effective_batch=effective_batch,
+            epochs=epochs,
+            max_prompt_tokens=max_prompt_tokens,
+            dtype=dtype,
+            device=device,
+        )
+    except ValidationError as exc:
+        console.print(f"[red]error:[/red] invalid training settings:\n{exc}")
+        raise typer.Exit(code=1) from exc
+    try:
+        check_checkpoint_dir(str(checkpoint_dir), resume_from_step)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     trainer = HFTrainer.from_config(config)
     try:
         run = train(

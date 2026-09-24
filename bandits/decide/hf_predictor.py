@@ -59,6 +59,17 @@ def encode_prompt(tokenizer, prompt: str, device: str, *, model_label: str):
     return inputs.to(device)
 
 
+def letter_token_ids(tokenizer, prompt: str, letters, *, model_label: str) -> dict[str, int]:
+    """``letter_token_id`` for every letter, plus the check that no two
+    letters share a token -- otherwise their logits are the same number and
+    the options cannot be told apart. Shared by the predictor and the
+    trainer so both accept and reject exactly the same prompts."""
+    ids = {letter: letter_token_id(tokenizer, prompt, letter, model_label=model_label) for letter in letters}
+    if len(set(ids.values())) != len(ids):
+        raise TokenizationError(f"requested letters do not map to distinct tokens: {ids}")
+    return ids
+
+
 class HFPredictor:
     """One forward pass over a frozen (or LoRA-adapted) causal LM, never
     ``generate()``. Pinned to an exact model id + revision so a scorer run
@@ -133,15 +144,7 @@ class HFPredictor:
     def predict(self, prompt: str, letters: list[str]) -> LogitPrediction:
         torch = self._torch
         model_label = f"{self.model_id}@{self.revision}"
-        letter_token_ids = {
-            letter: letter_token_id(self._tokenizer, prompt, letter, model_label=model_label)
-            for letter in letters
-        }
-        distinct = set(letter_token_ids.values())
-        if len(distinct) != len(letter_token_ids):
-            raise TokenizationError(
-                f"requested letters do not map to distinct tokens: {letter_token_ids}"
-            )
+        letter_ids = letter_token_ids(self._tokenizer, prompt, letters, model_label=model_label)
 
         # No padding: we tokenize and score exactly one prompt per call, so
         # there is nothing to pad against, and `padding=True` on a batch of
@@ -153,6 +156,6 @@ class HFPredictor:
             outputs = self._model(**inputs)
         logits = outputs.logits[0, -1, :].float()
 
-        letter_logits = {letter: float(logits[token_id].item()) for letter, token_id in letter_token_ids.items()}
+        letter_logits = {letter: float(logits[token_id].item()) for letter, token_id in letter_ids.items()}
         full_vocab_logsumexp = float(torch.logsumexp(logits, dim=-1).item())
         return LogitPrediction(letter_logits=letter_logits, full_vocab_logsumexp=full_vocab_logsumexp)
