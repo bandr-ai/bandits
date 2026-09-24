@@ -23,7 +23,7 @@ from bandits.decide.prompt import (
     prompt_digest,
     template_digest,
 )
-from bandits.store import Contract, DerivedEnvelope, DerivedStore
+from bandits.store import ArtifactConflict, Contract, DerivedEnvelope, DerivedStore
 
 DEFAULT_MAX_PROMPT_TOKENS = 8_000
 ScoreMode = Literal["single_order", "two_order_average"]
@@ -287,24 +287,38 @@ def compute_scorer_run_id(run: ScorerRun) -> str:
     result rather than minted as a new artifact every time. ``latency_seconds``
     is excluded from the hashed payload for exactly that reason -- it stays
     in the stored payload (``save_scorer_run``), just not in identity."""
-    payload = run.model_dump(mode="json")
-    for result in payload["results"]:
-        result.pop("latency_seconds", None)
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    digest = hashlib.sha256(_identity_json(run).encode()).hexdigest()
     return f"decision-scorer-run-{digest[:16]}"
 
 
+def _identity_json(run: ScorerRun) -> str:
+    payload = run.model_dump(mode="json")
+    for result in payload["results"]:
+        result.pop("latency_seconds", None)
+    return json.dumps(payload, sort_keys=True)
+
+
 def save_scorer_run(run: ScorerRun, store: DerivedStore) -> DerivedEnvelope:
-    return store.write(
-        compute_scorer_run_id(run),
-        kind="decision_scorer_run",
-        parent_artifact_id=run.dataset_id or run.model_id,
-        payload=run.model_dump_json().encode(),
-        summary={
-            "results": len(run.results),
-            "rejections": len(run.rejections),
-        },
-    )
+    """An exact rerun has the same id but a different stored latency, so the
+    store sees different bytes. That is the same logical result: keep the
+    first run's payload and return its envelope. Any other difference under
+    the same id is a real conflict and still raises."""
+    run_id = compute_scorer_run_id(run)
+    try:
+        return store.write(
+            run_id,
+            kind="decision_scorer_run",
+            parent_artifact_id=run.dataset_id or run.model_id,
+            payload=run.model_dump_json().encode(),
+            summary={
+                "results": len(run.results),
+                "rejections": len(run.rejections),
+            },
+        )
+    except ArtifactConflict:
+        if _identity_json(load_scorer_run(run_id, store)) != _identity_json(run):
+            raise
+        return store.read_envelope(run_id)
 
 
 def load_scorer_run(scorer_run_id: str, store: DerivedStore) -> ScorerRun:
