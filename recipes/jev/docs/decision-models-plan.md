@@ -21,7 +21,7 @@ A "Jev-style model" here means: a normal LLM that reads a state, a question and 
 
 | Decision | Choice |
 | --- | --- |
-| Where | Everything inside the Bandits repo (`bandits/decide/`). Heavy deps (torch, transformers, peft) in an optional `decide` extra. |
+| Where | A recipe on top of Bandits: `recipes/jev/` (package `bandits_jev`, command `jev`). It reads Bandits core (traces, judge runs, the artifact store) and core never imports it. Heavy deps (torch, transformers, peft) in the recipe's own `train` extra. |
 | Training method | **SFT only**: cross-entropy on the option logits, LoRA. No RL, no "RLCD". |
 | Recipe | **Nimble-style core** (LoRA r16 on all linear layers of a 4B/9B Qwen, cross-entropy over A–Z option-letter logits, LR 5e-5, batch 8, 1 epoch; full recipe in A2) **+ AutoJev's calibration and discipline** (option shuffling, temperature on its own split, checkpoint picked on dev). Not AutoJev's 27B full-weight training or 255-slot head (needs an H200 + ~389 GB RAM). |
 | Confidence | One temperature per trained model, fitted on a separate calibration split. |
@@ -44,17 +44,17 @@ A "Jev-style model" here means: a normal LLM that reads a state, a question and 
 | Existing piece | Where | Use in V3 |
 | --- | --- | --- |
 | Content-addressed artifact store | `bandits/store.py` (`DerivedStore`) | Save datasets, scorer runs, training runs, calibrations, bundles |
-| Typer CLI | `bandits/cli.py` (already has `decision-dataset`) | Add `decision-import`, `decision-score`, `decision-train`, … |
+| Typer CLI | the recipe's own `jev` command (`bandits_jev/cli.py`) | `jev dataset`, `jev import`, `jev score`, `jev train`, … |
 | Optional-extra pattern | `pyproject.toml` (`audit`, `emulate` extras) | New `decide` extra for torch/transformers/peft |
 | Tests inject a fake predictor | existing test suite | Fake tiny model for scorer/trainer tests |
-| Brier, ECE, reliability bins | `scripts/trail_nextstate_eval.py` (binary, script-only) | Move into `bandits/decide/metrics.py`, extend to multi-option |
+| Brier, ECE, reliability bins | `scripts/trail_nextstate_eval.py` (binary, script-only) | Move into `bandits_jev/metrics.py`, extend to multi-option |
 | Percentile bootstrap | `bandits/emulate/report.py` (`_bootstrap_mean_interval`) | Generalize to paired, grouped bootstrap |
 | Retrying HTTP client | `bandits/transport.py` (Fireworks-specific) | Pattern for the Jev API client |
 
 Watch-outs:
 - **No web server or UI exists in Bandits.** The UI and `/v1/decisions` API add the first server dependency (FastAPI/uvicorn) → put them in the `decide` extra or a `ui` extra, not core.
 - **No torch anywhere yet.** Core stays at three dependencies; everything heavy is lazy-imported.
-- **"SFT" already means something in Bandits**: `build-sft` / `export-nextstate` *export* chat SFT rows for training an agent. Our feature *trains* a decision model. Use distinct names (`decision-train`, never `sft`) to avoid confusion.
+- **"SFT" already means something in Bandits**: `build-sft` / `export-nextstate` *export* chat SFT rows for training an agent. Our feature *trains* a decision model. Use distinct names (`jev train`, never `sft`) to avoid confusion.
 
 ## 4. Track A: the launch path (build this now)
 
@@ -106,7 +106,7 @@ Done when: each candidate's label source and license checked, and the success ba
   - rejected rows point at a source record (file + line number, or trace + turn) instead of always a trace;
   - judge-only count fields become optional.
   The existing judge compiler stays and keeps passing its tests as one producer.
-- `bandits decision-import file.jsonl` → that format. Hard or soft labels, optional split/group/source/license fields, bad lines quarantined with line number and reason.
+- `jev import file.jsonl` → that format. Hard or soft labels, optional split/group/source/license fields, bad lines quarantined with line number and reason.
 - A JevBench importer built on top of it (keeps each item's source and license).
 - One versioned prompt builder used everywhere (scoring, training, serving). The prompt text is hashed and saved with every result.
 - Scorer: one forward pass → option-letter logits → softmax. Raw logits kept. Checks that each letter is one token. Rejects prompts over the length limit (8k tokens to start, configurable) instead of cutting them.

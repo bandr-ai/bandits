@@ -4,7 +4,7 @@ allowed option-letter logits. Never calls ``generate()``.
 The heavy model lives behind a small ``LogitPredictor`` protocol so tests run
 against a fake tokenizer/model with no download and no GPU; a real HF/torch
 predictor is a thin adapter over the same protocol, implemented in
-``bandits.decide.hf_predictor`` (the only module in this package allowed to
+``bandits_jev.hf_predictor`` (the only module in this package allowed to
 import torch, and imported lazily from there).
 """
 
@@ -16,14 +16,14 @@ import math
 import time
 from typing import Literal, Protocol
 
-from bandits.decide.dataset import DecisionExample
-from bandits.decide.prompt import (
+from bandits.store import ArtifactConflict, Contract, DerivedEnvelope, DerivedStore
+from bandits_jev.dataset import DecisionExample
+from bandits_jev.prompt import (
     PROMPT_VERSION,
     build_prompt,
     prompt_digest,
     template_digest,
 )
-from bandits.store import ArtifactConflict, Contract, DerivedEnvelope, DerivedStore
 
 DEFAULT_MAX_PROMPT_TOKENS = 8_000
 ScoreMode = Literal["single_order", "two_order_average"]

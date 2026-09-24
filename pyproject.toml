@@ -21,14 +21,6 @@ emulate = [
     "dspy[deno]>=3.3.1",
     "jsonschema>=4.23",
 ]
-decide = [
-    # Decision-model scoring, training and serving only. Lazy-imported so core
-    # stays at three dependencies. Its tests run a real tiny model on CPU in a
-    # separate CI job (quality.yml: decide) and are skipped without this extra.
-    "torch>=2.2",
-    "transformers>=4.44",
-    "peft>=0.12",
-]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
