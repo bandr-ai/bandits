@@ -13,7 +13,7 @@ probabilities can never drift apart by construction.
 from __future__ import annotations
 
 from bandits.decide.dataset import DecisionExample
-from bandits.decide.hf_predictor import letter_token_id
+from bandits.decide.hf_predictor import encode_prompt, letter_token_id
 from bandits.decide.prompt import build_prompt
 
 
@@ -89,7 +89,7 @@ class HFTrainer:
             for letter in letters.values()
         }
 
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = encode_prompt(self._tokenizer, prompt, self.device, model_label=model_label)
         outputs = self._model(**inputs)
         logits = outputs.logits[0, -1, :]
 

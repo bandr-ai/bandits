@@ -43,6 +43,22 @@ def letter_token_id(tokenizer, prompt: str, letter: str, *, model_label: str) ->
     return answer_ids[0]
 
 
+def encode_prompt(tokenizer, prompt: str, device: str, *, model_label: str):
+    """Tokenize ``prompt`` for a forward pass whose last position must be the
+    answer cue. A tokenizer configured to append a special token (e.g.
+    ``add_eos_token=True``) would move the readout to after that token, so
+    reject it instead of reading the wrong position. Shared by the frozen
+    predictor and the trainer."""
+    inputs = tokenizer(prompt, return_tensors="pt")
+    base_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if int(inputs["input_ids"][0, -1]) != base_ids[-1]:
+        raise TokenizationError(
+            f"tokenizer for {model_label} appends a trailing special token; "
+            "the final position is not the answer cue"
+        )
+    return inputs.to(device)
+
+
 class HFPredictor:
     """One forward pass over a frozen (or LoRA-adapted) causal LM, never
     ``generate()``. Pinned to an exact model id + revision so a scorer run
@@ -105,7 +121,7 @@ class HFPredictor:
         # there is nothing to pad against, and `padding=True` on a batch of
         # one raises on any tokenizer with no pad token configured (GPT-2,
         # Llama, Mistral, ...). The final position is simply the last token.
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = encode_prompt(self._tokenizer, prompt, self.device, model_label=model_label)
         with torch.no_grad():
             outputs = self._model(**inputs)
         logits = outputs.logits[0, -1, :].float()
