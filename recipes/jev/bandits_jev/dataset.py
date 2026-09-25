@@ -802,6 +802,7 @@ def merge_decision_datasets(parts: Sequence[tuple[str, DecisionDataset]]) -> Dec
     if len(parts) < 2:
         raise ValueError("merging needs at least two datasets")
     seen: dict[str, str] = {}
+    seen_steps: dict[tuple[str, int], str] = {}
     for dataset_id, dataset in parts:
         for example in dataset.examples:
             if example.decision_id in seen:
@@ -809,6 +810,17 @@ def merge_decision_datasets(parts: Sequence[tuple[str, DecisionDataset]]) -> Dec
                     f"decision {example.decision_id} is in both {seen[example.decision_id]} and {dataset_id}"
                 )
             seen[example.decision_id] = dataset_id
+            # Two judge runs over the same traces give the same step two
+            # decision ids: the merged dataset would train on it twice, and
+            # its verifier cost could not be attributed between the runs.
+            step = (example.lineage.trace_id, example.lineage.turn_index)
+            if step[0] is not None and step[1] is not None:
+                if step in seen_steps and seen_steps[step] != dataset_id:
+                    raise ValueError(
+                        f"trace {step[0]!r} turn {step[1]} is in both {seen_steps[step]} and {dataset_id} "
+                        "(two judge runs over the same traces); merge only one run per trace"
+                    )
+                seen_steps[step] = dataset_id
     schemas = {d.decision_schema.model_dump_json() if d.decision_schema else None for _, d in parts}
     schema = parts[0][1].decision_schema if len(schemas) == 1 else None
     examples = tuple(e for _, d in parts for e in d.examples)

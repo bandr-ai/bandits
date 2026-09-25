@@ -754,3 +754,15 @@ def test_as_test_only_moves_every_row_to_test_and_keeps_groups_valid() -> None:
     assert {e.split for e in held_out.examples} == {"test"}
     assert held_out.counts.test == held_out.counts.examples == dataset.counts.examples
     assert (held_out.counts.train, held_out.counts.dev, held_out.counts.calibration) == (0, 0, 0)
+
+
+def test_merge_refuses_the_same_step_from_two_judge_runs() -> None:
+    from bandits_jev.dataset import merge_decision_datasets
+
+    traces = [_trace(f"s{i}") for i in range(5)]
+    verdicts = [v for t in traces for v in _all_observed_verdicts(t)]
+    first = build_decision_dataset_from_corpus(traces, _run(traces, verdicts), "judge-run-1")
+    second = build_decision_dataset_from_corpus(traces, _run(traces, verdicts), "judge-run-2")
+
+    with pytest.raises(ValueError, match="two judge runs over the same traces"):
+        merge_decision_datasets([("ds-1", first), ("ds-2", second)])

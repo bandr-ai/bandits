@@ -30,6 +30,8 @@
 #   DEVICE, DTYPE  default: cuda, bfloat16 (DEVICE=cpu DTYPE=float32 with a tiny model rehearses
 #                  the whole script without a GPU)
 #   SKIP_INSTALL=1 reuse the recipe's existing environment as is
+#   PROJECT_DIR  default: $OUT/project. Point phase 2 at phase 1's project so its finished
+#                training runs and checkpoints are reused instead of retrained
 #   OUT          default: runs/jev-<UTC timestamp>
 #
 # Example:
@@ -64,7 +66,7 @@ DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
 OUT="$(realpath -m "${OUT:-runs/jev-phase$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}")"
 RECIPE="$(cd "$(dirname "$0")/.." && pwd)"
-PROJECT="$OUT/project"
+PROJECT="$(realpath -m "${PROJECT_DIR:-$OUT/project}")"
 
 log() { printf '\n== %s\n' "$*"; }
 

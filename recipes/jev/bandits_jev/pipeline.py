@@ -180,6 +180,9 @@ def run_pipeline(
     training = [e for e in dataset.examples if e.split != "test"]
     training_ids = {e.decision_id for e in training}
     training_traces = {e.lineage.trace_id for e in training if e.lineage.trace_id is not None}
+    # group_id is the split's own unit: a lineage for judged traces (retries
+    # of one session share it), the group or content key for imported rows.
+    training_groups = {e.group_id for e in training if e.group_id is not None}
     for held_out_id in held_out_dataset_ids:
         if held_out_id == dataset_id:
             raise ValueError("a held-out dataset must not be the training dataset")
@@ -190,11 +193,13 @@ def run_pipeline(
         leaked = [
             e.decision_id
             for e in rows
-            if e.decision_id in training_ids or (e.lineage.trace_id is not None and e.lineage.trace_id in training_traces)
+            if e.decision_id in training_ids
+            or (e.lineage.trace_id is not None and e.lineage.trace_id in training_traces)
+            or (e.group_id is not None and e.group_id in training_groups)
         ]
         if leaked:
             raise ValueError(
-                f"{len(leaked)} held-out row(s) of {held_out_id} come from traces also used in training "
+                f"{len(leaked)} held-out row(s) of {held_out_id} share a trace or group (lineage) with training "
                 f"(train, dev or calibration): {leaked[:3]}"
             )
         if not rows:
