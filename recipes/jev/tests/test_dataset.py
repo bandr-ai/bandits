@@ -307,14 +307,52 @@ def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None
     assert all(len(sides) == 1 for sides in by_trace.values())
 
 
-def test_no_task_set_defaults_every_example_to_train() -> None:
-    trace = _trace("a")
-    verdicts = _all_observed_verdicts(trace)
-    run = _run([trace], verdicts)
-    dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
+def test_no_task_set_splits_by_trace_into_all_four_splits() -> None:
+    traces = [_trace(f"t{i}") for i in range(60)]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+    run = _run(traces, verdicts)
+    dataset = build_decision_dataset_from_corpus(traces, run, "judge-run-1")
 
-    assert all(r.split == "train" for r in dataset.examples)
+    by_trace: dict[str, set[str]] = {}
+    for row in dataset.examples:
+        by_trace.setdefault(row.lineage.trace_id, set()).add(row.split)
+    assert all(len(sides) == 1 for sides in by_trace.values())  # no trace straddles splits
+    assert {r.split for r in dataset.examples} == {"train", "dev", "calibration", "test"}
     assert dataset.source_task_set_id is None
+    counts = dataset.counts
+    assert (counts.train, counts.dev, counts.calibration, counts.test) == tuple(
+        sum(1 for r in dataset.examples if r.split == s) for s in ("train", "dev", "calibration", "test")
+    )
+
+
+def test_trace_split_is_stable_across_compiles_and_trace_order() -> None:
+    traces = [_trace(f"t{i}") for i in range(20)]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+    first = build_decision_dataset_from_corpus(traces, _run(traces, verdicts), "judge-run-1")
+    second = build_decision_dataset_from_corpus(
+        list(reversed(traces)), _run(traces, verdicts), "judge-run-1"
+    )
+
+    assert {r.decision_id: r.split for r in first.examples} == {
+        r.decision_id: r.split for r in second.examples
+    }
+
+
+def test_every_row_is_grouped_by_its_trace() -> None:
+    fit_trace, held_out_trace = _trace("a"), _trace("b")
+    verdicts = _all_observed_verdicts(fit_trace) + _all_observed_verdicts(held_out_trace)
+    run = _run([fit_trace, held_out_trace], verdicts)
+    without = build_decision_dataset_from_corpus([fit_trace, held_out_trace], run, "judge-run-1")
+    with_task_set = build_decision_dataset_from_corpus(
+        [fit_trace, held_out_trace],
+        run,
+        "judge-run-1",
+        task_set=_family_task_set(fit_trace, held_out_trace),
+        task_set_id="taskset-1",
+    )
+
+    for dataset in (without, with_task_set):
+        assert all(r.group_id == r.lineage.trace_id for r in dataset.examples)
 
 
 def test_task_set_from_a_different_corpus_is_rejected() -> None:
@@ -581,3 +619,30 @@ def test_v2_payload_is_not_touched_by_the_v1_migration() -> None:
 
     round_tripped = DecisionDataset.model_validate(dataset.model_dump(mode="json"))
     assert round_tripped == dataset
+
+
+def test_summary_counts_ties_separately_and_flags_long_states() -> None:
+    import json
+
+    from bandits_jev.dataset import LONG_STATE_CHARS, summarize_dataset
+    from bandits_jev.importer import import_jsonl
+
+    options = {"success": "s", "unclear": "u", "failure": "f"}
+    rows = [
+        {"state": "short", "question": "q", "options": options, "target": "failure", "split": "test"},
+        {"state": "x" * (LONG_STATE_CHARS + 1), "question": "q", "options": options, "target": "success", "split": "test"},
+        {
+            "state": "tied",
+            "question": "q",
+            "options": options,
+            "target": {"success": 0.5, "unclear": 0.0, "failure": 0.5},
+            "split": "test",
+        },
+    ]
+    dataset = import_jsonl("\n".join(json.dumps(r) for r in rows), source_file="s.jsonl")
+    summary = summarize_dataset(dataset)
+
+    assert summary["test"].rows == 3
+    assert summary["test"].majority_label == {"failure": 1, "success": 1, "tie": 1}
+    assert summary["test"].long_states == 1
+    assert summary["train"].rows == 0 and summary["train"].majority_label == {}
