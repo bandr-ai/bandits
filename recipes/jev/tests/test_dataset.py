@@ -288,7 +288,7 @@ def _family_task_set(fit_trace: Trace, held_out_trace: Trace) -> TaskSet:
     )
 
 
-def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None:
+def test_family_split_keeps_fit_in_train_and_held_out_in_an_evaluation_split() -> None:
     fit_trace, held_out_trace = _trace("a"), _trace("b")
     task_set = _family_task_set(fit_trace, held_out_trace)
     verdicts = []
@@ -301,11 +301,51 @@ def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None
 
     splits = {r.lineage.trace_id: r.split for r in dataset.examples}
     assert splits["a"] == "train"
-    assert splits["b"] == "dev"
+    assert splits["b"] in {"dev", "calibration", "test"}
     by_trace: dict[str, set[str]] = {}
     for row in dataset.examples:
         by_trace.setdefault(row.lineage.trace_id, set()).add(row.split)
     assert all(len(sides) == 1 for sides in by_trace.values())
+
+
+def test_task_set_held_out_lineages_fill_dev_calibration_and_test() -> None:
+    fit_trace = _trace("fit")
+    held_out = [_trace(f"held-{i}", lineage_id=f"lineage-{i}") for i in range(60)]
+    traces = [fit_trace, *held_out]
+    family = TaskFamily(
+        family_id="family-1",
+        descriptor="fix a bug",
+        trace_ids=tuple(trace.trace_id for trace in traces),
+        medoid_trace_id=fit_trace.trace_id,
+        workload_mass=len(traces),
+        fit_trace_ids=(fit_trace.trace_id,),
+        held_out_trace_ids=tuple(trace.trace_id for trace in held_out),
+    )
+    task_set = TaskSet(
+        corpus_id="corpus-1",
+        analysis_id="analysis-1",
+        families=(family,),
+        selected=(),
+        total_workload_mass=len(traces),
+        workload_coverage=1.0,
+    )
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+
+    dataset = build_decision_dataset_from_corpus(
+        traces,
+        _run(traces, verdicts),
+        "judge-run-1",
+        task_set=task_set,
+        task_set_id="taskset-1",
+    )
+    held_out_rows = [row for row in dataset.examples if row.lineage.trace_id != "fit"]
+
+    assert {row.split for row in held_out_rows} == {"dev", "calibration", "test"}
+    assert {row.split for row in dataset.examples if row.lineage.trace_id == "fit"} == {"train"}
+    by_lineage: dict[str, set[str]] = {}
+    for row in held_out_rows:
+        by_lineage.setdefault(row.group_id, set()).add(row.split)
+    assert all(len(splits) == 1 for splits in by_lineage.values())
 
 
 def test_no_task_set_splits_by_trace_into_all_four_splits() -> None:

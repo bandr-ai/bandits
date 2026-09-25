@@ -55,8 +55,8 @@ def dataset_command(
     task_set_id: str = typer.Option(
         None,
         "--task-set",
-        help="Split along this task set's own within-family fit/held-out membership "
-        "(train/dev only). The task set must come from the same corpus as the judge run, "
+        help="Keep this task set's fit traces in train and split its held-out lineages across "
+        "dev/calibration/test. The task set must come from the same corpus as the judge run, "
         "and every judged trace must resolve to one of its families or it is quarantined. "
         "Omit to split by trace into train/dev/calibration/test (~70/10/10/10), keeping "
         "every trace's steps in one split.",
