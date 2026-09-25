@@ -439,3 +439,42 @@ def test_tied_targets_are_counted_and_left_out_of_accuracy(store) -> None:
     assert all(r.predictions[TRAINED].gold_probability is None for r in main.rows if r.gold is None)
     comparison = next(c for c in main.comparisons if (c.candidate, c.baseline) == (TRAINED, UNTRAINED))
     assert comparison.rows == 90  # NLL/Brier still use every shared row
+
+
+def test_costs_are_measured_or_unknown_never_zero(store) -> None:
+    from bandits_jev.cost import DecisionCost, VerifierCost, save_verifier_cost
+
+    dataset_id, dataset, truths = build_dataset(store, per_split={"train": 200, "test": 100})
+    dataset_id, dataset = _judge_labeled(store, dataset)
+    untrained = save(make_run(dataset_id, dataset, truths, split="test", scale=0.3, noise=1.0), store)
+    trained = save(make_run(dataset_id, dataset, truths, split="test", scale=3.0, adapter_digest=ADAPTER), store)
+
+    unpriced = _columns(build_report(store, untrained_run_id=untrained, trained_run_id=trained, draws=50).sections[0])
+    assert unpriced[TRAINED].cost_per_1k_usd is None and "unknown" in unpriced[TRAINED].cost_basis
+    assert unpriced[VERIFIER].cost_per_1k_usd is None and "unknown" in unpriced[VERIFIER].cost_basis
+    assert unpriced[MAJORITY].cost_per_1k_usd is None
+
+    test_ids = [e.decision_id for e in dataset.examples if e.split == "test"]
+    cost = VerifierCost(
+        dataset_id=dataset_id, ledger="ledger.jsonl", models=("judge/model",),
+        input_usd_per_mtok=0.2, output_usd_per_mtok=0.8,
+        per_decision={d: DecisionCost(calls=3, failed_calls=0, prompt_tokens=3000, completion_tokens=1500,
+                                      seconds=4.0, usd=0.0018) for d in test_ids[:80]},
+        uncovered_decisions=20, retries=0,
+    )
+    cost_id = save_verifier_cost(cost, store).artifact_id
+    report = build_report(
+        store, untrained_run_id=untrained, trained_run_id=trained, draws=50,
+        verifier_cost_id=cost_id, gpu_usd_per_hour=3.6,
+    )
+    columns = _columns(report.sections[0])
+
+    assert columns[VERIFIER].cost_per_1k_usd == pytest.approx(1.8)  # $0.0018 × 1,000, over the 80 covered
+    assert "80/100 decisions" in columns[VERIFIER].cost_basis
+    assert columns[VERIFIER].metrics.latency_p50_seconds == pytest.approx(4.0)  # uncovered rows not averaged as 0
+    assert columns[TRAINED].cost_per_1k_usd == pytest.approx(0.01)  # 0.01 s × $3.6/h × 1,000
+    assert report.gpu_usd_per_hour == 3.6 and report.verifier_cost_id == cost_id
+    from bandits_jev.report import compute_report_id, report_markdown
+
+    markdown = report_markdown(report, compute_report_id(report))
+    assert "trained vs the verifier:** 180.0× cheaper per decision, 400.0× faster at the median" in markdown

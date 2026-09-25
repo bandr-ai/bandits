@@ -30,6 +30,7 @@ from bandits_jev.calibration import (
     load_calibration,
     tempered_probabilities,
 )
+from bandits_jev.cost import VerifierCost, load_verifier_cost
 from bandits_jev.dataset import DecisionDataset, DecisionExample, load_decision_dataset
 from bandits_jev.metrics import (
     NLL_PROBABILITY_FLOOR,
@@ -123,6 +124,12 @@ class Column(Contract):
     mode: str | None = None
     predictions_source: str | None = None
     cost_usd: float | None = None
+    """An imported run's total bill, as recorded at import."""
+    cost_per_1k_usd: float | None = None
+    """Dollars per 1,000 decisions over this column's scored rows. None when
+    the price is unknown -- never 0 for "unknown"."""
+    cost_basis: str | None = None
+    """Where ``cost_per_1k_usd`` comes from, or why it is unknown."""
     metrics: ColumnMetrics | None = None
     rejections: RejectionSummary | None = None
 
@@ -201,6 +208,10 @@ class EvaluationReport(Contract):
     bootstrap_seed: int
     ece_bins: int
     nll_probability_floor: float = NLL_PROBABILITY_FLOOR
+    gpu_usd_per_hour: float | None = None
+    """The hourly GPU price the local model columns' cost is computed from,
+    as given; None when not given (those costs then read "unknown")."""
+    verifier_cost_id: str | None = None
     sections: tuple[ReportSection, ...]
     test_usage: tuple[TestUsage, ...]
     """One audit for every report section evaluated on a locked test split."""
@@ -327,10 +338,59 @@ def _column_metrics(
     )
 
 
-def _column(column: _ColumnInput, examples: list[DecisionExample], n_bins: int) -> Column:
+class _Pricing:
+    def __init__(self, gpu_usd_per_hour: float | None, verifier_cost: VerifierCost | None) -> None:
+        self.gpu_usd_per_hour = gpu_usd_per_hour
+        self.verifier_cost = verifier_cost
+
+
+def _cost(
+    column: _ColumnInput, examples: list[DecisionExample], pricing: _Pricing
+) -> tuple[float | None, str]:
+    run = column.run
+    assert run is not None
+    ids = {e.decision_id for e in examples}
+    scored = [r for r in run.results if r.decision_id in ids]
+    if not scored:
+        return None, "no rows scored"
+    if column.name == MAJORITY:
+        return None, "no model: a fixed answer"
+    if column.name == VERIFIER:
+        cost = pricing.verifier_cost
+        if cost is None:
+            return None, "unknown: no verifier cost given (jev verifier-cost)"
+        covered = [cost.per_decision[r.decision_id] for r in scored if r.decision_id in cost.per_decision]
+        if not covered:
+            return None, "unknown: the ledger covers none of these decisions"
+        per_1k = 1000 * sum(c.usd for c in covered) / len(covered)
+        basis = (
+            f"ledger `{cost.ledger}`, {len(covered)}/{len(scored)} decisions, "
+            f"${cost.input_usd_per_mtok:g} in / ${cost.output_usd_per_mtok:g} out per Mtok"
+        )
+        over = sum(1 for r in scored if r.decision_id in set(cost.over_counted_decisions))
+        if over:
+            basis += f"; warning: {over} decision(s) have more calls than votes asked, cost may be overstated"
+        return per_1k, basis
+    if run.predictions_source is not None:
+        if run.cost_usd is None:
+            return None, "unknown: no bill recorded at import"
+        return 1000 * run.cost_usd / len(run.results), f"actual bill ${run.cost_usd:g} for {len(run.results)} decisions"
+    if pricing.gpu_usd_per_hour is None:
+        return None, "unknown: no GPU price given (--gpu-usd-per-hour)"
+    mean_seconds = sum(r.latency_seconds for r in scored) / len(scored)
+    return (
+        1000 * mean_seconds * pricing.gpu_usd_per_hour / 3600,
+        f"GPU ${pricing.gpu_usd_per_hour:g}/h × measured latency",
+    )
+
+
+def _column(
+    column: _ColumnInput, examples: list[DecisionExample], n_bins: int, pricing: _Pricing
+) -> Column:
     if column.run is None:
         return Column(name=column.name, status=NOT_RUN)
     run = column.run
+    cost_per_1k, cost_basis = _cost(column, examples, pricing)
     return Column(
         name=column.name,
         status="run",
@@ -343,6 +403,8 @@ def _column(column: _ColumnInput, examples: list[DecisionExample], n_bins: int) 
         mode=run.mode,
         predictions_source=run.predictions_source,
         cost_usd=run.cost_usd,
+        cost_per_1k_usd=cost_per_1k,
+        cost_basis=cost_basis,
         metrics=_column_metrics(column, examples, n_bins),
         rejections=_rejections(run),
     )
@@ -438,11 +500,12 @@ def _section(
     draws: int,
     seed: int,
     n_bins: int,
+    pricing: _Pricing,
 ) -> ReportSection:
     examples = [e for e in dataset.examples if e.split == split]
     if not examples:
         raise ValueError(f"dataset {dataset_id} has no {split!r} examples")
-    columns = _reference_columns(dataset, dataset_id, split, examples) + columns
+    columns = _reference_columns(dataset, dataset_id, split, examples, pricing.verifier_cost) + columns
     ids = {e.decision_id for e in examples}
     for column in columns:
         if column.run is None:
@@ -463,7 +526,7 @@ def _section(
         split=split,
         items=len(examples),
         resample_by="group_id" if any(e.group_id is not None for e in examples) else "row",
-        columns=tuple(_column(c, examples, n_bins) for c in columns),
+        columns=tuple(_column(c, examples, n_bins, pricing) for c in columns),
         comparisons=tuple(c for c in built if c is not None),
         rows=_rows(columns, examples),
     )
@@ -476,10 +539,12 @@ def _derived_run(
     dataset_id: str,
     split: str,
     source: str,
+    latency_of=None,
 ) -> ScorerRun:
     """A run computed from the dataset itself rather than scored by a model,
     so the report can still be rebuilt from saved artifacts alone. Latency
-    is unknown (None), never 0."""
+    is unknown (None) unless ``latency_of`` supplies it for a row (the
+    verifier's, from its ledger); never 0."""
     results = []
     for example in examples:
         probs = probabilities_of(example)
@@ -499,7 +564,7 @@ def _derived_run(
                 candidate_token_mass=1.0,
                 mode="single_order",
                 prompt_digest="",
-                latency_seconds=None,
+                latency_seconds=latency_of(example) if latency_of is not None else None,
             )
         )
     return ScorerRun(
@@ -533,7 +598,11 @@ def _train_prior(dataset: DecisionDataset) -> dict[str, float] | None:
 
 
 def _reference_columns(
-    dataset: DecisionDataset, dataset_id: str, split: str, examples: list[DecisionExample]
+    dataset: DecisionDataset,
+    dataset_id: str,
+    split: str,
+    examples: list[DecisionExample],
+    verifier_cost: VerifierCost | None = None,
 ) -> list[_ColumnInput]:
     """The yardsticks every trained model is read against.
 
@@ -556,6 +625,12 @@ def _reference_columns(
                     dataset_id=dataset_id,
                     split=split,
                     source=f"derived:verifier_votes ({', '.join(sorted(judges))})",
+                    latency_of=(
+                        (lambda e: verifier_cost.per_decision[e.decision_id].seconds
+                         if e.decision_id in verifier_cost.per_decision else None)
+                        if verifier_cost is not None
+                        else None
+                    ),
                 ),
             )
         )
@@ -667,6 +742,8 @@ def build_report(
     draws: int = 2000,
     seed: int = 0,
     n_bins: int = 10,
+    verifier_cost_id: str | None = None,
+    gpu_usd_per_hour: float | None = None,
 ) -> EvaluationReport:
     """``external`` is a sequence of (untrained run id, trained run id) pairs
     scored on datasets the model never trained on; each becomes its own
@@ -676,6 +753,10 @@ def build_report(
     two_order = load_scorer_run(untrained_two_order_run_id, store) if untrained_two_order_run_id else None
     jev = load_scorer_run(jev_run_id, store) if jev_run_id else None
     calibration = load_calibration(calibration_id, store) if calibration_id else None
+    verifier_cost = load_verifier_cost(verifier_cost_id, store) if verifier_cost_id else None
+    if gpu_usd_per_hour is not None and gpu_usd_per_hour < 0:
+        raise ValueError("--gpu-usd-per-hour must be non-negative")
+    pricing = _Pricing(gpu_usd_per_hour, verifier_cost)
     if jev is not None and jev.predictions_source is None:
         raise ValueError("the jev column must be an imported predictions run")
 
@@ -727,6 +808,7 @@ def build_report(
             draws=draws,
             seed=seed,
             n_bins=n_bins,
+            pricing=pricing,
         )
     ]
     test_usages: list[TestUsage] = []
@@ -780,6 +862,7 @@ def build_report(
                 draws=draws,
                 seed=seed,
                 n_bins=n_bins,
+                pricing=pricing,
             )
         )
         if ext_split == "test":
@@ -790,6 +873,8 @@ def build_report(
         bootstrap_draws=draws,
         bootstrap_seed=seed,
         ece_bins=n_bins,
+        gpu_usd_per_hour=gpu_usd_per_hour,
+        verifier_cost_id=verifier_cost_id,
         sections=tuple(sections),
         test_usage=tuple(test_usages),
     )
@@ -850,6 +935,33 @@ _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
 )
 
 
+def _versus_verifier(section: ReportSection) -> list[str]:
+    """The headline for verifier distillation, stated only from measured
+    numbers: how much cheaper and faster each trained column is than the
+    verifier it copies. Omitted when either side's number is unknown."""
+    by_name = {c.name: c for c in section.columns}
+    verifier = by_name.get(VERIFIER)
+    if verifier is None or verifier.metrics is None:
+        return []
+    lines = []
+    for name in (TRAINED_CALIBRATED, TRAINED):
+        column = by_name.get(name)
+        if column is None or column.metrics is None:
+            continue
+        parts = []
+        if verifier.cost_per_1k_usd and column.cost_per_1k_usd:
+            parts.append(f"{verifier.cost_per_1k_usd / column.cost_per_1k_usd:.1f}× cheaper per decision")
+        v_p50, c_p50 = verifier.metrics.latency_p50_seconds, column.metrics.latency_p50_seconds
+        if v_p50 and c_p50:
+            parts.append(f"{v_p50 / c_p50:.1f}× faster at the median")
+        if column.metrics.accuracy is not None:
+            parts.append(f"agrees with the verifier on {column.metrics.accuracy:.1%} of untied decisions")
+        if parts:
+            lines += [f"**{name} vs the verifier:** " + ", ".join(parts) + ".", ""]
+        break
+    return lines
+
+
 def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
     lines = [f"## {section.name}", ""]
     lines.append(
@@ -884,9 +996,15 @@ def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
         "| temperature | " + " | ".join(_num(c.temperature) if c.temperature is not None else "—" for c in section.columns) + " |"
     )
     lines.append(
-        "| cost (USD) | " + " | ".join(f"{c.cost_usd:.2f}" if c.cost_usd is not None else "—" for c in section.columns) + " |"
+        "| cost per 1k decisions (USD) | "
+        + " | ".join(
+            NOT_RUN if c.status == NOT_RUN else (f"{c.cost_per_1k_usd:.4f}" if c.cost_per_1k_usd is not None else "unknown")
+            for c in section.columns
+        )
+        + " |"
     )
     lines.append("")
+    lines += _versus_verifier(section)
     if section.comparisons:
         lines += [
             "Paired differences, candidate − baseline, 95% bootstrap interval "
@@ -915,7 +1033,10 @@ def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
             lines.append(f"- {column.name}: {NOT_RUN}")
             continue
         if column.scorer_run_id is None:
-            lines.append(f"- {column.name}: {column.predictions_source}, computed from the dataset itself")
+            lines.append(
+                f"- {column.name}: {column.predictions_source}, computed from the dataset itself; "
+                f"cost: {column.cost_basis}"
+            )
             continue
         source = f"`{column.scorer_run_id}`"
         if column.calibration_id:
@@ -923,7 +1044,7 @@ def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
         model = column.predictions_source or f"{column.model_id}@{column.revision}"
         if column.adapter_digest:
             model += f" + adapter {column.adapter_digest}"
-        lines.append(f"- {column.name}: {source} ({model}, {column.mode})")
+        lines.append(f"- {column.name}: {source} ({model}, {column.mode}); cost: {column.cost_basis}")
     lines.append("")
     return lines
 
