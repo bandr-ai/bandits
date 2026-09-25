@@ -142,7 +142,7 @@ def test_grouped_rows_resample_by_group(store) -> None:
     assert comparison.rows == 300 and comparison.resampling_units == 30
 
 
-def test_rejections_are_counted_with_reasons_and_paired_rows_exclude_them(store) -> None:
+def test_rejections_reduce_coverage_adjusted_metrics_and_stay_in_comparisons(store) -> None:
     ids, _, _ = _setup(store, rejected=7)
     report = build_report(store, untrained_run_id=ids["untrained"], trained_run_id=ids["trained"], draws=100)
     main = report.sections[0]
@@ -151,7 +151,11 @@ def test_rejections_are_counted_with_reasons_and_paired_rows_exclude_them(store)
     assert untrained.rejections.count == 7
     assert untrained.rejections.reasons == {"prompt is N tokens, over the N limit": 7}
     assert untrained.metrics.rows == 293
-    assert main.comparisons[0].rows == 293
+    assert untrained.metrics.coverage == 293 / 300
+    assert untrained.metrics.coverage_adjusted_accuracy == pytest.approx(
+        untrained.metrics.accuracy * untrained.metrics.coverage
+    )
+    assert main.comparisons[0].rows == 300
 
 
 def test_jev_column_from_imported_predictions_records_the_bill(store) -> None:
@@ -237,6 +241,33 @@ def test_mismatched_inputs_are_refused(store) -> None:
     cal_untrained = save(make_run(ids["dataset"], dataset, truths, split="calibration", scale=0.3), store)
     with pytest.raises(ValueError, match="same dataset and split"):
         build_report(store, untrained_run_id=cal_untrained, trained_run_id=ids["trained"])
+    cal_trained = save(
+        make_run(ids["dataset"], dataset, truths, split="calibration", scale=3.0, adapter_digest=ADAPTER),
+        store,
+    )
+    with pytest.raises(ValueError, match="must evaluate a 'dev' or 'test' split"):
+        build_report(store, untrained_run_id=cal_untrained, trained_run_id=cal_trained)
+
+
+def test_external_set_must_match_main_base_model_and_revision(store) -> None:
+    ids, _, _ = _setup(store)
+    ext_id, ext, ext_truths = build_dataset(store, per_split={"test": 12}, seed=9, tag="external-model")
+    ext_untrained_run = make_run(ext_id, ext, ext_truths, split="test", scale=0.5).model_copy(
+        update={"model_id": "different-base"}
+    )
+    ext_trained_run = make_run(
+        ext_id, ext, ext_truths, split="test", scale=0.5, adapter_digest=ADAPTER
+    ).model_copy(update={"model_id": "different-base"})
+    ext_untrained = save(ext_untrained_run, store)
+    ext_trained = save(ext_trained_run, store)
+
+    with pytest.raises(ValueError, match="different base model or revision"):
+        build_report(
+            store,
+            untrained_run_id=ids["untrained"],
+            trained_run_id=ids["trained"],
+            external=[(ext_untrained, ext_trained)],
+        )
 
 
 def test_cli_calibrate_then_report(store, tmp_path) -> None:
