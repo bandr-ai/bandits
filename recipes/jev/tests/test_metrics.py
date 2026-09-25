@@ -112,3 +112,12 @@ def test_gold_option_is_none_on_a_tie_never_the_first_option() -> None:
     assert gold_option({"a": 0.2, "b": 0.8}) == "b"
     assert gold_option({"a": 0.5, "b": 0.5}) is None
     assert gold_option({"a": 1 / 3, "b": 1 / 3, "c": 1 / 3}) is None
+
+
+def test_zero_bins_or_draws_are_refused_with_a_clear_error() -> None:
+    from bandits_jev.metrics import reliability_bins
+
+    with pytest.raises(ValueError, match="n_bins"):
+        reliability_bins([(0.5, True)], n_bins=0)
+    with pytest.raises(ValueError, match="draws"):
+        grouped_bootstrap_interval([0.1, 0.2], draws=0)

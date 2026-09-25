@@ -38,6 +38,8 @@ def reliability_bins(pairs: list[tuple[float, bool]], n_bins: int = 10) -> list[
     ECE number is easy to overread on a small slice without seeing which
     bins actually held data.
     """
+    if n_bins < 1:
+        raise ValueError(f"n_bins must be at least 1, got {n_bins}")
     bins: list[list[tuple[float, bool]]] = [[] for _ in range(n_bins)]
     for p, y in pairs:
         idx = min(int(p * n_bins), n_bins - 1)
@@ -161,6 +163,8 @@ def grouped_bootstrap_interval(
     sequence as a plain per-row bootstrap, so ungrouped callers get the
     numbers they always got.
     """
+    if draws < 1:
+        raise ValueError(f"draws must be at least 1, got {draws}")
     if not values:
         return None
     if groups is not None and len(groups) != len(values):
