@@ -32,12 +32,13 @@ def _span(span_id: str, kind: SpanKind, name: str, output, status=SpanStatus.OK)
     )
 
 
-def _trace(trace_id: str, task: str = "fix the bug") -> Trace:
+def _trace(trace_id: str, task: str = "fix the bug", *, lineage_id: str | None = None) -> Trace:
     return Trace(
         trace_id=trace_id,
         source="test",
         source_digest="d",
         task=task,
+        lineage_id=lineage_id,
         spans=(
             _span("m1", SpanKind.MODEL, "gpt", "open schema.py"),
             _span("t1", SpanKind.TOOL, "execute", "schema.py not found", SpanStatus.ERROR),
@@ -336,6 +337,29 @@ def test_trace_split_is_stable_across_compiles_and_trace_order() -> None:
     assert {r.decision_id: r.split for r in first.examples} == {
         r.decision_id: r.split for r in second.examples
     }
+
+
+def test_related_trace_lineage_shares_split_and_resampling_group() -> None:
+    first_trace = _trace("retry-1", lineage_id="ticket-7")
+    second_trace = _trace("retry-2", lineage_id="ticket-7")
+    unrelated = _trace("other")
+    traces = [first_trace, second_trace, unrelated]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+
+    dataset = build_decision_dataset_from_corpus(
+        traces, _run(traces, verdicts), "judge-run-1"
+    )
+    related = [
+        row for row in dataset.examples if row.lineage.trace_id in {"retry-1", "retry-2"}
+    ]
+
+    assert len({row.split for row in related}) == 1
+    assert {row.group_id for row in related} == {"ticket-7"}
+    assert all(
+        row.group_id == row.lineage.trace_id
+        for row in dataset.examples
+        if row.lineage.trace_id == "other"
+    )
 
 
 def test_every_row_is_grouped_by_its_trace() -> None:
