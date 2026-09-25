@@ -5,12 +5,14 @@ from saved artifacts.
 Nothing here scores a model. Every number is recomputed from stored scorer
 runs, a stored calibration and the dataset's targets, with a fixed bootstrap
 seed and no timestamps, so the same artifacts always produce the same bytes.
-Every aggregate is traceable: the report carries one row per scored item
-with each column's chosen option and probability on the gold option.
+Every aggregate is traceable: the report carries one row per evaluation item
+and records each available column's chosen option and probability on the gold
+option. Coverage-adjusted accuracy and paired comparisons count a rejected
+item as incorrect, so rejecting hard items cannot improve a system's result.
 
-Comparisons are paired (both columns scored the same row) and their 95%
-intervals resample by ``group_id`` when the dataset has groups, so related
-rows are not counted as independent evidence.
+Comparisons cover every row in the evaluation split and their 95% intervals
+resample by ``group_id`` when the dataset has groups, so related rows are not
+counted as independent evidence.
 """
 
 from __future__ import annotations
@@ -62,7 +64,11 @@ class ReliabilityBin(Contract):
 
 class ColumnMetrics(Contract):
     rows: int
+    coverage: float
+    """Share of evaluation rows for which the column produced a prediction."""
     accuracy: float
+    coverage_adjusted_accuracy: float
+    """Correct predictions divided by all evaluation rows; rejections are wrong."""
     macro_f1: float
     nll: float
     brier: float
@@ -117,7 +123,7 @@ class PairedComparison(Contract):
     candidate: str
     baseline: str
     rows: int
-    """Rows scored by both columns; the only rows compared."""
+    """Rows in the evaluation split; rejected rows are included."""
     resampling_units: int
     accuracy: Interval
     """candidate minus baseline; positive is better."""
@@ -261,7 +267,9 @@ def _column_metrics(
     no_latency = column.run.predictions_source is not None and not any(latencies)
     return ColumnMetrics(
         rows=n,
+        coverage=n / len(examples),
         accuracy=sum(1 for c, g in label_pairs if c == g) / n,
+        coverage_adjusted_accuracy=sum(1 for c, g in label_pairs if c == g) / len(examples),
         macro_f1=macro_f1(label_pairs) or 0.0,
         nll=nll / n,
         brier=brier / n,
@@ -326,26 +334,34 @@ def _comparison(
         return None
     cand = {r.decision_id: r for r in candidate.run.results}
     base = {r.decision_id: r for r in baseline.run.results}
-    shared = [e for e in examples if e.decision_id in cand and e.decision_id in base]
-    if not shared:
-        return None
     accuracy: list[float] = []
     nll: list[float] = []
     brier: list[float] = []
     groups: list[str] = []
-    for example in shared:
+    for example in examples:
         target = example.target.probabilities
         gold = argmax_option(target)
-        c = _distribution(cand[example.decision_id], candidate.calibration)
-        b = _distribution(base[example.decision_id], baseline.calibration)
-        accuracy.append(float(argmax_option(c) == gold) - float(argmax_option(b) == gold))
+        c = (
+            _distribution(cand[example.decision_id], candidate.calibration)
+            if example.decision_id in cand
+            else {}
+        )
+        b = (
+            _distribution(base[example.decision_id], baseline.calibration)
+            if example.decision_id in base
+            else {}
+        )
+        accuracy.append(
+            float(bool(c) and argmax_option(c) == gold)
+            - float(bool(b) and argmax_option(b) == gold)
+        )
         nll.append(row_nll(c, target) - row_nll(b, target))
         brier.append(row_brier(c, target) - row_brier(b, target))
         groups.append(_group_of(example))
     return PairedComparison(
         candidate=candidate.name,
         baseline=baseline.name,
-        rows=len(shared),
+        rows=len(examples),
         resampling_units=len(set(groups)),
         accuracy=_interval(accuracy, groups, draws, seed),
         nll=_interval(nll, groups, draws, seed),
@@ -424,6 +440,13 @@ def _check_same_items(runs: dict[str, ScorerRun]) -> tuple[str, str]:
     if dataset_id is None or split is None:
         raise ValueError("every scorer run in a report must record its dataset and split")
     return dataset_id, split
+
+
+def _check_evaluation_split(split: str, section: str) -> None:
+    if split not in ("dev", "test"):
+        raise ValueError(
+            f"{section} report must evaluate a 'dev' or 'test' split, not {split!r}"
+        )
 
 
 def _check_models(
@@ -511,6 +534,7 @@ def build_report(
     if jev is not None:
         main_runs[JEV] = jev
     dataset_id, split = _check_same_items(main_runs)
+    _check_evaluation_split(split, "main")
     _check_models(untrained, trained, two_order, calibration, dataset_id)
 
     columns = [_ColumnInput(UNTRAINED, run_id=untrained_run_id, run=untrained)]
@@ -547,8 +571,11 @@ def build_report(
         ext_untrained = load_scorer_run(ext_untrained_id, store)
         ext_trained = load_scorer_run(ext_trained_id, store)
         ext_dataset_id, ext_split = _check_same_items({UNTRAINED: ext_untrained, TRAINED: ext_trained})
+        _check_evaluation_split(ext_split, "external")
         if ext_dataset_id == dataset_id:
             raise ValueError("an external set must be a different dataset than the main one")
+        if (ext_trained.model_id, ext_trained.revision) != (trained.model_id, trained.revision):
+            raise ValueError("the external trained run used a different base model or revision")
         if ext_trained.adapter_digest != trained.adapter_digest:
             raise ValueError("the external trained run used a different adapter than the main trained run")
         _check_models(ext_untrained, ext_trained, None, None, ext_dataset_id)
@@ -631,7 +658,9 @@ def _interval_text(interval: Interval) -> str:
 
 _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
     ("rows scored", "rows", 0),
-    ("accuracy", "accuracy", 4),
+    ("coverage", "coverage", 4),
+    ("accuracy (scored rows)", "accuracy", 4),
+    ("coverage-adjusted accuracy", "coverage_adjusted_accuracy", 4),
     ("macro F1", "macro_f1", 4),
     ("NLL", "nll", 4),
     ("Brier", "brier", 4),
