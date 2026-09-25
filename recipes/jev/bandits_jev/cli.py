@@ -339,6 +339,61 @@ def calibrate_command(
     console.print(f"ece:            {calibration.ece_before:.4f} -> {calibration.ece_after:.4f}")
 
 
+@app.command(name="verifier-cost")
+def verifier_cost_command(
+    dataset_id: str = typer.Argument(..., help="A judge-labeled decision dataset (from `jev dataset`)."),
+    ledger: Path = typer.Option(..., "--ledger", help="The Bandits ledger JSONL the judge run wrote (BANDITS_LEDGER)."),
+    input_usd_per_mtok: float = typer.Option(
+        ..., "--input-usd-per-mtok", help="The judge model's input price, USD per million tokens, as billed."
+    ),
+    output_usd_per_mtok: float = typer.Option(
+        ..., "--output-usd-per-mtok", help="The judge model's output price, USD per million tokens, as billed."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Price the verifier per decision from its ledger: every judge call's
+    tokens and time, attributed to the step it judged. Prices are given, never
+    guessed."""
+    from bandits_jev.cost import save_verifier_cost, verifier_cost_from_ledger
+    from bandits_jev.dataset import load_decision_dataset
+
+    store = _derived(project)
+    try:
+        dataset = load_decision_dataset(dataset_id, store)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
+        raise typer.Exit(code=1) from exc
+    try:
+        with ledger.open(encoding="utf-8") as lines:
+            cost = verifier_cost_from_ledger(
+                lines,
+                dataset,
+                dataset_id,
+                ledger=str(ledger),
+                input_usd_per_mtok=input_usd_per_mtok,
+                output_usd_per_mtok=output_usd_per_mtok,
+            )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_verifier_cost(cost, store)
+    decisions = list(cost.per_decision.values())
+    console.print(f"verifier_cost_id:  {envelope.artifact_id}")
+    console.print(f"decisions priced:  {len(decisions)} ({cost.uncovered_decisions} not in the ledger)")
+    if decisions:
+        per_1k = 1000 * sum(d.usd for d in decisions) / len(decisions)
+        seconds = sum(d.seconds for d in decisions) / len(decisions)
+        console.print(f"cost per 1k:       ${per_1k:.4f}")
+        console.print(f"seconds/decision:  {seconds:.3f} (sum of calls)")
+    console.print(f"retries:           {cost.retries}")
+    if cost.over_counted_decisions:
+        console.print(
+            f"[yellow]warning:[/yellow] {len(cost.over_counted_decisions)} decision(s) have more successful "
+            "judge calls than votes asked; the ledger may hold more than one judge run over the same steps, "
+            "which overstates the verifier's cost. Pass only the ledger of the run that labeled this dataset."
+        )
+
+
 @app.command(name="report")
 def report_command(
     untrained: str = typer.Option(..., "--untrained", help="Scorer run: base model, one option order."),
@@ -354,6 +409,14 @@ def report_command(
     draws: int = typer.Option(2000, "--draws", help="Bootstrap draws."),
     seed: int = typer.Option(0, "--seed", help="Bootstrap seed."),
     bins: int = typer.Option(10, "--bins", help="Fixed-width ECE / reliability bins."),
+    verifier_cost: str = typer.Option(
+        None, "--verifier-cost", help="A `jev verifier-cost` result: the verifier column's cost and latency."
+    ),
+    gpu_usd_per_hour: float = typer.Option(
+        None,
+        "--gpu-usd-per-hour",
+        help="The GPU's hourly price, for the local model columns' cost. Omit and they read 'unknown'.",
+    ),
     output: Path = typer.Option(..., "--output", help="Directory for report.json, report.md and charts."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -380,6 +443,8 @@ def report_command(
             draws=draws,
             seed=seed,
             n_bins=bins,
+            verifier_cost_id=verifier_cost,
+            gpu_usd_per_hour=gpu_usd_per_hour,
         )
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] missing artifact: {exc.filename or exc}")
