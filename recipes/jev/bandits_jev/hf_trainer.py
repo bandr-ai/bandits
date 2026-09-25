@@ -16,7 +16,7 @@ import platform
 from importlib.metadata import version
 
 from bandits_jev.dataset import DecisionExample
-from bandits_jev.hf_predictor import HFPredictor, encode_prompt, letter_token_ids
+from bandits_jev.hf_predictor import HFPredictor, context_limit, encode_prompt, letter_token_ids
 from bandits_jev.prompt import build_prompt
 
 _TRAINING_STATE_FILE = "training_state.pt"
@@ -70,6 +70,7 @@ class HFTrainer:
             target_modules="all-linear",
             task_type="CAUSAL_LM",
         )
+        self.max_context_tokens = context_limit(base_model)
         self._model = get_peft_model(base_model, peft_config).to(device)
         self._optimizer = torch.optim.AdamW(
             (p for p in self._model.parameters() if p.requires_grad), lr=learning_rate
