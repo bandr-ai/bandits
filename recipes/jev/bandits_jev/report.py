@@ -35,16 +35,21 @@ from bandits_jev.metrics import (
     NLL_PROBABILITY_FLOOR,
     argmax_option,
     ece,
+    gold_option,
     grouped_bootstrap_interval,
-    is_correct,
     macro_f1,
     reliability_bins,
     row_brier,
     row_nll,
-    top_options,
     total_variation,
 )
-from bandits_jev.scorer import DecisionScoreResult, ScorerRun, _softmax, load_scorer_run
+from bandits_jev.scorer import (
+    DecisionScoreResult,
+    OptionScore,
+    ScorerRun,
+    _softmax,
+    load_scorer_run,
+)
 
 REPORT_VERSION = 1
 NOT_RUN = "not run"
@@ -54,6 +59,8 @@ UNTRAINED_TWO_ORDER = "untrained (two orders)"
 TRAINED = "trained"
 TRAINED_CALIBRATED = "trained + calibrated"
 JEV = "jev"
+VERIFIER = "verifier (reference)"
+MAJORITY = "majority (train prior)"
 
 
 class ReliabilityBin(Contract):
@@ -68,15 +75,20 @@ class ColumnMetrics(Contract):
     rows: int
     coverage: float
     """Share of evaluation rows for which the column produced a prediction."""
-    accuracy: float
-    coverage_adjusted_accuracy: float
-    """Correct predictions divided by all evaluation rows; rejections are wrong."""
+    accuracy: float | None
+    """Over scored rows whose target has a single top option. None when every
+    scored row ties."""
+    coverage_adjusted_accuracy: float | None
+    """Correct predictions divided by every untied evaluation row; rejections
+    are wrong. Tied rows are left out of both, as in ``accuracy``."""
     tied_target_rows: int
-    """Scored rows with more than one equally most-probable target option."""
-    macro_f1: float
+    """Scored rows whose target ties between options (e.g. a split vote). A
+    tied row has no single right answer, so it is left out of accuracy,
+    macro F1 and ECE and counted here; NLL and Brier still score it."""
+    macro_f1: float | None
     nll: float
     brier: float
-    ece: float
+    ece: float | None
     reliability: tuple[ReliabilityBin, ...]
     order_agreement: float | None
     """Share of rows whose two option orders chose the same option. None
@@ -131,8 +143,9 @@ class PairedComparison(Contract):
     rows: int
     """Rows in the evaluation split; rejected rows are included."""
     resampling_units: int
-    accuracy: Interval
-    """candidate minus baseline; positive is better."""
+    accuracy: Interval | None
+    """candidate minus baseline over the untied rows (a rejected row counts
+    as wrong); positive is better. None when every row ties."""
     nll: Interval
     """candidate minus baseline; negative is better."""
     brier: Interval
@@ -141,13 +154,15 @@ class PairedComparison(Contract):
 
 class RowPrediction(Contract):
     chosen: str
-    gold_probability: float
+    gold_probability: float | None
+    """None when the row's target ties (no single gold option)."""
 
 
 class ReportRow(Contract):
     decision_id: str
     group: str
-    gold: str
+    gold: str | None
+    """None when the target ties between options."""
     predictions: dict[str, RowPrediction]
 
 
@@ -262,14 +277,13 @@ def _column_metrics(
         result = results[example.decision_id]
         probs = _distribution(result, column.calibration)
         target = example.target.probabilities
-        chosen = argmax_option(probs)
-        correct += int(is_correct(probs, target))
-        confidence_pairs.append((probs[chosen], is_correct(probs, target)))
-        target_tops = top_options(target)
-        if len(target_tops) == 1:
-            label_pairs.append((chosen, next(iter(target_tops))))
-        else:
+        chosen, gold = argmax_option(probs), gold_option(target)
+        if gold is None:
             tied_targets += 1
+        else:
+            correct += int(chosen == gold)
+            confidence_pairs.append((probs[chosen], chosen == gold))
+            label_pairs.append((chosen, gold))
         nll += row_nll(probs, target)
         brier += row_brier(probs, target)
         passes = _pass_distributions(result, column.temperature)
@@ -277,6 +291,8 @@ def _column_metrics(
             agreements.append(argmax_option(passes[0]) == argmax_option(passes[1]))
             shifts.append(total_variation(*passes))
     n = len(scored)
+    untied_scored = n - tied_targets
+    untied_rows = sum(1 for e in examples if gold_option(e.target.probabilities) is not None)
     latencies = sorted(
         latency
         for e in scored
@@ -285,13 +301,13 @@ def _column_metrics(
     return ColumnMetrics(
         rows=n,
         coverage=n / len(examples),
-        accuracy=correct / n,
-        coverage_adjusted_accuracy=correct / len(examples),
+        accuracy=correct / untied_scored if untied_scored else None,
+        coverage_adjusted_accuracy=correct / untied_rows if untied_rows else None,
         tied_target_rows=tied_targets,
-        macro_f1=macro_f1(label_pairs) or 0.0,
+        macro_f1=macro_f1(label_pairs),
         nll=nll / n,
         brier=brier / n,
-        ece=ece(confidence_pairs, n_bins) or 0.0,
+        ece=ece(confidence_pairs, n_bins),
         reliability=tuple(
             ReliabilityBin(
                 low=b["range"][0],
@@ -354,6 +370,7 @@ def _comparison(
     cand = {r.decision_id: r for r in candidate.run.results}
     base = {r.decision_id: r for r in baseline.run.results}
     accuracy: list[float] = []
+    accuracy_groups: list[str] = []
     nll: list[float] = []
     brier: list[float] = []
     groups: list[str] = []
@@ -369,10 +386,12 @@ def _comparison(
             if example.decision_id in base
             else {}
         )
-        accuracy.append(
-            float(bool(c) and is_correct(c, target))
-            - float(bool(b) and is_correct(b, target))
-        )
+        gold = gold_option(target)
+        if gold is not None:  # a tied row has no single right answer
+            accuracy.append(
+                float(bool(c) and argmax_option(c) == gold) - float(bool(b) and argmax_option(b) == gold)
+            )
+            accuracy_groups.append(_group_of(example))
         nll.append(row_nll(c, target) - row_nll(b, target))
         brier.append(row_brier(c, target) - row_brier(b, target))
         groups.append(_group_of(example))
@@ -381,7 +400,7 @@ def _comparison(
         baseline=baseline.name,
         rows=len(examples),
         resampling_units=len(set(groups)),
-        accuracy=_interval(accuracy, groups, draws, seed),
+        accuracy=_interval(accuracy, accuracy_groups, draws, seed) if accuracy else None,
         nll=_interval(nll, groups, draws, seed),
         brier=_interval(brier, groups, draws, seed),
     )
@@ -391,7 +410,7 @@ def _rows(columns: list[_ColumnInput], examples: list[DecisionExample]) -> tuple
     by_column = {c.name: {r.decision_id: r for r in c.run.results} for c in columns if c.run is not None}
     rows = []
     for example in examples:
-        gold = argmax_option(example.target.probabilities)
+        gold = gold_option(example.target.probabilities)
         predictions = {}
         for column in columns:
             result = by_column.get(column.name, {}).get(example.decision_id)
@@ -399,7 +418,8 @@ def _rows(columns: list[_ColumnInput], examples: list[DecisionExample]) -> tuple
                 continue
             probs = _distribution(result, column.calibration)
             predictions[column.name] = RowPrediction(
-                chosen=argmax_option(probs), gold_probability=probs.get(gold, 0.0)
+                chosen=argmax_option(probs),
+                gold_probability=None if gold is None else probs.get(gold, 0.0),
             )
         rows.append(
             ReportRow(decision_id=example.decision_id, group=_group_of(example), gold=gold, predictions=predictions)
@@ -422,6 +442,7 @@ def _section(
     examples = [e for e in dataset.examples if e.split == split]
     if not examples:
         raise ValueError(f"dataset {dataset_id} has no {split!r} examples")
+    columns = _reference_columns(dataset, dataset_id, split, examples) + columns
     ids = {e.decision_id for e in examples}
     for column in columns:
         if column.run is None:
@@ -446,6 +467,118 @@ def _section(
         comparisons=tuple(c for c in built if c is not None),
         rows=_rows(columns, examples),
     )
+
+
+def _derived_run(
+    examples: list[DecisionExample],
+    probabilities_of,
+    *,
+    dataset_id: str,
+    split: str,
+    source: str,
+) -> ScorerRun:
+    """A run computed from the dataset itself rather than scored by a model,
+    so the report can still be rebuilt from saved artifacts alone. Latency
+    is unknown (None), never 0."""
+    results = []
+    for example in examples:
+        probs = probabilities_of(example)
+        scores = tuple(
+            OptionScore(
+                option_id=option,
+                probability=p,
+                raw_logit_pass1=math.log(max(p, NLL_PROBABILITY_FLOOR)),
+            )
+            for option, p in probs.items()
+        )
+        results.append(
+            DecisionScoreResult(
+                decision_id=example.decision_id,
+                scores=scores,
+                chosen_option_id=argmax_option(probs),
+                candidate_token_mass=1.0,
+                mode="single_order",
+                prompt_digest="",
+                latency_seconds=None,
+            )
+        )
+    return ScorerRun(
+        model_id=source,
+        revision="",
+        dtype="n/a",
+        device="n/a",
+        dataset_id=dataset_id,
+        split=split,
+        prompt_version=0,
+        template_digest="",
+        mode="single_order",
+        max_prompt_tokens=0,
+        results=tuple(results),
+        rejections=(),
+        predictions_source=source,
+    )
+
+
+def _train_prior(dataset: DecisionDataset) -> dict[str, float] | None:
+    """Mean target distribution over the train split: what a model that
+    ignores its input and always answers with the training label mix says."""
+    train = [e for e in dataset.examples if e.split == "train"]
+    if not train:
+        return None
+    totals: dict[str, float] = {}
+    for example in train:
+        for option, p in example.target.probabilities.items():
+            totals[option] = totals.get(option, 0.0) + p
+    return {option: total / len(train) for option, total in totals.items()}
+
+
+def _reference_columns(
+    dataset: DecisionDataset, dataset_id: str, split: str, examples: list[DecisionExample]
+) -> list[_ColumnInput]:
+    """The yardsticks every trained model is read against.
+
+    - verifier (reference): the verifier's own vote shares, present only
+      when every row was labeled by the Bandits judge. It agrees with itself
+      by definition; it is here so a reader sees what the student copies.
+    - majority (train prior): always answer with the train split's label
+      mix. A trained model that cannot beat this has learned nothing about
+      its input, however good its accuracy looks on a skewed split.
+    """
+    columns = []
+    judges = {e.judge.model for e in examples if e.judge is not None}
+    if judges and all(e.judge is not None for e in examples):
+        columns.append(
+            _ColumnInput(
+                VERIFIER,
+                run=_derived_run(
+                    examples,
+                    lambda e: dict(e.target.probabilities),
+                    dataset_id=dataset_id,
+                    split=split,
+                    source=f"derived:verifier_votes ({', '.join(sorted(judges))})",
+                ),
+            )
+        )
+    prior = _train_prior(dataset)
+
+    def prior_for(example: DecisionExample) -> dict[str, float]:
+        restricted = {o: prior.get(o, 0.0) for o in example.options}
+        total = sum(restricted.values())
+        if total <= 0:
+            return {o: 1.0 / len(example.options) for o in example.options}
+        return {o: p / total for o, p in restricted.items()}
+
+    columns.append(
+        _ColumnInput(
+            MAJORITY,
+            run=_derived_run(
+                examples, prior_for, dataset_id=dataset_id, split=split, source="derived:train_prior"
+            ),
+        )
+        if prior is not None
+        else _ColumnInput(MAJORITY)
+    )
+    return columns
 
 
 def _check_same_items(runs: dict[str, ScorerRun]) -> tuple[str, str]:
@@ -575,7 +708,13 @@ def build_report(
         else _ColumnInput(TRAINED_CALIBRATED)
     )
     columns.append(_ColumnInput(JEV, run_id=jev_run_id, run=jev) if jev is not None else _ColumnInput(JEV))
-    comparisons = [(TRAINED, UNTRAINED), (TRAINED_CALIBRATED, UNTRAINED), (TRAINED_CALIBRATED, JEV)]
+    comparisons = [
+        (TRAINED, UNTRAINED),
+        (TRAINED_CALIBRATED, UNTRAINED),
+        (TRAINED, MAJORITY),
+        (TRAINED_CALIBRATED, MAJORITY),
+        (TRAINED_CALIBRATED, JEV),
+    ]
 
     sections = [
         _section(
@@ -637,7 +776,7 @@ def build_report(
                 ext_dataset_id,
                 ext_split,
                 ext_columns,
-                [(TRAINED, UNTRAINED), (TRAINED_CALIBRATED, UNTRAINED)],
+                [(TRAINED, UNTRAINED), (TRAINED_CALIBRATED, UNTRAINED), (TRAINED, MAJORITY)],
                 draws=draws,
                 seed=seed,
                 n_bins=n_bins,
@@ -686,7 +825,9 @@ def _num(value: float | None, digits: int = 4) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
 
 
-def _interval_text(interval: Interval) -> str:
+def _interval_text(interval: Interval | None) -> str:
+    if interval is None:
+        return "—"
     return f"{interval.estimate:+.4f} [{interval.low:+.4f}, {interval.high:+.4f}]"
 
 
@@ -695,7 +836,7 @@ _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
     ("coverage", "coverage", 4),
     ("accuracy (scored rows)", "accuracy", 4),
     ("coverage-adjusted accuracy", "coverage_adjusted_accuracy", 4),
-    ("tied target rows", "tied_target_rows", 0),
+    ("tied target rows (not in accuracy)", "tied_target_rows", 0),
     ("macro F1", "macro_f1", 4),
     ("NLL", "nll", 4),
     ("Brier", "brier", 4),
@@ -773,6 +914,9 @@ def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
         if column.status == NOT_RUN:
             lines.append(f"- {column.name}: {NOT_RUN}")
             continue
+        if column.scorer_run_id is None:
+            lines.append(f"- {column.name}: {column.predictions_source}, computed from the dataset itself")
+            continue
         source = f"`{column.scorer_run_id}`"
         if column.calibration_id:
             source += f" + `{column.calibration_id}`"
@@ -818,7 +962,7 @@ def reliability_svg(section: ReportSection) -> str:
             parts += [f'<circle cx="{p.split(",")[0]}" cy="{p.split(",")[1]}" r="3" fill="{color}"/>' for p in points]
         y = pad + 16 * i
         parts.append(f'<rect x="{size + 4}" y="{y - 8}" width="10" height="10" fill="{color}"/>')
-        parts.append(f'<text x="{size + 20}" y="{y + 1}">{column.name} (ECE {column.metrics.ece:.3f})</text>')
+        parts.append(f'<text x="{size + 20}" y="{y + 1}">{column.name} (ECE {_num(column.metrics.ece, 3)})</text>')
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
 

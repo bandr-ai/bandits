@@ -9,6 +9,7 @@ from bandits_jev.metrics import (
     NLL_PROBABILITY_FLOOR,
     argmax_option,
     ece,
+    gold_option,
     grouped_bootstrap_interval,
     is_correct,
     macro_f1,
@@ -76,12 +77,18 @@ def test_argmax_ties_break_by_option_order_like_the_scorer() -> None:
     assert argmax_option({"b": 0.5, "a": 0.5}) == "b"
 
 
-def test_any_option_tied_at_the_top_of_the_target_is_correct() -> None:
+def test_a_tied_target_is_neither_right_nor_wrong_whatever_the_option_order() -> None:
+    """One tie rule everywhere: a tied row is left out of accuracy (None) and
+    counted, never credited or charged by dict order."""
     target = {"failure": 0.5, "success": 0.5, "unclear": 0.0}
 
-    assert is_correct({"success": 0.8, "failure": 0.2, "unclear": 0.0}, target)
-    assert is_correct({"failure": 0.8, "success": 0.2, "unclear": 0.0}, target)
-    assert not is_correct({"unclear": 0.8, "success": 0.2, "failure": 0.0}, target)
+    for prediction in (
+        {"success": 0.8, "failure": 0.2, "unclear": 0.0},
+        {"failure": 0.8, "success": 0.2, "unclear": 0.0},
+        {"unclear": 0.8, "success": 0.2, "failure": 0.0},
+    ):
+        assert is_correct(prediction, target) is None
+    assert is_correct({"failure": 0.9, "success": 0.1, "unclear": 0.0}, {"failure": 1.0, "success": 0.0, "unclear": 0.0})
 
 
 def test_macro_f1_is_unweighted_over_gold_and_predicted_labels() -> None:
@@ -99,3 +106,9 @@ def test_top_label_ece_of_a_perfectly_calibrated_bin_is_zero() -> None:
 def test_total_variation() -> None:
     assert total_variation({"a": 1.0, "b": 0.0}, {"a": 0.0, "b": 1.0}) == 1.0
     assert total_variation({"a": 0.5, "b": 0.5}, {"a": 0.5, "b": 0.5}) == 0.0
+
+
+def test_gold_option_is_none_on_a_tie_never_the_first_option() -> None:
+    assert gold_option({"a": 0.2, "b": 0.8}) == "b"
+    assert gold_option({"a": 0.5, "b": 0.5}) is None
+    assert gold_option({"a": 1 / 3, "b": 1 / 3, "c": 1 / 3}) is None

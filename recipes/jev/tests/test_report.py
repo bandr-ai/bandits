@@ -10,11 +10,13 @@ from bandits_jev.calibration import calibrate, save_calibration
 from bandits_jev.cli import app
 from bandits_jev.report import (
     JEV,
+    MAJORITY,
     NOT_RUN,
     TRAINED,
     TRAINED_CALIBRATED,
     UNTRAINED,
     UNTRAINED_TWO_ORDER,
+    VERIFIER,
     build_report,
     compute_report_id,
     save_report,
@@ -79,7 +81,10 @@ def test_report_has_every_column_and_jev_degrades_to_not_run(store) -> None:
     main = report.sections[0]
     columns = _columns(main)
 
-    assert list(columns) == [UNTRAINED, UNTRAINED_TWO_ORDER, TRAINED, TRAINED_CALIBRATED, JEV]
+    # No train split in this fixture, so the majority baseline cannot be formed;
+    # rows are user-labeled, so there is no verifier column at all.
+    assert list(columns) == [MAJORITY, UNTRAINED, UNTRAINED_TWO_ORDER, TRAINED, TRAINED_CALIBRATED, JEV]
+    assert columns[MAJORITY].status == NOT_RUN
     assert columns[JEV].status == NOT_RUN and columns[JEV].metrics is None
     assert columns[TRAINED].metrics.accuracy > columns[UNTRAINED].metrics.accuracy
     # Temperature fixes confidence, not ranking: same accuracy, better NLL/ECE.
@@ -370,3 +375,67 @@ def test_cli_calibrate_then_report(store, tmp_path) -> None:
     markdown = (tmp_path / "a" / "report.md").read_text()
     assert f"- jev: {NOT_RUN}" in markdown
     assert "Test split usage" in markdown
+
+
+def _judge_labeled(store, dataset, *, tie_every: int = 0):
+    """Re-save a fixture dataset as if the Bandits judge had labeled it (a
+    judge on every row), optionally turning every n-th test row's target
+    into a 50/50 tie."""
+    from bandits_jev.dataset import DecisionDataset, DecisionJudgeInfo, DecisionTarget
+    from bandits_jev.importer import save_imported_dataset
+
+    judge = DecisionJudgeInfo(
+        model="judge/model", prompt_digest="p", temperature=0.0, votes_requested=2, votes_valid=2,
+        settings_digest="s",
+    )
+    examples = []
+    test_index = 0
+    for e in dataset.examples:
+        update = {"judge": judge}
+        if e.split == "test":
+            if tie_every and test_index % tie_every == 0:
+                update["target"] = DecisionTarget(kind="soft", probabilities={"a": 0.5, "b": 0.5, "c": 0.0})
+            test_index += 1
+        examples.append(e.model_copy(update=update))
+    relabeled = DecisionDataset.model_validate({**dataset.model_dump(), "examples": [x.model_dump() for x in examples]})
+    return save_imported_dataset(relabeled, store, source_file="judge-labeled").artifact_id, relabeled
+
+
+def test_verifier_and_majority_columns_frame_the_trained_model(store) -> None:
+    dataset_id, dataset, truths = build_dataset(store, per_split={"train": 600, "calibration": 200, "test": 300})
+    dataset_id, dataset = _judge_labeled(store, dataset)
+    untrained = save(make_run(dataset_id, dataset, truths, split="test", scale=0.3, noise=1.0), store)
+    trained = save(make_run(dataset_id, dataset, truths, split="test", scale=3.0, adapter_digest=ADAPTER), store)
+
+    report = build_report(store, untrained_run_id=untrained, trained_run_id=trained, draws=200)
+    main = report.sections[0]
+    columns = _columns(main)
+
+    assert list(columns)[:2] == [VERIFIER, MAJORITY]
+    assert columns[VERIFIER].metrics.accuracy == 1.0  # agrees with itself by definition
+    assert columns[VERIFIER].scorer_run_id is None and columns[VERIFIER].metrics.latency_mean_seconds is None
+    majority = columns[MAJORITY].metrics
+    assert len({r.predictions[MAJORITY].chosen for r in main.rows}) == 1  # always the same answer
+    beats = next(c for c in main.comparisons if (c.candidate, c.baseline) == (TRAINED, MAJORITY))
+    assert beats.accuracy.estimate == pytest.approx(columns[TRAINED].metrics.accuracy - majority.accuracy)
+    assert beats.accuracy.excludes_zero
+
+
+def test_tied_targets_are_counted_and_left_out_of_accuracy(store) -> None:
+    dataset_id, dataset, truths = build_dataset(store, per_split={"train": 100, "test": 90})
+    dataset_id, dataset = _judge_labeled(store, dataset, tie_every=3)
+    untrained = save(make_run(dataset_id, dataset, truths, split="test", scale=0.3, noise=1.0), store)
+    trained = save(make_run(dataset_id, dataset, truths, split="test", scale=3.0, adapter_digest=ADAPTER), store)
+
+    report = build_report(store, untrained_run_id=untrained, trained_run_id=trained, draws=100)
+    main = report.sections[0]
+    trained_metrics = _columns(main)[TRAINED].metrics
+    untied = [r for r in main.rows if r.gold is not None]
+
+    assert trained_metrics.tied_target_rows == 30 and trained_metrics.rows == 90
+    assert trained_metrics.accuracy == sum(r.predictions[TRAINED].chosen == r.gold for r in untied) / 60
+    # Coverage-adjusted accuracy uses the same rule: tied rows are out of its denominator too.
+    assert trained_metrics.coverage_adjusted_accuracy == trained_metrics.accuracy  # nothing rejected here
+    assert all(r.predictions[TRAINED].gold_probability is None for r in main.rows if r.gold is None)
+    comparison = next(c for c in main.comparisons if (c.candidate, c.baseline) == (TRAINED, UNTRAINED))
+    assert comparison.rows == 90  # NLL/Brier still use every shared row
