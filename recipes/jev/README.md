@@ -16,17 +16,30 @@ uv sync --extra dev              # data, calibration, report, tests
 uv sync --extra dev --extra train  # plus scoring and training a real model (GPU)
 ```
 
+## One command
+
+```bash
+uv run jev run <judge-run-id> --model Qwen/Qwen3.5-4B --revision <sha> --seed 1 \
+  --checkpoint-dir runs/ckpt --output runs/report \
+  --ledger <judge ledger.jsonl> --input-usd-per-mtok <price> --output-usd-per-mtok <price> \
+  --gpu-usd-per-hour <price>
+```
+
+This takes a Bandits turn-judge run (or a dataset id from `jev import`) through the whole chain: dataset, untrained score, training, calibration, trained score and the report. Every step is saved as it finishes, so rerunning it reuses finished steps. If training is interrupted, `--resume-from-step N` continues it.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
+| `jev run <judge-run or dataset>` | Everything below, in order, resuming from finished steps |
 | `jev dataset <judge-run>` | Turn a Bandits turn-judge run into a decision dataset (the verifier's vote shares become the labels) |
 | `jev import <file.jsonl>` | Import your own labeled decisions |
 | `jev score <dataset> --split dev` | Score a split with a frozen model, optionally with `--adapter` for a trained one |
 | `jev train <dataset>` | LoRA fine-tune on train; the best checkpoint is picked on dev |
 | `jev calibrate <scorer-run>` | Fit one temperature on the calibration split |
 | `jev import-predictions <file>` | Bring in another system's answers (e.g. real Jev) with its bill |
-| `jev report ...` | The scorecard: untrained vs trained vs calibrated vs Jev, with paired intervals |
+| `jev verifier-cost <dataset> --ledger ...` | Price the verifier per decision from its ledger (prices are given, never guessed) |
+| `jev report ...` | The scorecard: verifier, majority baseline, untrained, trained, calibrated and Jev, with paired intervals, cost and latency |
 
 Run `uv run jev <command> --help` for options.
 

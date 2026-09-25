@@ -461,6 +461,171 @@ def report_command(
         console.print("[yellow]warning:[/yellow] the test split was scored by runs this report does not use")
 
 
+@app.command(name="run")
+def run_command(
+    source: str = typer.Argument(
+        ...,
+        help="A Bandits turn-judge run id (verifier labels from traces), or an existing "
+        "decision dataset id (e.g. from `jev import`).",
+    ),
+    model: str = typer.Option(..., "--model", help="Hugging Face base model id, e.g. Qwen/Qwen3.5-4B."),
+    revision: str = typer.Option(..., "--revision", help="Pinned base model revision (commit SHA)."),
+    seed: int = typer.Option(..., "--seed", help="Training data-order and shuffle seed."),
+    checkpoint_dir: Path = typer.Option(..., "--checkpoint-dir", help="Where LoRA checkpoints are saved."),
+    output: Path = typer.Option(..., "--output", help="Directory for report.json, report.md and charts."),
+    task_set_id: str = typer.Option(None, "--task-set", help="Split by this task set instead of by trace."),
+    minimum_valid_votes: int = typer.Option(1, "--minimum-valid-votes", min=1),
+    eval_every_steps: int = typer.Option(50, "--eval-every-steps"),
+    epochs: int = typer.Option(1, "--epochs"),
+    learning_rate: float = typer.Option(5e-5, "--learning-rate"),
+    effective_batch: int = typer.Option(8, "--effective-batch"),
+    lora_rank: int = typer.Option(16, "--lora-rank"),
+    lora_alpha: int = typer.Option(32, "--lora-alpha"),
+    max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
+    two_order: bool = typer.Option(False, "--two-order", help="Also score the untrained base with two option orders."),
+    ledger: Path = typer.Option(None, "--ledger", help="The judge run's ledger, to price the verifier column."),
+    input_usd_per_mtok: float = typer.Option(None, "--input-usd-per-mtok", help="Judge input price (with --ledger)."),
+    output_usd_per_mtok: float = typer.Option(None, "--output-usd-per-mtok", help="Judge output price (with --ledger)."),
+    gpu_usd_per_hour: float = typer.Option(None, "--gpu-usd-per-hour", help="GPU price, for the model columns' cost."),
+    draws: int = typer.Option(2000, "--draws"),
+    resume_from_step: int = typer.Option(
+        0, "--resume-from-step", help="Continue interrupted training from the checkpoint it saved at this step."
+    ),
+    allow_test: bool = typer.Option(
+        False,
+        "--allow-test",
+        help="Required: every run scores the locked test split, so each seed or config you try is a "
+        "deliberate extra look at it (all recorded in the report's test usage).",
+    ),
+    device: str = typer.Option("cuda", "--device"),
+    dtype: str = typer.Option("bfloat16", "--dtype"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Everything in one go: dataset, untrained score, training, calibration,
+    trained score and the report. Each step is saved as it finishes, and a
+    rerun reuses finished steps instead of recomputing them."""
+    from pydantic import ValidationError
+
+    from bandits.verify.nextstate import load_turn_judge_run
+    from bandits_jev.cost import save_verifier_cost, verifier_cost_from_ledger
+    from bandits_jev.dataset import (
+        build_decision_dataset_from_corpus,
+        load_decision_dataset,
+        save_decision_dataset,
+    )
+    from bandits_jev.pipeline import run_pipeline
+    from bandits_jev.trainer import build_training_config
+
+    if not allow_test:
+        console.print(
+            "[red]error:[/red] `jev run` scores the locked test split; pass --allow-test to do so deliberately"
+        )
+        raise typer.Exit(code=1)
+    if ledger is not None and (input_usd_per_mtok is None or output_usd_per_mtok is None):
+        console.print("[red]error:[/red] --ledger needs --input-usd-per-mtok and --output-usd-per-mtok")
+        raise typer.Exit(code=1)
+    store = _derived(project)
+    if source.startswith("decision-dataset-"):
+        try:
+            dataset = load_decision_dataset(source, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no decision dataset {source!r}")
+            raise typer.Exit(code=1) from exc
+        dataset_id = source
+    else:
+        try:
+            judge_run = load_turn_judge_run(source, store)
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no turn judge run or decision dataset {source!r}")
+            raise typer.Exit(code=1) from exc
+        task_set = _load_task_set(task_set_id, project) if task_set_id else None
+        traces = _corpus_traces(judge_run.corpus_id, project, judge_run.trace_ids)
+        try:
+            dataset = build_decision_dataset_from_corpus(
+                traces,
+                judge_run,
+                source,
+                task_set=task_set,
+                task_set_id=task_set_id,
+                minimum_valid_votes=minimum_valid_votes,
+            )
+        except ValueError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        dataset_id = save_decision_dataset(dataset, store).artifact_id
+    console.print(
+        f"dataset: {dataset_id} (train {dataset.counts.train}, dev {dataset.counts.dev}, "
+        f"calibration {dataset.counts.calibration}, test {dataset.counts.test})"
+    )
+
+    verifier_cost_id = None
+    if ledger is not None:
+        try:
+            with ledger.open(encoding="utf-8") as lines:
+                cost = verifier_cost_from_ledger(
+                    lines,
+                    dataset,
+                    dataset_id,
+                    ledger=str(ledger),
+                    input_usd_per_mtok=input_usd_per_mtok,
+                    output_usd_per_mtok=output_usd_per_mtok,
+                )
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        verifier_cost_id = save_verifier_cost(cost, store).artifact_id
+
+    try:
+        config = build_training_config(
+            base_model_id=model,
+            base_revision=revision,
+            dataset_id=dataset_id,
+            seed=seed,
+            eval_every_steps=eval_every_steps,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            learning_rate=learning_rate,
+            effective_batch=effective_batch,
+            epochs=epochs,
+            max_prompt_tokens=max_prompt_tokens,
+            dtype=dtype,
+            device=device,
+        )
+    except ValidationError as exc:
+        console.print(f"[red]error:[/red] invalid training settings: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    from bandits_jev.hf_predictor import HFPredictor
+    from bandits_jev.hf_trainer import HFTrainer
+
+    def make_predictor(adapter_path: str | None):
+        return HFPredictor(model, revision=revision, device=device, dtype=dtype, adapter_path=adapter_path)
+
+    try:
+        result = run_pipeline(
+            store,
+            dataset_id,
+            config=config,
+            checkpoint_dir=str(checkpoint_dir),
+            output=output,
+            make_predictor=make_predictor,
+            make_trainable=HFTrainer.from_config,
+            two_order=two_order,
+            verifier_cost_id=verifier_cost_id,
+            gpu_usd_per_hour=gpu_usd_per_hour,
+            draws=draws,
+            resume_from_step=resume_from_step,
+            allow_test=allow_test,
+            log=console.print,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"report: {result.report_id}")
+    for path in result.written:
+        console.print(f"wrote:  {path}")
+
+
 @app.command(name="train")
 def train_command(
     dataset_id: str,
