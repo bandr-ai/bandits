@@ -103,7 +103,8 @@ class DecisionScoreResult(Contract):
     prompt_digest: str
     """The first (non-reversed) pass's prompt digest. The reversed pass's
     prompt differs only in option order, under the same template version."""
-    latency_seconds: float
+    latency_seconds: float | None = None
+    """Wall-clock latency when reported. Imported predictions may omit it."""
 
 
 class RejectedScore(Contract):
@@ -128,6 +129,8 @@ class ScorerRun(Contract):
     """Digest of the LoRA adapter files scored on top of the base model
     (``adapter_digest``); None for the untrained base. Without it a trained
     run and an untrained run of the same base are indistinguishable."""
+    trained_on_dataset_id: str | None = None
+    """Dataset recorded by the adapter checkpoint's training progress."""
     predictions_source: str | None = None
     """Set only for a run imported from someone else's predictions (e.g.
     "imported:jev"), never for a run this scorer produced. Such a run did
@@ -138,7 +141,12 @@ class ScorerRun(Contract):
     recorded by whoever ran it. None when unknown or not applicable."""
 
 
-_OPTIONAL_IDENTITY_FIELDS = ("adapter_digest", "predictions_source", "cost_usd")
+_OPTIONAL_IDENTITY_FIELDS = (
+    "adapter_digest",
+    "trained_on_dataset_id",
+    "predictions_source",
+    "cost_usd",
+)
 """Added after scorer runs were already being saved. Left out of a run's
 identity while unset, so every run saved before they existed keeps its id."""
 
@@ -274,6 +282,7 @@ def score_dataset(
     dataset_id: str | None = None,
     split: str | None = None,
     adapter_digest: str | None = None,
+    trained_on_dataset_id: str | None = None,
 ) -> ScorerRun:
     results: list[DecisionScoreResult] = []
     rejections: list[RejectedScore] = []
@@ -297,6 +306,7 @@ def score_dataset(
         results=tuple(results),
         rejections=tuple(rejections),
         adapter_digest=adapter_digest,
+        trained_on_dataset_id=trained_on_dataset_id,
     )
 
 
@@ -315,6 +325,21 @@ def adapter_digest(adapter_path: str | Path) -> str:
         digest.update(path.name.encode())
         digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()[:16]
+
+
+def adapter_training_dataset_id(adapter_path: str | Path) -> str:
+    """Read the training dataset provenance saved beside an adapter."""
+    progress_path = Path(adapter_path) / "progress.json"
+    if not progress_path.is_file():
+        raise FileNotFoundError(f"no progress.json in {Path(adapter_path)}")
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        dataset_id = payload["config"]["dataset_id"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"{progress_path} has no valid config.dataset_id") from exc
+    if not isinstance(dataset_id, str) or not dataset_id:
+        raise ValueError(f"{progress_path} has no valid config.dataset_id")
+    return dataset_id
 
 
 def compute_scorer_run_id(run: ScorerRun) -> str:
@@ -433,7 +458,11 @@ def import_predictions(
                 candidate_token_mass=1.0,
                 mode="single_order",
                 prompt_digest="",
-                latency_seconds=float(row.get("latency_seconds") or 0.0),
+                latency_seconds=(
+                    float(row["latency_seconds"])
+                    if row.get("latency_seconds") is not None
+                    else None
+                ),
             )
         )
     return ScorerRun(
@@ -474,4 +503,12 @@ def _prediction_problem(row: dict, example: DecisionExample) -> str | None:
         return "probabilities must be finite and non-negative"
     if abs(sum(values) - 1.0) > 1e-3:
         return f"probabilities sum to {sum(values)!r}, not 1"
+    latency = row.get("latency_seconds")
+    if latency is not None:
+        try:
+            latency_value = float(latency)
+        except (TypeError, ValueError):
+            return "latency_seconds must be a number when provided"
+        if not math.isfinite(latency_value) or latency_value < 0:
+            return "latency_seconds must be finite and non-negative"
     return None

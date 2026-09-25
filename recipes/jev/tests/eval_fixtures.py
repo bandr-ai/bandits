@@ -84,6 +84,7 @@ def make_run(
     split: str,
     scale: float,
     adapter_digest: str | None = None,
+    trained_on_dataset_id: str | None = None,
     two_order: bool = False,
     order_bias: float = 0.0,
     reject: set[str] = frozenset(),
@@ -152,6 +153,11 @@ def make_run(
         results=tuple(results),
         rejections=tuple(rejections),
         adapter_digest=adapter_digest,
+        trained_on_dataset_id=(
+            trained_on_dataset_id
+            if trained_on_dataset_id is not None
+            else dataset_id if adapter_digest is not None else None
+        ),
     )
 
 

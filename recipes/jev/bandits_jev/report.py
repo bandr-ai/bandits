@@ -36,10 +36,12 @@ from bandits_jev.metrics import (
     argmax_option,
     ece,
     grouped_bootstrap_interval,
+    is_correct,
     macro_f1,
     reliability_bins,
     row_brier,
     row_nll,
+    top_options,
     total_variation,
 )
 from bandits_jev.scorer import DecisionScoreResult, ScorerRun, _softmax, load_scorer_run
@@ -69,6 +71,8 @@ class ColumnMetrics(Contract):
     accuracy: float
     coverage_adjusted_accuracy: float
     """Correct predictions divided by all evaluation rows; rejections are wrong."""
+    tied_target_rows: int
+    """Scored rows with more than one equally most-probable target option."""
     macro_f1: float
     nll: float
     brier: float
@@ -84,6 +88,8 @@ class ColumnMetrics(Contract):
     a fake 0."""
     latency_p50_seconds: float | None
     latency_p95_seconds: float | None
+    latency_rows: int
+    """Scored rows that actually reported latency."""
 
 
 class RejectionSummary(Contract):
@@ -181,7 +187,8 @@ class EvaluationReport(Contract):
     ece_bins: int
     nll_probability_floor: float = NLL_PROBABILITY_FLOOR
     sections: tuple[ReportSection, ...]
-    test_usage: TestUsage | None
+    test_usage: tuple[TestUsage, ...]
+    """One audit for every report section evaluated on a locked test split."""
 
 
 class _ColumnInput:
@@ -246,6 +253,8 @@ def _column_metrics(
         return None
     confidence_pairs: list[tuple[float, bool]] = []
     label_pairs: list[tuple[str, str]] = []
+    correct = 0
+    tied_targets = 0
     nll = brier = 0.0
     agreements: list[bool] = []
     shifts: list[float] = []
@@ -253,9 +262,14 @@ def _column_metrics(
         result = results[example.decision_id]
         probs = _distribution(result, column.calibration)
         target = example.target.probabilities
-        chosen, gold = argmax_option(probs), argmax_option(target)
-        confidence_pairs.append((probs[chosen], chosen == gold))
-        label_pairs.append((chosen, gold))
+        chosen = argmax_option(probs)
+        correct += int(is_correct(probs, target))
+        confidence_pairs.append((probs[chosen], is_correct(probs, target)))
+        target_tops = top_options(target)
+        if len(target_tops) == 1:
+            label_pairs.append((chosen, next(iter(target_tops))))
+        else:
+            tied_targets += 1
         nll += row_nll(probs, target)
         brier += row_brier(probs, target)
         passes = _pass_distributions(result, column.temperature)
@@ -263,13 +277,17 @@ def _column_metrics(
             agreements.append(argmax_option(passes[0]) == argmax_option(passes[1]))
             shifts.append(total_variation(*passes))
     n = len(scored)
-    latencies = sorted(results[e.decision_id].latency_seconds for e in scored)
-    no_latency = column.run.predictions_source is not None and not any(latencies)
+    latencies = sorted(
+        latency
+        for e in scored
+        if (latency := results[e.decision_id].latency_seconds) is not None
+    )
     return ColumnMetrics(
         rows=n,
         coverage=n / len(examples),
-        accuracy=sum(1 for c, g in label_pairs if c == g) / n,
-        coverage_adjusted_accuracy=sum(1 for c, g in label_pairs if c == g) / len(examples),
+        accuracy=correct / n,
+        coverage_adjusted_accuracy=correct / len(examples),
+        tied_target_rows=tied_targets,
         macro_f1=macro_f1(label_pairs) or 0.0,
         nll=nll / n,
         brier=brier / n,
@@ -286,9 +304,10 @@ def _column_metrics(
         ),
         order_agreement=sum(agreements) / len(agreements) if agreements else None,
         order_probability_shift=sum(shifts) / len(shifts) if shifts else None,
-        latency_mean_seconds=None if no_latency else sum(latencies) / n,
-        latency_p50_seconds=None if no_latency else _percentile(latencies, 0.50),
-        latency_p95_seconds=None if no_latency else _percentile(latencies, 0.95),
+        latency_mean_seconds=sum(latencies) / len(latencies) if latencies else None,
+        latency_p50_seconds=_percentile(latencies, 0.50) if latencies else None,
+        latency_p95_seconds=_percentile(latencies, 0.95) if latencies else None,
+        latency_rows=len(latencies),
     )
 
 
@@ -340,7 +359,6 @@ def _comparison(
     groups: list[str] = []
     for example in examples:
         target = example.target.probabilities
-        gold = argmax_option(target)
         c = (
             _distribution(cand[example.decision_id], candidate.calibration)
             if example.decision_id in cand
@@ -352,8 +370,8 @@ def _comparison(
             else {}
         )
         accuracy.append(
-            float(bool(c) and argmax_option(c) == gold)
-            - float(bool(b) and argmax_option(b) == gold)
+            float(bool(c) and is_correct(c, target))
+            - float(bool(b) and is_correct(b, target))
         )
         nll.append(row_nll(c, target) - row_nll(b, target))
         brier.append(row_brier(c, target) - row_brier(b, target))
@@ -536,6 +554,11 @@ def build_report(
     dataset_id, split = _check_same_items(main_runs)
     _check_evaluation_split(split, "main")
     _check_models(untrained, trained, two_order, calibration, dataset_id)
+    if trained.trained_on_dataset_id != dataset_id:
+        raise ValueError(
+            "the trained run's adapter was not trained on this dataset "
+            f"({trained.trained_on_dataset_id!r} != {dataset_id!r})"
+        )
 
     columns = [_ColumnInput(UNTRAINED, run_id=untrained_run_id, run=untrained)]
     columns.append(
@@ -567,6 +590,12 @@ def build_report(
             n_bins=n_bins,
         )
     ]
+    test_usages: list[TestUsage] = []
+    main_used = {untrained_run_id, trained_run_id}
+    main_used |= {i for i in (untrained_two_order_run_id, jev_run_id) if i}
+    if split == "test":
+        test_usages.append(_test_usage(store, dataset_id, main_used))
+
     for ext_untrained_id, ext_trained_id in external:
         ext_untrained = load_scorer_run(ext_untrained_id, store)
         ext_trained = load_scorer_run(ext_trained_id, store)
@@ -578,6 +607,10 @@ def build_report(
             raise ValueError("the external trained run used a different base model or revision")
         if ext_trained.adapter_digest != trained.adapter_digest:
             raise ValueError("the external trained run used a different adapter than the main trained run")
+        if ext_trained.trained_on_dataset_id != dataset_id:
+            raise ValueError(
+                "the external trained run's adapter does not record the main training dataset"
+            )
         _check_models(ext_untrained, ext_trained, None, None, ext_dataset_id)
         if calibration is not None and (ext_trained.mode, ext_trained.template_digest) != (
             calibration.mode,
@@ -610,15 +643,16 @@ def build_report(
                 n_bins=n_bins,
             )
         )
-
-    used = {untrained_run_id, trained_run_id}
-    used |= {i for i in (untrained_two_order_run_id, jev_run_id) if i}
+        if ext_split == "test":
+            test_usages.append(
+                _test_usage(store, ext_dataset_id, {ext_untrained_id, ext_trained_id})
+            )
     return EvaluationReport(
         bootstrap_draws=draws,
         bootstrap_seed=seed,
         ece_bins=n_bins,
         sections=tuple(sections),
-        test_usage=_test_usage(store, dataset_id, used) if split == "test" else None,
+        test_usage=tuple(test_usages),
     )
 
 
@@ -661,6 +695,7 @@ _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
     ("coverage", "coverage", 4),
     ("accuracy (scored rows)", "accuracy", 4),
     ("coverage-adjusted accuracy", "coverage_adjusted_accuracy", 4),
+    ("tied target rows", "tied_target_rows", 0),
     ("macro F1", "macro_f1", 4),
     ("NLL", "nll", 4),
     ("Brier", "brier", 4),
@@ -670,6 +705,7 @@ _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
     ("latency mean (s)", "latency_mean_seconds", 4),
     ("latency p50 (s)", "latency_p50_seconds", 4),
     ("latency p95 (s)", "latency_p95_seconds", 4),
+    ("latency rows", "latency_rows", 0),
 )
 
 
@@ -680,6 +716,12 @@ def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
         f"Intervals resample by {'group' if section.resample_by == 'group_id' else 'row'}."
     )
     lines.append("")
+    if section.split == "dev":
+        lines += [
+            "**Selection-split warning:** checkpoints are selected by dev accuracy, so trained "
+            "results on this split are optimistic and are not final test estimates.",
+            "",
+        ]
     names = [c.name for c in section.columns]
     lines.append("| metric | " + " | ".join(names) + " |")
     lines.append("|---|" + "---|" * len(names))
@@ -799,25 +841,31 @@ def report_markdown(report: EvaluationReport, report_id: str) -> str:
     ]
     for index, section in enumerate(report.sections):
         lines += _section_markdown(section, _chart_name(index))
-    if report.test_usage is not None:
+    if report.test_usage:
         lines += ["## Test split usage", ""]
-        runs = report.test_usage.runs
-        unused = [r for r in runs if not r.used_in_report]
-        lines.append(
-            f"{len(runs)} saved scorer run(s) over `{report.test_usage.dataset_id}`'s test split; "
-            f"{len(runs) - len(unused)} used here."
-        )
-        if unused:
-            lines.append("")
+        for usage in report.test_usage:
+            runs = usage.runs
+            unused = [r for r in runs if not r.used_in_report]
             lines.append(
-                "**Warning:** the test split was also scored by runs this report does not use. If any "
-                "choice was made after seeing them, this test set is now a dev set; cut a new one."
+                f"{len(runs)} saved scorer run(s) over `{usage.dataset_id}`'s test split; "
+                f"{len(runs) - len(unused)} used here."
             )
-        lines.append("")
-        for r in runs:
-            who = r.predictions_source or r.model_id + (f" + adapter {r.adapter_digest}" if r.adapter_digest else "")
-            lines.append(f"- `{r.scorer_run_id}` {who}, {r.mode}{'' if r.used_in_report else ' (not used here)'}")
-        lines.append("")
+            if unused:
+                lines.append("")
+                lines.append(
+                    "**Warning:** the test split was also scored by runs this report does not use. If any "
+                    "choice was made after seeing them, this test set is now a dev set; cut a new one."
+                )
+            lines.append("")
+            for r in runs:
+                who = r.predictions_source or r.model_id + (
+                    f" + adapter {r.adapter_digest}" if r.adapter_digest else ""
+                )
+                lines.append(
+                    f"- `{r.scorer_run_id}` {who}, {r.mode}"
+                    f"{'' if r.used_in_report else ' (not used here)'}"
+                )
+            lines.append("")
     lines.append("Per-row predictions behind every number above are in `report.json` (`sections[*].rows`).")
     return "\n".join(lines) + "\n"
 

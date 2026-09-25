@@ -10,6 +10,7 @@ from bandits_jev.metrics import (
     argmax_option,
     ece,
     grouped_bootstrap_interval,
+    is_correct,
     macro_f1,
     row_brier,
     row_nll,
@@ -73,6 +74,14 @@ def test_nll_floors_a_zero_probability_on_gold() -> None:
 
 def test_argmax_ties_break_by_option_order_like_the_scorer() -> None:
     assert argmax_option({"b": 0.5, "a": 0.5}) == "b"
+
+
+def test_any_option_tied_at_the_top_of_the_target_is_correct() -> None:
+    target = {"failure": 0.5, "success": 0.5, "unclear": 0.0}
+
+    assert is_correct({"success": 0.8, "failure": 0.2, "unclear": 0.0}, target)
+    assert is_correct({"failure": 0.8, "success": 0.2, "unclear": 0.0}, target)
+    assert not is_correct({"unclear": 0.8, "success": 0.2, "failure": 0.0}, target)
 
 
 def test_macro_f1_is_unweighted_over_gold_and_predicted_labels() -> None:

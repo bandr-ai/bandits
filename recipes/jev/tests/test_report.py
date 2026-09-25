@@ -188,6 +188,60 @@ def test_jev_column_from_imported_predictions_records_the_bill(store) -> None:
     assert any(c.baseline == JEV for c in report.sections[0].comparisons)
 
 
+def test_imported_latency_uses_only_rows_that_report_it(store) -> None:
+    ids, dataset, _ = _setup(store)
+    test = [e for e in dataset.examples if e.split == "test"]
+    lines = []
+    for index, example in enumerate(test):
+        row = {
+            "decision_id": example.decision_id,
+            "probabilities": {"a": 0.5, "b": 0.3, "c": 0.2},
+        }
+        if index < 2:
+            row["latency_seconds"] = 2.0 + index * 2.0
+        lines.append(json.dumps(row))
+    jev = import_predictions(
+        "\n".join(lines),
+        test,
+        name="jev",
+        model_id="jev",
+        revision="today",
+        dataset_id=ids["dataset"],
+        split="test",
+    )
+    report = build_report(
+        store,
+        untrained_run_id=ids["untrained"],
+        trained_run_id=ids["trained"],
+        jev_run_id=save(jev, store),
+        draws=100,
+    )
+    metrics = _columns(report.sections[0])[JEV].metrics
+
+    assert metrics.latency_rows == 2
+    assert metrics.latency_mean_seconds == 3.0
+
+
+def test_report_rejects_adapter_trained_on_a_different_dataset(store) -> None:
+    ids, dataset, truths = _setup(store)
+    wrong = make_run(
+        ids["dataset"],
+        dataset,
+        truths,
+        split="test",
+        scale=3.0,
+        adapter_digest=ADAPTER,
+        trained_on_dataset_id="decision-dataset-old-all-train",
+    )
+
+    with pytest.raises(ValueError, match="adapter was not trained on this dataset"):
+        build_report(
+            store,
+            untrained_run_id=ids["untrained"],
+            trained_run_id=save(wrong, store),
+        )
+
+
 def test_test_usage_flags_test_runs_the_report_did_not_use(store) -> None:
     ids, dataset, truths = _setup(store)
     extra = save(
@@ -195,7 +249,8 @@ def test_test_usage_flags_test_runs_the_report_did_not_use(store) -> None:
         store,
     )
     report = build_report(store, untrained_run_id=ids["untrained"], trained_run_id=ids["trained"], draws=100)
-    usage = {r.scorer_run_id: r.used_in_report for r in report.test_usage.runs}
+    assert len(report.test_usage) == 1
+    usage = {r.scorer_run_id: r.used_in_report for r in report.test_usage[0].runs}
 
     assert usage[ids["untrained"]] and usage[ids["trained"]]
     assert usage[extra] is False
@@ -208,7 +263,17 @@ def test_external_set_is_its_own_section_with_the_same_temperature(store) -> Non
     ext_untrained = save(make_run(ext_id, ext, ext_truths, split="test", scale=0.5), store)
     # The trained model got worse off-distribution: its logits are mostly noise here.
     ext_trained = save(
-        make_run(ext_id, ext, ext_truths, split="test", scale=0.1, noise=3.0, adapter_digest=ADAPTER), store
+        make_run(
+            ext_id,
+            ext,
+            ext_truths,
+            split="test",
+            scale=0.1,
+            noise=3.0,
+            adapter_digest=ADAPTER,
+            trained_on_dataset_id=ids["dataset"],
+        ),
+        store,
     )
     report = build_report(
         store,
@@ -223,6 +288,7 @@ def test_external_set_is_its_own_section_with_the_same_temperature(store) -> Non
     assert external.name == f"external: {ext_id}"
     assert _columns(external)[TRAINED_CALIBRATED].temperature == _columns(main)[TRAINED_CALIBRATED].temperature
     assert external.comparisons[0].accuracy.estimate < 0  # the regression shows up, not hidden
+    assert {usage.dataset_id for usage in report.test_usage} == {ids["dataset"], ext_id}
 
 
 def test_mismatched_inputs_are_refused(store) -> None:
@@ -256,7 +322,13 @@ def test_external_set_must_match_main_base_model_and_revision(store) -> None:
         update={"model_id": "different-base"}
     )
     ext_trained_run = make_run(
-        ext_id, ext, ext_truths, split="test", scale=0.5, adapter_digest=ADAPTER
+        ext_id,
+        ext,
+        ext_truths,
+        split="test",
+        scale=0.5,
+        adapter_digest=ADAPTER,
+        trained_on_dataset_id=ids["dataset"],
     ).model_copy(update={"model_id": "different-base"})
     ext_untrained = save(ext_untrained_run, store)
     ext_trained = save(ext_trained_run, store)
