@@ -169,8 +169,11 @@ for model in $MODELS; do
 done
 
 log "pack"
-tar -czf "$OUT.tar.gz" -C "$(dirname "$OUT")" \
-  "$(basename "$OUT")/reports" "$(basename "$OUT")/project/.bandits/derived" \
-  $(cd "$(dirname "$OUT")" && ls "$(basename "$OUT")"/*.json "$(basename "$OUT")"/*.log 2>/dev/null)
+# Reports, smoke results and logs come from $OUT; derived artifacts from the
+# project, which PROJECT_DIR may put outside $OUT (phase 2 reusing phase 1's).
+tar -czf "$OUT.tar.gz" \
+  -C "$(dirname "$OUT")" "$(basename "$OUT")/reports" \
+  $(cd "$(dirname "$OUT")" && ls "$(basename "$OUT")"/*.json "$(basename "$OUT")"/*.log 2>/dev/null) \
+  -C "$(dirname "$PROJECT")" "$(basename "$PROJECT")/.bandits/derived"
 echo "reports: $OUT/reports"
 echo "copy back: $OUT.tar.gz (reports, derived artifacts, smoke results, logs; no checkpoints)"
