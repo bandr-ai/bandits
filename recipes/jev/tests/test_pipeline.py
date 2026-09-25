@@ -217,7 +217,7 @@ def test_a_held_out_source_that_rejudged_training_traces_is_refused(tmp_path) ->
 
     config = build_training_config(base_model_id=_MODEL, base_revision="main", dataset_id=dataset_id, seed=1,
                                    eval_every_steps=0)
-    with pytest.raises(ValueError, match="traces also used in training"):
+    with pytest.raises(ValueError, match="share a trace or group"):
         run_pipeline(store, dataset_id, config=config, checkpoint_dir=str(tmp_path / "c"), output=tmp_path / "o",
                      make_predictor=never, make_trainable=never, held_out_dataset_ids=(rejudged_id,),
                      allow_test=True)
@@ -232,3 +232,35 @@ def test_task_set_is_refused_with_several_sources(tmp_path) -> None:
     )
 
     assert result.exit_code == 1 and "task set belongs to one corpus" in result.output.replace("--task-set", "task set")
+
+
+def test_a_held_out_retry_of_a_training_lineage_is_refused(tmp_path) -> None:
+    from bandits_jev.dataset import (
+        as_test_only,
+        build_decision_dataset_from_corpus,
+        save_decision_dataset,
+    )
+    from bandits_jev.pipeline import run_pipeline
+    from bandits_jev.trainer import build_training_config
+
+    store = DerivedStore(tmp_path / ".bandits")
+    traces = [_trace(f"t{i}").model_copy(update={"lineage_id": f"session-{i}"}) for i in range(40)]
+    verdicts = [_verdict(t.trace_id, x.index, x.action_span_id, votes=(1,))
+                for t in traces for x in extract_turns(t) if x.observed]
+    dataset = build_decision_dataset_from_corpus(traces, _run(traces, verdicts), "judge-run-1")
+    dataset_id = save_decision_dataset(dataset, store).artifact_id
+    # Retries: new trace ids, same lineages as training sessions.
+    retries = [_trace(f"retry-{i}").model_copy(update={"lineage_id": f"session-{i}"}) for i in range(40)]
+    retry_verdicts = [_verdict(t.trace_id, x.index, x.action_span_id, votes=(1,))
+                      for t in retries for x in extract_turns(t) if x.observed]
+    held = as_test_only(build_decision_dataset_from_corpus(retries, _run(retries, retry_verdicts), "judge-run-2"))
+    held_id = save_decision_dataset(held, store).artifact_id
+
+    def never(*_args):
+        raise AssertionError("no model may load before the leak check")
+
+    config = build_training_config(base_model_id=_MODEL, base_revision="main", dataset_id=dataset_id, seed=1,
+                                   eval_every_steps=0)
+    with pytest.raises(ValueError, match="share a trace or group"):
+        run_pipeline(store, dataset_id, config=config, checkpoint_dir=str(tmp_path / "c"), output=tmp_path / "o",
+                     make_predictor=never, make_trainable=never, held_out_dataset_ids=(held_id,), allow_test=True)
