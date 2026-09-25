@@ -132,6 +132,7 @@ def run_pipeline(
     n_bins: int = 10,
     resume_from_step: int = 0,
     allow_test: bool = False,
+    held_out_dataset_ids: tuple[str, ...] = (),
     log: Callable[[str], None] = lambda _message: None,
 ) -> PipelineResult:
     """``make_predictor(None)`` must load the untrained base named in
@@ -141,7 +142,10 @@ def run_pipeline(
     continues an interrupted training run from the checkpoint it saved at
     that step (see ``trainer.train``). ``allow_test`` must be set: every run
     scores the locked test split, and that is a deliberate choice, as with
-    ``jev score --allow-test``."""
+    ``jev score --allow-test``. ``held_out_dataset_ids`` are test-only
+    datasets from sources the model never trained on (see
+    ``dataset.as_test_only``); each is scored untrained and trained and
+    becomes its own report section."""
     if not allow_test:
         raise ValueError(
             "the pipeline scores the locked test split; pass allow_test (--allow-test) to do so deliberately"
@@ -152,6 +156,18 @@ def run_pipeline(
     by_split: dict[str, list[DecisionExample]] = {}
     for example in dataset.examples:
         by_split.setdefault(example.split, []).append(example)
+    held_out: dict[str, list[DecisionExample]] = {}
+    training_ids = {e.decision_id for e in dataset.examples if e.split != "test"}
+    for held_out_id in held_out_dataset_ids:
+        if held_out_id == dataset_id:
+            raise ValueError("a held-out dataset must not be the training dataset")
+        rows = [e for e in load_decision_dataset(held_out_id, store).examples if e.split == "test"]
+        leaked = [e.decision_id for e in rows if e.decision_id in training_ids]
+        if leaked:
+            raise ValueError(f"{len(leaked)} held-out row(s) of {held_out_id} are also in training: {leaked[:3]}")
+        if not rows:
+            raise ValueError(f"held-out dataset {held_out_id} has no test rows")
+        held_out[held_out_id] = rows
     missing = [s for s in ("train", "dev", "calibration", "test") if not by_split.get(s)]
     if missing:
         raise ValueError(f"dataset {dataset_id} has no {', '.join(missing)} rows; the pipeline needs all four splits")
@@ -159,12 +175,22 @@ def run_pipeline(
     steps: list[PipelineStep] = []
     model_id, revision = config.base_model_id, config.base_revision
 
-    def score(name: str, split: str, adapter_path: str | None, mode: ScoreMode) -> str:
+    def score(
+        name: str,
+        split: str,
+        adapter_path: str | None,
+        mode: ScoreMode,
+        *,
+        on_dataset: str | None = None,
+        rows: list[DecisionExample] | None = None,
+    ) -> str:
+        target_id = on_dataset or dataset_id
+        rows = rows if rows is not None else by_split[split]
         adapter = adapter_digest(adapter_path) if adapter_path is not None else None
         trained_on = adapter_training_dataset_id(adapter_path) if adapter_path is not None else None
         found = _find_scorer_run(
             store,
-            dataset_id=dataset_id,
+            dataset_id=target_id,
             split=split,
             model_id=model_id,
             revision=revision,
@@ -177,14 +203,14 @@ def run_pipeline(
             log(f"{name}: reusing {found}")
             steps.append(PipelineStep(name=name, artifact_id=found, reused=True))
             return found
-        log(f"{name}: scoring {len(by_split[split])} {split} rows")
+        log(f"{name}: scoring {len(rows)} {split} rows")
         predictor = make_predictor(adapter_path)
         run: ScorerRun = score_dataset(
             predictor,
-            by_split[split],
+            rows,
             mode=mode,
             max_prompt_tokens=config.max_prompt_tokens,
-            dataset_id=dataset_id,
+            dataset_id=target_id,
             split=split,
             adapter_digest=adapter,
             trained_on_dataset_id=trained_on,
@@ -232,6 +258,16 @@ def run_pipeline(
     log(f"temperature: {calibration.temperature:.4f}")
 
     trained_id = score("trained on test", "test", best.adapter_path, "single_order")
+    external = []
+    for held_out_id, rows in held_out.items():
+        external.append(
+            (
+                score(f"untrained on held-out {held_out_id}", "test", None, "single_order",
+                      on_dataset=held_out_id, rows=rows),
+                score(f"trained on held-out {held_out_id}", "test", best.adapter_path, "single_order",
+                      on_dataset=held_out_id, rows=rows),
+            )
+        )
 
     report = build_report(
         store,
@@ -239,6 +275,7 @@ def run_pipeline(
         trained_run_id=trained_id,
         untrained_two_order_run_id=two_order_id,
         calibration_id=calibration_id,
+        external=external,
         verifier_cost_id=verifier_cost_id,
         gpu_usd_per_hour=gpu_usd_per_hour,
         draws=draws,
