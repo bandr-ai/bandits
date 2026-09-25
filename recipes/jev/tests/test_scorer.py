@@ -327,3 +327,13 @@ def test_scorer_does_not_depend_on_traces_or_judge_code() -> None:
     source = inspect.getsource(scorer_module)
     assert "bandits.traces" not in source
     assert "bandits.verify" not in source
+
+
+def test_a_prompt_over_the_models_own_context_is_rejected_not_crashed() -> None:
+    predictor = FakePredictor()
+    predictor.max_context_tokens = 10
+    outcome = score_example(predictor, _example(), max_prompt_tokens=8_000)
+
+    assert isinstance(outcome, RejectedScore)
+    assert "model's 10-token context" in outcome.reasons[0]
+    assert predictor.predict_calls == []  # never sent to the model

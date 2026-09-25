@@ -190,6 +190,19 @@ def _score_once(
     return probs_by_option, raw_by_option, mass, prompt_digest(prompt)
 
 
+def token_limit(model, max_prompt_tokens: int) -> tuple[int, str]:
+    """The limit a prompt must fit: the configured ``max_prompt_tokens`` or,
+    when smaller, the model's own context length (``max_context_tokens``,
+    set by the Hugging Face adapters from the model config). A prompt over
+    the model's context does not merely score worse -- the forward pass
+    fails -- so it must be rejected like any other overlength prompt.
+    Returns the limit and how to name it in a rejection reason."""
+    context = getattr(model, "max_context_tokens", None)
+    if context is not None and context < max_prompt_tokens:
+        return context, f"model's {context}-token context"
+    return max_prompt_tokens, f"{max_prompt_tokens} limit"
+
+
 def _check_prompt_length(
     predictor: LogitPredictor, state: str, question: str, options: dict[str, str], max_prompt_tokens: int
 ) -> int | None:
@@ -213,25 +226,24 @@ def score_example(
 ) -> DecisionScoreResult | RejectedScore:
     """Score one example. Overlength prompts are rejected, never truncated --
     truncation would silently change what the model is being asked."""
-    over_limit = _check_prompt_length(
-        predictor, example.state, example.question, dict(example.options), max_prompt_tokens
-    )
+    limit, limit_name = token_limit(predictor, max_prompt_tokens)
+    over_limit = _check_prompt_length(predictor, example.state, example.question, dict(example.options), limit)
     if over_limit is not None:
         return RejectedScore(
             decision_id=example.decision_id,
-            reasons=(f"prompt is {over_limit} tokens, over the {max_prompt_tokens} limit",),
+            reasons=(f"prompt is {over_limit} tokens, over the {limit_name}",),
         )
     if mode == "two_order_average":
         reversed_options = dict(reversed(example.options.items()))
         reversed_over_limit = _check_prompt_length(
-            predictor, example.state, example.question, reversed_options, max_prompt_tokens
+            predictor, example.state, example.question, reversed_options, limit
         )
         if reversed_over_limit is not None:
             return RejectedScore(
                 decision_id=example.decision_id,
                 reasons=(
                     f"reversed-order prompt is {reversed_over_limit} tokens, over the "
-                    f"{max_prompt_tokens} limit (first-order prompt was within budget)",
+                    f"{limit_name} (first-order prompt was within budget)",
                 ),
             )
 

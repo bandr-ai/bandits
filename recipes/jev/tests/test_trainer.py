@@ -415,3 +415,13 @@ def test_evaluate_dev_refuses_when_every_row_ties() -> None:
     trainer = _trainer()
     with pytest.raises(ValueError, match="tied"):
         evaluate_dev(trainer.predictor(), [_soft("t", {"a": 0.5, "b": 0.5}, split="dev")])
+
+
+def test_real_model_rejects_a_prompt_longer_than_its_context_instead_of_crashing() -> None:
+    predictor = HFPredictor(_MODEL_ID, revision=_REVISION, device="cpu", dtype="float32")
+    assert predictor.max_context_tokens  # read from the model config
+    long = _example("long", "word " * (predictor.max_context_tokens + 50), "a", split="dev")
+
+    outcome = score_example(predictor, long)
+
+    assert "context" in outcome.reasons[0]
