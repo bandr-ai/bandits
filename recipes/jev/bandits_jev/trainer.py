@@ -24,7 +24,13 @@ from bandits.store import Contract, DerivedEnvelope, DerivedStore
 from bandits_jev.dataset import DecisionExample
 from bandits_jev.metrics import gold_option
 from bandits_jev.prompt import PROMPT_VERSION, build_prompt, template_digest
-from bandits_jev.scorer import LogitPredictor, ScoreMode, TokenizationError, score_dataset
+from bandits_jev.scorer import (
+    LogitPredictor,
+    ScoreMode,
+    TokenizationError,
+    score_dataset,
+    token_limit,
+)
 
 DEFAULT_LORA_RANK = 16
 DEFAULT_LORA_ALPHA = 32
@@ -174,17 +180,19 @@ def reject_unscorable(
     max_prompt_tokens: int,
 ) -> tuple[list[tuple[DecisionExample, dict[str, str]]], list[RejectedTrainExample]]:
     """Drop every data-order entry the scorer would reject: prompt over
-    ``max_prompt_tokens`` (same count and limit), or option letters that
+    ``max_prompt_tokens`` or the model's own context (same count and limit,
+    see ``scorer.token_limit``), or option letters that
     are not distinct single tokens. Each rejected row is recorded once.
     Deterministic, so a resume re-derives the same filtered order."""
     kept: list[tuple[DecisionExample, dict[str, str]]] = []
     rejected: dict[str, RejectedTrainExample] = {}
+    limit, limit_name = token_limit(trainable, max_prompt_tokens)
     for example, options in order:
         prompt, letters = build_prompt(example.state, example.question, options)
         reason = None
         tokens = trainable.token_count(prompt)
-        if tokens > max_prompt_tokens:
-            reason = f"prompt is {tokens} tokens, over the {max_prompt_tokens}-token limit"
+        if tokens > limit:
+            reason = f"prompt is {tokens} tokens, over the {limit_name}"
         else:
             try:
                 trainable.check_letters(prompt, list(letters.values()))
