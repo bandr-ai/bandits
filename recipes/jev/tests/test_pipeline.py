@@ -107,6 +107,12 @@ def test_a_held_out_source_gets_its_own_report_section(tmp_path) -> None:
     columns = {c["name"]: c for c in held_out["columns"]}
     assert columns["trained"]["status"] == "run" and columns["untrained"]["status"] == "run"
     assert columns["trained + calibrated"]["temperature"] is not None  # the main run's temperature
+    # The majority baseline answers with the *training* label mix, not the
+    # held-out set's (a test-only set has no train split of its own).
+    assert columns["majority (train prior)"]["status"] == "run"
+    assert any(
+        c["candidate"] == "trained" and c["baseline"] == "majority (train prior)" for c in held_out["comparisons"]
+    )
 
 
 def test_a_held_out_dataset_that_is_also_the_training_dataset_is_refused(tmp_path) -> None:

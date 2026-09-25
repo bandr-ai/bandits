@@ -477,4 +477,25 @@ def test_costs_are_measured_or_unknown_never_zero(store) -> None:
     from bandits_jev.report import compute_report_id, report_markdown
 
     markdown = report_markdown(report, compute_report_id(report))
-    assert "trained vs the verifier:** 180.0× cheaper per decision, 400.0× faster at the median" in markdown
+    versus = report.sections[0].versus_verifier
+    # 20 of the 100 compared rows have no verifier cost: no ratio on a subset.
+    assert versus.cost_ratio is None
+    assert "20 compared decision(s) have no verifier cost" in versus.notes[0]
+    assert versus.latency_ratio == pytest.approx(400.0) and versus.latency_rows == 80
+    assert "not computed: 20 compared decision(s)" in markdown
+
+    full = cost.model_copy(update={
+        "per_decision": {d: cost.per_decision[test_ids[0]] for d in test_ids}, "uncovered_decisions": 0,
+    })
+    full_id = save_verifier_cost(full, store).artifact_id
+    full_report = build_report(
+        store, untrained_run_id=untrained, trained_run_id=trained, draws=50,
+        verifier_cost_id=full_id, gpu_usd_per_hour=3.6,
+    )
+    versus = full_report.sections[0].versus_verifier
+    # Same 100 rows on both sides: $0.18 of verifier vs 100 x 0.01 s x $3.6/h = $0.001.
+    assert versus.cost_ratio == pytest.approx(180.0) and versus.notes == ()
+    assert versus.agreement == _columns(full_report.sections[0])[TRAINED].metrics.coverage_adjusted_accuracy
+    assert "trained vs the verifier** (100 of 100 rows scored): 180.0× cheaper per decision" in report_markdown(
+        full_report, compute_report_id(full_report)
+    )
