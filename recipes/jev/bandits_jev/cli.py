@@ -349,6 +349,15 @@ def calibrate_command(
     console.print(f"ece:            {calibration.ece_before:.4f} -> {calibration.ece_after:.4f}")
 
 
+def _warn_over_counted(cost) -> None:
+    if cost.over_counted_decisions:
+        console.print(
+            f"[yellow]warning:[/yellow] {len(cost.over_counted_decisions)} decision(s) have more successful "
+            "judge calls than votes asked; the ledger may hold more than one judge run over the same steps, "
+            "which overstates the verifier's cost. Pass only the ledger of the run that labeled this dataset."
+        )
+
+
 def _price_verifier(ledgers, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok):
     """Price a dataset's verifier from one or more ledgers read as one
     stream -- a merged dataset's judge runs each wrote their own."""
@@ -444,12 +453,7 @@ def verifier_cost_command(
         console.print(f"cost per 1k:       ${per_1k:.4f}")
         console.print(f"seconds/decision:  {seconds:.3f} (sum of calls)")
     console.print(f"retries:           {cost.retries}")
-    if cost.over_counted_decisions:
-        console.print(
-            f"[yellow]warning:[/yellow] {len(cost.over_counted_decisions)} decision(s) have more successful "
-            "judge calls than votes asked; the ledger may hold more than one judge run over the same steps, "
-            "which overstates the verifier's cost. Pass only the ledger of the run that labeled this dataset."
-        )
+    _warn_over_counted(cost)
 
 
 @app.command(name="report")
@@ -557,11 +561,17 @@ def run_command(
     resume_from_step: int = typer.Option(
         0, "--resume-from-step", help="Continue interrupted training from the checkpoint it saved at this step."
     ),
+    eval_split: str = typer.Option(
+        ...,
+        "--eval-split",
+        help="dev: the model-selection run (launch plan phase 1); never opens the locked test split and "
+        "its report is marked optimistic. test: the locked run (phase 2); needs --allow-test.",
+    ),
     allow_test: bool = typer.Option(
         False,
         "--allow-test",
-        help="Required: every run scores the locked test split, so each seed or config you try is a "
-        "deliberate extra look at it (all recorded in the report's test usage).",
+        help="Required with --eval-split test: each seed or config you try is then a deliberate extra "
+        "look at the locked split (all recorded in the report's test usage).",
     ),
     device: str = typer.Option("cuda", "--device"),
     dtype: str = typer.Option("bfloat16", "--dtype"),
@@ -584,9 +594,19 @@ def run_command(
     from bandits_jev.pipeline import run_pipeline
     from bandits_jev.trainer import build_training_config
 
-    if not allow_test:
+    if eval_split not in ("dev", "test"):
+        console.print(f"[red]error:[/red] --eval-split must be dev or test, got {eval_split!r}")
+        raise typer.Exit(code=1)
+    if eval_split == "test" and not allow_test:
         console.print(
-            "[red]error:[/red] `jev run` scores the locked test split; pass --allow-test to do so deliberately"
+            "[red]error:[/red] --eval-split test scores the locked test split; pass --allow-test to do so "
+            "deliberately, or use --eval-split dev"
+        )
+        raise typer.Exit(code=1)
+    if task_set_id and (len(sources) > 1 or held_out):
+        console.print(
+            "[red]error:[/red] --task-set belongs to one corpus; it cannot be applied to several sources "
+            "or to --held-out sources (their traces are not in it and would all be quarantined)"
         )
         raise typer.Exit(code=1)
     if ledger and (input_usd_per_mtok is None or output_usd_per_mtok is None):
@@ -648,6 +668,7 @@ def run_command(
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc
         verifier_cost_id = save_verifier_cost(cost, store).artifact_id
+        _warn_over_counted(cost)
 
     try:
         config = build_training_config(
@@ -690,6 +711,7 @@ def run_command(
             draws=draws,
             resume_from_step=resume_from_step,
             allow_test=allow_test,
+            eval_split=eval_split,
             held_out_dataset_ids=tuple(held_out_ids),
             log=console.print,
         )

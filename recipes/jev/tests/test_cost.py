@@ -135,3 +135,19 @@ def test_a_ledger_holding_two_runs_over_the_same_steps_is_flagged() -> None:
 
     assert cost.over_counted_decisions == ("d-t1-0",)
     assert cost.per_decision["d-t1-0"].calls == 4  # recorded as found, flagged, not silently trimmed
+
+
+def test_a_step_judged_by_two_runs_in_one_dataset_cannot_be_priced() -> None:
+    """Ledger rows carry no judge-run id, so two decisions for the same
+    trace and turn would silently share (or lose) each other's calls."""
+    dataset = _dataset([("t1", 0)])
+    second = dataset.examples[0].model_copy(update={"decision_id": "d-t1-0-other-judge-run"})
+    doubled = dataset.model_copy(
+        update={
+            "examples": dataset.examples + (second,),
+            "counts": dataset.counts.model_copy(update={"examples": 2, "test": 2}),
+        }
+    )
+
+    with pytest.raises(ValueError, match="more than one decision"):
+        _price([_call("t1", 0)], doubled)

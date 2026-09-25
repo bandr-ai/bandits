@@ -66,7 +66,9 @@ def verifier_cost_from_ledger(
     """Attribute every ``judge_turn`` model call in the ledger to the
     dataset decision for the same (trace, turn). Calls for turns the
     dataset does not contain are ignored; dataset decisions with no call
-    are counted, never priced at zero. Decisions with more successful calls
+    are counted, never priced at zero. A dataset holding the same step
+    under two decisions (two judge runs over the same traces) is refused:
+    the ledger cannot say which run a call belongs to. Decisions with more successful calls
     than the judge asked votes for are listed in ``over_counted_decisions``
     (two judge runs over the same steps in one ledger would double their
     cost). Refuses a ledger whose judge model
@@ -74,11 +76,24 @@ def verifier_cost_from_ledger(
     different verifier."""
     if input_usd_per_mtok < 0 or output_usd_per_mtok < 0:
         raise ValueError("prices must be non-negative")
-    by_turn = {
-        (e.lineage.trace_id, e.lineage.turn_index): e.decision_id
-        for e in dataset.examples
-        if e.lineage.trace_id is not None and e.lineage.turn_index is not None
-    }
+    by_turn: dict[tuple[str, int], str] = {}
+    ambiguous: set[tuple[str, int]] = set()
+    for e in dataset.examples:
+        if e.lineage.trace_id is None or e.lineage.turn_index is None:
+            continue
+        key = (e.lineage.trace_id, e.lineage.turn_index)
+        if key in by_turn and by_turn[key] != e.decision_id:
+            ambiguous.add(key)
+        by_turn[key] = e.decision_id
+    if ambiguous:
+        # Ledger rows carry no judge-run id, so a call for a step judged by
+        # two runs in this dataset cannot be attributed to either.
+        example = sorted(ambiguous)[0]
+        raise ValueError(
+            f"{len(ambiguous)} step(s) appear under more than one decision (e.g. trace {example[0]!r} "
+            f"turn {example[1]}), from different judge runs over the same traces; ledger calls cannot be "
+            "attributed between them. Price each judge run's dataset separately."
+        )
     votes_asked = {e.decision_id: e.judge.votes_requested for e in dataset.examples if e.judge is not None}
     if not by_turn:
         raise ValueError(f"{dataset_id} has no judge-labeled rows (no trace/turn lineage) to price")
