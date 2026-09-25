@@ -24,6 +24,10 @@ class DecisionCost(Contract):
     failed after the transport gave up retrying."""
     failed_calls: int
     prompt_tokens: int
+    cached_prompt_tokens: int = 0
+    """The part of ``prompt_tokens`` the provider served from its prompt
+    cache (``usage.prompt_tokens_details.cached_tokens``), billed at the
+    cached-input price when one is given."""
     completion_tokens: int
     seconds: float
     """Sum of the calls' own durations. Votes may run in parallel, so this is
@@ -39,6 +43,10 @@ class VerifierCost(Contract):
     models: tuple[str, ...]
     input_usd_per_mtok: float
     output_usd_per_mtok: float
+    cached_input_usd_per_mtok: float | None = None
+    """Price of cached input tokens. None: cached tokens were priced at the
+    full input price, which overstates the verifier's cost when the ledger
+    shows caching (see ``cached_prompt_tokens``)."""
     per_decision: dict[str, DecisionCost]
     """Keyed by decision id; only decisions of ``dataset_id`` the ledger
     covers."""
@@ -62,6 +70,7 @@ def verifier_cost_from_ledger(
     ledger: str,
     input_usd_per_mtok: float,
     output_usd_per_mtok: float,
+    cached_input_usd_per_mtok: float | None = None,
 ) -> VerifierCost:
     """Attribute every ``judge_turn`` model call in the ledger to the
     dataset decision for the same (trace, turn). Calls for turns the
@@ -74,7 +83,7 @@ def verifier_cost_from_ledger(
     cost). Refuses a ledger whose judge model
     differs from the one that labeled the dataset -- that would price a
     different verifier."""
-    if input_usd_per_mtok < 0 or output_usd_per_mtok < 0:
+    if input_usd_per_mtok < 0 or output_usd_per_mtok < 0 or (cached_input_usd_per_mtok or 0) < 0:
         raise ValueError("prices must be non-negative")
     by_turn: dict[tuple[str, int], str] = {}
     ambiguous: set[tuple[str, int]] = set()
@@ -122,13 +131,15 @@ def verifier_cost_from_ledger(
         models.add(str(row.get("model")))
         usage = row.get("usage") or {}
         t = totals.setdefault(
-            decision_id, {"calls": 0, "failed": 0, "succeeded": 0, "prompt": 0, "completion": 0, "seconds": 0.0}
+            decision_id,
+            {"calls": 0, "failed": 0, "succeeded": 0, "prompt": 0, "cached": 0, "completion": 0, "seconds": 0.0},
         )
         t["calls"] += 1
         succeeded = row.get("status") == "success"
         t["failed"] += 0 if succeeded else 1
         t["succeeded"] += 1 if succeeded else 0
         t["prompt"] += int(usage.get("prompt_tokens") or 0)
+        t["cached"] += int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         t["completion"] += int(usage.get("completion_tokens") or 0)
         t["seconds"] += float(row.get("duration_seconds") or 0.0)
 
@@ -141,9 +152,10 @@ def verifier_cost_from_ledger(
             calls=int(t["calls"]),
             failed_calls=int(t["failed"]),
             prompt_tokens=int(t["prompt"]),
+            cached_prompt_tokens=int(t["cached"]),
             completion_tokens=int(t["completion"]),
             seconds=t["seconds"],
-            usd=(t["prompt"] * input_usd_per_mtok + t["completion"] * output_usd_per_mtok) / 1e6,
+            usd=_usd(t, input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok),
         )
         for decision_id, t in sorted(totals.items())
     }
@@ -153,6 +165,7 @@ def verifier_cost_from_ledger(
         models=tuple(sorted(models)),
         input_usd_per_mtok=input_usd_per_mtok,
         output_usd_per_mtok=output_usd_per_mtok,
+        cached_input_usd_per_mtok=cached_input_usd_per_mtok,
         per_decision=per_decision,
         uncovered_decisions=len(set(by_turn.values()) - set(per_decision)),
         retries=retries,
@@ -162,6 +175,14 @@ def verifier_cost_from_ledger(
             if decision_id in votes_asked and t["succeeded"] > votes_asked[decision_id]
         ),
     )
+
+
+def _usd(totals: dict, input_usd: float, output_usd: float, cached_input_usd: float | None) -> float:
+    """Dollars for one decision's calls. Cached input tokens are billed at
+    the cached price when it is given, otherwise at the full input price."""
+    cached = min(totals["cached"], totals["prompt"]) if cached_input_usd is not None else 0
+    uncached = totals["prompt"] - cached
+    return (uncached * input_usd + cached * (cached_input_usd or 0.0) + totals["completion"] * output_usd) / 1e6
 
 
 def compute_verifier_cost_id(cost: VerifierCost) -> str:
