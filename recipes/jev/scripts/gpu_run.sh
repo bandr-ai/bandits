@@ -18,6 +18,8 @@
 #   LEDGERS                                  space-separated judge ledgers, to price the verifier (optional)
 #   INPUT_USD_PER_MTOK, OUTPUT_USD_PER_MTOK  the judge model's prices, required with LEDGERS
 #   FAST_KERNELS=1                           also install flash-linear-attention and causal-conv1d
+#   HELD_OUT_RUNS  judge run ids (a subset of JUDGE_RUNS) for the unseen-source check: a second
+#                  run per model trains without them and scores them as their own report section
 #   DEVICE, DTYPE  default: cuda, bfloat16 (DEVICE=cpu DTYPE=float32 with a tiny model rehearses
 #                  the whole script without a GPU)
 #   SKIP_INSTALL=1 reuse the recipe's existing environment as is
@@ -84,6 +86,21 @@ fi
 [[ -n "$DATASET" ]] || { echo "could not read the dataset id" >&2; exit 1; }
 echo "dataset: $DATASET"
 
+TRAIN_WITHOUT_HELD_OUT=""
+if [[ -n "${HELD_OUT_RUNS:-}" ]]; then
+  kept=()
+  for i in "${!datasets[@]}"; do
+    run="$(echo $JUDGE_RUNS | cut -d' ' -f$((i + 1)))"
+    [[ " $HELD_OUT_RUNS " == *" $run "* ]] || kept+=("${datasets[$i]}")
+  done
+  if (( ${#kept[@]} > 1 )); then
+    TRAIN_WITHOUT_HELD_OUT="$(dataset_id_of merge "${kept[@]}" --project "$PROJECT")"
+  else
+    TRAIN_WITHOUT_HELD_OUT="${kept[0]}"
+  fi
+  echo "dataset without held-out sources: $TRAIN_WITHOUT_HELD_OUT"
+fi
+
 price_args=()
 if [[ -n "${LEDGERS:-}" ]]; then
   : "${INPUT_USD_PER_MTOK:?set INPUT_USD_PER_MTOK with LEDGERS}"
@@ -109,6 +126,16 @@ for model in $MODELS; do
     --checkpoint-dir "$OUT/checkpoints/$name" --output "$OUT/reports/$name" \
     --two-order --allow-test ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
     2>&1 | tee "$OUT/run-$name.log"
+
+  if [[ -n "$TRAIN_WITHOUT_HELD_OUT" ]]; then
+    held_args=()
+    for run in $HELD_OUT_RUNS; do held_args+=(--held-out "$run"); done
+    log "jev run without ${HELD_OUT_RUNS}: $model@$revision"
+    jev run "$TRAIN_WITHOUT_HELD_OUT" "${held_args[@]}" --allow-test --model "$model" --revision "$revision" --seed "$SEED" \
+      --checkpoint-dir "$OUT/checkpoints/$name-held-out" --output "$OUT/reports/$name-held-out" \
+      ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
+      2>&1 | tee "$OUT/run-$name-held-out.log"
+  fi
 done
 
 log "pack"
