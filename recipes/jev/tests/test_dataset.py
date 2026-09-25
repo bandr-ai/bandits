@@ -740,3 +740,17 @@ def test_merge_keeps_every_rows_split_and_refuses_duplicates() -> None:
         merge_decision_datasets([("ds-1", first), ("ds-1-again", first)])
     with pytest.raises(ValueError, match="at least two"):
         merge_decision_datasets([("ds-1", first)])
+
+
+def test_as_test_only_moves_every_row_to_test_and_keeps_groups_valid() -> None:
+    from bandits_jev.dataset import as_test_only
+
+    traces = [_trace(f"h{i}") for i in range(12)]
+    dataset = build_decision_dataset_from_corpus(
+        traces, _run(traces, [v for t in traces for v in _all_observed_verdicts(t)]), "judge-run-h"
+    )
+    held_out = as_test_only(dataset)
+
+    assert {e.split for e in held_out.examples} == {"test"}
+    assert held_out.counts.test == held_out.counts.examples == dataset.counts.examples
+    assert (held_out.counts.train, held_out.counts.dev, held_out.counts.calibration) == (0, 0, 0)
