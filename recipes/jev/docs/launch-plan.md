@@ -35,6 +35,7 @@ Rehearsed end to end on the real data with a tiny model on CPU. Nothing has trai
 ### 4.1 Data
 
 - **Sources:** Bandits turn-judge runs over TRAIL GAIA, TRAIL SWE and tau2 (1,863 judged steps today), plus #98: the same judge with **3 votes**, over more traces, aiming for **≥ 1,000 test steps** (±~3-point intervals; today's 172 give ±~7).
+- **Labels:** the verifier's vote shares, trained as soft targets (a 2-of-3 vote trains toward 2/3, not toward the winner). Rows whose votes tie are left out of accuracy and counted; NLL and Brier still use them.
 - **Splits:** by trace, ~70/10/10/10 train/dev/calibration/test, fixed at compile time (#91). Every step of a conversation stays in one split. Intervals resample whole traces.
 - **Unseen source:** a second run holds out **TRAIL SWE** entirely as test-only (#108).
 - **Human labels:** TRAIL's error annotations, mapped onto the same steps (#107).
