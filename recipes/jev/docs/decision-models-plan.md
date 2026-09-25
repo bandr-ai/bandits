@@ -1,5 +1,7 @@
 # Bandits Decision Models: Plan V3
 
+> **Superseded for launch by [launch-plan.md](launch-plan.md)** (2026-09-25): the headline is now a Jev trained on your verifier's labels from traces, and that plan holds the benchmark, the success bars and the run order. This file stays as background.
+
 2026-09-23 · the build plan for Decision Models (tracking issue #73, features #65–#72). Research background: [decision-models-learnings.md](decision-models-learnings.md).
 
 ## 1. What we are building

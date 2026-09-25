@@ -45,5 +45,6 @@ Run `uv run jev <command> --help` for options.
 
 ## Docs
 
-- [Plan](docs/decision-models-plan.md) and [research notes](docs/decision-models-learnings.md)
+- **[Launch plan](docs/launch-plan.md): the one plan for testing and launch**
+- [Original plan](docs/decision-models-plan.md) and [research notes](docs/decision-models-learnings.md)
 - [Demo dataset and success bar](docs/decision-models-demo-dataset.md)
