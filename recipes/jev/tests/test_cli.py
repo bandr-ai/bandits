@@ -49,6 +49,29 @@ def test_score_refuses_the_test_split_without_allow_test(tmp_path) -> None:
     assert "--allow-test" in plain(result.stdout)
 
 
+def test_import_predictions_refuses_test_without_allow_test(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "import-predictions",
+            str(tmp_path / "predictions.jsonl"),
+            "--dataset",
+            "decision-dataset-does-not-matter",
+            "--name",
+            "jev",
+            "--model",
+            "jev",
+            "--revision",
+            "today",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--allow-test" in plain(result.stdout)
+
+
 @pytest.mark.parametrize("command", ["dataset", "import", "score", "train", "calibrate", "import-predictions", "report"])
 def test_every_command_is_on_the_jev_cli(command) -> None:
     assert runner.invoke(app, [command, "--help"]).exit_code == 0

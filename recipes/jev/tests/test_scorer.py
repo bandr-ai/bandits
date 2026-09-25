@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 
 import pytest
@@ -14,6 +15,7 @@ from bandits_jev.scorer import (
     RejectedScore,
     ScorerRun,
     TokenizationError,
+    adapter_training_dataset_id,
     compute_scorer_run_id,
     load_scorer_run,
     save_scorer_run,
@@ -260,6 +262,21 @@ def test_scorer_run_records_dataset_split_and_template_contract() -> None:
     assert run.dtype == "float32"
     assert run.device == "cpu"
     assert run.template_digest
+
+
+def test_adapter_training_dataset_is_read_from_checkpoint_progress(tmp_path) -> None:
+    checkpoint = tmp_path / "step-3"
+    checkpoint.mkdir()
+    (checkpoint / "progress.json").write_text(
+        json.dumps({"config": {"dataset_id": "decision-dataset-training"}})
+    )
+
+    assert adapter_training_dataset_id(checkpoint) == "decision-dataset-training"
+
+
+def test_adapter_training_dataset_requires_checkpoint_progress(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="progress.json"):
+        adapter_training_dataset_id(tmp_path)
 
 
 def test_scorer_run_artifact_round_trips() -> None:

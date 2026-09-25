@@ -174,7 +174,12 @@ def score_command(
     softmax over the option-letter logits."""
     from bandits_jev.dataset import load_decision_dataset
     from bandits_jev.hf_predictor import HFPredictor
-    from bandits_jev.scorer import adapter_digest, save_scorer_run, score_dataset
+    from bandits_jev.scorer import (
+        adapter_digest,
+        adapter_training_dataset_id,
+        save_scorer_run,
+        score_dataset,
+    )
 
     if split not in _DECISION_SPLITS:
         console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
@@ -199,10 +204,12 @@ def score_command(
         raise typer.Exit(code=1)
 
     digest = None
+    trained_on_dataset_id = None
     if adapter is not None:
         try:
             digest = adapter_digest(adapter)
-        except (FileNotFoundError, NotADirectoryError) as exc:
+            trained_on_dataset_id = adapter_training_dataset_id(adapter)
+        except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
             console.print(f"[red]error:[/red] {adapter} is not a saved adapter: {exc}")
             raise typer.Exit(code=1) from exc
     predictor = HFPredictor(
@@ -221,6 +228,7 @@ def score_command(
         dataset_id=dataset_id,
         split=split,
         adapter_digest=digest,
+        trained_on_dataset_id=trained_on_dataset_id,
     )
     envelope = save_scorer_run(run, store)
     console.print(f"scorer_run_id: {envelope.artifact_id}")
@@ -236,6 +244,11 @@ def import_predictions_command(
     model: str = typer.Option(..., "--model", help="The producing model or API, as its provider names it."),
     revision: str = typer.Option(..., "--revision", help="Model/API version, or the date it was called."),
     split: str = typer.Option("test", "--split"),
+    allow_test: bool = typer.Option(
+        False,
+        "--allow-test",
+        help="Required to import predictions for the locked test split.",
+    ),
     cost_usd: float = typer.Option(None, "--cost-usd", help="The actual bill for producing these predictions."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -247,6 +260,12 @@ def import_predictions_command(
 
     if split not in _DECISION_SPLITS:
         console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
+        raise typer.Exit(code=1)
+    if split == "test" and not allow_test:
+        console.print(
+            "[red]error:[/red] importing predictions for the test split requires --allow-test; "
+            "it is meant to be scored once, for the final report"
+        )
         raise typer.Exit(code=1)
     store = _derived(project)
     try:
@@ -370,7 +389,7 @@ def report_command(
     console.print(f"decision_report_id: {envelope.artifact_id}")
     for path in written:
         console.print(f"wrote:              {path}")
-    if report.test_usage is not None and any(not r.used_in_report for r in report.test_usage.runs):
+    if any(not r.used_in_report for usage in report.test_usage for r in usage.runs):
         console.print("[yellow]warning:[/yellow] the test split was scored by runs this report does not use")
 
 

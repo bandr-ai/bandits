@@ -76,8 +76,17 @@ def argmax_option(probabilities: Mapping[str, float]) -> str:
     return max(probabilities.items(), key=lambda kv: kv[1])[0]
 
 
+def top_options(probabilities: Mapping[str, float]) -> frozenset[str]:
+    """All maximum-probability options, without a dict-order tie break."""
+    if not probabilities:
+        raise ValueError("cannot find the top options of an empty distribution")
+    top = max(probabilities.values())
+    return frozenset(option for option, probability in probabilities.items() if probability == top)
+
+
 def is_correct(probabilities: Mapping[str, float], target: Mapping[str, float]) -> bool:
-    return argmax_option(probabilities) == argmax_option(target)
+    """Whether the predicted argmax is any of the target's tied top options."""
+    return argmax_option(probabilities) in top_options(target)
 
 
 def row_nll(probabilities: Mapping[str, float], target: Mapping[str, float]) -> float:
