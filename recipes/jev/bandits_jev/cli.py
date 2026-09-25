@@ -358,7 +358,7 @@ def _warn_over_counted(cost) -> None:
         )
 
 
-def _price_verifier(ledgers, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok):
+def _price_verifier(ledgers, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok=None):
     """Price a dataset's verifier from one or more ledgers read as one
     stream -- a merged dataset's judge runs each wrote their own."""
     import itertools
@@ -374,6 +374,7 @@ def _price_verifier(ledgers, dataset, dataset_id, input_usd_per_mtok, output_usd
             ledger=", ".join(str(path) for path in ledgers),
             input_usd_per_mtok=input_usd_per_mtok,
             output_usd_per_mtok=output_usd_per_mtok,
+            cached_input_usd_per_mtok=cached_input_usd_per_mtok,
         )
     finally:
         for handle in handles:
@@ -424,6 +425,11 @@ def verifier_cost_command(
     output_usd_per_mtok: float = typer.Option(
         ..., "--output-usd-per-mtok", help="The judge model's output price, USD per million tokens, as billed."
     ),
+    cached_input_usd_per_mtok: float = typer.Option(
+        None,
+        "--cached-input-usd-per-mtok",
+        help="The price of cached input tokens. Omit and they are priced at the full input price (overstated).",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Price the verifier per decision from its ledger: every judge call's
@@ -439,7 +445,9 @@ def verifier_cost_command(
         console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
         raise typer.Exit(code=1) from exc
     try:
-        cost = _price_verifier(ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok)
+        cost = _price_verifier(
+            ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok
+        )
     except (OSError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -556,6 +564,9 @@ def run_command(
     ),
     input_usd_per_mtok: float = typer.Option(None, "--input-usd-per-mtok", help="Judge input price (with --ledger)."),
     output_usd_per_mtok: float = typer.Option(None, "--output-usd-per-mtok", help="Judge output price (with --ledger)."),
+    cached_input_usd_per_mtok: float = typer.Option(
+        None, "--cached-input-usd-per-mtok", help="Judge cached-input price (with --ledger)."
+    ),
     gpu_usd_per_hour: float = typer.Option(None, "--gpu-usd-per-hour", help="GPU price, for the model columns' cost."),
     draws: int = typer.Option(2000, "--draws"),
     resume_from_step: int = typer.Option(
@@ -663,7 +674,9 @@ def run_command(
     verifier_cost_id = None
     if ledger:
         try:
-            cost = _price_verifier(ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok)
+            cost = _price_verifier(
+                ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok
+            )
         except (OSError, ValueError) as exc:
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc

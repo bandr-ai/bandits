@@ -23,6 +23,8 @@
 #   GPU_USD_PER_HOUR                         the box's hourly price, for the cost columns (optional)
 #   LEDGERS                                  space-separated judge ledgers, to price the verifier (optional)
 #   INPUT_USD_PER_MTOK, OUTPUT_USD_PER_MTOK  the judge model's prices, required with LEDGERS
+#   CACHED_INPUT_USD_PER_MTOK                the judge's cached-input price (recommended with LEDGERS:
+#                                            without it cached tokens are priced at the full rate)
 #   FAST_KERNELS=1                           also install flash-linear-attention and causal-conv1d
 #   HELD_OUT_RUNS  phase 2 only: judge run ids (a subset of JUDGE_RUNS) for the unseen-source
 #                  check; a second run per model trains without them and scores them as their
@@ -137,6 +139,9 @@ if [[ -n "${LEDGERS:-}" ]]; then
   : "${OUTPUT_USD_PER_MTOK:?set OUTPUT_USD_PER_MTOK with LEDGERS}"
   for l in $LEDGERS; do price_args+=(--ledger "$(realpath "$l")"); done
   price_args+=(--input-usd-per-mtok "$INPUT_USD_PER_MTOK" --output-usd-per-mtok "$OUTPUT_USD_PER_MTOK")
+  if [[ -n "${CACHED_INPUT_USD_PER_MTOK:-}" ]]; then
+    price_args+=(--cached-input-usd-per-mtok "$CACHED_INPUT_USD_PER_MTOK")
+  fi
 fi
 if [[ -n "${GPU_USD_PER_HOUR:-}" ]]; then
   price_args+=(--gpu-usd-per-hour "$GPU_USD_PER_HOUR")

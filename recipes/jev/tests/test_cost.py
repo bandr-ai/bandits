@@ -52,7 +52,7 @@ def _dataset(turns: list[tuple[str, int]]) -> DecisionDataset:
     )
 
 
-def _call(trace, turn, *, prompt=1000, completion=500, seconds=2.0, status="success", model=_JUDGE):
+def _call(trace, turn, *, prompt=1000, completion=500, seconds=2.0, status="success", model=_JUDGE, cached=0):
     return json.dumps(
         {
             "stage": "judge_turn",
@@ -61,7 +61,13 @@ def _call(trace, turn, *, prompt=1000, completion=500, seconds=2.0, status="succ
             "turn_index": turn,
             "model": model,
             "status": status,
-            "usage": {"prompt_tokens": prompt, "completion_tokens": completion} if status == "success" else None,
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            }
+            if status == "success"
+            else None,
             "duration_seconds": seconds,
         }
     )
@@ -151,3 +157,17 @@ def test_a_step_judged_by_two_runs_in_one_dataset_cannot_be_priced() -> None:
 
     with pytest.raises(ValueError, match="more than one decision"):
         _price([_call("t1", 0)], doubled)
+
+
+def test_cached_input_tokens_are_priced_at_the_cached_rate() -> None:
+    dataset = _dataset([("t1", 0)])
+    lines = [_call("t1", 0, prompt=1000, completion=500, cached=900)]
+    full = _price(lines, dataset)
+    cached = verifier_cost_from_ledger(
+        lines, dataset, "ds-1", ledger="l", input_usd_per_mtok=0.2, output_usd_per_mtok=0.8,
+        cached_input_usd_per_mtok=0.04,
+    )
+
+    assert full.per_decision["d-t1-0"].cached_prompt_tokens == 900
+    assert full.per_decision["d-t1-0"].usd == pytest.approx((1000 * 0.2 + 500 * 0.8) / 1e6)
+    assert cached.per_decision["d-t1-0"].usd == pytest.approx((100 * 0.2 + 900 * 0.04 + 500 * 0.8) / 1e6)
