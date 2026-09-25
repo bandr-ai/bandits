@@ -19,6 +19,7 @@ from __future__ import annotations
 import gc
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 from bandits.store import Contract, DerivedStore
 from bandits_jev.calibration import calibrate, compute_calibration_id, save_calibration
@@ -72,12 +73,17 @@ def _find_scorer_run(
     trained_on: str | None,
     mode: ScoreMode,
     max_prompt_tokens: int,
+    device: str,
+    dtype: str,
 ) -> str | None:
     """An already-saved run of exactly this scoring, if there is one --
     including the adapter's recorded training dataset, so a reused trained
-    run carries the provenance the report checks."""
+    run carries the provenance the report checks, and the device and dtype,
+    so a CPU rehearsal's logits and latency are never reused (and priced)
+    as a GPU run's."""
     wanted = (
-        dataset_id, split, model_id, revision, adapter, trained_on, mode, template_digest(), max_prompt_tokens
+        dataset_id, split, model_id, revision, adapter, trained_on, mode, template_digest(), max_prompt_tokens,
+        device, dtype,
     )
     for envelope in sorted(store.list(kind="decision_scorer_run"), key=lambda e: e.artifact_id):
         run = load_scorer_run(envelope.artifact_id, store)
@@ -91,6 +97,8 @@ def _find_scorer_run(
             run.mode,
             run.template_digest,
             run.max_prompt_tokens,
+            run.device,
+            run.dtype,
         )
         if have == wanted and run.predictions_source is None:
             return envelope.artifact_id
@@ -132,23 +140,35 @@ def run_pipeline(
     n_bins: int = 10,
     resume_from_step: int = 0,
     allow_test: bool = False,
+    eval_split: Literal["dev", "test"] = "test",
     held_out_dataset_ids: tuple[str, ...] = (),
     log: Callable[[str], None] = lambda _message: None,
 ) -> PipelineResult:
     """``make_predictor(None)`` must load the untrained base named in
     ``config``; ``make_predictor(path)`` the base plus the adapter saved at
-    ``path``. The test split is scored twice (untrained, trained), and each
-    only if that exact scoring is not already saved. ``resume_from_step``
+    ``path``. The ``eval_split`` is scored twice (untrained, trained), and
+    each only if that exact scoring is not already saved. ``eval_split="dev"``
+    is the model-selection run (launch plan phase 1): it never opens the
+    locked test split, and its report is marked optimistic, since
+    checkpoints are also picked on dev. ``resume_from_step``
     continues an interrupted training run from the checkpoint it saved at
     that step (see ``trainer.train``). ``allow_test`` must be set: every run
     scores the locked test split, and that is a deliberate choice, as with
-    ``jev score --allow-test``. ``held_out_dataset_ids`` are test-only
+    ``jev score --allow-test`` (only when ``eval_split`` is "test").
+    ``held_out_dataset_ids`` are test-only
     datasets from sources the model never trained on (see
     ``dataset.as_test_only``); each is scored untrained and trained and
     becomes its own report section."""
-    if not allow_test:
+    if eval_split not in ("dev", "test"):
+        raise ValueError(f"eval_split must be 'dev' or 'test', not {eval_split!r}")
+    if eval_split == "test" and not allow_test:
         raise ValueError(
-            "the pipeline scores the locked test split; pass allow_test (--allow-test) to do so deliberately"
+            "evaluating on test scores the locked test split; pass allow_test (--allow-test) to do so "
+            "deliberately, or evaluate on dev"
+        )
+    if eval_split == "dev" and held_out_dataset_ids:
+        raise ValueError(
+            "held-out sources are test-only, so they belong to the locked test run, not a dev run"
         )
     if config.dataset_id != dataset_id:
         raise ValueError(f"the training config names dataset {config.dataset_id!r}, not {dataset_id!r}")
@@ -157,14 +177,26 @@ def run_pipeline(
     for example in dataset.examples:
         by_split.setdefault(example.split, []).append(example)
     held_out: dict[str, list[DecisionExample]] = {}
-    training_ids = {e.decision_id for e in dataset.examples if e.split != "test"}
+    training = [e for e in dataset.examples if e.split != "test"]
+    training_ids = {e.decision_id for e in training}
+    training_traces = {e.lineage.trace_id for e in training if e.lineage.trace_id is not None}
     for held_out_id in held_out_dataset_ids:
         if held_out_id == dataset_id:
             raise ValueError("a held-out dataset must not be the training dataset")
         rows = [e for e in load_decision_dataset(held_out_id, store).examples if e.split == "test"]
-        leaked = [e.decision_id for e in rows if e.decision_id in training_ids]
+        # Decision ids include the judge run, so a held-out source that
+        # re-judged a trace already in train/dev/calibration gets fresh ids;
+        # the trace itself is the identity that must not cross over.
+        leaked = [
+            e.decision_id
+            for e in rows
+            if e.decision_id in training_ids or (e.lineage.trace_id is not None and e.lineage.trace_id in training_traces)
+        ]
         if leaked:
-            raise ValueError(f"{len(leaked)} held-out row(s) of {held_out_id} are also in training: {leaked[:3]}")
+            raise ValueError(
+                f"{len(leaked)} held-out row(s) of {held_out_id} come from traces also used in training "
+                f"(train, dev or calibration): {leaked[:3]}"
+            )
         if not rows:
             raise ValueError(f"held-out dataset {held_out_id} has no test rows")
         held_out[held_out_id] = rows
@@ -198,6 +230,8 @@ def run_pipeline(
             trained_on=trained_on,
             mode=mode,
             max_prompt_tokens=config.max_prompt_tokens,
+            device=config.device,
+            dtype=config.dtype,
         )
         if found is not None:
             log(f"{name}: reusing {found}")
@@ -221,8 +255,10 @@ def run_pipeline(
         steps.append(PipelineStep(name=name, artifact_id=run_id, reused=False))
         return run_id
 
-    untrained_id = score("untrained on test", "test", None, "single_order")
-    two_order_id = score("untrained on test (two orders)", "test", None, "two_order_average") if two_order else None
+    untrained_id = score(f"untrained on {eval_split}", eval_split, None, "single_order")
+    two_order_id = (
+        score(f"untrained on {eval_split} (two orders)", eval_split, None, "two_order_average") if two_order else None
+    )
 
     found_training = _find_training_run(store, config)
     if found_training is not None:
@@ -257,7 +293,7 @@ def run_pipeline(
     steps.append(PipelineStep(name="calibration", artifact_id=calibration_id, reused=existed))
     log(f"temperature: {calibration.temperature:.4f}")
 
-    trained_id = score("trained on test", "test", best.adapter_path, "single_order")
+    trained_id = score(f"trained on {eval_split}", eval_split, best.adapter_path, "single_order")
     external = []
     for held_out_id, rows in held_out.items():
         external.append(
