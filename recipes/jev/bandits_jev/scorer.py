@@ -509,7 +509,7 @@ def _prediction_problem(row: dict, example: DecisionExample) -> str | None:
         )
     try:
         values = [float(v) for v in probabilities.values()]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "probabilities must be numbers"
     if any(not math.isfinite(v) or v < 0 for v in values):
         return "probabilities must be finite and non-negative"
@@ -519,7 +519,7 @@ def _prediction_problem(row: dict, example: DecisionExample) -> str | None:
     if latency is not None:
         try:
             latency_value = float(latency)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return "latency_seconds must be a number when provided"
         if not math.isfinite(latency_value) or latency_value < 0:
             return "latency_seconds must be finite and non-negative"

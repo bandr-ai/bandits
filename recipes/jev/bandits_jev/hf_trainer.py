@@ -123,9 +123,12 @@ class HFTrainer:
         assumed to stay at a fixed position.
 
         Soft targets use the same cross-entropy formula against the target
-        distribution instead of a one-hot vector; not exercised by the
-        launch path, but not a separate code path either. Computed in
-        float32, like the scorer's softmax, whatever the model dtype.
+        distribution instead of a one-hot vector. This is intended for the
+        launch path: verifier labels are the judge's vote shares, so with
+        several votes a split vote trains toward the split (see
+        ``tests/test_trainer.py``'s soft-target test), not toward one
+        winner. Computed in float32, like the scorer's softmax, whatever the
+        model dtype.
         """
         torch = self._torch
         options = option_order or dict(example.options)

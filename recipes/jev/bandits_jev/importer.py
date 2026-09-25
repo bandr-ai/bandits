@@ -331,7 +331,7 @@ def import_jsonl(
 
     A row missing an explicit ``split`` gets one deterministically from a
     hash of its own content: ``group_id`` when set, otherwise a hash of its
-    question+options (never the source file path or line number, so a
+    state+question+options (never the source file path or line number, so a
     rename or a reordered file can never reshuffle splits or leak the locked
     test split -- see ``deterministic_split``). Rows that share a
     ``group_id`` but disagree on their split (whether explicit or hashed)

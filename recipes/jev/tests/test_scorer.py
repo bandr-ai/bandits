@@ -337,3 +337,19 @@ def test_a_prompt_over_the_models_own_context_is_rejected_not_crashed() -> None:
     assert isinstance(outcome, RejectedScore)
     assert "model's 10-token context" in outcome.reasons[0]
     assert predictor.predict_calls == []  # never sent to the model
+
+
+def test_an_overflowing_imported_number_is_a_rejection_not_a_crash() -> None:
+    import json
+
+    from bandits_jev.scorer import import_predictions
+
+    example = _example()
+    huge = json.dumps(
+        {"decision_id": example.decision_id, "probabilities": {"a": 10**400, "b": 0, "c": 0}}
+    )
+    run = import_predictions(
+        huge, [example], name="x", model_id="x", revision="r", dataset_id="d", split="test"
+    )
+
+    assert not run.results and "numbers" in run.rejections[0].reasons[0]
