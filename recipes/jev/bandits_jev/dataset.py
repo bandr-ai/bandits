@@ -776,6 +776,22 @@ def summarize_dataset(dataset: DecisionDataset) -> dict[str, SplitSummary]:
     return summary
 
 
+def as_test_only(dataset: DecisionDataset) -> DecisionDataset:
+    """The same rows, every one in ``test``: a whole source held out, so a
+    model trained without it can be scored on a kind of agent it never
+    saw. Its rows must never also be in a training dataset -- build that one
+    from the other sources only."""
+    examples = tuple(e.model_copy(update={"split": "test"}) for e in dataset.examples)
+    return dataset.model_copy(
+        update={
+            "examples": examples,
+            "counts": dataset.counts.model_copy(
+                update={"train": 0, "dev": 0, "calibration": 0, "test": len(examples)}
+            ),
+        }
+    )
+
+
 def merge_decision_datasets(parts: Sequence[tuple[str, DecisionDataset]]) -> DecisionDataset:
     """One dataset from several (e.g. judge runs over different corpora).
     Every row keeps the split it was given, so merging never moves a row

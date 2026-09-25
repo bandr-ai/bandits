@@ -64,6 +64,12 @@ def dataset_command(
     minimum_valid_votes: int = typer.Option(
         1, "--minimum-valid-votes", min=1, help="Quarantine a turn with fewer successful votes."
     ),
+    test_only: bool = typer.Option(
+        False,
+        "--test-only",
+        help="Put every row in test: a whole source held out to check a model on a kind of agent "
+        "it never trained on (pass it to `jev run --held-out`).",
+    ),
     output: Path = typer.Option(None, "--output", help="Write examples and quarantine JSONL."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -72,6 +78,7 @@ def dataset_command(
     from bandits.verify.nextstate import load_turn_judge_run
     from bandits_jev.dataset import (
         LONG_STATE_CHARS,
+        as_test_only,
         build_decision_dataset_from_corpus,
         save_decision_dataset,
         summarize_dataset,
@@ -99,11 +106,14 @@ def dataset_command(
     except ValueError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    if test_only:
+        dataset = as_test_only(dataset)
     envelope = save_decision_dataset(dataset, store)
     console.print(f"decision_dataset_id: {envelope.artifact_id}")
     console.print(f"examples:            {dataset.counts.examples}")
     console.print(f"quarantined:         {dataset.counts.quarantined}")
-    console.print(f"split by:            {'task set ' + task_set_id if task_set_id else 'trace'}")
+    split_by = "test only (held-out source)" if test_only else ("task set " + task_set_id if task_set_id else "trace")
+    console.print(f"split by:            {split_by}")
     table = Table("split", "rows", "majority label (rows)", "state chars p50 / p99", f"> {LONG_STATE_CHARS:,} chars")
     for split, row in summarize_dataset(dataset).items():
         labels = ", ".join(f"{label} {n}" for label, n in row.majority_label.items()) or "—"
@@ -534,6 +544,12 @@ def run_command(
     ledger: list[Path] = typer.Option(
         None, "--ledger", help="The judge runs' ledgers, to price the verifier column. Repeatable."
     ),
+    held_out: list[str] = typer.Option(
+        None,
+        "--held-out",
+        help="A judge run or dataset from a source kept out of training entirely; scored as its "
+        "own report section. Repeatable.",
+    ),
     input_usd_per_mtok: float = typer.Option(None, "--input-usd-per-mtok", help="Judge input price (with --ledger)."),
     output_usd_per_mtok: float = typer.Option(None, "--output-usd-per-mtok", help="Judge output price (with --ledger)."),
     gpu_usd_per_hour: float = typer.Option(None, "--gpu-usd-per-hour", help="GPU price, for the model columns' cost."),
@@ -559,6 +575,7 @@ def run_command(
     from bandits.verify.nextstate import load_turn_judge_run
     from bandits_jev.cost import save_verifier_cost
     from bandits_jev.dataset import (
+        as_test_only,
         build_decision_dataset_from_corpus,
         load_decision_dataset,
         merge_decision_datasets,
@@ -576,15 +593,13 @@ def run_command(
         console.print("[red]error:[/red] --ledger needs --input-usd-per-mtok and --output-usd-per-mtok")
         raise typer.Exit(code=1)
     store = _derived(project)
-    parts = []
-    for source in sources:
+    def compile_source(source: str):
         if source.startswith("decision-dataset-"):
             try:
-                parts.append((source, load_decision_dataset(source, store)))
+                return source, load_decision_dataset(source, store)
             except FileNotFoundError as exc:
                 console.print(f"[red]error:[/red] no decision dataset {source!r}")
                 raise typer.Exit(code=1) from exc
-            continue
         try:
             judge_run = load_turn_judge_run(source, store)
         except FileNotFoundError as exc:
@@ -604,7 +619,13 @@ def run_command(
         except ValueError as exc:
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc
-        parts.append((save_decision_dataset(compiled, store).artifact_id, compiled))
+        return save_decision_dataset(compiled, store).artifact_id, compiled
+
+    parts = [compile_source(source) for source in sources]
+    held_out_ids = []
+    for source in held_out or []:
+        _, compiled = compile_source(source)
+        held_out_ids.append(save_decision_dataset(as_test_only(compiled), store).artifact_id)
     if len(parts) == 1:
         dataset_id, dataset = parts[0]
     else:
@@ -669,6 +690,7 @@ def run_command(
             draws=draws,
             resume_from_step=resume_from_step,
             allow_test=allow_test,
+            held_out_dataset_ids=tuple(held_out_ids),
             log=console.print,
         )
     except ValueError as exc:

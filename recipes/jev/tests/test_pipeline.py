@@ -25,10 +25,10 @@ _MODEL = "hf-internal-testing/tiny-random-gpt2"
 runner = CliRunner()
 
 
-def _corpus_and_judge_run(project):
-    """80 traces of two judged steps each: the first step's reaction is an
+def _corpus_and_judge_run(project, *, prefix: str = "trace", count: int = 80):
+    """Traces of two judged steps each: the first step's reaction is an
     error (judged failure), the second's is a pass (judged success)."""
-    traces = [_trace(f"trace-{i}", task=f"fix bug {i}") for i in range(80)]
+    traces = [_trace(f"{prefix}-{i}", task=f"fix bug {i} in {prefix}") for i in range(count)]
     corpus = TraceCorpus(source="test", traces=tuple(traces))
     corpus_id = ArtifactStore(project / ".bandits").write(corpus, source_path="test").artifact_id
     verdicts = []
@@ -41,11 +41,11 @@ def _corpus_and_judge_run(project):
     return save_turn_judge_run(judge_run, DerivedStore(project / ".bandits")).artifact_id
 
 
-def _jev_run(project, judge_run_id, output):
+def _jev_run(project, judge_run_id, output, *extra):
     return runner.invoke(
         app,
         [
-            "run", judge_run_id,
+            "run", judge_run_id, *extra,
             "--model", _MODEL, "--revision", "main", "--seed", "3",
             "--checkpoint-dir", str(project / "checkpoints"), "--output", str(output),
             "--effective-batch", "8", "--eval-every-steps", "0", "--lora-rank", "4", "--lora-alpha", "8",
@@ -90,3 +90,50 @@ def test_jev_run_refuses_to_score_test_without_allow_test(tmp_path) -> None:
 
     assert result.exit_code == 1
     assert "--allow-test" in result.output
+
+
+def test_a_held_out_source_gets_its_own_report_section(tmp_path) -> None:
+    project = tmp_path / "project"
+    judge_run_id = _corpus_and_judge_run(project)
+    held_out_run_id = _corpus_and_judge_run(project, prefix="other-agent", count=15)
+
+    result = _jev_run(project, judge_run_id, tmp_path / "report", "--held-out", held_out_run_id)
+    assert result.exit_code == 0, result.output
+
+    report = json.loads((tmp_path / "report" / "report.json").read_text())
+    main, held_out = report["sections"]
+    assert held_out["name"].startswith("external: ")
+    assert held_out["items"] == 30  # 15 traces x 2 judged steps, all in test
+    columns = {c["name"]: c for c in held_out["columns"]}
+    assert columns["trained"]["status"] == "run" and columns["untrained"]["status"] == "run"
+    assert columns["trained + calibrated"]["temperature"] is not None  # the main run's temperature
+
+
+def test_a_held_out_dataset_that_is_also_the_training_dataset_is_refused(tmp_path) -> None:
+    from bandits_jev.dataset import build_decision_dataset_from_corpus, save_decision_dataset
+    from bandits_jev.pipeline import run_pipeline
+    from bandits_jev.trainer import build_training_config
+
+    project = tmp_path / "project"
+    store = DerivedStore(project / ".bandits")
+    traces = [_trace(f"t{i}") for i in range(40)]
+    dataset = build_decision_dataset_from_corpus(
+        traces,
+        _run(traces, [_verdict(t.trace_id, x.index, x.action_span_id, votes=(1,))
+                      for t in traces for x in extract_turns(t) if x.observed]),
+        "judge-run-1",
+    )
+    dataset_id = save_decision_dataset(dataset, store).artifact_id
+
+    def never(*_args):
+        raise AssertionError("no model may load before the leak check")
+
+    config = build_training_config(
+        base_model_id=_MODEL, base_revision="main", dataset_id=dataset_id, seed=1, eval_every_steps=0
+    )
+    with pytest.raises(ValueError, match="must not be the training dataset"):
+        run_pipeline(
+            store, dataset_id, config=config, checkpoint_dir=str(tmp_path / "c"), output=tmp_path / "o",
+            make_predictor=never, make_trainable=never, held_out_dataset_ids=(dataset_id,),
+            allow_test=True,
+        )
