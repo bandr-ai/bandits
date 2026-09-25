@@ -339,10 +339,66 @@ def calibrate_command(
     console.print(f"ece:            {calibration.ece_before:.4f} -> {calibration.ece_after:.4f}")
 
 
+def _price_verifier(ledgers, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok):
+    """Price a dataset's verifier from one or more ledgers read as one
+    stream -- a merged dataset's judge runs each wrote their own."""
+    import itertools
+
+    from bandits_jev.cost import verifier_cost_from_ledger
+
+    handles = [path.open(encoding="utf-8") for path in ledgers]
+    try:
+        return verifier_cost_from_ledger(
+            itertools.chain.from_iterable(handles),
+            dataset,
+            dataset_id,
+            ledger=", ".join(str(path) for path in ledgers),
+            input_usd_per_mtok=input_usd_per_mtok,
+            output_usd_per_mtok=output_usd_per_mtok,
+        )
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+@app.command(name="merge")
+def merge_command(
+    dataset_ids: list[str] = typer.Argument(..., help="Two or more decision dataset ids."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Merge decision datasets (e.g. from judge runs over different corpora)
+    into one. Every row keeps the split it already has."""
+    from bandits_jev.dataset import (
+        load_decision_dataset,
+        merge_decision_datasets,
+        save_decision_dataset,
+    )
+
+    store = _derived(project)
+    try:
+        parts = [(dataset_id, load_decision_dataset(dataset_id, store)) for dataset_id in dataset_ids]
+        merged = merge_decision_datasets(parts)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no decision dataset {exc.filename or exc}")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    envelope = save_decision_dataset(merged, store)
+    counts = merged.counts
+    console.print(f"decision_dataset_id: {envelope.artifact_id}")
+    console.print(
+        f"examples:            {counts.examples} (train {counts.train}, dev {counts.dev}, "
+        f"calibration {counts.calibration}, test {counts.test})"
+    )
+
+
 @app.command(name="verifier-cost")
 def verifier_cost_command(
     dataset_id: str = typer.Argument(..., help="A judge-labeled decision dataset (from `jev dataset`)."),
-    ledger: Path = typer.Option(..., "--ledger", help="The Bandits ledger JSONL the judge run wrote (BANDITS_LEDGER)."),
+    ledger: list[Path] = typer.Option(
+        ..., "--ledger", help="The Bandits ledger JSONL the judge run wrote (BANDITS_LEDGER). Repeatable."
+    ),
     input_usd_per_mtok: float = typer.Option(
         ..., "--input-usd-per-mtok", help="The judge model's input price, USD per million tokens, as billed."
     ),
@@ -354,7 +410,7 @@ def verifier_cost_command(
     """Price the verifier per decision from its ledger: every judge call's
     tokens and time, attributed to the step it judged. Prices are given, never
     guessed."""
-    from bandits_jev.cost import save_verifier_cost, verifier_cost_from_ledger
+    from bandits_jev.cost import save_verifier_cost
     from bandits_jev.dataset import load_decision_dataset
 
     store = _derived(project)
@@ -364,15 +420,7 @@ def verifier_cost_command(
         console.print(f"[red]error:[/red] no decision dataset {dataset_id!r}")
         raise typer.Exit(code=1) from exc
     try:
-        with ledger.open(encoding="utf-8") as lines:
-            cost = verifier_cost_from_ledger(
-                lines,
-                dataset,
-                dataset_id,
-                ledger=str(ledger),
-                input_usd_per_mtok=input_usd_per_mtok,
-                output_usd_per_mtok=output_usd_per_mtok,
-            )
+        cost = _price_verifier(ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok)
     except (OSError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -463,10 +511,10 @@ def report_command(
 
 @app.command(name="run")
 def run_command(
-    source: str = typer.Argument(
+    sources: list[str] = typer.Argument(
         ...,
-        help="A Bandits turn-judge run id (verifier labels from traces), or an existing "
-        "decision dataset id (e.g. from `jev import`).",
+        help="One or more Bandits turn-judge run ids (verifier labels from traces) and/or "
+        "decision dataset ids (e.g. from `jev import`). Several are merged into one dataset.",
     ),
     model: str = typer.Option(..., "--model", help="Hugging Face base model id, e.g. Qwen/Qwen3.5-4B."),
     revision: str = typer.Option(..., "--revision", help="Pinned base model revision (commit SHA)."),
@@ -483,7 +531,9 @@ def run_command(
     lora_alpha: int = typer.Option(32, "--lora-alpha"),
     max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
     two_order: bool = typer.Option(False, "--two-order", help="Also score the untrained base with two option orders."),
-    ledger: Path = typer.Option(None, "--ledger", help="The judge run's ledger, to price the verifier column."),
+    ledger: list[Path] = typer.Option(
+        None, "--ledger", help="The judge runs' ledgers, to price the verifier column. Repeatable."
+    ),
     input_usd_per_mtok: float = typer.Option(None, "--input-usd-per-mtok", help="Judge input price (with --ledger)."),
     output_usd_per_mtok: float = typer.Option(None, "--output-usd-per-mtok", help="Judge output price (with --ledger)."),
     gpu_usd_per_hour: float = typer.Option(None, "--gpu-usd-per-hour", help="GPU price, for the model columns' cost."),
@@ -507,10 +557,11 @@ def run_command(
     from pydantic import ValidationError
 
     from bandits.verify.nextstate import load_turn_judge_run
-    from bandits_jev.cost import save_verifier_cost, verifier_cost_from_ledger
+    from bandits_jev.cost import save_verifier_cost
     from bandits_jev.dataset import (
         build_decision_dataset_from_corpus,
         load_decision_dataset,
+        merge_decision_datasets,
         save_decision_dataset,
     )
     from bandits_jev.pipeline import run_pipeline
@@ -521,18 +572,19 @@ def run_command(
             "[red]error:[/red] `jev run` scores the locked test split; pass --allow-test to do so deliberately"
         )
         raise typer.Exit(code=1)
-    if ledger is not None and (input_usd_per_mtok is None or output_usd_per_mtok is None):
+    if ledger and (input_usd_per_mtok is None or output_usd_per_mtok is None):
         console.print("[red]error:[/red] --ledger needs --input-usd-per-mtok and --output-usd-per-mtok")
         raise typer.Exit(code=1)
     store = _derived(project)
-    if source.startswith("decision-dataset-"):
-        try:
-            dataset = load_decision_dataset(source, store)
-        except FileNotFoundError as exc:
-            console.print(f"[red]error:[/red] no decision dataset {source!r}")
-            raise typer.Exit(code=1) from exc
-        dataset_id = source
-    else:
+    parts = []
+    for source in sources:
+        if source.startswith("decision-dataset-"):
+            try:
+                parts.append((source, load_decision_dataset(source, store)))
+            except FileNotFoundError as exc:
+                console.print(f"[red]error:[/red] no decision dataset {source!r}")
+                raise typer.Exit(code=1) from exc
+            continue
         try:
             judge_run = load_turn_judge_run(source, store)
         except FileNotFoundError as exc:
@@ -541,7 +593,7 @@ def run_command(
         task_set = _load_task_set(task_set_id, project) if task_set_id else None
         traces = _corpus_traces(judge_run.corpus_id, project, judge_run.trace_ids)
         try:
-            dataset = build_decision_dataset_from_corpus(
+            compiled = build_decision_dataset_from_corpus(
                 traces,
                 judge_run,
                 source,
@@ -552,6 +604,15 @@ def run_command(
         except ValueError as exc:
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc
+        parts.append((save_decision_dataset(compiled, store).artifact_id, compiled))
+    if len(parts) == 1:
+        dataset_id, dataset = parts[0]
+    else:
+        try:
+            dataset = merge_decision_datasets(parts)
+        except ValueError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
         dataset_id = save_decision_dataset(dataset, store).artifact_id
     console.print(
         f"dataset: {dataset_id} (train {dataset.counts.train}, dev {dataset.counts.dev}, "
@@ -559,17 +620,9 @@ def run_command(
     )
 
     verifier_cost_id = None
-    if ledger is not None:
+    if ledger:
         try:
-            with ledger.open(encoding="utf-8") as lines:
-                cost = verifier_cost_from_ledger(
-                    lines,
-                    dataset,
-                    dataset_id,
-                    ledger=str(ledger),
-                    input_usd_per_mtok=input_usd_per_mtok,
-                    output_usd_per_mtok=output_usd_per_mtok,
-                )
+            cost = _price_verifier(ledger, dataset, dataset_id, input_usd_per_mtok, output_usd_per_mtok)
         except (OSError, ValueError) as exc:
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc

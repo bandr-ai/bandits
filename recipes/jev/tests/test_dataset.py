@@ -710,3 +710,33 @@ def test_summary_counts_ties_separately_and_flags_long_states() -> None:
     assert summary["test"].majority_label == {"failure": 1, "success": 1, "tie": 1}
     assert summary["test"].long_states == 1
     assert summary["train"].rows == 0 and summary["train"].majority_label == {}
+
+
+def test_merge_keeps_every_rows_split_and_refuses_duplicates() -> None:
+    from bandits_jev.dataset import merge_decision_datasets
+
+    first_traces = [_trace(f"a{i}") for i in range(10)]
+    second_traces = [_trace(f"b{i}") for i in range(10)]
+    first = build_decision_dataset_from_corpus(
+        first_traces,
+        _run(first_traces, [v for t in first_traces for v in _all_observed_verdicts(t)]),
+        "judge-run-1",
+    )
+    second = build_decision_dataset_from_corpus(
+        second_traces,
+        _run(second_traces, [v for t in second_traces for v in _all_observed_verdicts(t)]),
+        "judge-run-2",
+    )
+    merged = merge_decision_datasets([("ds-1", first), ("ds-2", second)])
+
+    assert merged.counts.examples == first.counts.examples + second.counts.examples
+    assert {e.decision_id: e.split for e in merged.examples} == {
+        **{e.decision_id: e.split for e in first.examples},
+        **{e.decision_id: e.split for e in second.examples},
+    }
+    assert merged.source_artifact_ids == ("ds-1", "ds-2")
+    assert merged.decision_schema == first.decision_schema  # same shared schema kept
+    with pytest.raises(ValueError, match="is in both"):
+        merge_decision_datasets([("ds-1", first), ("ds-1-again", first)])
+    with pytest.raises(ValueError, match="at least two"):
+        merge_decision_datasets([("ds-1", first)])

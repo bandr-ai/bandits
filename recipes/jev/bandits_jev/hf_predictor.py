@@ -70,6 +70,19 @@ def letter_token_ids(tokenizer, prompt: str, letters, *, model_label: str) -> di
     return ids
 
 
+def context_limit(model) -> int | None:
+    """The model's own maximum sequence length, from its config (GPT-2 names
+    it ``n_positions``; most others ``max_position_embeddings``, possibly on a
+    nested ``text_config``). None when the config states none."""
+    config = getattr(model, "config", None)
+    for holder in (config, getattr(config, "text_config", None)):
+        for name in ("max_position_embeddings", "n_positions"):
+            value = getattr(holder, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
 class HFPredictor:
     """One forward pass over a frozen (or LoRA-adapted) causal LM, never
     ``generate()``. Pinned to an exact model id + revision so a scorer run
@@ -108,6 +121,7 @@ class HFPredictor:
 
             model = PeftModel.from_pretrained(model, adapter_path)
         self._model = model.to(device)
+        self.max_context_tokens = context_limit(model)
         self._model.eval()
         self._torch = torch
 
@@ -135,6 +149,7 @@ class HFPredictor:
         predictor.adapter_path = adapter_path
         predictor._tokenizer = tokenizer
         predictor._model = model
+        predictor.max_context_tokens = context_limit(model)
         predictor._torch = torch
         return predictor
 

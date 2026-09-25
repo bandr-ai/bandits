@@ -776,6 +776,53 @@ def summarize_dataset(dataset: DecisionDataset) -> dict[str, SplitSummary]:
     return summary
 
 
+def merge_decision_datasets(parts: Sequence[tuple[str, DecisionDataset]]) -> DecisionDataset:
+    """One dataset from several (e.g. judge runs over different corpora).
+    Every row keeps the split it was given, so merging never moves a row
+    across train/test; a decision id present in two parts is refused, and a
+    group that would straddle splits is rejected by the dataset's own
+    validation. The shared question/options schema is kept only when every
+    part declares the same one."""
+    if len(parts) < 2:
+        raise ValueError("merging needs at least two datasets")
+    seen: dict[str, str] = {}
+    for dataset_id, dataset in parts:
+        for example in dataset.examples:
+            if example.decision_id in seen:
+                raise ValueError(
+                    f"decision {example.decision_id} is in both {seen[example.decision_id]} and {dataset_id}"
+                )
+            seen[example.decision_id] = dataset_id
+    schemas = {d.decision_schema.model_dump_json() if d.decision_schema else None for _, d in parts}
+    schema = parts[0][1].decision_schema if len(schemas) == 1 else None
+    examples = tuple(e for _, d in parts for e in d.examples)
+    quarantined = tuple(q for _, d in parts for q in d.quarantined)
+    by_split: dict[str, int] = {}
+    for e in examples:
+        by_split[e.split] = by_split.get(e.split, 0) + 1
+    requested = {d.counts.votes_requested for _, d in parts}
+    valid_min = [d.counts.votes_valid_min for _, d in parts if d.counts.examples]
+    valid_max = [d.counts.votes_valid_max for _, d in parts if d.counts.examples]
+    return DecisionDataset(
+        producer="merged",
+        source_artifact_ids=tuple(dataset_id for dataset_id, _ in parts),
+        decision_schema=schema,
+        examples=examples,
+        quarantined=quarantined,
+        counts=DecisionDatasetCounts(
+            examples=len(examples),
+            train=by_split.get("train", 0),
+            dev=by_split.get("dev", 0),
+            calibration=by_split.get("calibration", 0),
+            test=by_split.get("test", 0),
+            quarantined=len(quarantined),
+            votes_requested=requested.pop() if len(requested) == 1 else 0,
+            votes_valid_min=min(valid_min) if valid_min else 0,
+            votes_valid_max=max(valid_max) if valid_max else 0,
+        ),
+    )
+
+
 def compute_dataset_id(dataset: DecisionDataset) -> str:
     digest = hashlib.sha256(dataset.model_dump_json().encode()).hexdigest()
     return f"decision-dataset-{digest[:16]}"
