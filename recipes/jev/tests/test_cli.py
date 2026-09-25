@@ -72,6 +72,6 @@ def test_import_predictions_refuses_test_without_allow_test(tmp_path) -> None:
     assert "--allow-test" in plain(result.stdout)
 
 
-@pytest.mark.parametrize("command", ["dataset", "import", "score", "train", "calibrate", "import-predictions", "report", "verifier-cost"])
+@pytest.mark.parametrize("command", ["dataset", "import", "score", "train", "calibrate", "import-predictions", "report", "verifier-cost", "run"])
 def test_every_command_is_on_the_jev_cli(command) -> None:
     assert runner.invoke(app, [command, "--help"]).exit_code == 0
