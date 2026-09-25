@@ -14,7 +14,8 @@ import json
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-from bandits.decide.dataset import (
+from bandits.store import DerivedEnvelope, DerivedStore
+from bandits_jev.dataset import (
     DecisionDataset,
     DecisionDatasetCounts,
     DecisionExample,
@@ -23,8 +24,7 @@ from bandits.decide.dataset import (
     DecisionTarget,
     RejectedDecision,
 )
-from bandits.decide.prompt import MAX_OPTIONS
-from bandits.store import DerivedEnvelope, DerivedStore
+from bandits_jev.prompt import MAX_OPTIONS
 
 _VALID_SPLITS: frozenset[str] = frozenset({"train", "dev", "calibration", "test"})
 

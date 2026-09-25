@@ -14,11 +14,14 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest --cov=bandits --cov-report=term-missing
 
-  decide:
-    # Decision-model tests against a real tiny model (hf-internal-testing/
-    # tiny-random-gpt2) on CPU. Separate from `test` because it installs
-    # torch and downloads a model; skipped there without the decide extra.
+  jev:
+    # The Jev recipe (recipes/jev), in its own environment so core never
+    # installs torch. Its model tests run a real tiny model
+    # (hf-internal-testing/tiny-random-gpt2) on CPU.
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: recipes/jev
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -30,4 +33,5 @@ jobs:
       # CPU-only torch wheel: the default PyPI wheel pulls ~3 GB of CUDA libs.
       - run: uv pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
       - run: uv pip install "transformers>=4.44" "peft>=0.12"
-      - run: uv run --no-sync pytest tests/decide -q
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest

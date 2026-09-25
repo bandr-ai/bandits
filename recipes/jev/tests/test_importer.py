@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 
-from bandits.decide.importer import (
+from bandits.store import DerivedStore
+from bandits_jev.importer import (
     import_jevbench,
     import_jsonl,
     save_imported_dataset,
 )
-from bandits.store import DerivedStore
 
 
 def _row(**kwargs) -> str:
@@ -99,7 +99,7 @@ def test_probabilities_not_summing_to_one_is_quarantined() -> None:
 
 
 def test_reimporting_identical_content_under_the_same_filename_yields_the_same_dataset_id() -> None:
-    from bandits.decide.importer import compute_import_dataset_id
+    from bandits_jev.importer import compute_import_dataset_id
 
     text = "\n".join([_row(), _row(question="q2")])
     first = import_jsonl(text, source_file="demo.jsonl")
@@ -113,7 +113,7 @@ def test_dataset_id_intentionally_differs_across_a_rename() -> None:
     provenance for "this exact file", so it legitimately changes on rename,
     unlike a row's own decision_id/split (see the rename-stability test
     below)."""
-    from bandits.decide.importer import compute_import_dataset_id
+    from bandits_jev.importer import compute_import_dataset_id
 
     text = "\n".join([_row(), _row(question="q2")])
     original = import_jsonl(text, source_file="demo.jsonl")
@@ -403,7 +403,7 @@ def test_import_round_trips_through_store(tmp_path) -> None:
     envelope = save_imported_dataset(dataset, store, source_file="demo.jsonl")
 
     loaded = store.read_payload(envelope.artifact_id)
-    from bandits.decide.dataset import DecisionDataset
+    from bandits_jev.dataset import DecisionDataset
 
     round_tripped = DecisionDataset.model_validate_json(loaded)
     assert round_tripped == dataset

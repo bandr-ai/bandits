@@ -5,10 +5,10 @@ the training-run artifact.
 Pure logic, no torch import -- the actual forward/backward pass lives behind
 a small ``Trainable`` protocol (mirroring ``scorer.LogitPredictor``) so this
 module's data-flow, resume and checkpoint-selection logic stays separate
-from the model code. ``bandits.decide.hf_trainer.HFTrainer`` implements the
+from the model code. ``bandits_jev.hf_trainer.HFTrainer`` implements the
 protocol for real; there is no fake/mock implementation -- tests exercise
 this module against ``HFTrainer`` wired to a tiny public checkpoint (see
-``tests/decide/test_trainer.py``), never a hand-rolled stand-in.
+``recipes/jev/tests/test_trainer.py``), never a hand-rolled stand-in.
 """
 
 from __future__ import annotations
@@ -20,10 +20,11 @@ from typing import Protocol
 
 from pydantic import Field
 
-from bandits.decide.dataset import DecisionExample
-from bandits.decide.prompt import PROMPT_VERSION, build_prompt, template_digest
-from bandits.decide.scorer import LogitPredictor, ScoreMode, TokenizationError, score_dataset
 from bandits.store import Contract, DerivedEnvelope, DerivedStore
+from bandits_jev.dataset import DecisionExample
+from bandits_jev.metrics import is_correct
+from bandits_jev.prompt import PROMPT_VERSION, build_prompt, template_digest
+from bandits_jev.scorer import LogitPredictor, ScoreMode, TokenizationError, score_dataset
 
 DEFAULT_LORA_RANK = 16
 DEFAULT_LORA_ALPHA = 32
@@ -208,10 +209,9 @@ def evaluate_dev(
     mode: ScoreMode = "single_order",
     max_prompt_tokens: int = 8_000,
 ) -> DevEvaluation:
-    """Accuracy of the argmax option against the target's highest-probability
-    option (a hard target's single correct option, or a soft target's
-    plurality), over scored rows only. Raises if no dev row could be scored:
-    a checkpoint cannot be judged against nothing."""
+    """Accuracy of the argmax option against any target option tied for the
+    highest probability, over scored rows only. Raises if no dev row could
+    be scored: a checkpoint cannot be judged against nothing."""
     run = score_dataset(predictor, dev_examples, mode=mode, max_prompt_tokens=max_prompt_tokens)
     if not run.results:
         raise ValueError(
@@ -222,8 +222,8 @@ def evaluate_dev(
     correct = 0
     for result in run.results:
         target = by_id[result.decision_id].target.probabilities
-        gold = max(target.items(), key=lambda kv: kv[1])[0]
-        if result.chosen_option_id == gold:
+        probabilities = {score.option_id: score.probability for score in result.scores}
+        if is_correct(probabilities, target):
             correct += 1
     return DevEvaluation(
         accuracy=correct / len(run.results), scored=len(run.results), rejected=len(run.rejections)

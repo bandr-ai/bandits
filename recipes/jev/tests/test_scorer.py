@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 
 import pytest
 
-from bandits.decide.dataset import DecisionExample, DecisionLineage, DecisionTarget
-from bandits.decide.prompt import MAX_OPTIONS, build_prompt
-from bandits.decide.scorer import (
+from bandits.store import DerivedStore
+from bandits_jev.dataset import DecisionExample, DecisionLineage, DecisionTarget
+from bandits_jev.prompt import MAX_OPTIONS, build_prompt
+from bandits_jev.scorer import (
     DecisionScoreResult,
     LogitPrediction,
     RejectedScore,
     ScorerRun,
     TokenizationError,
+    adapter_training_dataset_id,
     compute_scorer_run_id,
     load_scorer_run,
     save_scorer_run,
     score_dataset,
     score_example,
 )
-from bandits.store import DerivedStore
 
 
 def _example(options: dict[str, str] | None = None, target_option: str = "a") -> DecisionExample:
@@ -218,7 +220,7 @@ def test_generate_is_never_called() -> None:
     """Structural guarantee: the scorer module's source contains no call to
     `.generate(`, and the predictor protocol it depends on exposes no such
     method -- there is no code path through which it could be invoked."""
-    import bandits.decide.scorer as scorer_module
+    import bandits_jev.scorer as scorer_module
 
     source = inspect.getsource(scorer_module)
     assert ".generate(" not in source
@@ -260,6 +262,21 @@ def test_scorer_run_records_dataset_split_and_template_contract() -> None:
     assert run.dtype == "float32"
     assert run.device == "cpu"
     assert run.template_digest
+
+
+def test_adapter_training_dataset_is_read_from_checkpoint_progress(tmp_path) -> None:
+    checkpoint = tmp_path / "step-3"
+    checkpoint.mkdir()
+    (checkpoint / "progress.json").write_text(
+        json.dumps({"config": {"dataset_id": "decision-dataset-training"}})
+    )
+
+    assert adapter_training_dataset_id(checkpoint) == "decision-dataset-training"
+
+
+def test_adapter_training_dataset_requires_checkpoint_progress(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="progress.json"):
+        adapter_training_dataset_id(tmp_path)
 
 
 def test_scorer_run_artifact_round_trips() -> None:
@@ -305,7 +322,7 @@ def test_saving_an_exact_rerun_with_different_latency_returns_the_first_artifact
 
 
 def test_scorer_does_not_depend_on_traces_or_judge_code() -> None:
-    import bandits.decide.scorer as scorer_module
+    import bandits_jev.scorer as scorer_module
 
     source = inspect.getsource(scorer_module)
     assert "bandits.traces" not in source
