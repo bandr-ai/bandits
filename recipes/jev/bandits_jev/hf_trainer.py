@@ -2,7 +2,7 @@
 scorer. Cross-entropy over the option-letter logits at the answer position,
 never a full-vocabulary language-modeling loss.
 
-One of two modules in ``bandits.decide`` allowed to import torch/transformers
+One of two modules in ``bandits_jev`` allowed to import torch/transformers
 (the other is ``hf_predictor.py``), and only inside function bodies. The
 loss reads letters through the same ``encode_prompt``/``letter_token_id`` as
 ``HFPredictor``, and dev scoring goes through ``HFPredictor`` itself
@@ -15,9 +15,9 @@ from __future__ import annotations
 import platform
 from importlib.metadata import version
 
-from bandits.decide.dataset import DecisionExample
-from bandits.decide.hf_predictor import HFPredictor, encode_prompt, letter_token_ids
-from bandits.decide.prompt import build_prompt
+from bandits_jev.dataset import DecisionExample
+from bandits_jev.hf_predictor import HFPredictor, encode_prompt, letter_token_ids
+from bandits_jev.prompt import build_prompt
 
 _TRAINING_STATE_FILE = "training_state.pt"
 

@@ -12,11 +12,12 @@ pytest.importorskip("torch")
 pytest.importorskip("transformers")
 pytest.importorskip("peft")
 
-from bandits.decide.dataset import DecisionExample, DecisionLineage, DecisionTarget
-from bandits.decide.hf_predictor import HFPredictor
-from bandits.decide.hf_trainer import HFTrainer
-from bandits.decide.scorer import score_example
-from bandits.decide.trainer import (
+from bandits.store import DerivedStore
+from bandits_jev.dataset import DecisionExample, DecisionLineage, DecisionTarget
+from bandits_jev.hf_predictor import HFPredictor
+from bandits_jev.hf_trainer import HFTrainer
+from bandits_jev.scorer import score_example
+from bandits_jev.trainer import (
     build_data_order,
     build_training_config,
     evaluate_dev,
@@ -25,7 +26,6 @@ from bandits.decide.trainer import (
     shuffled_options,
     train,
 )
-from bandits.store import DerivedStore
 
 _MODEL_ID = "hf-internal-testing/tiny-random-gpt2"
 _REVISION = "main"
@@ -351,7 +351,7 @@ def test_rows_failing_the_letter_contract_are_rejected_not_trained_on(tmp_path) 
     """A row the scorer would reject (letters not distinct tokens) must not
     be trained on either. Real HFTrainer; only its letter check is made to
     fail for one row, since the tiny tokenizer has no colliding letters."""
-    from bandits.decide.scorer import TokenizationError
+    from bandits_jev.scorer import TokenizationError
 
     class CollidingTrainer(HFTrainer):
         def check_letters(self, prompt, letters) -> None:

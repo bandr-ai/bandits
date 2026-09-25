@@ -4,7 +4,7 @@ allowed option-letter logits. Never calls ``generate()``.
 The heavy model lives behind a small ``LogitPredictor`` protocol so tests run
 against a fake tokenizer/model with no download and no GPU; a real HF/torch
 predictor is a thin adapter over the same protocol, implemented in
-``bandits.decide.hf_predictor`` (the only module in this package allowed to
+``bandits_jev.hf_predictor`` (the only module in this package allowed to
 import torch, and imported lazily from there).
 """
 
@@ -14,16 +14,17 @@ import hashlib
 import json
 import math
 import time
+from pathlib import Path
 from typing import Literal, Protocol
 
-from bandits.decide.dataset import DecisionExample
-from bandits.decide.prompt import (
+from bandits.store import ArtifactConflict, Contract, DerivedEnvelope, DerivedStore
+from bandits_jev.dataset import DecisionExample
+from bandits_jev.prompt import (
     PROMPT_VERSION,
     build_prompt,
     prompt_digest,
     template_digest,
 )
-from bandits.store import ArtifactConflict, Contract, DerivedEnvelope, DerivedStore
 
 DEFAULT_MAX_PROMPT_TOKENS = 8_000
 ScoreMode = Literal["single_order", "two_order_average"]
@@ -102,7 +103,8 @@ class DecisionScoreResult(Contract):
     prompt_digest: str
     """The first (non-reversed) pass's prompt digest. The reversed pass's
     prompt differs only in option order, under the same template version."""
-    latency_seconds: float
+    latency_seconds: float | None = None
+    """Wall-clock latency when reported. Imported predictions may omit it."""
 
 
 class RejectedScore(Contract):
@@ -123,6 +125,30 @@ class ScorerRun(Contract):
     max_prompt_tokens: int
     results: tuple[DecisionScoreResult, ...]
     rejections: tuple[RejectedScore, ...]
+    adapter_digest: str | None = None
+    """Digest of the LoRA adapter files scored on top of the base model
+    (``adapter_digest``); None for the untrained base. Without it a trained
+    run and an untrained run of the same base are indistinguishable."""
+    trained_on_dataset_id: str | None = None
+    """Dataset recorded by the adapter checkpoint's training progress."""
+    predictions_source: str | None = None
+    """Set only for a run imported from someone else's predictions (e.g.
+    "imported:jev"), never for a run this scorer produced. Such a run did
+    not use this repo's prompt, so ``prompt_version``/``template_digest`` are
+    0/"" and ``raw_logit_pass1`` holds log(probability)."""
+    cost_usd: float | None = None
+    """The actual bill for producing an imported run's predictions, as
+    recorded by whoever ran it. None when unknown or not applicable."""
+
+
+_OPTIONAL_IDENTITY_FIELDS = (
+    "adapter_digest",
+    "trained_on_dataset_id",
+    "predictions_source",
+    "cost_usd",
+)
+"""Added after scorer runs were already being saved. Left out of a run's
+identity while unset, so every run saved before they existed keeps its id."""
 
 
 def _softmax(logits: dict[str, float]) -> dict[str, float]:
@@ -255,6 +281,8 @@ def score_dataset(
     max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
     dataset_id: str | None = None,
     split: str | None = None,
+    adapter_digest: str | None = None,
+    trained_on_dataset_id: str | None = None,
 ) -> ScorerRun:
     results: list[DecisionScoreResult] = []
     rejections: list[RejectedScore] = []
@@ -277,7 +305,41 @@ def score_dataset(
         max_prompt_tokens=max_prompt_tokens,
         results=tuple(results),
         rejections=tuple(rejections),
+        adapter_digest=adapter_digest,
+        trained_on_dataset_id=trained_on_dataset_id,
     )
+
+
+def adapter_digest(adapter_path: str | Path) -> str:
+    """Digest of a saved LoRA adapter: its config and weight files, by name
+    and content. Optimizer state and training progress saved beside them in
+    a checkpoint directory are not part of the model and are ignored."""
+    root = Path(adapter_path)
+    files = sorted(
+        p for p in root.iterdir() if p.is_file() and p.name.startswith(("adapter_config", "adapter_model"))
+    )
+    if not any(p.name.startswith("adapter_model") for p in files):
+        raise FileNotFoundError(f"no adapter_model file in {root}")
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(path.name.encode())
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()[:16]
+
+
+def adapter_training_dataset_id(adapter_path: str | Path) -> str:
+    """Read the training dataset provenance saved beside an adapter."""
+    progress_path = Path(adapter_path) / "progress.json"
+    if not progress_path.is_file():
+        raise FileNotFoundError(f"no progress.json in {Path(adapter_path)}")
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        dataset_id = payload["config"]["dataset_id"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"{progress_path} has no valid config.dataset_id") from exc
+    if not isinstance(dataset_id, str) or not dataset_id:
+        raise ValueError(f"{progress_path} has no valid config.dataset_id")
+    return dataset_id
 
 
 def compute_scorer_run_id(run: ScorerRun) -> str:
@@ -293,6 +355,9 @@ def compute_scorer_run_id(run: ScorerRun) -> str:
 
 def _identity_json(run: ScorerRun) -> str:
     payload = run.model_dump(mode="json")
+    for field in _OPTIONAL_IDENTITY_FIELDS:
+        if payload.get(field) is None:
+            payload.pop(field, None)
     for result in payload["results"]:
         result.pop("latency_seconds", None)
     return json.dumps(payload, sort_keys=True)
@@ -323,3 +388,127 @@ def save_scorer_run(run: ScorerRun, store: DerivedStore) -> DerivedEnvelope:
 
 def load_scorer_run(scorer_run_id: str, store: DerivedStore) -> ScorerRun:
     return ScorerRun.model_validate_json(store.read_payload(scorer_run_id))
+
+
+def import_predictions(
+    text: str,
+    examples: list[DecisionExample],
+    *,
+    name: str,
+    model_id: str,
+    revision: str,
+    dataset_id: str,
+    split: str,
+    cost_usd: float | None = None,
+) -> ScorerRun:
+    """Turn another system's predictions into a ``ScorerRun`` so the report
+    scores them with exactly the metrics it applies to local runs.
+
+    One JSON object per line: ``{"decision_id", "probabilities": {option_id:
+    p}, "latency_seconds"?}``. Every example in ``examples`` either gets a
+    result or a rejection -- a missing, malformed or mismatched line is
+    rejected with its reason, never dropped, so a system that skipped hard
+    rows can't look better by having answered only easy ones. Probabilities
+    must be finite, non-negative and sum to 1 within 1e-3; they are then
+    renormalized exactly.
+    """
+    by_id = {e.decision_id: e for e in examples}
+    predicted: dict[str, dict] = {}
+    rejections: dict[str, list[str]] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"line {line_number}: not valid JSON ({exc})") from exc
+        decision_id = row.get("decision_id") if isinstance(row, dict) else None
+        if decision_id not in by_id:
+            raise ValueError(f"line {line_number}: decision_id {decision_id!r} is not in this split")
+        if decision_id in predicted or decision_id in rejections:
+            raise ValueError(f"line {line_number}: duplicate prediction for {decision_id!r}")
+        problem = _prediction_problem(row, by_id[decision_id])
+        if problem is not None:
+            rejections[decision_id] = [f"line {line_number}: {problem}"]
+            continue
+        predicted[decision_id] = row
+
+    results: list[DecisionScoreResult] = []
+    rejected: list[RejectedScore] = []
+    for example in examples:
+        row = predicted.get(example.decision_id)
+        if row is None:
+            reasons = rejections.get(example.decision_id, [f"no prediction from {name}"])
+            rejected.append(RejectedScore(decision_id=example.decision_id, reasons=tuple(reasons)))
+            continue
+        raw = {o: float(row["probabilities"][o]) for o in example.options}
+        total = sum(raw.values())
+        probs = {o: p / total for o, p in raw.items()}
+        scores = tuple(
+            OptionScore(
+                option_id=o, probability=p, raw_logit_pass1=math.log(max(p, _IMPORTED_LOG_FLOOR))
+            )
+            for o, p in probs.items()
+        )
+        results.append(
+            DecisionScoreResult(
+                decision_id=example.decision_id,
+                scores=scores,
+                chosen_option_id=max(scores, key=lambda s: s.probability).option_id,
+                candidate_token_mass=1.0,
+                mode="single_order",
+                prompt_digest="",
+                latency_seconds=(
+                    float(row["latency_seconds"])
+                    if row.get("latency_seconds") is not None
+                    else None
+                ),
+            )
+        )
+    return ScorerRun(
+        model_id=model_id,
+        revision=revision,
+        dtype="n/a",
+        device="n/a",
+        dataset_id=dataset_id,
+        split=split,
+        prompt_version=0,
+        template_digest="",
+        mode="single_order",
+        max_prompt_tokens=0,
+        results=tuple(results),
+        rejections=tuple(rejected),
+        predictions_source=f"imported:{name}",
+        cost_usd=cost_usd,
+    )
+
+
+_IMPORTED_LOG_FLOOR = 1e-15
+
+
+def _prediction_problem(row: dict, example: DecisionExample) -> str | None:
+    probabilities = row.get("probabilities")
+    if not isinstance(probabilities, dict):
+        return "'probabilities' must be an object of option id -> probability"
+    if set(probabilities) != set(example.options):
+        return (
+            f"probabilities cover {sorted(probabilities)}, but this example's options are "
+            f"{sorted(example.options)}"
+        )
+    try:
+        values = [float(v) for v in probabilities.values()]
+    except (TypeError, ValueError):
+        return "probabilities must be numbers"
+    if any(not math.isfinite(v) or v < 0 for v in values):
+        return "probabilities must be finite and non-negative"
+    if abs(sum(values) - 1.0) > 1e-3:
+        return f"probabilities sum to {sum(values)!r}, not 1"
+    latency = row.get("latency_seconds")
+    if latency is not None:
+        try:
+            latency_value = float(latency)
+        except (TypeError, ValueError):
+            return "latency_seconds must be a number when provided"
+        if not math.isfinite(latency_value) or latency_value < 0:
+            return "latency_seconds must be finite and non-negative"
+    return None

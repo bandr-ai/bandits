@@ -6,7 +6,11 @@ import pytest
 from pydantic import ValidationError
 
 from bandits.analyze.models import TaskFamily, TaskSet
-from bandits.decide.dataset import (
+from bandits.store import DerivedStore
+from bandits.traces import Span, SpanKind, SpanStatus, Trace
+from bandits.verify.nextstate import Archetype, TraceSignal, TurnJudgeRun, TurnVerdict, _vote_shares
+from bandits.verify.turns import extract_turns
+from bandits_jev.dataset import (
     ACTION_OUTCOME_OPTIONS,
     ACTION_OUTCOME_QUESTION,
     DecisionDataset,
@@ -18,10 +22,6 @@ from bandits.decide.dataset import (
     save_decision_dataset,
     source_from_trace,
 )
-from bandits.store import DerivedStore
-from bandits.traces import Span, SpanKind, SpanStatus, Trace
-from bandits.verify.nextstate import Archetype, TraceSignal, TurnJudgeRun, TurnVerdict, _vote_shares
-from bandits.verify.turns import extract_turns
 
 _T = datetime(2025, 1, 1, tzinfo=UTC)
 
@@ -400,7 +400,7 @@ def test_hard_target_must_concentrate_on_one_option() -> None:
 
 
 def test_choice_needs_at_least_two_nonempty_options() -> None:
-    from bandits.decide.dataset import DecisionExample, DecisionLineage
+    from bandits_jev.dataset import DecisionExample, DecisionLineage
 
     def _example(options: dict[str, str], probabilities: dict[str, float]) -> None:
         DecisionExample(
@@ -425,7 +425,7 @@ def test_choice_needs_at_least_two_nonempty_options() -> None:
 
 
 def test_dataset_rejects_a_row_that_does_not_match_its_shared_schema() -> None:
-    from bandits.decide.dataset import (
+    from bandits_jev.dataset import (
         DecisionDataset,
         DecisionDatasetCounts,
         DecisionExample,
@@ -465,7 +465,7 @@ def test_dataset_rejects_a_row_that_does_not_match_its_shared_schema() -> None:
 
 
 def test_dataset_rejects_a_wrong_examples_count() -> None:
-    from bandits.decide.dataset import DecisionDataset, DecisionDatasetCounts
+    from bandits_jev.dataset import DecisionDataset, DecisionDatasetCounts
 
     with pytest.raises(ValidationError, match="counts.examples"):
         DecisionDataset(
