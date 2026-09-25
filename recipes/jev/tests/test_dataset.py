@@ -32,12 +32,13 @@ def _span(span_id: str, kind: SpanKind, name: str, output, status=SpanStatus.OK)
     )
 
 
-def _trace(trace_id: str, task: str = "fix the bug") -> Trace:
+def _trace(trace_id: str, task: str = "fix the bug", *, lineage_id: str | None = None) -> Trace:
     return Trace(
         trace_id=trace_id,
         source="test",
         source_digest="d",
         task=task,
+        lineage_id=lineage_id,
         spans=(
             _span("m1", SpanKind.MODEL, "gpt", "open schema.py"),
             _span("t1", SpanKind.TOOL, "execute", "schema.py not found", SpanStatus.ERROR),
@@ -287,7 +288,7 @@ def _family_task_set(fit_trace: Trace, held_out_trace: Trace) -> TaskSet:
     )
 
 
-def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None:
+def test_family_split_keeps_fit_in_train_and_held_out_in_an_evaluation_split() -> None:
     fit_trace, held_out_trace = _trace("a"), _trace("b")
     task_set = _family_task_set(fit_trace, held_out_trace)
     verdicts = []
@@ -300,21 +301,122 @@ def test_family_split_follows_the_task_set_never_splits_within_a_trace() -> None
 
     splits = {r.lineage.trace_id: r.split for r in dataset.examples}
     assert splits["a"] == "train"
-    assert splits["b"] == "dev"
+    assert splits["b"] in {"dev", "calibration", "test"}
     by_trace: dict[str, set[str]] = {}
     for row in dataset.examples:
         by_trace.setdefault(row.lineage.trace_id, set()).add(row.split)
     assert all(len(sides) == 1 for sides in by_trace.values())
 
 
-def test_no_task_set_defaults_every_example_to_train() -> None:
-    trace = _trace("a")
-    verdicts = _all_observed_verdicts(trace)
-    run = _run([trace], verdicts)
-    dataset = build_decision_dataset_from_corpus([trace], run, "judge-run-1")
+def test_task_set_held_out_lineages_fill_dev_calibration_and_test() -> None:
+    fit_trace = _trace("fit")
+    held_out = [_trace(f"held-{i}", lineage_id=f"lineage-{i}") for i in range(60)]
+    traces = [fit_trace, *held_out]
+    family = TaskFamily(
+        family_id="family-1",
+        descriptor="fix a bug",
+        trace_ids=tuple(trace.trace_id for trace in traces),
+        medoid_trace_id=fit_trace.trace_id,
+        workload_mass=len(traces),
+        fit_trace_ids=(fit_trace.trace_id,),
+        held_out_trace_ids=tuple(trace.trace_id for trace in held_out),
+    )
+    task_set = TaskSet(
+        corpus_id="corpus-1",
+        analysis_id="analysis-1",
+        families=(family,),
+        selected=(),
+        total_workload_mass=len(traces),
+        workload_coverage=1.0,
+    )
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
 
-    assert all(r.split == "train" for r in dataset.examples)
+    dataset = build_decision_dataset_from_corpus(
+        traces,
+        _run(traces, verdicts),
+        "judge-run-1",
+        task_set=task_set,
+        task_set_id="taskset-1",
+    )
+    held_out_rows = [row for row in dataset.examples if row.lineage.trace_id != "fit"]
+
+    assert {row.split for row in held_out_rows} == {"dev", "calibration", "test"}
+    assert {row.split for row in dataset.examples if row.lineage.trace_id == "fit"} == {"train"}
+    by_lineage: dict[str, set[str]] = {}
+    for row in held_out_rows:
+        by_lineage.setdefault(row.group_id, set()).add(row.split)
+    assert all(len(splits) == 1 for splits in by_lineage.values())
+
+
+def test_no_task_set_splits_by_trace_into_all_four_splits() -> None:
+    traces = [_trace(f"t{i}") for i in range(60)]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+    run = _run(traces, verdicts)
+    dataset = build_decision_dataset_from_corpus(traces, run, "judge-run-1")
+
+    by_trace: dict[str, set[str]] = {}
+    for row in dataset.examples:
+        by_trace.setdefault(row.lineage.trace_id, set()).add(row.split)
+    assert all(len(sides) == 1 for sides in by_trace.values())  # no trace straddles splits
+    assert {r.split for r in dataset.examples} == {"train", "dev", "calibration", "test"}
     assert dataset.source_task_set_id is None
+    counts = dataset.counts
+    assert (counts.train, counts.dev, counts.calibration, counts.test) == tuple(
+        sum(1 for r in dataset.examples if r.split == s) for s in ("train", "dev", "calibration", "test")
+    )
+
+
+def test_trace_split_is_stable_across_compiles_and_trace_order() -> None:
+    traces = [_trace(f"t{i}") for i in range(20)]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+    first = build_decision_dataset_from_corpus(traces, _run(traces, verdicts), "judge-run-1")
+    second = build_decision_dataset_from_corpus(
+        list(reversed(traces)), _run(traces, verdicts), "judge-run-1"
+    )
+
+    assert {r.decision_id: r.split for r in first.examples} == {
+        r.decision_id: r.split for r in second.examples
+    }
+
+
+def test_related_trace_lineage_shares_split_and_resampling_group() -> None:
+    first_trace = _trace("retry-1", lineage_id="ticket-7")
+    second_trace = _trace("retry-2", lineage_id="ticket-7")
+    unrelated = _trace("other")
+    traces = [first_trace, second_trace, unrelated]
+    verdicts = [v for trace in traces for v in _all_observed_verdicts(trace)]
+
+    dataset = build_decision_dataset_from_corpus(
+        traces, _run(traces, verdicts), "judge-run-1"
+    )
+    related = [
+        row for row in dataset.examples if row.lineage.trace_id in {"retry-1", "retry-2"}
+    ]
+
+    assert len({row.split for row in related}) == 1
+    assert {row.group_id for row in related} == {"ticket-7"}
+    assert all(
+        row.group_id == row.lineage.trace_id
+        for row in dataset.examples
+        if row.lineage.trace_id == "other"
+    )
+
+
+def test_every_row_is_grouped_by_its_trace() -> None:
+    fit_trace, held_out_trace = _trace("a"), _trace("b")
+    verdicts = _all_observed_verdicts(fit_trace) + _all_observed_verdicts(held_out_trace)
+    run = _run([fit_trace, held_out_trace], verdicts)
+    without = build_decision_dataset_from_corpus([fit_trace, held_out_trace], run, "judge-run-1")
+    with_task_set = build_decision_dataset_from_corpus(
+        [fit_trace, held_out_trace],
+        run,
+        "judge-run-1",
+        task_set=_family_task_set(fit_trace, held_out_trace),
+        task_set_id="taskset-1",
+    )
+
+    for dataset in (without, with_task_set):
+        assert all(r.group_id == r.lineage.trace_id for r in dataset.examples)
 
 
 def test_task_set_from_a_different_corpus_is_rejected() -> None:
@@ -581,3 +683,30 @@ def test_v2_payload_is_not_touched_by_the_v1_migration() -> None:
 
     round_tripped = DecisionDataset.model_validate(dataset.model_dump(mode="json"))
     assert round_tripped == dataset
+
+
+def test_summary_counts_ties_separately_and_flags_long_states() -> None:
+    import json
+
+    from bandits_jev.dataset import LONG_STATE_CHARS, summarize_dataset
+    from bandits_jev.importer import import_jsonl
+
+    options = {"success": "s", "unclear": "u", "failure": "f"}
+    rows = [
+        {"state": "short", "question": "q", "options": options, "target": "failure", "split": "test"},
+        {"state": "x" * (LONG_STATE_CHARS + 1), "question": "q", "options": options, "target": "success", "split": "test"},
+        {
+            "state": "tied",
+            "question": "q",
+            "options": options,
+            "target": {"success": 0.5, "unclear": 0.0, "failure": 0.5},
+            "split": "test",
+        },
+    ]
+    dataset = import_jsonl("\n".join(json.dumps(r) for r in rows), source_file="s.jsonl")
+    summary = summarize_dataset(dataset)
+
+    assert summary["test"].rows == 3
+    assert summary["test"].majority_label == {"failure": 1, "success": 1, "tie": 1}
+    assert summary["test"].long_states == 1
+    assert summary["train"].rows == 0 and summary["train"].majority_label == {}
