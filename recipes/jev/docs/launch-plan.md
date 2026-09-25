@@ -83,12 +83,12 @@ The unseen-source result and the learning curve have no bar; they are reported a
 - Prices recorded: the verifier's and the cheaper judge's per-token prices, and the GPU's hourly price.
 
 **Phase 1: GPU session 1, dev only (Alex; ~1–2 h on one 48 GB+ GPU)**
-- `gpu_run.sh` smoke test for `Qwen/Qwen3.5-4B-Base` and `Qwen/Qwen3.5-4B`.
+- `PHASE=1 scripts/gpu_run.sh`: smoke test, then `jev run --eval-split dev` for `Qwen/Qwen3.5-4B-Base` and `Qwen/Qwen3.5-4B`. It never opens the test split.
 - One seed each, scored on **dev**. **Pick the model by dev agreement** (higher wins; a tie goes to Base). Nothing is scored on test.
 - Learning curve on dev.
 
 **Phase 2: GPU session 2, the locked test run, once (Alex; ~2–3 h)**
-- The chosen model × **3 seeds** (1, 2, 3), each through `jev run`, plus the held-out-SWE run.
+- `PHASE=2 scripts/gpu_run.sh` (`jev run --eval-split test --allow-test`): the chosen model × **3 seeds** (1, 2, 3), plus the held-out-SWE run (`HELD_OUT_RUNS`).
 - Every bar in §5 checked from the reports. The test split is not scored again for this dataset.
 
 **Phase 3: write-up (Laxman)**
