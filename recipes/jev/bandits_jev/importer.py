@@ -20,9 +20,9 @@ from bandits_jev.dataset import (
     DecisionDatasetCounts,
     DecisionExample,
     DecisionLineage,
-    DecisionSplit,
     DecisionTarget,
     RejectedDecision,
+    deterministic_split,
 )
 from bandits_jev.prompt import MAX_OPTIONS
 
@@ -44,21 +44,6 @@ def _row_identity_key(question: str, options: dict[str, str], state: str) -> str
     train/dev/calibration/test or leak the locked test split."""
     payload = json.dumps({"question": question, "options": options, "state": state}, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def _deterministic_split(key: str) -> DecisionSplit:
-    """Assign a split from a stable hash of a content key (a row's own id,
-    its group id, or a hash of its question+options -- never a file path or
-    line number). Roughly 70/10/10/10 train/dev/calibration/test."""
-    digest = hashlib.sha256(key.encode()).digest()
-    bucket = digest[0] / 256.0
-    if bucket < 0.70:
-        return "train"
-    if bucket < 0.80:
-        return "dev"
-    if bucket < 0.90:
-        return "calibration"
-    return "test"
 
 
 def _parse_target(raw: Any, options: dict[str, str], reasons: list[str]) -> DecisionTarget | None:
@@ -165,7 +150,7 @@ def _parse_row(
         options={str(k): str(v) for k, v in options.items()},
         target=target,
         label_source=str(raw.get("label_source", "user_import")),
-        split=split or _deterministic_split(split_key),
+        split=split or deterministic_split(split_key),
         lineage=DecisionLineage(
             source_kind="jsonl_import",
             record_id=record_id,
@@ -348,7 +333,7 @@ def import_jsonl(
     hash of its own content: ``group_id`` when set, otherwise a hash of its
     question+options (never the source file path or line number, so a
     rename or a reordered file can never reshuffle splits or leak the locked
-    test split -- see ``_deterministic_split``). Rows that share a
+    test split -- see ``deterministic_split``). Rows that share a
     ``group_id`` but disagree on their split (whether explicit or hashed)
     are quarantined as a group, never silently resolved by picking one.
 
