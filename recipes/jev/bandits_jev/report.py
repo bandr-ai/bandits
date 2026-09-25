@@ -173,6 +173,30 @@ class ReportRow(Contract):
     predictions: dict[str, RowPrediction]
 
 
+class VersusVerifier(Contract):
+    """The distillation headline, computed on one set of rows for both
+    sides: the decisions the candidate scored. Rejected rows count as
+    disagreement; a ratio whose inputs are missing for any compared row is
+    left out (None, with the reason), never computed on a subset."""
+
+    candidate: str
+    rows: int
+    """Evaluation rows, scored or not."""
+    compared_rows: int
+    """Rows the candidate scored: the rows both costs and latencies use."""
+    agreement: float | None
+    """The candidate's coverage-adjusted agreement with the verifier: correct
+    over every untied evaluation row, a rejected row counting as a miss."""
+    coverage: float
+    cost_ratio: float | None
+    """Verifier cost over candidate cost on the compared rows."""
+    latency_ratio: float | None
+    """Verifier median latency over candidate median latency on the
+    compared rows where both were measured."""
+    latency_rows: int
+    notes: tuple[str, ...] = ()
+
+
 class ReportSection(Contract):
     name: str
     dataset_id: str
@@ -183,6 +207,7 @@ class ReportSection(Contract):
     columns: tuple[Column, ...]
     comparisons: tuple[PairedComparison, ...]
     rows: tuple[ReportRow, ...]
+    versus_verifier: VersusVerifier | None = None
 
 
 class TestRunRecord(Contract):
@@ -501,11 +526,18 @@ def _section(
     seed: int,
     n_bins: int,
     pricing: _Pricing,
+    prior_dataset: DecisionDataset | None = None,
 ) -> ReportSection:
+    """``prior_dataset`` is the dataset the model trained on, when it is not
+    ``dataset`` itself (external and held-out sections): the majority
+    baseline answers with *its* train label mix."""
     examples = [e for e in dataset.examples if e.split == split]
     if not examples:
         raise ValueError(f"dataset {dataset_id} has no {split!r} examples")
-    columns = _reference_columns(dataset, dataset_id, split, examples, pricing.verifier_cost) + columns
+    columns = (
+        _reference_columns(dataset, dataset_id, split, examples, pricing.verifier_cost, prior_dataset=prior_dataset)
+        + columns
+    )
     ids = {e.decision_id for e in examples}
     for column in columns:
         if column.run is None:
@@ -520,15 +552,84 @@ def _section(
         _comparison(by_name[cand], by_name[base], examples, draws=draws, seed=seed)
         for cand, base in comparisons
     ]
+    built_columns = tuple(_column(c, examples, n_bins, pricing) for c in columns)
     return ReportSection(
         name=name,
         dataset_id=dataset_id,
         split=split,
         items=len(examples),
         resample_by="group_id" if any(e.group_id is not None for e in examples) else "row",
-        columns=tuple(_column(c, examples, n_bins, pricing) for c in columns),
+        columns=built_columns,
         comparisons=tuple(c for c in built if c is not None),
         rows=_rows(columns, examples),
+        versus_verifier=_versus_verifier_numbers(columns, built_columns, examples, pricing),
+    )
+
+
+def _versus_verifier_numbers(
+    inputs: list[_ColumnInput],
+    columns: tuple[Column, ...],
+    examples: list[DecisionExample],
+    pricing: _Pricing,
+) -> VersusVerifier | None:
+    """How the trained model compares with the verifier it copies, on the
+    rows the trained model scored. Only for a judge-labeled section."""
+    by_input = {c.name: c for c in inputs}
+    by_column = {c.name: c for c in columns}
+    if VERIFIER not in by_input or by_input[VERIFIER].run is None:
+        return None
+    name = next(
+        (n for n in (TRAINED_CALIBRATED, TRAINED) if by_input.get(n) is not None and by_input[n].run is not None),
+        None,
+    )
+    if name is None or by_column[name].metrics is None:
+        return None
+    candidate = by_input[name].run
+    metrics = by_column[name].metrics
+    ids = {e.decision_id for e in examples}
+    scored = [r for r in candidate.results if r.decision_id in ids]
+    notes: list[str] = []
+
+    cost_ratio = None
+    verifier_cost = pricing.verifier_cost
+    if verifier_cost is None:
+        notes.append("no verifier cost given (--verifier-cost / --ledger)")
+    elif pricing.gpu_usd_per_hour is None:
+        notes.append("no GPU price given (--gpu-usd-per-hour)")
+    else:
+        uncovered = [r.decision_id for r in scored if r.decision_id not in verifier_cost.per_decision]
+        unmeasured = [r.decision_id for r in scored if r.latency_seconds is None]
+        if uncovered:
+            notes.append(f"{len(uncovered)} compared decision(s) have no verifier cost in the ledger")
+        if unmeasured:
+            notes.append(f"{len(unmeasured)} compared decision(s) have no measured model latency")
+        if scored and not uncovered and not unmeasured:
+            verifier_usd = sum(verifier_cost.per_decision[r.decision_id].usd for r in scored)
+            model_usd = sum(r.latency_seconds for r in scored) * pricing.gpu_usd_per_hour / 3600
+            cost_ratio = verifier_usd / model_usd if model_usd > 0 else None
+
+    latency_ratio = None
+    pairs = [
+        (verifier_cost.per_decision[r.decision_id].seconds, r.latency_seconds)
+        for r in scored
+        if verifier_cost is not None
+        and r.decision_id in verifier_cost.per_decision
+        and r.latency_seconds is not None
+    ]
+    if pairs:
+        verifier_p50 = _percentile(sorted(v for v, _ in pairs), 0.50)
+        model_p50 = _percentile(sorted(m for _, m in pairs), 0.50)
+        latency_ratio = verifier_p50 / model_p50 if model_p50 > 0 else None
+    return VersusVerifier(
+        candidate=name,
+        rows=len(examples),
+        compared_rows=len(scored),
+        agreement=metrics.coverage_adjusted_accuracy,
+        coverage=metrics.coverage,
+        cost_ratio=cost_ratio,
+        latency_ratio=latency_ratio,
+        latency_rows=len(pairs),
+        notes=tuple(notes),
     )
 
 
@@ -603,6 +704,8 @@ def _reference_columns(
     split: str,
     examples: list[DecisionExample],
     verifier_cost: VerifierCost | None = None,
+    *,
+    prior_dataset: DecisionDataset | None = None,
 ) -> list[_ColumnInput]:
     """The yardsticks every trained model is read against.
 
@@ -634,7 +737,7 @@ def _reference_columns(
                 ),
             )
         )
-    prior = _train_prior(dataset)
+    prior = _train_prior(prior_dataset if prior_dataset is not None else dataset)
 
     def prior_for(example: DecisionExample) -> dict[str, float]:
         restricted = {o: prior.get(o, 0.0) for o in example.options}
@@ -797,10 +900,11 @@ def build_report(
         (TRAINED_CALIBRATED, JEV),
     ]
 
+    main_dataset = load_decision_dataset(dataset_id, store)
     sections = [
         _section(
             "main",
-            load_decision_dataset(dataset_id, store),
+            main_dataset,
             dataset_id,
             split,
             columns,
@@ -863,6 +967,7 @@ def build_report(
                 seed=seed,
                 n_bins=n_bins,
                 pricing=pricing,
+                prior_dataset=main_dataset,
             )
         )
         if ext_split == "test":
@@ -936,30 +1041,27 @@ _METRIC_ROWS: tuple[tuple[str, str, int], ...] = (
 
 
 def _versus_verifier(section: ReportSection) -> list[str]:
-    """The headline for verifier distillation, stated only from measured
-    numbers: how much cheaper and faster each trained column is than the
-    verifier it copies. Omitted when either side's number is unknown."""
-    by_name = {c.name: c for c in section.columns}
-    verifier = by_name.get(VERIFIER)
-    if verifier is None or verifier.metrics is None:
+    """The distillation headline, only from numbers measured on the same
+    rows (see ``VersusVerifier``); a missing ratio is left out and its
+    reason printed."""
+    versus = section.versus_verifier
+    if versus is None:
         return []
-    lines = []
-    for name in (TRAINED_CALIBRATED, TRAINED):
-        column = by_name.get(name)
-        if column is None or column.metrics is None:
-            continue
-        parts = []
-        if verifier.cost_per_1k_usd and column.cost_per_1k_usd:
-            parts.append(f"{verifier.cost_per_1k_usd / column.cost_per_1k_usd:.1f}× cheaper per decision")
-        v_p50, c_p50 = verifier.metrics.latency_p50_seconds, column.metrics.latency_p50_seconds
-        if v_p50 and c_p50:
-            parts.append(f"{v_p50 / c_p50:.1f}× faster at the median")
-        if column.metrics.accuracy is not None:
-            parts.append(f"agrees with the verifier on {column.metrics.accuracy:.1%} of untied decisions")
-        if parts:
-            lines += [f"**{name} vs the verifier:** " + ", ".join(parts) + ".", ""]
-        break
-    return lines
+    parts = []
+    if versus.cost_ratio is not None:
+        parts.append(f"{versus.cost_ratio:.1f}× cheaper per decision")
+    if versus.latency_ratio is not None:
+        parts.append(f"{versus.latency_ratio:.1f}× faster at the median")
+    if versus.agreement is not None:
+        parts.append(
+            f"agrees with the verifier on {versus.agreement:.1%} of untied decisions "
+            f"(rejected rows count as disagreement; coverage {versus.coverage:.1%})"
+        )
+    lines = [f"**{versus.candidate} vs the verifier** ({versus.compared_rows} of {versus.rows} rows scored): "
+             + (", ".join(parts) if parts else "no measured comparison") + "."]
+    for note in versus.notes:
+        lines.append(f"- not computed: {note}")
+    return lines + [""]
 
 
 def _section_markdown(section: ReportSection, chart_name: str) -> list[str]:
