@@ -388,10 +388,15 @@ def _cost(
         if not covered:
             return None, "unknown: the ledger covers none of these decisions"
         per_1k = 1000 * sum(c.usd for c in covered) / len(covered)
+        cached_price = (
+            f", ${cost.cached_input_usd_per_mtok:g} cached in" if cost.cached_input_usd_per_mtok is not None else ""
+        )
         basis = (
             f"ledger `{cost.ledger}`, {len(covered)}/{len(scored)} decisions, "
-            f"${cost.input_usd_per_mtok:g} in / ${cost.output_usd_per_mtok:g} out per Mtok"
+            f"${cost.input_usd_per_mtok:g} in{cached_price} / ${cost.output_usd_per_mtok:g} out per Mtok"
         )
+        if cost.cached_input_usd_per_mtok is None and any(c.cached_prompt_tokens for c in covered):
+            basis += "; warning: cached input tokens priced at the full input price, cost overstated"
         over = sum(1 for r in scored if r.decision_id in set(cost.over_counted_decisions))
         if over:
             basis += f"; warning: {over} decision(s) have more calls than votes asked, cost may be overstated"
