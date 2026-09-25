@@ -101,7 +101,7 @@ Done when: each candidate's label source and license checked, and the success ba
 
 - **Generalize the `DecisionDataset` format first** (new schema version):
   - question and options per row (the one-shared-schema check becomes optional, for producers like the judge compiler);
-  - splits `train` / `dev` / `calibration` / `test`; the judge compiler maps fit → train and held-out → dev;
+  - splits `train` / `dev` / `calibration` / `test`; the judge compiler maps fit → train and divides held-out lineages across dev/calibration/test;
   - `family_id` becomes an optional `group_id` (keeps related rows in one split and drives bootstrap resampling);
   - rejected rows point at a source record (file + line number, or trace + turn) instead of always a trace;
   - judge-only count fields become optional.

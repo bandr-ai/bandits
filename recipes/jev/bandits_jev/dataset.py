@@ -129,6 +129,34 @@ class DecisionJudgeInfo(Contract):
 
 DecisionSplit = Literal["train", "dev", "calibration", "test"]
 
+def deterministic_split(key: str) -> DecisionSplit:
+    """Assign a split from a stable hash of a key -- a trace id, a group id,
+    or a hash of a row's own content, never a file path, line number or
+    position. Roughly 70/10/10/10 train/dev/calibration/test. Shared by the
+    judge compiler (keyed by trace) and the importer (keyed by group or
+    content), so both producers split the same way."""
+    digest = hashlib.sha256(key.encode()).digest()
+    bucket = digest[0] / 256.0
+    if bucket < 0.70:
+        return "train"
+    if bucket < 0.80:
+        return "dev"
+    if bucket < 0.90:
+        return "calibration"
+    return "test"
+
+
+def deterministic_held_out_split(key: str) -> DecisionSplit:
+    """Split a task set's held-out dependency groups across evaluation uses.
+
+    Fit traces remain training-only. Held-out lineages are divided roughly
+    equally into dev, calibration and test so checkpoint selection,
+    temperature fitting and final evaluation use disjoint groups.
+    """
+    bucket = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") % 3
+    return ("dev", "calibration", "test")[bucket]
+
+
 _LEGACY_SPLIT_MAP: dict[str, DecisionSplit] = {
     "within_family_fit": "train",
     "within_family_held_out": "dev",
@@ -158,9 +186,11 @@ class DecisionExample(Contract):
     target: DecisionTarget
     label_source: str
     split: DecisionSplit
-    """train / dev / calibration / test. The judge compiler maps its own
-    fit -> train and held_out -> dev; see ``_family_split``. A row's split is
-    fixed at compile/import time and never redrawn afterward."""
+    """train / dev / calibration / test. The judge compiler splits by trace:
+    a task set's fit -> train and held_out -> dev/calibration/test, or,
+    without one, all four splits from a hash of the lineage/trace id; see
+    ``_trace_split``. A row's split is fixed at compile/import time and never
+    redrawn afterward."""
     lineage: DecisionLineage
     judge: DecisionJudgeInfo | None = None
     """None for a non-judge label source (human, sealed outcome, synthetic)."""
@@ -345,8 +375,8 @@ class DecisionDataset(Contract):
     def rows_sharing_a_group_stay_in_one_split(self) -> DecisionDataset:
         """Only ``group_id`` is an inviolable split-grouping key. ``family_id``
         is not: the judge compiler deliberately splits a family's own traces
-        across train/dev (fit/held-out), so enforcing this on family_id would
-        reject its normal output."""
+        across train and the three held-out splits, so enforcing this on
+        family_id would reject its normal output."""
         split_by_group: dict[str, str] = {}
         for e in self.examples:
             if e.group_id is None:
@@ -431,12 +461,24 @@ class DecisionSource(Contract):
     normalized trace) can still build a dataset."""
 
     trace_id: str
+    lineage_id: str | None = None
+    """Session, ticket, or retry chain shared by related traces, when known."""
     task: str | None
     turns: tuple[Turn, ...]
 
 
 def source_from_trace(trace: Trace) -> DecisionSource:
-    return DecisionSource(trace_id=trace.trace_id, task=trace.task, turns=extract_turns(trace))
+    return DecisionSource(
+        trace_id=trace.trace_id,
+        lineage_id=trace.lineage_id,
+        task=trace.task,
+        turns=extract_turns(trace),
+    )
+
+
+def _source_group_id(source: DecisionSource) -> str:
+    """The dependency unit used for both splitting and resampling."""
+    return source.lineage_id if source.lineage_id is not None else source.trace_id
 
 
 def compute_decision_id(judge_run_id: str, trace_id: str, turn_index: int) -> str:
@@ -517,6 +559,7 @@ def build_decision_dataset(
                 )
             )
             continue
+        group_id = _source_group_id(source)
         previous_action: str | None = None
         for turn in source.turns:
             verdict = verdict_by_key.get((trace_id, turn.index))
@@ -577,13 +620,14 @@ def build_decision_dataset(
                 DecisionExample(
                     decision_id=compute_decision_id(judge_run_id, trace_id, turn.index),
                     family_id=family_id,
+                    group_id=group_id,
                     state=_render_state(source.task, previous_action, turn),
                     question=ACTION_OUTCOME_QUESTION,
                     primitive="choice",
                     options=dict(ACTION_OUTCOME_OPTIONS),
                     target=_vote_target(judge_votes),
                     label_source="judge_votes",
-                    split=_family_split(task_set, family_id, trace_id),
+                    split=_trace_split(task_set, family_id, trace_id, source.lineage_id),
                     lineage=DecisionLineage(
                         source_kind="action_outcome_judge_votes",
                         record_id=f"{trace_id}:{turn.index}",
@@ -608,8 +652,9 @@ def build_decision_dataset(
             )
             previous_action = turn.action
 
-    train = sum(1 for e in examples if e.split == "train")
-    dev = len(examples) - train
+    by_split: dict[str, int] = {}
+    for e in examples:
+        by_split[e.split] = by_split.get(e.split, 0) + 1
     source_artifact_ids = (judge_run_id,) + ((task_set_id,) if task_set_id else ())
     return DecisionDataset(
         producer="action_outcome_judge_votes",
@@ -623,8 +668,10 @@ def build_decision_dataset(
         quarantined=tuple(quarantined),
         counts=DecisionDatasetCounts(
             examples=len(examples),
-            train=train,
-            dev=dev,
+            train=by_split.get("train", 0),
+            dev=by_split.get("dev", 0),
+            calibration=by_split.get("calibration", 0),
+            test=by_split.get("test", 0),
             quarantined=len(quarantined),
             votes_requested=judge_run.votes,
             votes_valid_min=min(votes_valid) if votes_valid else 0,
@@ -633,21 +680,34 @@ def build_decision_dataset(
     )
 
 
-def _family_split(task_set: TaskSet | None, family_id: str, trace_id: str) -> DecisionSplit:
-    """A trace's split comes from its family's own fit/held-out membership,
-    never a fresh random draw -- drawing one here could put two traces from
-    the same family, or even a retry of the same episode, on opposite sides.
-    Maps the task set's own fit -> train and held_out -> dev (see
-    ``DecisionExample.split``); this is a held-out-episode split within a
-    known family, not a held-out-family (unseen task) split. Unplaced traces
-    are quarantined by the caller before this is reached, so the only
-    remaining case without an explicit task-set assignment is "no task set at
-    all", which defaults to train."""
+def _trace_split(
+    task_set: TaskSet | None,
+    family_id: str,
+    trace_id: str,
+    lineage_id: str | None,
+) -> DecisionSplit:
+    """Every related lineage lands in one split.
+
+    A trace's turns share its task, and traces in one lineage are retries or
+    episodes from the same session or ticket. Splitting either unit would let
+    train see information about a held-out row.
+
+    With a task set, fit membership maps to train. Held-out lineages are
+    deterministically divided across dev, calibration and test, preserving
+    the task set's train boundary while keeping model selection, temperature
+    fitting and final evaluation disjoint. Unplaced traces are quarantined
+    by the caller before this is reached.
+
+    Without one, the lineage id picks one of all four splits, falling back to
+    the trace id when no lineage was declared. Thus related traces stay
+    together while ungrouped sources retain per-trace behavior."""
     if task_set is None:
-        return "train"
+        split_key = f"lineage:{lineage_id}" if lineage_id is not None else f"trace:{trace_id}"
+        return deterministic_split(split_key)
     family = task_set.family_by_id().get(family_id)
     if family is not None and trace_id in family.held_out_trace_ids:
-        return "dev"
+        held_out_key = f"lineage:{lineage_id}" if lineage_id is not None else f"trace:{trace_id}"
+        return deterministic_held_out_split(held_out_key)
     return "train"
 
 
@@ -671,6 +731,49 @@ def build_decision_dataset_from_corpus(
         task_set_id=task_set_id,
         minimum_valid_votes=minimum_valid_votes,
     )
+
+
+_SPLITS: tuple[DecisionSplit, ...] = ("train", "dev", "calibration", "test")
+
+LONG_STATE_CHARS = 32_000
+"""A rough flag, not a token count: at ~4 characters per token a state this
+long is likely over the scorer's default 8k-token limit. The scorer's real
+tokenizer count is what actually rejects a row."""
+
+
+class SplitSummary(Contract):
+    rows: int
+    majority_label: dict[str, int]
+    """Rows per target's highest-probability option. A row whose target ties
+    between options is counted under "tie", not assigned to either."""
+    state_chars_p50: int
+    state_chars_p99: int
+    long_states: int
+    """Rows with a state over ``LONG_STATE_CHARS``."""
+
+
+def summarize_dataset(dataset: DecisionDataset) -> dict[str, SplitSummary]:
+    """Per-split size, label balance and state length -- what to check
+    before training: a split dominated by one label makes "always answer
+    that" look good, and long states get rejected by the scorer."""
+    summary: dict[str, SplitSummary] = {}
+    for split in _SPLITS:
+        rows = [e for e in dataset.examples if e.split == split]
+        labels: dict[str, int] = {}
+        for e in rows:
+            top = max(e.target.probabilities.values())
+            winners = [o for o, p in e.target.probabilities.items() if p == top]
+            key = winners[0] if len(winners) == 1 else "tie"
+            labels[key] = labels.get(key, 0) + 1
+        lengths = sorted(len(e.state) for e in rows)
+        summary[split] = SplitSummary(
+            rows=len(rows),
+            majority_label=dict(sorted(labels.items())),
+            state_chars_p50=lengths[len(lengths) // 2] if lengths else 0,
+            state_chars_p99=lengths[min(len(lengths) - 1, int(0.99 * len(lengths)))] if lengths else 0,
+            long_states=sum(1 for n in lengths if n > LONG_STATE_CHARS),
+        )
+    return summary
 
 
 def compute_dataset_id(dataset: DecisionDataset) -> str:
