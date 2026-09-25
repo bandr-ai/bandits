@@ -70,8 +70,10 @@ for n in case_hold twitter jailbreak injections vitaminc; do
   uv run jev import work/candidates/$n.jsonl --project work/decide
 done
 # For each dataset id printed above (dev only; never --allow-test):
-uv run --extra train jev score <dataset-id> --split dev \
-  --model Qwen/Qwen3.5-4B --revision <pinned sha> --project work/decide
+DATASET_ID=decision-dataset-...        # from the import output
+REVISION=...                           # the pinned model commit SHA
+uv run --extra train jev score "$DATASET_ID" --split dev \
+  --model Qwen/Qwen3.5-4B --revision "$REVISION" --project work/decide
 ```
 
 Each run is saved as a `decision_scorer_run` artifact. Fill in:
