@@ -370,3 +370,48 @@ def test_rows_failing_the_letter_contract_are_rejected_not_trained_on(tmp_path) 
     assert [r.decision_id for r in run.rejected_train] == ["train-collide"]
     assert "distinct tokens" in run.rejected_train[0].reasons[0]
     assert run.steps_completed == 3
+
+
+def _soft(decision_id: str, probabilities: dict[str, float], *, split: str = "train") -> DecisionExample:
+    return DecisionExample(
+        decision_id=decision_id,
+        family_id=decision_id,
+        state="a customer asks about apples and bananas",
+        question="which fruit is mentioned",
+        primitive="choice",
+        options={"a": "apple", "b": "banana"},
+        target=DecisionTarget(kind="soft", probabilities=probabilities),
+        label_source="judge_votes",
+        split=split,
+        lineage=DecisionLineage(source_kind="test", record_id=decision_id),
+    )
+
+
+def test_soft_target_loss_is_the_vote_weighted_cross_entropy() -> None:
+    """A 3-to-1 vote trains toward 0.75/0.25, not toward the winner alone:
+    cross-entropy is linear in the target, so the soft loss must equal the
+    vote-weighted mix of the two one-hot losses on the same forward pass."""
+    trainer = _trainer()
+    order = {"a": "apple", "b": "banana"}
+    soft = trainer.compute_loss(_soft("s", {"a": 0.75, "b": 0.25}), option_order=order).item()
+    only_a = trainer.compute_loss(_soft("s", {"a": 1.0, "b": 0.0}), option_order=order).item()
+    only_b = trainer.compute_loss(_soft("s", {"a": 0.0, "b": 1.0}), option_order=order).item()
+
+    assert soft == pytest.approx(0.75 * only_a + 0.25 * only_b, rel=1e-5)
+    assert only_a != pytest.approx(only_b)  # the two answers are genuinely different targets
+
+
+def test_evaluate_dev_leaves_tied_votes_out_of_accuracy() -> None:
+    trainer = _trainer()
+    dev = _dev_examples(4) + [_soft("dev-tie", {"a": 0.5, "b": 0.5}, split="dev")]
+
+    evaluation = evaluate_dev(trainer.predictor(), dev)
+
+    assert evaluation.scored == 5 and evaluation.tied == 1
+    assert evaluation.accuracy in {0.0, 0.25, 0.5, 0.75, 1.0}  # out of the 4 untied rows
+
+
+def test_evaluate_dev_refuses_when_every_row_ties() -> None:
+    trainer = _trainer()
+    with pytest.raises(ValueError, match="tied"):
+        evaluate_dev(trainer.predictor(), [_soft("t", {"a": 0.5, "b": 0.5}, split="dev")])

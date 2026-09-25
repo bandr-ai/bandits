@@ -22,7 +22,7 @@ from pydantic import Field
 
 from bandits.store import Contract, DerivedEnvelope, DerivedStore
 from bandits_jev.dataset import DecisionExample
-from bandits_jev.metrics import is_correct
+from bandits_jev.metrics import gold_option
 from bandits_jev.prompt import PROMPT_VERSION, build_prompt, template_digest
 from bandits_jev.scorer import LogitPredictor, ScoreMode, TokenizationError, score_dataset
 
@@ -93,10 +93,13 @@ class TrainingRunConfig(Contract):
 
 class DevEvaluation(Contract):
     accuracy: float
-    """Over scored rows only; rejected rows are a scoring failure, not a
-    wrong answer, and are counted separately."""
+    """Over scored, untied rows only; rejected rows are a scoring failure,
+    not a wrong answer, and are counted separately."""
     scored: int
     rejected: int
+    tied: int = 0
+    """Scored rows whose target ties between options (a split vote), left
+    out of accuracy."""
 
 
 class CheckpointRecord(Contract):
@@ -209,9 +212,12 @@ def evaluate_dev(
     mode: ScoreMode = "single_order",
     max_prompt_tokens: int = 8_000,
 ) -> DevEvaluation:
-    """Accuracy of the argmax option against any target option tied for the
-    highest probability, over scored rows only. Raises if no dev row could
-    be scored: a checkpoint cannot be judged against nothing."""
+    """Accuracy of the argmax option against the target's highest-probability
+    option (a hard target's single correct option, or a soft target's
+    plurality), over scored rows only. A tied soft target (a split vote) has
+    no single right answer and is left out and counted. Raises if no dev row
+    could be scored, or every scored row ties: a checkpoint cannot be judged
+    against nothing."""
     run = score_dataset(predictor, dev_examples, mode=mode, max_prompt_tokens=max_prompt_tokens)
     if not run.results:
         raise ValueError(
@@ -219,14 +225,24 @@ def evaluate_dev(
             "cannot select a checkpoint by dev"
         )
     by_id = {e.decision_id: e for e in dev_examples}
-    correct = 0
+    correct = untied = 0
     for result in run.results:
-        target = by_id[result.decision_id].target.probabilities
-        probabilities = {score.option_id: score.probability for score in result.scores}
-        if is_correct(probabilities, target):
+        gold = gold_option(by_id[result.decision_id].target.probabilities)
+        if gold is None:  # a split vote has no single right answer
+            continue
+        untied += 1
+        if result.chosen_option_id == gold:
             correct += 1
+    if not untied:
+        raise ValueError(
+            f"every scored dev example has a tied target ({len(run.results)} rows); "
+            "cannot select a checkpoint by dev accuracy"
+        )
     return DevEvaluation(
-        accuracy=correct / len(run.results), scored=len(run.results), rejected=len(run.rejections)
+        accuracy=correct / untied,
+        scored=len(run.results),
+        rejected=len(run.rejections),
+        tied=len(run.results) - untied,
     )
 
 
