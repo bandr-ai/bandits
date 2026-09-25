@@ -146,6 +146,17 @@ def deterministic_split(key: str) -> DecisionSplit:
     return "test"
 
 
+def deterministic_held_out_split(key: str) -> DecisionSplit:
+    """Split a task set's held-out dependency groups across evaluation uses.
+
+    Fit traces remain training-only. Held-out lineages are divided roughly
+    equally into dev, calibration and test so checkpoint selection,
+    temperature fitting and final evaluation use disjoint groups.
+    """
+    bucket = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") % 3
+    return ("dev", "calibration", "test")[bucket]
+
+
 _LEGACY_SPLIT_MAP: dict[str, DecisionSplit] = {
     "within_family_fit": "train",
     "within_family_held_out": "dev",
@@ -176,9 +187,10 @@ class DecisionExample(Contract):
     label_source: str
     split: DecisionSplit
     """train / dev / calibration / test. The judge compiler splits by trace:
-    a task set's fit -> train and held_out -> dev, or, without one, all four
-    splits from a hash of the trace id; see ``_trace_split``. A row's split
-    is fixed at compile/import time and never redrawn afterward."""
+    a task set's fit -> train and held_out -> dev/calibration/test, or,
+    without one, all four splits from a hash of the lineage/trace id; see
+    ``_trace_split``. A row's split is fixed at compile/import time and never
+    redrawn afterward."""
     lineage: DecisionLineage
     judge: DecisionJudgeInfo | None = None
     """None for a non-judge label source (human, sealed outcome, synthetic)."""
@@ -363,8 +375,8 @@ class DecisionDataset(Contract):
     def rows_sharing_a_group_stay_in_one_split(self) -> DecisionDataset:
         """Only ``group_id`` is an inviolable split-grouping key. ``family_id``
         is not: the judge compiler deliberately splits a family's own traces
-        across train/dev (fit/held-out), so enforcing this on family_id would
-        reject its normal output."""
+        across train and the three held-out splits, so enforcing this on
+        family_id would reject its normal output."""
         split_by_group: dict[str, str] = {}
         for e in self.examples:
             if e.group_id is None:
@@ -680,10 +692,11 @@ def _trace_split(
     episodes from the same session or ticket. Splitting either unit would let
     train see information about a held-out row.
 
-    With a task set, the split comes from the family's own fit/held-out
-    membership (fit -> train, held_out -> dev): a held-out-episode split
-    within a known family. Unplaced traces are quarantined by the caller
-    before this is reached.
+    With a task set, fit membership maps to train. Held-out lineages are
+    deterministically divided across dev, calibration and test, preserving
+    the task set's train boundary while keeping model selection, temperature
+    fitting and final evaluation disjoint. Unplaced traces are quarantined
+    by the caller before this is reached.
 
     Without one, the lineage id picks one of all four splits, falling back to
     the trace id when no lineage was declared. Thus related traces stay
@@ -693,7 +706,8 @@ def _trace_split(
         return deterministic_split(split_key)
     family = task_set.family_by_id().get(family_id)
     if family is not None and trace_id in family.held_out_trace_ids:
-        return "dev"
+        held_out_key = f"lineage:{lineage_id}" if lineage_id is not None else f"trace:{trace_id}"
+        return deterministic_held_out_split(held_out_key)
     return "train"
 
 
