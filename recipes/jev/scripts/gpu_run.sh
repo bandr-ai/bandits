@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# The first real-model run (#95), in one command on a fresh GPU box.
+# The real-model runs of the launch plan (recipes/jev/docs/launch-plan.md §6),
+# one command per phase on a fresh GPU box.
+#
+#   PHASE=1  model selection, dev only: never opens the locked test split
+#   PHASE=2  the locked test run: scores test once per model and seed
 #
 #   1. install the recipe with the train extra
 #   2. gather the Bandits projects (corpora + judge runs) into one project
-#   3. build one dataset from the judge runs (split by trace, merged)
+#   3. build one dataset from the judge runs (split by lineage, merged)
 #   4. smoke-test each model (tokenizer, letter mass, loss falls) and stop on failure
 #   5. `jev run` for each model: untrained, train, calibrate, trained, report
+#      (phase 1 evaluates on dev; phase 2 on test, plus HELD_OUT_RUNS if set)
 #   6. pack the reports and artifacts into one tarball to copy back
 #
 # Run from the repo root. Configuration is by environment variable:
 #
+#   PHASE        1 or 2 (required)
 #   PROJECTS     space-separated Bandits project dirs, each holding .bandits (required)
 #   JUDGE_RUNS   space-separated turn-judge run ids inside them (required)
 #   MODELS       default: "Qwen/Qwen3.5-4B-Base Qwen/Qwen3.5-4B"
@@ -18,26 +24,45 @@
 #   LEDGERS                                  space-separated judge ledgers, to price the verifier (optional)
 #   INPUT_USD_PER_MTOK, OUTPUT_USD_PER_MTOK  the judge model's prices, required with LEDGERS
 #   FAST_KERNELS=1                           also install flash-linear-attention and causal-conv1d
-#   HELD_OUT_RUNS  judge run ids (a subset of JUDGE_RUNS) for the unseen-source check: a second
-#                  run per model trains without them and scores them as their own report section
+#   HELD_OUT_RUNS  phase 2 only: judge run ids (a subset of JUDGE_RUNS) for the unseen-source
+#                  check; a second run per model trains without them and scores them as their
+#                  own report section
 #   DEVICE, DTYPE  default: cuda, bfloat16 (DEVICE=cpu DTYPE=float32 with a tiny model rehearses
 #                  the whole script without a GPU)
 #   SKIP_INSTALL=1 reuse the recipe's existing environment as is
 #   OUT          default: runs/jev-<UTC timestamp>
 #
 # Example:
-#   PROJECTS="work/trail-ns work/tau2-ns" \
+#   PHASE=1 PROJECTS="work/trail-ns work/tau2-ns" \
 #   JUDGE_RUNS="turn-judge-0044b8f5c041155c turn-judge-b83480800ad90a25 turn-judge-d450cf34d97b27a2" \
 #   GPU_USD_PER_HOUR=1.2 recipes/jev/scripts/gpu_run.sh
 set -euo pipefail
 
+: "${PHASE:?set PHASE=1 (model selection, dev only) or PHASE=2 (the locked test run)}"
+case "$PHASE" in
+  1) EVAL_ARGS=(--eval-split dev) ;;
+  2) EVAL_ARGS=(--eval-split test --allow-test) ;;
+  *) echo "PHASE must be 1 or 2, got $PHASE" >&2; exit 1 ;;
+esac
+if [[ "$PHASE" == "1" && -n "${HELD_OUT_RUNS:-}" ]]; then
+  echo "HELD_OUT_RUNS is for phase 2: held-out sources are test-only" >&2
+  exit 1
+fi
 : "${PROJECTS:?set PROJECTS to the Bandits project dirs}"
 : "${JUDGE_RUNS:?set JUDGE_RUNS to the turn-judge run ids}"
+if [[ -n "${HELD_OUT_RUNS:-}" ]]; then
+  training_runs=0
+  for run in $JUDGE_RUNS; do [[ " $HELD_OUT_RUNS " == *" $run "* ]] || training_runs=$((training_runs + 1)); done
+  if (( training_runs == 0 )); then
+    echo "HELD_OUT_RUNS must leave at least one judge run to train on" >&2
+    exit 1
+  fi
+fi
 MODELS="${MODELS:-Qwen/Qwen3.5-4B-Base Qwen/Qwen3.5-4B}"
 SEED="${SEED:-1}"
 DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
-OUT="$(realpath -m "${OUT:-runs/jev-$(date -u +%Y%m%dT%H%M%SZ)}")"
+OUT="$(realpath -m "${OUT:-runs/jev-phase$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}")"
 RECIPE="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT="$OUT/project"
 
@@ -93,7 +118,10 @@ if [[ -n "${HELD_OUT_RUNS:-}" ]]; then
     run="$(echo $JUDGE_RUNS | cut -d' ' -f$((i + 1)))"
     [[ " $HELD_OUT_RUNS " == *" $run "* ]] || kept+=("${datasets[$i]}")
   done
-  if (( ${#kept[@]} > 1 )); then
+  if (( ${#kept[@]} == 0 )); then
+    echo "HELD_OUT_RUNS must leave at least one judge run to train on" >&2
+    exit 1
+  elif (( ${#kept[@]} > 1 )); then
     TRAIN_WITHOUT_HELD_OUT="$(dataset_id_of merge "${kept[@]}" --project "$PROJECT")"
   else
     TRAIN_WITHOUT_HELD_OUT="${kept[0]}"
@@ -124,14 +152,14 @@ for model in $MODELS; do
   log "jev run: $model@$revision"
   jev run "$DATASET" --model "$model" --revision "$revision" --seed "$SEED" \
     --checkpoint-dir "$OUT/checkpoints/$name" --output "$OUT/reports/$name" \
-    --two-order --allow-test ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
+    --two-order "${EVAL_ARGS[@]}" ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
     2>&1 | tee "$OUT/run-$name.log"
 
   if [[ -n "$TRAIN_WITHOUT_HELD_OUT" ]]; then
     held_args=()
     for run in $HELD_OUT_RUNS; do held_args+=(--held-out "$run"); done
     log "jev run without ${HELD_OUT_RUNS}: $model@$revision"
-    jev run "$TRAIN_WITHOUT_HELD_OUT" "${held_args[@]}" --allow-test --model "$model" --revision "$revision" --seed "$SEED" \
+    jev run "$TRAIN_WITHOUT_HELD_OUT" "${held_args[@]}" --two-order "${EVAL_ARGS[@]}" --model "$model" --revision "$revision" --seed "$SEED" \
       --checkpoint-dir "$OUT/checkpoints/$name-held-out" --output "$OUT/reports/$name-held-out" \
       ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
       2>&1 | tee "$OUT/run-$name-held-out.log"
