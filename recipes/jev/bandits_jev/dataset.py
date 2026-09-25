@@ -449,12 +449,24 @@ class DecisionSource(Contract):
     normalized trace) can still build a dataset."""
 
     trace_id: str
+    lineage_id: str | None = None
+    """Session, ticket, or retry chain shared by related traces, when known."""
     task: str | None
     turns: tuple[Turn, ...]
 
 
 def source_from_trace(trace: Trace) -> DecisionSource:
-    return DecisionSource(trace_id=trace.trace_id, task=trace.task, turns=extract_turns(trace))
+    return DecisionSource(
+        trace_id=trace.trace_id,
+        lineage_id=trace.lineage_id,
+        task=trace.task,
+        turns=extract_turns(trace),
+    )
+
+
+def _source_group_id(source: DecisionSource) -> str:
+    """The dependency unit used for both splitting and resampling."""
+    return source.lineage_id if source.lineage_id is not None else source.trace_id
 
 
 def compute_decision_id(judge_run_id: str, trace_id: str, turn_index: int) -> str:
@@ -535,6 +547,7 @@ def build_decision_dataset(
                 )
             )
             continue
+        group_id = _source_group_id(source)
         previous_action: str | None = None
         for turn in source.turns:
             verdict = verdict_by_key.get((trace_id, turn.index))
@@ -595,14 +608,14 @@ def build_decision_dataset(
                 DecisionExample(
                     decision_id=compute_decision_id(judge_run_id, trace_id, turn.index),
                     family_id=family_id,
-                    group_id=trace_id,
+                    group_id=group_id,
                     state=_render_state(source.task, previous_action, turn),
                     question=ACTION_OUTCOME_QUESTION,
                     primitive="choice",
                     options=dict(ACTION_OUTCOME_OPTIONS),
                     target=_vote_target(judge_votes),
                     label_source="judge_votes",
-                    split=_trace_split(task_set, family_id, trace_id),
+                    split=_trace_split(task_set, family_id, trace_id, source.lineage_id),
                     lineage=DecisionLineage(
                         source_kind="action_outcome_judge_votes",
                         record_id=f"{trace_id}:{turn.index}",
@@ -655,22 +668,29 @@ def build_decision_dataset(
     )
 
 
-def _trace_split(task_set: TaskSet | None, family_id: str, trace_id: str) -> DecisionSplit:
-    """Every row of one trace lands in one split -- a trace's turns share its
-    task, and splitting them would let train see the answer to a dev row's
-    episode.
+def _trace_split(
+    task_set: TaskSet | None,
+    family_id: str,
+    trace_id: str,
+    lineage_id: str | None,
+) -> DecisionSplit:
+    """Every related lineage lands in one split.
+
+    A trace's turns share its task, and traces in one lineage are retries or
+    episodes from the same session or ticket. Splitting either unit would let
+    train see information about a held-out row.
 
     With a task set, the split comes from the family's own fit/held-out
     membership (fit -> train, held_out -> dev): a held-out-episode split
     within a known family. Unplaced traces are quarantined by the caller
     before this is reached.
 
-    Without one, the trace id alone picks one of all four splits via
-    ``deterministic_split``, so the same judge run always splits the same
-    way and a dataset compiled straight from traces has dev, calibration and
-    a locked test split -- not everything in train."""
+    Without one, the lineage id picks one of all four splits, falling back to
+    the trace id when no lineage was declared. Thus related traces stay
+    together while ungrouped sources retain per-trace behavior."""
     if task_set is None:
-        return deterministic_split(f"trace:{trace_id}")
+        split_key = f"lineage:{lineage_id}" if lineage_id is not None else f"trace:{trace_id}"
+        return deterministic_split(split_key)
     family = task_set.family_by_id().get(family_id)
     if family is not None and trace_id in family.held_out_trace_ids:
         return "dev"
