@@ -16,7 +16,7 @@ from collections.abc import Mapping
 
 from bandits.store import Contract, DerivedEnvelope, DerivedStore
 from bandits_jev.dataset import DecisionExample
-from bandits_jev.metrics import argmax_option, ece, is_correct, row_brier, row_nll
+from bandits_jev.metrics import argmax_option, ece, gold_option, row_brier, row_nll
 from bandits_jev.scorer import DecisionScoreResult, ScorerRun, _softmax
 
 CALIBRATION_SPLIT = "calibration"
@@ -118,8 +118,10 @@ def _summary(
         target = targets[r.decision_id]
         nll += row_nll(probs, target)
         brier += row_brier(probs, target)
-        chosen = argmax_option(probs)
-        pairs.append((probs[chosen], is_correct(probs, target)))
+        gold = gold_option(target)
+        if gold is not None:  # a tied target has no single right answer
+            chosen = argmax_option(probs)
+            pairs.append((probs[chosen], chosen == gold))
     n = len(results)
     return nll / n, brier / n, ece(pairs, n_bins) or 0.0
 

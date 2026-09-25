@@ -84,9 +84,22 @@ def top_options(probabilities: Mapping[str, float]) -> frozenset[str]:
     return frozenset(option for option, probability in probabilities.items() if probability == top)
 
 
-def is_correct(probabilities: Mapping[str, float], target: Mapping[str, float]) -> bool:
-    """Whether the predicted argmax is any of the target's tied top options."""
-    return argmax_option(probabilities) in top_options(target)
+def gold_option(target: Mapping[str, float]) -> str | None:
+    """The target's single highest-probability option, or None when several
+    options tie for the top -- e.g. a 1/1/1 or 2/2 split vote. A tied row has
+    no single right answer, so it is left out of accuracy, macro F1 and ECE
+    (and counted), never silently credited to whichever option comes first.
+    NLL and Brier still score it against the full distribution."""
+    if not target:
+        raise ValueError("cannot take the gold option of an empty target")
+    top = max(target.values())
+    winners = [option for option, p in target.items() if p == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def is_correct(probabilities: Mapping[str, float], target: Mapping[str, float]) -> bool | None:
+    gold = gold_option(target)
+    return None if gold is None else argmax_option(probabilities) == gold
 
 
 def row_nll(probabilities: Mapping[str, float], target: Mapping[str, float]) -> float:
