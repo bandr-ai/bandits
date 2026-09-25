@@ -13,6 +13,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from bandits.analyze import load_task_set
 from bandits.store import ArtifactStore, DerivedStore
@@ -54,23 +55,26 @@ def dataset_command(
     task_set_id: str = typer.Option(
         None,
         "--task-set",
-        help="Split examples along this task set's own within-family fit/held-out "
-        "membership, so no family is split across the boundary. The task set must "
-        "have been built from the same corpus as the judge run, and every judged "
-        "trace must resolve to one of its families or it is quarantined. Omit to "
-        "put every example in within_family_fit.",
+        help="Split along this task set's own within-family fit/held-out membership "
+        "(train/dev only). The task set must come from the same corpus as the judge run, "
+        "and every judged trace must resolve to one of its families or it is quarantined. "
+        "Omit to split by trace into train/dev/calibration/test (~70/10/10/10), keeping "
+        "every trace's steps in one split.",
     ),
     minimum_valid_votes: int = typer.Option(
         1, "--minimum-valid-votes", min=1, help="Quarantine a turn with fewer successful votes."
     ),
-    output: Path = typer.Option(None, "--output", help="Write fit+held-out and quarantine JSONL."),
+    output: Path = typer.Option(None, "--output", help="Write examples and quarantine JSONL."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Compile a turn-judge run's verdicts into a generic decision dataset."""
+    """Compile a turn-judge run's verdicts into a decision dataset: every
+    judged step becomes a question, the verifier's vote shares its label."""
     from bandits.verify.nextstate import load_turn_judge_run
     from bandits_jev.dataset import (
+        LONG_STATE_CHARS,
         build_decision_dataset_from_corpus,
         save_decision_dataset,
+        summarize_dataset,
         write_decision_dataset,
     )
 
@@ -96,16 +100,15 @@ def dataset_command(
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     envelope = save_decision_dataset(dataset, store)
-    console.print(f"decision_dataset_id:     {envelope.artifact_id}")
-    console.print(f"examples:                {dataset.counts.examples}")
-    console.print(f"train:                   {dataset.counts.train}")
-    console.print(f"dev:                     {dataset.counts.dev}")
-    console.print(f"quarantined:             {dataset.counts.quarantined}")
-    if not task_set_id:
-        console.print(
-            "[yellow]no --task-set given:[/yellow] every example was put in train; "
-            "there is no dev split to certify against"
-        )
+    console.print(f"decision_dataset_id: {envelope.artifact_id}")
+    console.print(f"examples:            {dataset.counts.examples}")
+    console.print(f"quarantined:         {dataset.counts.quarantined}")
+    console.print(f"split by:            {'task set ' + task_set_id if task_set_id else 'trace'}")
+    table = Table("split", "rows", "majority label (rows)", "state chars p50 / p99", f"> {LONG_STATE_CHARS:,} chars")
+    for split, row in summarize_dataset(dataset).items():
+        labels = ", ".join(f"{label} {n}" for label, n in row.majority_label.items()) or "—"
+        table.add_row(split, str(row.rows), labels, f"{row.state_chars_p50:,} / {row.state_chars_p99:,}", str(row.long_states))
+    console.print(table)
     if output is not None:
         rows_path, quarantine_path = write_decision_dataset(dataset, output)
         console.print(f"output:              {rows_path}")

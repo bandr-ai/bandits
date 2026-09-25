@@ -129,6 +129,23 @@ class DecisionJudgeInfo(Contract):
 
 DecisionSplit = Literal["train", "dev", "calibration", "test"]
 
+def deterministic_split(key: str) -> DecisionSplit:
+    """Assign a split from a stable hash of a key -- a trace id, a group id,
+    or a hash of a row's own content, never a file path, line number or
+    position. Roughly 70/10/10/10 train/dev/calibration/test. Shared by the
+    judge compiler (keyed by trace) and the importer (keyed by group or
+    content), so both producers split the same way."""
+    digest = hashlib.sha256(key.encode()).digest()
+    bucket = digest[0] / 256.0
+    if bucket < 0.70:
+        return "train"
+    if bucket < 0.80:
+        return "dev"
+    if bucket < 0.90:
+        return "calibration"
+    return "test"
+
+
 _LEGACY_SPLIT_MAP: dict[str, DecisionSplit] = {
     "within_family_fit": "train",
     "within_family_held_out": "dev",
@@ -158,9 +175,10 @@ class DecisionExample(Contract):
     target: DecisionTarget
     label_source: str
     split: DecisionSplit
-    """train / dev / calibration / test. The judge compiler maps its own
-    fit -> train and held_out -> dev; see ``_family_split``. A row's split is
-    fixed at compile/import time and never redrawn afterward."""
+    """train / dev / calibration / test. The judge compiler splits by trace:
+    a task set's fit -> train and held_out -> dev, or, without one, all four
+    splits from a hash of the trace id; see ``_trace_split``. A row's split
+    is fixed at compile/import time and never redrawn afterward."""
     lineage: DecisionLineage
     judge: DecisionJudgeInfo | None = None
     """None for a non-judge label source (human, sealed outcome, synthetic)."""
@@ -577,13 +595,14 @@ def build_decision_dataset(
                 DecisionExample(
                     decision_id=compute_decision_id(judge_run_id, trace_id, turn.index),
                     family_id=family_id,
+                    group_id=trace_id,
                     state=_render_state(source.task, previous_action, turn),
                     question=ACTION_OUTCOME_QUESTION,
                     primitive="choice",
                     options=dict(ACTION_OUTCOME_OPTIONS),
                     target=_vote_target(judge_votes),
                     label_source="judge_votes",
-                    split=_family_split(task_set, family_id, trace_id),
+                    split=_trace_split(task_set, family_id, trace_id),
                     lineage=DecisionLineage(
                         source_kind="action_outcome_judge_votes",
                         record_id=f"{trace_id}:{turn.index}",
@@ -608,8 +627,9 @@ def build_decision_dataset(
             )
             previous_action = turn.action
 
-    train = sum(1 for e in examples if e.split == "train")
-    dev = len(examples) - train
+    by_split: dict[str, int] = {}
+    for e in examples:
+        by_split[e.split] = by_split.get(e.split, 0) + 1
     source_artifact_ids = (judge_run_id,) + ((task_set_id,) if task_set_id else ())
     return DecisionDataset(
         producer="action_outcome_judge_votes",
@@ -623,8 +643,10 @@ def build_decision_dataset(
         quarantined=tuple(quarantined),
         counts=DecisionDatasetCounts(
             examples=len(examples),
-            train=train,
-            dev=dev,
+            train=by_split.get("train", 0),
+            dev=by_split.get("dev", 0),
+            calibration=by_split.get("calibration", 0),
+            test=by_split.get("test", 0),
             quarantined=len(quarantined),
             votes_requested=judge_run.votes,
             votes_valid_min=min(votes_valid) if votes_valid else 0,
@@ -633,18 +655,22 @@ def build_decision_dataset(
     )
 
 
-def _family_split(task_set: TaskSet | None, family_id: str, trace_id: str) -> DecisionSplit:
-    """A trace's split comes from its family's own fit/held-out membership,
-    never a fresh random draw -- drawing one here could put two traces from
-    the same family, or even a retry of the same episode, on opposite sides.
-    Maps the task set's own fit -> train and held_out -> dev (see
-    ``DecisionExample.split``); this is a held-out-episode split within a
-    known family, not a held-out-family (unseen task) split. Unplaced traces
-    are quarantined by the caller before this is reached, so the only
-    remaining case without an explicit task-set assignment is "no task set at
-    all", which defaults to train."""
+def _trace_split(task_set: TaskSet | None, family_id: str, trace_id: str) -> DecisionSplit:
+    """Every row of one trace lands in one split -- a trace's turns share its
+    task, and splitting them would let train see the answer to a dev row's
+    episode.
+
+    With a task set, the split comes from the family's own fit/held-out
+    membership (fit -> train, held_out -> dev): a held-out-episode split
+    within a known family. Unplaced traces are quarantined by the caller
+    before this is reached.
+
+    Without one, the trace id alone picks one of all four splits via
+    ``deterministic_split``, so the same judge run always splits the same
+    way and a dataset compiled straight from traces has dev, calibration and
+    a locked test split -- not everything in train."""
     if task_set is None:
-        return "train"
+        return deterministic_split(f"trace:{trace_id}")
     family = task_set.family_by_id().get(family_id)
     if family is not None and trace_id in family.held_out_trace_ids:
         return "dev"
@@ -671,6 +697,49 @@ def build_decision_dataset_from_corpus(
         task_set_id=task_set_id,
         minimum_valid_votes=minimum_valid_votes,
     )
+
+
+_SPLITS: tuple[DecisionSplit, ...] = ("train", "dev", "calibration", "test")
+
+LONG_STATE_CHARS = 32_000
+"""A rough flag, not a token count: at ~4 characters per token a state this
+long is likely over the scorer's default 8k-token limit. The scorer's real
+tokenizer count is what actually rejects a row."""
+
+
+class SplitSummary(Contract):
+    rows: int
+    majority_label: dict[str, int]
+    """Rows per target's highest-probability option. A row whose target ties
+    between options is counted under "tie", not assigned to either."""
+    state_chars_p50: int
+    state_chars_p99: int
+    long_states: int
+    """Rows with a state over ``LONG_STATE_CHARS``."""
+
+
+def summarize_dataset(dataset: DecisionDataset) -> dict[str, SplitSummary]:
+    """Per-split size, label balance and state length -- what to check
+    before training: a split dominated by one label makes "always answer
+    that" look good, and long states get rejected by the scorer."""
+    summary: dict[str, SplitSummary] = {}
+    for split in _SPLITS:
+        rows = [e for e in dataset.examples if e.split == split]
+        labels: dict[str, int] = {}
+        for e in rows:
+            top = max(e.target.probabilities.values())
+            winners = [o for o, p in e.target.probabilities.items() if p == top]
+            key = winners[0] if len(winners) == 1 else "tie"
+            labels[key] = labels.get(key, 0) + 1
+        lengths = sorted(len(e.state) for e in rows)
+        summary[split] = SplitSummary(
+            rows=len(rows),
+            majority_label=dict(sorted(labels.items())),
+            state_chars_p50=lengths[len(lengths) // 2] if lengths else 0,
+            state_chars_p99=lengths[min(len(lengths) - 1, int(0.99 * len(lengths)))] if lengths else 0,
+            long_states=sum(1 for n in lengths if n > LONG_STATE_CHARS),
+        )
+    return summary
 
 
 def compute_dataset_id(dataset: DecisionDataset) -> str:
