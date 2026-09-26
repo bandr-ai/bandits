@@ -681,6 +681,28 @@ def _decode_span(
     )
 
 
+def _cyclic(spans: dict[str, _Decoded]) -> set[str]:
+    """Spans whose parent chain loops back on itself.
+
+    Each span has one parent, so walking up from every span once finds every
+    loop: a walk that meets a span already on its own path has closed one.
+    """
+    state: dict[str, int] = {}  # 1: on the current walk, 2: settled
+    looped: set[str] = set()
+    for start in spans:
+        path: list[str] = []
+        node: str | None = start
+        while node in spans and node not in state:
+            state[node] = 1
+            path.append(node)
+            node = spans[node].parent_id
+        if node in spans and state.get(node) == 1:
+            looped.update(path[path.index(node) :])
+        for visited in path:
+            state[visited] = 2
+    return looped
+
+
 def _pipeline_steps(spans: dict[str, _Decoded]) -> set[str]:
     """Declared steps with no model or tool call beneath them, outermost only."""
     children: dict[str, list[str]] = {}
@@ -828,6 +850,18 @@ def _task(spans: list[Span], decoded: dict[str, _Decoded]) -> str | None:
     return None
 
 
+def _episode_root(spans: dict[str, _Decoded]) -> _Decoded | None:
+    """The span the episode started from, whether or not it was kept.
+
+    An agent or workflow wrapper is where GenAI instrumentation declares the
+    system instructions and tool definitions for the whole run; filtering it
+    out as structure must not take that context with it. A root whose parent
+    was not exported counts, so a partial export still has one.
+    """
+    roots = [s for s in spans.values() if s.parent_id is None or s.parent_id not in spans]
+    return min(roots, key=lambda s: (s.parent_id is not None, s.started_at, s.index), default=None)
+
+
 def _files(path: Path) -> list[Path]:
     if not path.is_dir():
         return [path]
@@ -883,7 +917,21 @@ def load_otlp_standard(
     spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
     task_by_trace: dict[str, str] = {}
     lineage_by_trace: dict[str, str] = {}
+    episode_attributes: dict[str, dict[str, Any]] = {}
     for trace_id, decoded in by_trace.items():
+        looped = _cyclic(decoded)
+        for span_id in sorted(looped):
+            issues.append(
+                TraceIssue(
+                    kind="malformed_span",
+                    detail=f"span {span_id} of trace {trace_id} is its own ancestor through "
+                    "parentSpanId; a trace is a tree, so it cannot be placed",
+                    location=decoded[span_id].location,
+                )
+            )
+        decoded = {k: v for k, v in decoded.items() if k not in looped}
+        if not decoded:
+            continue
         steps = _pipeline_steps(decoded)
         covered = _covered(decoded, steps)
         collected: list[tuple[int, Span]] = []
@@ -920,6 +968,12 @@ def load_otlp_standard(
             lineage_by_trace.pop(trace_id, None)
             continue
         spans_by_trace[trace_id] = collected
+        root = _episode_root(decoded)
+        if root is not None:
+            episode_attributes[trace_id] = {
+                **root.attributes,
+                **_normalized_messages(root.attributes, root.events, prompt_is_text=False),
+            }
         ordered = [s for _, s in sorted(collected, key=lambda p: (p[1].started_at, p[0]))]
         task = _task(ordered, decoded)
         if task is not None:
@@ -943,4 +997,5 @@ def load_otlp_standard(
         source_digest=source_digest,
         issues=issues,
         redaction_ruleset=ruleset_name,
+        episode_attributes=episode_attributes,
     )
