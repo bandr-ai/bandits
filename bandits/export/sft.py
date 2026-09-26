@@ -12,6 +12,7 @@ from collections import Counter
 from typing import Any
 
 from bandits.export.models import ToolCall, ToolFunction, TrainingMessage
+from bandits.genai import PIPELINE_STEP, system_prompt_of
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, UserTurn
 
 
@@ -125,6 +126,18 @@ def build_transcript(
             "trace does not represent"
         )
 
+    # A transcript carries one system prompt. A call that recorded running
+    # under another was answering a policy this row would not show, and
+    # training on it teaches that answer as a response to the wrong one.
+    for span in trace.spans:
+        if span.kind is SpanKind.MODEL:
+            recorded = system_prompt_of(span.attributes)
+            if recorded is not None and recorded.strip() != (trace.system_prompt or "").strip():
+                defects.append(
+                    "a model call ran under a system prompt the transcript does not carry"
+                )
+                break
+
     messages: list[TrainingMessage] = []
     if trace.system_prompt:
         # The instructions the episode ran under, where the source recorded
@@ -149,6 +162,13 @@ def build_transcript(
 
     for span in trace.spans:
         if span.kind is SpanKind.TOOL:
+            if span.attributes.get(PIPELINE_STEP):
+                # Work the pipeline did, not a call the model made. What it
+                # returned reached the model only through the messages the
+                # next call recorded, which the transcript already carries.
+                warnings.append(f"pipeline step {span.name!r} is not a model call; left out")
+                close_turn(span.span_id)
+                continue
             if not span.call_recorded:
                 # A result the source never paired with a call. The only way to
                 # put it in a transcript is to write the assistant turn that

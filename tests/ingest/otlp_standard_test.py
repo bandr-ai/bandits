@@ -559,3 +559,288 @@ def test_cyclic_parent_ids_are_issues_not_a_hang(tmp_path) -> None:
     assert [s.span_id for s in _only_trace(corpus).spans] == ["child", "ok"]
     looped = [i for i in corpus.issues if i.kind == "malformed_span"]
     assert sorted(i.detail.split()[1] for i in looped) == ["self", "x", "y"]
+
+
+# ---------- review round 2 ----------
+
+
+def test_an_evaluator_declaration_wins_over_any_other_convention(tmp_path) -> None:
+    judged = _span(
+        "e",
+        "judge",
+        {
+            "gen_ai.operation.name": "chat",
+            "langfuse.observation.type": "EVALUATOR",
+            "input.value": "Score this answer",
+        },
+        at=1,
+    )
+    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
+    path = _write(tmp_path / "eval.jsonl", _request([_span("a", "chat", chat), judged]))
+
+    corpus = load_otlp_standard(path)
+
+    assert [s.span_id for s in _only_trace(corpus).spans] == ["a"]
+    assert any("EVALUATOR" in i.detail for i in corpus.issues if i.kind == "unrepresented_span")
+
+
+def test_nothing_beneath_an_evaluator_enters_the_corpus(tmp_path) -> None:
+    spans = [
+        _span("root", "run", {"openinference.span.kind": "AGENT"}),
+        _span("eval", "grade", {"openinference.span.kind": "EVALUATOR"}, parent="root"),
+        # An LLM-as-judge call: its prompt is the grading rubric, not the task.
+        _span(
+            "judge",
+            "ChatOpenAI",
+            {"openinference.span.kind": "LLM", "input.value": "Grade: was it right?"},
+            parent="eval",
+        ),
+        _span(
+            "work",
+            "ChatOpenAI",
+            {"openinference.span.kind": "LLM", "input.value": "Refund 7741"},
+            parent="root",
+            at=1,
+        ),
+    ]
+    path = _write(tmp_path / "judge.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+
+    assert [s.span_id for s in trace.spans] == ["work"]
+    assert trace.task == "Refund 7741"
+
+
+def test_a_recorded_system_message_becomes_the_system_prompt(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    first = [
+        {"role": "system", "content": "Refund only paid orders."},
+        {"role": "user", "content": "Refund 7741"},
+    ]
+    spans = [
+        _span(
+            "m1",
+            "chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "input.value": json.dumps(first),
+                "output.value": "Done.",
+            },
+        )
+    ]
+    path = _write(tmp_path / "sys.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+    messages, defects, _ = build_transcript(trace)
+
+    assert trace.system_prompt == "Refund only paid orders."
+    assert messages[0].role == "system"
+    assert messages[0].content == "Refund only paid orders."
+    assert defects == ()
+
+
+def test_a_call_under_a_different_system_prompt_refuses_the_row(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    def call(span_id: str, system: str, at: int) -> dict:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": "q"}]
+        return _span(
+            span_id,
+            "chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "input.value": json.dumps(messages),
+                "output.value": "a",
+            },
+            at=at,
+        )
+
+    path = _write(
+        tmp_path / "two.jsonl", _request([call("m1", "Classify.", 0), call("m2", "Answer.", 1)])
+    )
+
+    trace = _only_trace(load_otlp_standard(path))
+    _, defects, _ = build_transcript(trace)
+
+    assert trace.system_prompt == "Classify."
+    assert any("system prompt" in d for d in defects)
+
+
+def test_an_openinference_tool_call_id_is_not_recovered_twice(tmp_path) -> None:
+    first_in = [{"role": "user", "content": "Weather?"}]
+    first_out = {
+        "role": "assistant",
+        "tool_calls": [{"id": "c1", "function": {"name": "weather", "arguments": "{}"}}],
+    }
+    second_in = [*first_in, first_out, {"role": "tool", "tool_call_id": "c1", "content": "18C"}]
+    spans = [
+        _span(
+            "m1",
+            "llm",
+            {
+                "openinference.span.kind": "LLM",
+                "input.value": json.dumps(first_in),
+                "output.value": json.dumps(first_out),
+            },
+        ),
+        _span(
+            "t1",
+            "weather",
+            {
+                "openinference.span.kind": "TOOL",
+                "tool.name": "weather",
+                "tool_call.id": "c1",
+                "output.value": "18C",
+            },
+            parent="m1",
+            at=1,
+        ),
+        _span(
+            "m2",
+            "llm",
+            {
+                "openinference.span.kind": "LLM",
+                "input.value": json.dumps(second_in),
+                "output.value": "18C.",
+            },
+            at=2,
+        ),
+    ]
+    path = _write(tmp_path / "oi-dup.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+
+    assert [s.span_id for s in trace.spans if s.kind is SpanKind.TOOL] == ["t1"]
+
+
+def test_a_tool_only_response_is_a_call_not_assistant_text(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    response = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "c9", "function": {"name": "lookup", "arguments": '{"id": 7}'}}],
+    }
+    spans = [
+        _span(
+            "m1",
+            "chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "input.value": json.dumps([{"role": "user", "content": "Find 7"}]),
+                "output.value": json.dumps(response),
+            },
+        )
+    ]
+    path = _write(tmp_path / "toolonly.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+    messages, defects, _ = build_transcript(trace)
+
+    model, call = trace.spans
+    assert model.output is None
+    # The call happened; its result was never recorded. Both facts are kept.
+    assert call.kind is SpanKind.TOOL
+    assert call.name == "lookup"
+    assert call.arguments == {"id": 7}
+    assert call.output is None
+    assert not any(
+        m.role == "assistant" and m.content and "tool_calls" in m.content for m in messages
+    )
+    assert any("no recorded result" in d for d in defects)
+
+
+def test_pipeline_steps_are_left_out_of_a_transcript_not_fatal_to_it(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    spans = [
+        _span("root", "answer", {"langfuse.observation.type": "SPAN"}),
+        _span(
+            "search",
+            "search_node",
+            {
+                "langfuse.observation.type": "CHAIN",
+                "input.value": '{"q": "leave"}',
+                "output.value": '{"docs": ["20 days"]}',
+            },
+            parent="root",
+        ),
+        _span(
+            "gen",
+            "ANSWER",
+            {
+                "langfuse.observation.type": "GENERATION",
+                "input.value": json.dumps([{"role": "user", "content": "Leave? Docs: 20 days"}]),
+                "output.value": "20 days.",
+            },
+            parent="root",
+            at=1,
+        ),
+    ]
+    path = _write(tmp_path / "rag.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+    messages, defects, warnings = build_transcript(trace)
+
+    assert [s.span_id for s in trace.spans] == ["search", "gen"]
+    assert defects == ()
+    assert [m.role for m in messages] == ["user", "assistant"]
+    assert any("search_node" in w for w in warnings)
+
+
+@pytest.mark.parametrize("nanos", ["9" * 30, str(10**22), "-5", "1e18"])
+def test_an_unrepresentable_timestamp_is_an_issue_not_a_crash(tmp_path, nanos) -> None:
+    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
+    bad = _span("bad", "chat", chat)
+    bad["startTimeUnixNano"] = nanos
+    path = _write(tmp_path / "ts.jsonl", _request([bad, _span("ok", "chat", chat)]))
+
+    corpus = load_otlp_standard(path)
+
+    assert [s.span_id for s in _only_trace(corpus).spans] == ["ok"]
+    assert [i.kind for i in corpus.issues] == ["malformed_span"]
+
+
+def test_a_non_string_kind_attribute_is_not_a_crash(tmp_path) -> None:
+    odd = _span("odd", "x", {"openinference.span.kind": ["LLM"], "gen_ai.operation.name": 3})
+    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
+    path = _write(tmp_path / "odd.jsonl", _request([odd, _span("ok", "chat", chat)]))
+
+    corpus = load_otlp_standard(path)
+
+    assert [s.span_id for s in _only_trace(corpus).spans] == ["ok"]
+
+
+def test_invalid_utf8_is_reported_not_silently_replaced(tmp_path) -> None:
+    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
+    good = json.dumps(_request([_span("ok", "chat", chat)])).encode()
+    bad = json.dumps(_request([_span("bad", "chat", chat, trace="a" * 32)])).encode()
+    bad = bad.replace(b'"hi"', b'"h\xff"')
+    path = tmp_path / "utf8.jsonl"
+    path.write_bytes(good + b"\n" + bad + b"\n")
+
+    corpus = load_otlp_standard(path)
+
+    assert [t.trace_id for t in corpus.traces] == [TRACE]
+    assert [i.kind for i in corpus.issues] == ["malformed_json"]
+    assert corpus.issues[0].location.endswith(":2")
+
+
+def test_truncated_json_messages_are_not_read_as_user_text(tmp_path) -> None:
+    truncated = json.dumps([{"role": "user", "content": "Refund 7741 please"}])[:25]
+    spans = [
+        _span(
+            "m",
+            "chat",
+            {"gen_ai.operation.name": "chat", "input.value": truncated + "...[truncated]"},
+        )
+    ]
+    path = _write(tmp_path / "trunc.jsonl", _request(spans))
+
+    corpus = load_otlp_standard(path)
+    trace = _only_trace(corpus)
+
+    assert trace.task is None
+    assert trace.user_turns == ()
+    assert any(i.kind == "unparsed_value" for i in corpus.issues)
