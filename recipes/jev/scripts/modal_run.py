@@ -9,8 +9,9 @@ From the repo root, with the Bandits work projects in ./work (gitignored):
 The checkout this script sits in and the two work projects (work/trail-ns,
 work/tau2-ns) are copied into the image, and the recipe's train environment
 is installed at build time. From a git worktree, which has no work/, set
-JEV_WORK to the main checkout's work/. Secrets (.env) and gitignored data are
-left out of the image.
+JEV_WORK to the main checkout's work/. .env files and gitignored data are
+left out of the image, and of each work project only its .bandits store and
+the launch ledgers go in.
 
 Runs, the shared project (so phase 2 reuses phase 1's finished training) and
 the Hugging Face cache live on persistent volumes. Launch runs one after
@@ -47,6 +48,17 @@ JUDGE_RUNS = "turn-judge-0044b8f5c041155c turn-judge-b83480800ad90a25 turn-judge
 LEDGERS = "/work/tau2-ns/ledger-judge-sub.jsonl /work/trail-ns/ledger-gaia-v2.jsonl /work/trail-ns/ledger-swe-v3.jsonl"
 SWE_JUDGE_RUN = "turn-judge-b83480800ad90a25"
 
+
+def _not_read_by_the_run(path: Path) -> bool:
+    """A work project is uploaded as only what gpu_run.sh reads from it: its
+    .bandits store and the launch ledgers. Old ledgers, logs, evaluations and
+    anything else there (a .env included) stay local."""
+    kept = path.parts[:1] == (".bandits",) or path.name in {
+        Path(ledger).name for ledger in LEDGERS.split()
+    }
+    return not kept or path.name == ".env"
+
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "curl")
@@ -71,8 +83,8 @@ image = (
             ".bandits",
         ],
     )
-    .add_local_dir(str(WORK / "trail-ns"), "/work/trail-ns", copy=True)
-    .add_local_dir(str(WORK / "tau2-ns"), "/work/tau2-ns", copy=True)
+    .add_local_dir(str(WORK / "trail-ns"), "/work/trail-ns", copy=True, ignore=_not_read_by_the_run)
+    .add_local_dir(str(WORK / "tau2-ns"), "/work/tau2-ns", copy=True, ignore=_not_read_by_the_run)
     # flash-linear-attention is Triton only (no CUDA build) and speeds up
     # Qwen3.5's linear-attention layers; causal-conv1d is skipped (it needs
     # a CUDA toolchain), so the conv falls back to PyTorch.
@@ -144,7 +156,7 @@ def run_phase(phase: int, extra_env: dict[str, str], tag: str) -> str:
         runs.commit()
         hf_cache.commit()
     last = "".join(tail)
-    if returncode == 124:
+    if returncode in (124, 137):  # 137: still running at the timeout's --kill-after
         raise RuntimeError(
             f"gpu_run.sh stopped after {SCRIPT_TIMEOUT_S}s; log at {out}.console.log\n{last}"
         )
