@@ -27,6 +27,7 @@ MODEL span, ``"execute_tool"`` is a TOOL span. Anything else is a
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -179,6 +180,9 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     # Calls a model's own output declared, so one never answered can still be
     # kept as the action it was.
     declared_by_output: dict[str, str] = {}
+    # Explicit tool spans already matched to a call that named no id, so one
+    # execution never answers two calls.
+    claimed: set[str] = set()
     combined: list[Span] = []
 
     for span in spans:
@@ -206,6 +210,11 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                     recorded = call is not None
                     if call is not None:
                         parent_id, tool_name, arguments = call
+                        if _executed_without_id(spans, parent_id, tool_name, claimed):
+                            # The export recorded this execution as its own
+                            # span; the history only repeats its result.
+                            emitted.add(call_id)
+                            continue
                     else:
                         parent_id, arguments = None, {}
                         tool_name = name if isinstance(name, str) and name else "tool"
@@ -251,7 +260,6 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     # leave a transcript where the model decided nothing at that step; it is
     # kept with no output, which every consumer already reads as "no result".
     unanswered: dict[str, list[Span]] = {}
-    claimed: set[str] = set()
     for call_id, origin in declared_by_output.items():
         if call_id in emitted:
             continue
@@ -286,7 +294,9 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     return tuple(placed)
 
 
-def _executed_without_id(spans: list[Span], origin: str, tool_name: str, claimed: set[str]) -> bool:
+def _executed_without_id(
+    spans: Sequence[Span], origin: str, tool_name: str, claimed: set[str]
+) -> bool:
     """Whether a recorded tool span of this name answered the call, unlabelled.
 
     Some instrumentations record the execution without the call id. The one

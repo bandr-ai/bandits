@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any
 
 from bandits.export.models import ToolCall, ToolFunction, TrainingMessage
-from bandits.genai import PIPELINE_STEP, system_prompt_of
+from bandits.genai import PIPELINE_STEP, input_texts, system_prompt_of
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, UserTurn
 
 
@@ -40,6 +40,11 @@ def _call_arguments(span: Span, carrier: Span | None) -> dict[str, Any]:
     if carrier is not None:
         return carrier.arguments
     return {}
+
+
+def _squashed(text: str) -> str:
+    """Whitespace runs as one space, so re-wrapping text is not a difference."""
+    return " ".join(text.split())
 
 
 def _tool_call_id(span: Span) -> str:
@@ -164,8 +169,9 @@ def build_transcript(
         if span.kind is SpanKind.TOOL:
             if span.attributes.get(PIPELINE_STEP):
                 # Work the pipeline did, not a call the model made. What it
-                # returned reached the model only through the messages the
-                # next call recorded, which the transcript already carries.
+                # returned can only have reached a model through that call's
+                # recorded input, and the check on model spans below refuses
+                # the row if the transcript does not show all of that input.
                 warnings.append(f"pipeline step {span.name!r} is not a model call; left out")
                 close_turn(span.span_id)
                 continue
@@ -221,6 +227,19 @@ def build_transcript(
             )
             close_turn(span.span_id)
             continue
+
+        # What the model answered is only a demonstration of answering what
+        # the transcript shows it. Recorded input the transcript has no place
+        # for (evidence handed over as an unpaired tool message, few-shot
+        # turns, an injected context block) would leave the answer resting on
+        # text the row never shows, so the row goes rather than the evidence.
+        recorded = input_texts(span.attributes)
+        if recorded:
+            shown = _squashed("\n".join(m.content or "" for m in messages))
+            if any(_squashed(text) not in shown for text in recorded):
+                defects.append(
+                    "a model call's recorded input holds text the transcript does not show"
+                )
 
         if span.output is not None:
             messages.append(
