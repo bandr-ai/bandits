@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from bandits.genai import system_instructions, system_prompt_of
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
@@ -67,6 +68,9 @@ _CONTEXT_KEYS = (
 )
 """Settings the run used. Recorded because a demonstration is only reproducible
 against the configuration that produced it."""
+
+_TOOL_CALL_ID_KEYS = ("gen_ai.tool.call.id", "tool_call.id")
+"""Where a tool span records the id of the call it executed (GenAI, OpenInference)."""
 
 _OPERATION_TO_KIND = {
     "chat": SpanKind.MODEL,
@@ -169,8 +173,12 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
         call_id
         for span in spans
         if span.kind is SpanKind.TOOL
-        and isinstance(call_id := span.attributes.get("gen_ai.tool.call.id"), str)
+        for key in _TOOL_CALL_ID_KEYS
+        if isinstance(call_id := span.attributes.get(key), str)
     }
+    # Calls a model's own output declared, so one never answered can still be
+    # kept as the action it was.
+    declared_by_output: dict[str, str] = {}
     combined: list[Span] = []
 
     for span in spans:
@@ -237,7 +245,69 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                             arguments if isinstance(arguments, dict) else {"raw": arguments},
                         ),
                     )
-    return tuple(combined)
+                    declared_by_output.setdefault(call_id, span.span_id)
+
+    # A call the model made whose result nothing recorded. Dropping it would
+    # leave a transcript where the model decided nothing at that step; it is
+    # kept with no output, which every consumer already reads as "no result".
+    unanswered: dict[str, list[Span]] = {}
+    claimed: set[str] = set()
+    for call_id, origin in declared_by_output.items():
+        if call_id in emitted:
+            continue
+        _, tool_name, arguments = calls[call_id]
+        if _executed_without_id(combined, origin, tool_name, claimed):
+            continue
+        source = next(span for span in spans if span.span_id == origin)
+        unanswered.setdefault(origin, []).append(
+            Span(
+                span_id=f"{origin}:tool:{call_id}",
+                parent_span_id=origin,
+                kind=SpanKind.TOOL,
+                name=tool_name,
+                started_at=source.ended_at,
+                ended_at=source.ended_at,
+                arguments=arguments,
+                output=None,
+                attributes={
+                    "synthetic_time": True,
+                    "source": "gen_ai.output.messages",
+                    "result_recorded": False,
+                },
+            )
+        )
+    if not unanswered:
+        return tuple(combined)
+    placed: list[Span] = []
+    for span in combined:
+        placed.append(span)
+        if span.kind is SpanKind.MODEL:
+            placed.extend(unanswered.pop(span.span_id, ()))
+    return tuple(placed)
+
+
+def _executed_without_id(spans: list[Span], origin: str, tool_name: str, claimed: set[str]) -> bool:
+    """Whether a recorded tool span of this name answered the call, unlabelled.
+
+    Some instrumentations record the execution without the call id. The one
+    that ran it is a tool span of the same name between the model call that
+    asked and the next model call; each such span answers at most one call.
+    """
+    start = next((i for i, span in enumerate(spans) if span.span_id == origin), None)
+    if start is None:
+        return False
+    for span in spans[start + 1 :]:
+        if span.kind is SpanKind.MODEL:
+            return False
+        if (
+            span.name == tool_name
+            and span.span_id not in claimed
+            and not span.attributes.get("synthetic_time")
+            and not any(isinstance(span.attributes.get(k), str) for k in _TOOL_CALL_ID_KEYS)
+        ):
+            claimed.add(span.span_id)
+            return True
+    return False
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -380,22 +450,9 @@ def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
 
 def context_from_attributes(attributes: dict[str, Any]) -> tuple[object, str | None, dict]:
     """The toolset, system prompt and settings one span's attributes declare."""
-    system_prompt = _first(attributes, _SYSTEM_PROMPT_KEYS)
-    if isinstance(system_prompt, str) and system_prompt.lstrip().startswith("["):
-        system_prompt = _json_value(system_prompt)
-    if isinstance(system_prompt, list):
-        # GenAI semconv records system instructions as a list of parts.
-        text = [
-            part["content"]
-            for part in system_prompt
-            if isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("content"), str)
-        ]
-        system_prompt = "\n".join(text) if text else None
     return (
         parse_toolset(_first(attributes, _TOOLSET_KEYS)),
-        system_prompt if isinstance(system_prompt, str) else None,
+        system_instructions(_first(attributes, _SYSTEM_PROMPT_KEYS)),
         {key: attributes[key] for key in _CONTEXT_KEYS if attributes.get(key) is not None},
     )
 
@@ -498,6 +555,20 @@ def assemble_corpus(
             tools = root_tools if root_tools is not None else tools
             system_prompt = root_prompt if root_prompt is not None else system_prompt
             context = {**context, **root_context}
+        if system_prompt is None:
+            # Most exporters record the policy as the system message opening
+            # each model call rather than on the root. The first call's is what
+            # the episode started under; a later call under a different one is
+            # for the exporter to refuse, not for this to pick between.
+            system_prompt = next(
+                (
+                    prompt
+                    for span in ordered
+                    if span.kind is SpanKind.MODEL
+                    and (prompt := system_prompt_of(span.attributes)) is not None
+                ),
+                None,
+            )
         traces.append(
             Trace(
                 trace_id=trace_id,

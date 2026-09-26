@@ -47,13 +47,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections import Counter
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bandits.genai import PIPELINE_STEP
 from bandits.ingest.otlp import (
     _LINEAGE_KEYS,
     _declared_completion,
@@ -69,7 +69,9 @@ _MODEL = "model"
 _TOOL = "tool"
 _STEP = "step"
 _NONE = "none"
-"""Classifications. ``_NONE`` is a span with no model or tool meaning."""
+_EXCLUDED = "excluded"
+"""Classifications. ``_NONE`` is a span with no model or tool meaning;
+``_EXCLUDED`` one that must not reach the corpus, nor anything beneath it."""
 
 _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
     (
@@ -96,7 +98,7 @@ _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
             "RERANKER": _STEP,
             "GUARDRAIL": _STEP,
             "EMBEDDING": _NONE,
-            "EVALUATOR": _NONE,
+            "EVALUATOR": _EXCLUDED,
             "PROMPT": _NONE,
             "UNKNOWN": _NONE,
         },
@@ -117,16 +119,18 @@ _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
             "RETRIEVER": _STEP,
             "GUARDRAIL": _STEP,
             "EMBEDDING": _NONE,
-            "EVALUATOR": _NONE,
+            "EVALUATOR": _EXCLUDED,
             "EVENT": _NONE,
         },
     ),
 )
-"""Checked in order; the first convention that declares a recognized value wins.
+"""Checked in order; the first convention that declares a recognized value wins,
+except that an exclusion declared by any convention wins over all of them.
 
-Evaluators are deliberately never steps: a score attached after the fact is a
-label on the episode, and letting it into the trajectory would leak it into
-whatever is judged or trained from it."""
+An evaluator is a label on the episode attached after the fact, often by a
+model call of its own. Letting it, or the LLM-as-judge call inside it, into the
+trajectory would leak the grade into whatever is judged or trained from it. A
+span that some library also stamped ``chat`` is still that evaluator."""
 
 _LINEAGE = (*_LINEAGE_KEYS, "langfuse.session.id", "langfuse.session_id")
 
@@ -165,7 +169,6 @@ _EVENT_ROLES = {
     "gen_ai.assistant.message": "assistant",
     "gen_ai.tool.message": "tool",
 }
-_INDEXED = re.compile(r"^(\d+)\.(.+)$")
 
 
 # ---------- OTLP/JSON decoding ----------
@@ -218,7 +221,10 @@ def _timestamp(value: object) -> datetime | None:
     if nanos <= 0:
         return None
     seconds, remainder = divmod(nanos, 1_000_000_000)
-    return datetime.fromtimestamp(seconds, tz=UTC) + timedelta(microseconds=remainder // 1000)
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC) + timedelta(microseconds=remainder // 1000)
+    except (OverflowError, OSError, ValueError):
+        return None  # past what a datetime can hold: not a time this span ran at
 
 
 def _is_error(status: object, attributes: dict[str, Any]) -> bool:
@@ -233,6 +239,12 @@ def _is_error(status: object, attributes: dict[str, Any]) -> bool:
 # ---------- message normalization ----------
 
 
+_UNPARSED: Any = object()
+"""A value that opens as a JSON object or array and does not parse: in practice
+an exporter that cut a long value off. Read as text it would put half a
+serialized message list in the transcript as if someone had typed it."""
+
+
 def _json_value(value: object) -> object:
     if not isinstance(value, str):
         return value
@@ -242,7 +254,8 @@ def _json_value(value: object) -> object:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
-        return value
+        # Prose can open with a bracket; only a JSON-looking opening is cut JSON.
+        return _UNPARSED if stripped.startswith(('{"', "[{", '["', "[[")) else value
 
 
 def _unflatten(attributes: dict[str, Any], prefix: str) -> list[dict[str, Any]]:
@@ -396,6 +409,8 @@ def _message(raw: object) -> dict[str, Any] | None:
 def _messages(value: object) -> list[dict[str, Any]] | None:
     """A message list, when *value* is one in any common shape; else None."""
     value = _json_value(value)
+    if value is _UNPARSED:
+        return None
     if isinstance(value, dict):
         if isinstance(value.get("messages"), list):
             value = value["messages"]
@@ -433,12 +448,16 @@ def _event_messages(events: list[dict[str, Any]]) -> tuple[list | None, list | N
             outputs.extend(_messages(attrs.get("gen_ai.completion")) or [])
         elif name in _EVENT_ROLES:
             body = _json_value(attrs.get("gen_ai.event.content", attrs.get("content")))
+            if body is _UNPARSED:
+                continue
             body = body if isinstance(body, dict) else {"content": body}
             message = _message({**attrs, **body, "role": _EVENT_ROLES[name]})
             if message:
                 inputs.append(message)
         elif name == "gen_ai.choice":
             body = _json_value(attrs.get("gen_ai.event.content", attrs.get("message")))
+            if body is _UNPARSED:
+                continue
             if isinstance(body, dict) and isinstance(body.get("message"), dict):
                 body = body["message"]
             message = _message(
@@ -458,9 +477,17 @@ def _first_value(attributes: dict[str, Any], keys: tuple[str, ...]) -> tuple[str
 
 
 def _normalized_messages(
-    attributes: dict[str, Any], events: list[dict[str, Any]], *, prompt_is_text: bool
+    attributes: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    prompt_is_text: bool,
+    unparsed: Counter[str] | None = None,
 ) -> dict[str, Any]:
-    """GenAI message attributes a span did not declare, read from other conventions."""
+    """GenAI message attributes a span did not declare, read from other conventions.
+
+    A value that looks like cut-off JSON is counted into *unparsed* and read as
+    nothing, never as text.
+    """
     added: dict[str, Any] = {}
     details = next(
         (
@@ -484,6 +511,8 @@ def _normalized_messages(
     ):
         key = f"gen_ai.{direction}.messages"
         if attributes.get(key) is not None:
+            if unparsed is not None and _json_value(attributes[key]) is _UNPARSED:
+                unparsed[key] += 1
             continue
         candidates: list[tuple[str, Any]] = [
             (f"event:{key}", _messages(details.get(key))),
@@ -496,9 +525,15 @@ def _normalized_messages(
         ]
         declared = _first_value(attributes, value_keys)
         if declared is not None:
-            found = _messages(declared[1])
-            if found is None and prompt_is_text:
-                found = _text_message(role, _json_value(declared[1]))
+            parsed = _json_value(declared[1])
+            if parsed is _UNPARSED:
+                if unparsed is not None:
+                    unparsed[declared[0]] += 1
+                found = None
+            else:
+                found = _messages(parsed)
+                if found is None and prompt_is_text:
+                    found = _text_message(role, parsed)
             candidates.append((declared[0], found))
         origin, messages = next(((o, m) for o, m in candidates if m), (None, None))
         if messages:
@@ -539,35 +574,58 @@ class _Decoded:
 
 
 def _classify(attributes: dict[str, Any]) -> tuple[str, str]:
+    found: tuple[str, str] | None = None
     first_declared: str | None = None
     for key, table in _CONVENTIONS:
         value = attributes.get(key)
         if value is None:
             continue
         label = f"{key}={value}"
-        if value in table:
-            return table[value], label
-        first_declared = first_declared or label
-    return _NONE, first_declared or "no declared kind"
+        role = table.get(value) if isinstance(value, str) else None
+        if role == _EXCLUDED:
+            return role, label
+        if role is None:
+            first_declared = first_declared or label
+        elif found is None:
+            found = (role, label)
+    return found or (_NONE, first_declared or "no declared kind")
+
+
+def _exclude_subtrees(spans: dict[str, _Decoded]) -> None:
+    """Mark everything beneath an excluded span excluded, under its label."""
+    for span in spans.values():
+        if span.role == _EXCLUDED:
+            continue
+        parent, seen = span.parent_id, {span.span_id}
+        while parent in spans and parent not in seen:
+            if spans[parent].role == _EXCLUDED:
+                span.role, span.label = _EXCLUDED, spans[parent].label
+                break
+            seen.add(parent)
+            parent = spans[parent].parent_id
 
 
 def _requests(data: bytes, location: str) -> Iterator[tuple[str, object]]:
-    """Each ``ExportTraceServiceRequest`` in a file, with where it was found."""
-    text = data.decode("utf-8", errors="replace")
+    """Each ``ExportTraceServiceRequest`` in a file, with where it was found.
+
+    A whole-file document (one request, or an array of them) first; otherwise
+    one request per line, where a line that is not UTF-8 JSON is its own error
+    and never costs its neighbors. Bytes are never replaced to make them decode.
+    """
     try:
-        whole = json.loads(text)
-    except json.JSONDecodeError:
+        whole = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         whole = None
     if whole is not None:
         for i, item in enumerate(whole if isinstance(whole, list) else [whole]):
             yield f"{location}[{i}]" if isinstance(whole, list) else location, item
         return
-    for number, line in enumerate(text.split("\n"), start=1):
+    for number, line in enumerate(data.split(b"\n"), start=1):
         if not line.strip():
             continue
         try:
-            yield f"{location}:{number}", json.loads(line)
-        except json.JSONDecodeError as exc:
+            yield f"{location}:{number}", json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             yield f"{location}:{number}", exc
 
 
@@ -575,7 +633,7 @@ def _decode_file(
     path: Path, data: bytes, issues: list[TraceIssue], counter: list[int]
 ) -> Iterator[_Decoded]:
     for location, request in _requests(data, str(path)):
-        if isinstance(request, json.JSONDecodeError):
+        if isinstance(request, (json.JSONDecodeError, UnicodeDecodeError)):
             issues.append(TraceIssue(kind="malformed_json", detail=str(request), location=location))
             continue
         resource_spans = (
@@ -647,7 +705,8 @@ def _decode_span(
         issues.append(
             TraceIssue(
                 kind="malformed_span",
-                detail="startTimeUnixNano/endTimeUnixNano must be positive unix nanoseconds",
+                detail="startTimeUnixNano/endTimeUnixNano must be positive unix "
+                "nanoseconds within the representable calendar",
                 location=location,
             )
         )
@@ -757,12 +816,27 @@ def _covered(spans: dict[str, _Decoded], selected: set[str]) -> set[str]:
     return covered
 
 
-def _io_value(attributes: dict[str, Any], keys: tuple[str, ...]) -> object:
+def _io_value(attributes: dict[str, Any], keys: tuple[str, ...], unparsed: Counter[str]) -> object:
+    """The first declared value under *keys*, parsed when it is JSON.
+
+    Cut-off JSON is counted and kept as the string it was: a tool's recorded
+    result is still what the tool returned, however much of it survived.
+    """
     found = _first_value(attributes, keys)
-    return _json_value(found[1]) if found else None
+    if found is None:
+        return None
+    return _counted(found[0], found[1], unparsed)
 
 
-def _to_span(decoded: _Decoded, *, as_step: bool) -> Span:
+def _counted(key: str, value: object, unparsed: Counter[str]) -> object:
+    parsed = _json_value(value)
+    if parsed is _UNPARSED:
+        unparsed[key] += 1
+        return value
+    return parsed
+
+
+def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Span:
     attributes = dict(decoded.attributes)
     if decoded.events:
         attributes["otel.events"] = decoded.events
@@ -774,11 +848,20 @@ def _to_span(decoded: _Decoded, *, as_step: bool) -> Span:
         # whatever state the pipeline passed it, and reading messages out of
         # that would invent user turns the model never received.
         attributes.update(
-            _normalized_messages(decoded.attributes, decoded.events, prompt_is_text=True)
+            _normalized_messages(
+                decoded.attributes, decoded.events, prompt_is_text=True, unparsed=unparsed
+            )
         )
         output = _declared_completion(attributes)
-        if output is None:
-            output = _io_value(attributes, _OUTPUT_VALUE_KEYS)
+        if output is None and attributes.get("gen_ai.output.messages") is None:
+            # Only when no response message was found at all: a structured
+            # answer the model returned as data. A response that was messages
+            # but held no text made tool calls, which are recovered as tool
+            # spans, and dumping it here would read as the model saying JSON.
+            output = _first_value(attributes, _OUTPUT_VALUE_KEYS)
+            output = _json_value(output[1]) if output is not None else None
+            if output is _UNPARSED:
+                output = None
         return Span(
             span_id=decoded.span_id,
             parent_span_id=decoded.parent_id,
@@ -791,13 +874,16 @@ def _to_span(decoded: _Decoded, *, as_step: bool) -> Span:
             attributes=attributes,
         )
 
-    arguments = _json_value(attributes.get("gen_ai.tool.call.arguments"))
-    if arguments is None:
-        arguments = _io_value(attributes, _INPUT_VALUE_KEYS)
+    arguments = attributes.get("gen_ai.tool.call.arguments")
+    if arguments is not None:
+        arguments = _counted("gen_ai.tool.call.arguments", arguments, unparsed)
+    else:
+        arguments = _io_value(attributes, _INPUT_VALUE_KEYS, unparsed)
     output = attributes.get("gen_ai.tool.call.result")
-    output = (
-        _json_value(output) if output is not None else _io_value(attributes, _OUTPUT_VALUE_KEYS)
-    )
+    if output is not None:
+        output = _counted("gen_ai.tool.call.result", output, unparsed)
+    else:
+        output = _io_value(attributes, _OUTPUT_VALUE_KEYS, unparsed)
     name = (
         next(
             (
@@ -811,7 +897,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool) -> Span:
         else decoded.name
     )
     if as_step:
-        attributes["bandits.pipeline_step"] = True
+        attributes[PIPELINE_STEP] = True
     return Span(
         span_id=decoded.span_id,
         parent_span_id=decoded.parent_id,
@@ -832,8 +918,13 @@ def _to_span(decoded: _Decoded, *, as_step: bool) -> Span:
 
 
 def _task(spans: list[Span], decoded: dict[str, _Decoded]) -> str | None:
-    """The root's declared ``task``, else the first user instruction recorded."""
-    for span in decoded.values():
+    """The root's declared ``task``, else the first user instruction recorded.
+
+    Never read from an excluded span: an evaluator's prompt is a grading
+    rubric, and taking it for the task would group and judge by the grade.
+    """
+    candidates = [s for s in decoded.values() if s.role != _EXCLUDED]
+    for span in candidates:
         if span.parent_id is None and isinstance(span.attributes.get("task"), str):
             return span.attributes["task"]
     for span in spans:
@@ -842,7 +933,7 @@ def _task(spans: list[Span], decoded: dict[str, _Decoded]) -> str | None:
             return task
     # A wrapper span (a LangGraph root, an agent invocation) often carries the
     # conversation it was started with; only a message-shaped input counts.
-    for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index)):
+    for span in sorted(candidates, key=lambda s: (s.started_at, s.index)):
         messages = _normalized_messages(span.attributes, span.events, prompt_is_text=False)
         task = _declared_task({**span.attributes, **messages})
         if task:
@@ -858,7 +949,11 @@ def _episode_root(spans: dict[str, _Decoded]) -> _Decoded | None:
     out as structure must not take that context with it. A root whose parent
     was not exported counts, so a partial export still has one.
     """
-    roots = [s for s in spans.values() if s.parent_id is None or s.parent_id not in spans]
+    roots = [
+        s
+        for s in spans.values()
+        if (s.parent_id is None or s.parent_id not in spans) and s.role != _EXCLUDED
+    ]
     return min(roots, key=lambda s: (s.parent_id is not None, s.started_at, s.index), default=None)
 
 
@@ -914,6 +1009,7 @@ def load_otlp_standard(
     )
 
     unrepresented: Counter[str] = Counter()
+    unparsed: Counter[str] = Counter()
     spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
     task_by_trace: dict[str, str] = {}
     lineage_by_trace: dict[str, str] = {}
@@ -932,18 +1028,19 @@ def load_otlp_standard(
         decoded = {k: v for k, v in decoded.items() if k not in looped}
         if not decoded:
             continue
+        _exclude_subtrees(decoded)
         steps = _pipeline_steps(decoded)
         covered = _covered(decoded, steps)
         collected: list[tuple[int, Span]] = []
         for span in sorted(decoded.values(), key=lambda s: s.index):
             if span.role in (_MODEL, _TOOL):
-                collected.append((span.index, _to_span(span, as_step=False)))
+                collected.append((span.index, _to_span(span, as_step=False, unparsed=unparsed)))
             elif span.span_id in steps:
                 if pipeline_steps:
-                    collected.append((span.index, _to_span(span, as_step=True)))
+                    collected.append((span.index, _to_span(span, as_step=True, unparsed=unparsed)))
                 else:
                     unrepresented[span.label] += 1
-            elif span.role == _NONE and span.span_id not in covered:
+            elif span.role == _EXCLUDED or (span.role == _NONE and span.span_id not in covered):
                 unrepresented[span.label] += 1
             # Otherwise a step with calls beneath it (represented by them) or a
             # span inside a selected step (represented by the step).
@@ -979,6 +1076,15 @@ def load_otlp_standard(
         if task is not None:
             task_by_trace[trace_id] = task
 
+    for key, count in sorted(unparsed.items()):
+        issues.append(
+            TraceIssue(
+                kind="unparsed_value",
+                detail=f"{count} value(s) under {key} open as JSON but do not parse, as an "
+                "exporter that cuts long values off leaves them; none was read as message text",
+                location=str(path),
+            )
+        )
     for label, count in sorted(unrepresented.items()):
         issues.append(
             TraceIssue(
