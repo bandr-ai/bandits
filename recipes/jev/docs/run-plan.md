@@ -91,7 +91,7 @@ Copied on purpose from what worked in public:
   INPUT_USD_PER_MTOK=0.05 CACHED_INPUT_USD_PER_MTOK=0.01 OUTPUT_USD_PER_MTOK=0.20 GPU_USD_PER_HOUR=<box price> \
   recipes/jev/scripts/gpu_run.sh
   ```
-- **You get:** per model, a smoke result (`smoke-*.json`) and a dev report (`reports/<model>/report.md` + `report.json`), all in one tarball.
+- **You get:** per model, a smoke result (`smoke-*.json`) and a dev report (`reports/<model>/report.md` + `report.json`), all in one tarball. The console streams live and is saved beside the tarball as `<run-dir>.console.log`. Its last lines print each model pinned to the exact snapshot it trained (`model@sha`); keep that line for run 2.
 - **Decide:**
   1. **Stop check:** if neither model's `trained + calibrated − majority` agreement interval is above 0 on dev, the claim doesn't hold as built. Stop and choose between more data (#98), 9B, or a different claim before spending more.
   2. **Model:** the higher dev agreement (coverage-adjusted) wins; a tie goes to Base. This is launch plan §6.
@@ -106,9 +106,9 @@ Copied on purpose from what worked in public:
 - **Why:** the launch numbers, with error ranges, and 3 seeds to show the result isn't luck.
 - **Command:**
   ```bash
-  uvx modal run recipes/jev/scripts/modal_run.py --phase 2 --models <chosen> --seed <1|2|3>
+  uvx modal run recipes/jev/scripts/modal_run.py --phase 2 --models <chosen>@<sha from run 1> --seed <1|2|3>
   ```
-  Run it once per seed. Add `--held-out-swe` to one of them for run 3.
+  Run it once per seed, **one after another**, and add `--held-out-swe` to one of them for run 3. The pin keeps every seed on run 1's snapshot (an unpinned model takes whatever the Hub has that day, and seed 1 would then retrain). Running them one at a time lets each run reuse what the last one saved: a container sees the shared project as it was when it started.
 - **Checks bars:** B1 (beats majority), B5 (calibrated), B6 (cheap and fast). B2, B3 and B4 need #106, #105 and #107 first (§6).
 
 ### Run 3: does it work on an agent it never saw? (part of phase 2)
@@ -145,7 +145,7 @@ The test split is scored once. If run 2 happens before these exist, B2–B4 can 
 
 - **Code:** `git fetch && git checkout feat/jev`. The recipe lives in `recipes/jev/`, and core Bandits (`bandits/`) is left untouched on purpose: the recipe reads core, core never imports it.
 - **Environment:** `cd recipes/jev && uv sync --extra dev` (add `--extra train` for torch). For CPU tests, install the CPU torch wheel as `.github/workflows/quality.yml` does. `uv run pytest` and `uv run ruff check .` must pass.
-- **Data:** the `work/` folder in the main checkout (gitignored; ~83 MB for the two projects used). Git worktrees don't have it, so run Modal from the main checkout.
+- **Data:** the `work/` folder in the main checkout (gitignored; ~83 MB for the two projects used). Git worktrees don't have it: run Modal from the main checkout with this branch checked out, or from a worktree with `JEV_WORK=<main checkout>/work`. The image is built from the checkout the script sits in; `.env` and other gitignored data are left out of it.
 - **Modal:** the `modal` command on Laxman's machine is broken; use `uvx modal ...`. Two saved profiles, `laxmansrivast` (active) and `laxmanvidushi`. Launching spends money, so confirm the profile first.
 - **Fireworks:** the key is in `.env` (`FIREWORKS_API_KEY`), used by `bandits judge-turns` (#98, #105).
 - **Workflow:**
