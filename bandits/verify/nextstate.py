@@ -215,6 +215,13 @@ class TurnVerdict(Contract):
     score: int | None = None
     """+1, 0 or −1. None when the turn was unobserved or the judge failed."""
 
+    judge_votes: dict[str, float] | None = None
+    """Vote share for "-1", "0", "1" among the votes actually cast. None
+    wherever ``score`` is None: an unobserved or failed turn has no votes to
+    take a share of. This is disagreement among repeated calls to one judge,
+    not a calibrated or ground-truth probability -- with one vote it is a
+    one-hot; with several it shows how split the judge was, nothing more."""
+
     hint: str = ""
     votes: tuple[int, ...] = ()
     response: str = ""
@@ -303,6 +310,21 @@ def _majority(votes: Sequence[int]) -> int:
     return 0 if len(winners) > 1 else winners[0]
 
 
+def _vote_shares(votes: Sequence[int]) -> dict[str, float]:
+    """Fraction of votes landing on each label, dense over all three labels.
+
+    A label with zero votes among those cast reports 0.0, not an omitted key:
+    that 0.0 is the observed frequency of that outcome among the votes that
+    were actually taken, not a manufactured opinion. A consumer selecting
+    "-1" is selecting p(error) for every judged example this way, rather than
+    silently restricting itself to the subset that happened to see a
+    negative vote -- see the calibration report's use of this in
+    ``scripts/trail_nextstate_eval.py``.
+    """
+    n = len(votes)
+    return {str(label): votes.count(label) / n for label in (-1, 0, 1)}
+
+
 def judge_turn(
     task: str | None,
     turn: Turn,
@@ -355,6 +377,7 @@ def judge_turn(
     return TurnVerdict(
         **base,
         score=final,
+        judge_votes=_vote_shares(scores),
         hint=hint,
         votes=tuple(scores),
         response="\n---\n".join(responses)[-4000:],

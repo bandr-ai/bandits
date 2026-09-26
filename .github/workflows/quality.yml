@@ -13,3 +13,27 @@ jobs:
       - run: uv sync --extra dev --extra emulate
       - run: uv run ruff check .
       - run: uv run pytest --cov=bandits --cov-report=term-missing
+
+  jev:
+    # The Jev recipe (recipes/jev), in its own environment so core never
+    # installs torch. Its model tests run a real tiny model
+    # (hf-internal-testing/tiny-random-gpt2) on CPU.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: recipes/jev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-tiny-random-gpt2-v1
+      - run: uv sync --extra dev
+      # CPU-only torch wheel: the default PyPI wheel pulls ~3 GB of CUDA libs.
+      - run: uv pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
+      - run: uv pip install "transformers>=4.44" "peft>=0.12"
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest
