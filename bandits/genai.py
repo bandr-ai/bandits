@@ -73,30 +73,24 @@ def system_prompt_of(attributes: dict[str, Any]) -> str | None:
     return "\n".join(leading) if leading else None
 
 
-def input_texts(attributes: dict[str, Any]) -> list[str]:
-    """Every piece of text a model call recorded receiving, in any role.
+def input_units(attributes: dict[str, Any]) -> list[tuple[str, str] | None]:
+    """A model call's recorded input as ``(role, text)`` per message, in order.
 
-    Text parts and plain string contents only. A tool result paired with its
-    call by id is carried by the tool span it became, and comparing the two
-    renderings of one structured result would refuse rows over whitespace.
+    A message with no text (a bare tool call, a tool result paired by id) is
+    ``None``: its tool span carries it, and it still separates the messages on
+    either side, so they are not read as one. Comparing the two renderings of
+    one structured result would refuse rows over whitespace.
     """
     messages = _parsed(attributes.get("gen_ai.input.messages"))
     if not isinstance(messages, list):
         return []
-    texts: list[str] = []
+    units: list[tuple[str, str] | None] = []
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
             continue
-        parts = message.get("parts")
-        if isinstance(parts, list):
-            texts.extend(
-                part["content"]
-                for part in parts
-                if isinstance(part, dict)
-                and part.get("type") == "text"
-                and isinstance(part.get("content"), str)
-                and part["content"].strip()
-            )
-        elif isinstance(message.get("content"), str) and message["content"].strip():
-            texts.append(message["content"])
-    return texts
+        role = "system" if message["role"] == "developer" else message["role"]
+        text = _text_parts(message.get("parts"))
+        if text is None and isinstance(message.get("content"), str):
+            text = message["content"]
+        units.append((role, text) if text and text.strip() else None)
+    return units
