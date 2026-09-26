@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any
 
 from bandits.export.models import ToolCall, ToolFunction, TrainingMessage
-from bandits.genai import PIPELINE_STEP, input_texts, system_prompt_of
+from bandits.genai import PIPELINE_STEP, input_units, system_prompt_of
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, UserTurn
 
 
@@ -42,9 +42,38 @@ def _call_arguments(span: Span, carrier: Span | None) -> dict[str, Any]:
     return {}
 
 
-def _squashed(text: str) -> str:
-    """Whitespace runs as one space, so re-wrapping text is not a difference."""
-    return " ".join(text.split())
+def _merged(units: list[tuple[str, str] | None]) -> list[tuple[str, str]]:
+    """Adjacent same-role messages as one, whitespace runs as one space.
+
+    Sources split one turn into several messages, or several into one, with
+    no difference in what the model read; a ``None`` keeps its neighbors apart.
+    """
+    merged: list[tuple[str, str]] = []
+    previous: str | None = None
+    for unit in units:
+        if unit is None:
+            previous = None
+            continue
+        role, text = unit
+        text = " ".join(text.split())
+        if role == previous:
+            merged[-1] = (role, f"{merged[-1][1]} {text}")
+        else:
+            merged.append((role, text))
+        previous = role
+    return merged
+
+
+def _in_order(recorded: list[tuple[str, str]], shown: list[tuple[str, str]]) -> bool:
+    """Whether every recorded message appears in *shown*, in order, each once."""
+    position = 0
+    for unit in recorded:
+        while position < len(shown) and shown[position] != unit:
+            position += 1
+        if position == len(shown):
+            return False
+        position += 1
+    return True
 
 
 def _tool_call_id(span: Span) -> str:
@@ -229,16 +258,17 @@ def build_transcript(
             continue
 
         # What the model answered is only a demonstration of answering what
-        # the transcript shows it. Recorded input the transcript has no place
-        # for (evidence handed over as an unpaired tool message, few-shot
-        # turns, an injected context block) would leave the answer resting on
-        # text the row never shows, so the row goes rather than the evidence.
-        recorded = input_texts(span.attributes)
+        # the transcript shows it. Every message the call recorded receiving
+        # must be there, in order, under its role, as often as recorded: an
+        # example turn, evidence handed over as an unpaired tool message, or
+        # an injected context block the row has no place for would leave the
+        # answer resting on input the row never shows.
+        recorded = _merged(input_units(span.attributes))
         if recorded:
-            shown = _squashed("\n".join(m.content or "" for m in messages))
-            if any(_squashed(text) not in shown for text in recorded):
+            shown = _merged([(m.role, m.content) if m.content else None for m in messages])
+            if not _in_order(recorded, shown):
                 defects.append(
-                    "a model call's recorded input holds text the transcript does not show"
+                    "a model call's recorded input holds messages the transcript does not show"
                 )
 
         if span.output is not None:

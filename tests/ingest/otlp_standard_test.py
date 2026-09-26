@@ -973,3 +973,93 @@ def test_evidence_the_transcript_carries_keeps_the_row(tmp_path) -> None:
 
     assert defects == ()
     assert messages[0].content == "How many days?\nDocs: employees get 20 days."
+
+
+# ---------- review round 4 ----------
+
+
+def _chat_call(span_id: str, messages: list[dict], output: object, at: int) -> dict:
+    return _span(
+        span_id,
+        "chat",
+        {
+            "gen_ai.operation.name": "chat",
+            "input.value": json.dumps(messages),
+            "output.value": output if isinstance(output, str) else json.dumps(output),
+        },
+        at=at,
+    )
+
+
+def test_an_omitted_example_is_not_excused_by_matching_words(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    # A few-shot assistant turn no span produced. Its text also occurs inside
+    # the user's question, which must not count as the example being shown.
+    call = [
+        {"role": "assistant", "content": "20 days"},
+        {"role": "user", "content": "Is it 20 days of leave?"},
+    ]
+    path = _write(tmp_path / "fewshot.jsonl", _request([_chat_call("m", call, "Yes.", 0)]))
+
+    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
+
+    assert any("does not show" in d for d in defects)
+
+
+def test_a_repeated_turn_must_appear_as_often_as_recorded(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    second = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "go"},
+    ]
+    spans = [
+        _chat_call("m1", [{"role": "user", "content": "go"}], "done", 0),
+        _chat_call("m2", second, "done", 1),
+    ]
+    path = _write(tmp_path / "repeat.jsonl", _request(spans))
+
+    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
+
+    assert any("does not show" in d for d in defects)
+
+
+def test_a_faithful_agent_loop_keeps_its_row(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    system = {"role": "system", "content": "Use tools."}
+    first_in = [system, {"role": "user", "content": "Weather in Paris?"}]
+    first_out = {
+        "role": "assistant",
+        "content": "Checking.",
+        "tool_calls": [
+            {"id": "c1", "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}
+        ],
+    }
+    second_in = [
+        *first_in,
+        first_out,
+        {"role": "tool", "tool_call_id": "c1", "content": "18C"},
+        {"role": "user", "content": "And tomorrow?"},
+    ]
+    spans = [
+        _chat_call("m1", first_in, first_out, 0),
+        _chat_call("m2", second_in, "Also mild.", 1),
+    ]
+    path = _write(tmp_path / "loop.jsonl", _request(spans))
+
+    messages, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
+
+    assert defects == ()
+    assert [m.role for m in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
