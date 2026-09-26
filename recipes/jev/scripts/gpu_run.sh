@@ -98,7 +98,8 @@ dataset_id_of() {
 }
 
 log "gather projects into $PROJECT"
-mkdir -p "$PROJECT/.bandits"
+# $OUT too: PROJECT_DIR may put the project outside it.
+mkdir -p "$OUT" "$PROJECT/.bandits"
 for p in $PROJECTS; do
   cp -rn "$(realpath "$p")/.bandits/." "$PROJECT/.bandits/"
 done
