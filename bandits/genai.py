@@ -71,3 +71,32 @@ def system_prompt_of(attributes: dict[str, Any]) -> str | None:
         if text:
             leading.append(text)
     return "\n".join(leading) if leading else None
+
+
+def input_texts(attributes: dict[str, Any]) -> list[str]:
+    """Every piece of text a model call recorded receiving, in any role.
+
+    Text parts and plain string contents only. A tool result paired with its
+    call by id is carried by the tool span it became, and comparing the two
+    renderings of one structured result would refuse rows over whitespace.
+    """
+    messages = _parsed(attributes.get("gen_ai.input.messages"))
+    if not isinstance(messages, list):
+        return []
+    texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            texts.extend(
+                part["content"]
+                for part in parts
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("content"), str)
+                and part["content"].strip()
+            )
+        elif isinstance(message.get("content"), str) and message["content"].strip():
+            texts.append(message["content"])
+    return texts

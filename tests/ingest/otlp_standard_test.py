@@ -844,3 +844,132 @@ def test_truncated_json_messages_are_not_read_as_user_text(tmp_path) -> None:
     assert trace.task is None
     assert trace.user_turns == ()
     assert any(i.kind == "unparsed_value" for i in corpus.issues)
+
+
+# ---------- review round 3 ----------
+
+
+def test_an_id_less_execution_is_not_recovered_again_from_history(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    first_in = [{"role": "user", "content": "Find leave policy"}]
+    first_out = {
+        "role": "assistant",
+        "tool_calls": [{"id": "c1", "function": {"name": "search", "arguments": "{}"}}],
+    }
+    second_in = [
+        *first_in,
+        first_out,
+        {"role": "tool", "tool_call_id": "c1", "content": "20 days"},
+    ]
+    spans = [
+        _span(
+            "m1",
+            "chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "input.value": json.dumps(first_in),
+                "output.value": json.dumps(first_out),
+            },
+        ),
+        _span(
+            "t1",
+            "search",
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "search",
+                "output.value": "20 days",
+            },
+            parent="m1",
+            at=1,
+        ),
+        _span(
+            "m2",
+            "chat",
+            {
+                "gen_ai.operation.name": "chat",
+                "input.value": json.dumps(second_in),
+                "output.value": "20 days.",
+            },
+            at=2,
+        ),
+    ]
+    path = _write(tmp_path / "noid.jsonl", _request(spans))
+
+    trace = _only_trace(load_otlp_standard(path))
+    messages, _, _ = build_transcript(trace)
+
+    assert [s.span_id for s in trace.spans if s.kind is SpanKind.TOOL] == ["t1"]
+    assert [m.role for m in messages].count("tool") == 1
+
+
+def test_input_the_transcript_cannot_show_refuses_the_row(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    # Retrieval evidence handed to the model as a tool-role message with no call
+    # to answer. The transcript has nowhere to put it, so the row must go.
+    answer_in = [
+        {"role": "user", "content": "How many days?"},
+        {"role": "tool", "content": "Policy: employees get 20 days."},
+    ]
+    spans = [
+        _span("root", "rag", {"langfuse.observation.type": "SPAN"}),
+        _span(
+            "search",
+            "retrieve",
+            {
+                "langfuse.observation.type": "RETRIEVER",
+                "input.value": "days",
+                "output.value": "Policy: employees get 20 days.",
+            },
+            parent="root",
+        ),
+        _span(
+            "gen",
+            "answer",
+            {
+                "langfuse.observation.type": "GENERATION",
+                "input.value": json.dumps(answer_in),
+                "output.value": "20 days.",
+            },
+            parent="root",
+            at=1,
+        ),
+    ]
+    path = _write(tmp_path / "evidence.jsonl", _request(spans))
+
+    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
+
+    assert any("input" in d and "does not show" in d for d in defects)
+
+
+def test_evidence_the_transcript_carries_keeps_the_row(tmp_path) -> None:
+    from bandits.export import build_transcript
+
+    answer_in = [{"role": "user", "content": "How many days?\nDocs: employees get 20 days."}]
+    spans = [
+        _span("root", "rag", {"langfuse.observation.type": "SPAN"}),
+        _span(
+            "search",
+            "retrieve",
+            {"langfuse.observation.type": "RETRIEVER", "output.value": "20 days"},
+            parent="root",
+        ),
+        _span(
+            "gen",
+            "answer",
+            {
+                "langfuse.observation.type": "GENERATION",
+                "input.value": json.dumps(answer_in),
+                "output.value": "20 days.",
+            },
+            parent="root",
+            at=1,
+        ),
+    ]
+    path = _write(tmp_path / "carried.jsonl", _request(spans))
+
+    messages, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
+
+    assert defects == ()
+    assert messages[0].content == "How many days?\nDocs: employees get 20 days."
