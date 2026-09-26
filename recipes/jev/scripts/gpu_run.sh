@@ -18,7 +18,9 @@
 #   PHASE        1 or 2 (required)
 #   PROJECTS     space-separated Bandits project dirs, each holding .bandits (required)
 #   JUDGE_RUNS   space-separated turn-judge run ids inside them (required)
-#   MODELS       default: "Qwen/Qwen3.5-4B-Base Qwen/Qwen3.5-4B"
+#   MODELS       default: "Qwen/Qwen3.5-4B-Base Qwen/Qwen3.5-4B". Pin a model's revision as
+#                model@sha; an unpinned model uses the Hub's current sha. The end of the run
+#                prints each model pinned, to pass to the next phase so it trains the same snapshot
 #   SEED         default: 1
 #   GPU_USD_PER_HOUR                         the box's hourly price, for the cost columns (optional)
 #   LEDGERS                                  space-separated judge ledgers, to price the verifier (optional)
@@ -147,8 +149,15 @@ if [[ -n "${GPU_USD_PER_HOUR:-}" ]]; then
   price_args+=(--gpu-usd-per-hour "$GPU_USD_PER_HOUR")
 fi
 
-for model in $MODELS; do
-  revision="$(curl -fsS "https://huggingface.co/api/models/$model" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+pinned=()
+for spec in $MODELS; do
+  model="${spec%%@*}"
+  if [[ "$spec" == *@* ]]; then
+    revision="${spec#*@}"
+  else
+    revision="$(curl -fsS "https://huggingface.co/api/models/$model" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+  fi
+  pinned+=("$model@$revision")
   name="${model//\//__}"
   log "smoke: $model@$revision"
   (cd "$RECIPE" && uv run --no-sync python scripts/smoke.py \
@@ -181,4 +190,5 @@ tar -czf "$OUT.tar.gz" \
   $(cd "$(dirname "$OUT")" && ls "$(basename "$OUT")"/*.json "$(basename "$OUT")"/*.log 2>/dev/null) \
   -C "$(dirname "$PROJECT")" "$(basename "$PROJECT")/.bandits/derived"
 echo "reports: $OUT/reports"
+echo "models as run (pass as MODELS to repeat on the same snapshots): ${pinned[*]}"
 echo "copy back: $OUT.tar.gz (reports, derived artifacts, smoke results, logs; no checkpoints)"
