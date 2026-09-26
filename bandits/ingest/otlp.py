@@ -375,8 +375,24 @@ def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
         root = next((span for span in spans if span.parent_span_id not in exported_ids), None)
     if root is None:
         return None, None, {}
-    attributes = root.attributes
+    return context_from_attributes(root.attributes)
+
+
+def context_from_attributes(attributes: dict[str, Any]) -> tuple[object, str | None, dict]:
+    """The toolset, system prompt and settings one span's attributes declare."""
     system_prompt = _first(attributes, _SYSTEM_PROMPT_KEYS)
+    if isinstance(system_prompt, str) and system_prompt.lstrip().startswith("["):
+        system_prompt = _json_value(system_prompt)
+    if isinstance(system_prompt, list):
+        # GenAI semconv records system instructions as a list of parts.
+        text = [
+            part["content"]
+            for part in system_prompt
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("content"), str)
+        ]
+        system_prompt = "\n".join(text) if text else None
     return (
         parse_toolset(_first(attributes, _TOOLSET_KEYS)),
         system_prompt if isinstance(system_prompt, str) else None,
@@ -453,6 +469,7 @@ def assemble_corpus(
     source_digest: str,
     issues: list[TraceIssue],
     redaction_ruleset: str,
+    episode_attributes: dict[str, dict[str, Any]] | None = None,
 ) -> TraceCorpus:
     """Order each trace's spans and read its episode-level context.
 
@@ -460,6 +477,10 @@ def assemble_corpus(
     names, how an episode is assembled from them does not depend on how the
     export laid them out. ``spans_by_trace`` pairs each span with its position
     in the source, which breaks timestamp ties.
+
+    ``episode_attributes`` is the episode root's own attributes, for an adapter
+    that did not keep the root as a span (an agent or workflow wrapper). What it
+    declares wins; the first kept span fills in only what it leaves unsaid.
     """
     traces = []
     for trace_id, collected in sorted(spans_by_trace.items()):
@@ -471,6 +492,12 @@ def assemble_corpus(
         )
         ordered = _embedded_tool_spans(ordered)
         tools, system_prompt, context = _declared_context(ordered)
+        declared = (episode_attributes or {}).get(trace_id)
+        if declared:
+            root_tools, root_prompt, root_context = context_from_attributes(declared)
+            tools = root_tools if root_tools is not None else tools
+            system_prompt = root_prompt if root_prompt is not None else system_prompt
+            context = {**context, **root_context}
         traces.append(
             Trace(
                 trace_id=trace_id,

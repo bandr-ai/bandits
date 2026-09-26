@@ -504,3 +504,58 @@ def test_dispatch_and_cli(tmp_path) -> None:
     )
     assert result.exit_code == 0, result.stdout
     assert "traces:      1" in result.stdout
+
+
+def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
+    tools = [
+        {
+            "type": "function",
+            "name": "refund",
+            "description": "Refund an order",
+            "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}},
+        }
+    ]
+    root = _span(
+        "agent",
+        "invoke_agent support",
+        {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.system_instructions": json.dumps(
+                [{"type": "text", "content": "Refund only paid orders."}]
+            ),
+            "gen_ai.tool.definitions": json.dumps(tools),
+            "gen_ai.request.model": "gpt-5",
+        },
+    )
+    chat = _span(
+        "c",
+        "chat",
+        {"gen_ai.operation.name": "chat", "input.value": "Refund 7741"},
+        parent="agent",
+    )
+    path = _write(tmp_path / "agent.jsonl", _request([root, chat]))
+
+    trace = _only_trace(load_otlp_standard(path))
+
+    assert [s.span_id for s in trace.spans] == ["c"]
+    assert trace.system_prompt == "Refund only paid orders."
+    assert [t.name for t in trace.tools_available or ()] == ["refund"]
+    assert trace.runtime_context == {"gen_ai.request.model": "gpt-5"}
+
+
+def test_cyclic_parent_ids_are_issues_not_a_hang(tmp_path) -> None:
+    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
+    spans = [
+        _span("self", "chat", chat, parent="self"),
+        _span("x", "chain", {"openinference.span.kind": "CHAIN"}, parent="y"),
+        _span("y", "chain", {"openinference.span.kind": "CHAIN"}, parent="x"),
+        _span("child", "chat", chat, parent="x", at=1),
+        _span("ok", "chat", chat, at=2),
+    ]
+    path = _write(tmp_path / "cycle.jsonl", _request(spans))
+
+    corpus = load_otlp_standard(path)
+
+    assert [s.span_id for s in _only_trace(corpus).spans] == ["child", "ok"]
+    looped = [i for i in corpus.issues if i.kind == "malformed_span"]
+    assert sorted(i.detail.split()[1] for i in looped) == ["self", "x", "y"]
