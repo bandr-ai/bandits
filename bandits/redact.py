@@ -176,11 +176,15 @@ def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Re
     chunks: list[bytes] = []
     issues: list[TraceIssue] = []
     cursor = 0
+    # Matches arrive in order, so each line number is counted on from the last
+    # one; counting from the top every time is quadratic on a large export.
+    line, counted_to = 1, 0
     for start, end, kind in spans:
         chunks.append(original[cursor:start])
         chunks.append(_REPLACEMENT % kind.encode())
         cursor = end
-        line = original.count(_NEWLINE, 0, start) + 1
+        line += original.count(_NEWLINE, counted_to, start)
+        counted_to = start
         issues.append(
             TraceIssue(
                 kind="redaction",
