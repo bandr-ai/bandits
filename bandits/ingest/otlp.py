@@ -163,7 +163,14 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     explicitly marked synthetic.
     """
     calls: dict[str, tuple[str, str, dict[str, Any]]] = {}
-    emitted: set[str] = set()
+    # A call the export also recorded as its own execute_tool span is already
+    # represented; re-deriving it from the messages would count it twice.
+    emitted: set[str] = {
+        call_id
+        for span in spans
+        if span.kind is SpanKind.TOOL
+        and isinstance(call_id := span.attributes.get("gen_ai.tool.call.id"), str)
+    }
     combined: list[Span] = []
 
     for span in spans:
@@ -426,6 +433,34 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
         if lineage_id is not None:
             lineage_by_trace.setdefault(trace_id, lineage_id)
 
+    return assemble_corpus(
+        spans_by_trace,
+        task_by_trace=task_by_trace,
+        lineage_by_trace=lineage_by_trace,
+        source="otlp",
+        source_digest=source_digest,
+        issues=issues,
+        redaction_ruleset=source.ruleset,
+    )
+
+
+def assemble_corpus(
+    spans_by_trace: dict[str, list[tuple[int, Span]]],
+    *,
+    task_by_trace: dict[str, str],
+    lineage_by_trace: dict[str, str],
+    source: str,
+    source_digest: str,
+    issues: list[TraceIssue],
+    redaction_ruleset: str,
+) -> TraceCorpus:
+    """Order each trace's spans and read its episode-level context.
+
+    Shared by every OTLP-family adapter: once spans carry the GenAI attribute
+    names, how an episode is assembled from them does not depend on how the
+    export laid them out. ``spans_by_trace`` pairs each span with its position
+    in the source, which breaks timestamp ties.
+    """
     traces = []
     for trace_id, collected in sorted(spans_by_trace.items()):
         # Source order breaks ties, not span_id: exporters often stamp a whole
@@ -439,7 +474,7 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
         traces.append(
             Trace(
                 trace_id=trace_id,
-                source="otlp",
+                source=source,
                 source_digest=source_digest,
                 task=task_by_trace.get(trace_id),
                 lineage_id=lineage_by_trace.get(trace_id),
@@ -451,8 +486,8 @@ def load_otlp(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> TraceC
             )
         )
     return TraceCorpus(
-        source="otlp",
+        source=source,
         traces=tuple(traces),
         issues=tuple(issues),
-        redaction_ruleset=source.ruleset,
+        redaction_ruleset=redaction_ruleset,
     )

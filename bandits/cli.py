@@ -125,11 +125,19 @@ def ingest(
         "RLM command to remember: every mining, audit and assignment run "
         "reading this corpus strips it before a model ever sees it.",
     ),
+    pipeline_steps: bool = typer.Option(
+        True,
+        "--pipeline-steps/--no-pipeline-steps",
+        help="otlp-std only. Keep declared workflow steps with no model or tool call "
+        "beneath them (a retrieval, a rerank) as tool spans the agent did not call.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Load a trace export into the local artifact store."""
     try:
-        corpus = load_corpus(path, source, ruleset_by_name(redaction))
+        corpus = load_corpus(
+            path, source, ruleset_by_name(redaction), pipeline_steps=pipeline_steps
+        )
     except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
