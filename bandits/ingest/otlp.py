@@ -537,6 +537,7 @@ def assemble_corpus(
     issues: list[TraceIssue],
     redaction_ruleset: str,
     episode_attributes: dict[str, dict[str, Any]] | None = None,
+    trace_extras: dict[str, dict[str, Any]] | None = None,
 ) -> TraceCorpus:
     """Order each trace's spans and read its episode-level context.
 
@@ -589,8 +590,10 @@ def assemble_corpus(
                 tools_available=tools,  # type: ignore[arg-type]
                 system_prompt=system_prompt,
                 runtime_context=context,
-                user_turns=_user_turns(ordered),
                 spans=ordered,
+                # A workflow's extras replace user turns entirely: a model's
+                # prompt is the program talking, never a person.
+                **{"user_turns": _user_turns(ordered), **(trace_extras or {}).get(trace_id, {})},
             )
         )
     return TraceCorpus(

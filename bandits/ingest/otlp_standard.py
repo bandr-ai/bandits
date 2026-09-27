@@ -61,7 +61,16 @@ from bandits.ingest.otlp import (
     assemble_corpus,
 )
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
-from bandits.traces import Span, SpanKind, SpanStatus, TraceCorpus, TraceIssue
+from bandits.traces import (
+    Span,
+    SpanKind,
+    SpanStatus,
+    TraceCorpus,
+    TraceIssue,
+    UserTurn,
+    WorkflowDeclaration,
+    WorkflowNode,
+)
 
 SOURCE = "otlp-std"
 
@@ -957,6 +966,47 @@ def _episode_root(spans: dict[str, _Decoded]) -> _Decoded | None:
     return min(roots, key=lambda s: (s.parent_id is not None, s.started_at, s.index), default=None)
 
 
+_CONTAINER_MARKERS = (("langfuse.synthetic_span", "trace_record"),)
+"""Attributes by which a converter declares a span it made itself to hold
+trace-level fields. Such a span records nothing the application did: it is a
+structural root, never the invocation."""
+
+
+def _is_container(span: _Decoded) -> bool:
+    return any(span.attributes.get(key) == value for key, value in _CONTAINER_MARKERS)
+
+
+def _framework(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Framework metadata a node recorded (``langgraph_step`` and its kind)."""
+    return {
+        key.rsplit(".", 1)[-1]: value
+        for key, value in attributes.items()
+        if key.rsplit(".", 1)[-1].startswith("langgraph_")
+    }
+
+
+def _invocation_candidates(spans: dict[str, _Decoded]) -> list[str]:
+    """Outermost spans once converter containers are looked through.
+
+    A model or tool call is never a candidate: a lone call surviving at the top
+    of a partial export is not the application run that made it.
+    """
+    out = []
+    for span in sorted(spans.values(), key=lambda s: (s.started_at, s.index)):
+        if _is_container(span) or span.role in (_MODEL, _TOOL, _EXCLUDED):
+            continue
+        parent, seen, outermost = span.parent_id, {span.span_id}, True
+        while parent in spans and parent not in seen:
+            if not _is_container(spans[parent]):
+                outermost = False
+                break
+            seen.add(parent)
+            parent = spans[parent].parent_id
+        if outermost:
+            out.append(span.span_id)
+    return out
+
+
 def _files(path: Path) -> list[Path]:
     if not path.is_dir():
         return [path]
@@ -968,8 +1018,19 @@ def load_otlp_standard(
     ruleset: RedactionRuleset = DEFAULT_RULESET,
     *,
     pipeline_steps: bool = True,
+    workflow: WorkflowDeclaration | None = None,
 ) -> TraceCorpus:
-    """Read a standard OTLP/JSON export (a file or a directory) into one corpus."""
+    """Read a standard OTLP/JSON export (a file or a directory) into one corpus.
+
+    ``workflow`` declares the export a program-driven workflow. Then no model
+    input becomes a user turn, the task comes only from the declared fields of
+    the invocation record, steps containing model calls are kept as structure,
+    and each model call gets evidence links (``bandits.ingest.workflow``).
+    """
+    from bandits.ingest.workflow import build_request
+
+    workflow_extras: dict[str, dict[str, Any]] = {}
+    workflow_counts: Counter[str] = Counter()
     files = _files(path)
     if not files:
         raise FileNotFoundError(f"no .json or .jsonl files under {path}")
@@ -1040,7 +1101,13 @@ def load_otlp_standard(
                     collected.append((span.index, _to_span(span, as_step=True, unparsed=unparsed)))
                 else:
                     unrepresented[span.label] += 1
-            elif span.role == _EXCLUDED or (span.role == _NONE and span.span_id not in covered):
+            elif span.role == _EXCLUDED or (
+                span.role == _NONE
+                and span.span_id not in covered
+                # A workflow keeps these as structure (below); only a converter's
+                # container is left out, and it is reported.
+                and (workflow is None or _is_container(span))
+            ):
                 unrepresented[span.label] += 1
             # Otherwise a step with calls beneath it (represented by them) or a
             # span inside a selected step (represented by the step).
@@ -1066,6 +1133,83 @@ def load_otlp_standard(
             continue
         spans_by_trace[trace_id] = collected
         root = _episode_root(decoded)
+        if workflow is not None:
+            candidates = _invocation_candidates(decoded)
+            scratch: Counter[str] = Counter()
+            records = {
+                span_id: {
+                    "input": _io_value(decoded[span_id].attributes, _INPUT_VALUE_KEYS, scratch),
+                    "output": _io_value(decoded[span_id].attributes, _OUTPUT_VALUE_KEYS, scratch),
+                }
+                for span_id in candidates
+            }
+            request = build_request(candidates=candidates, records=records, declaration=workflow)
+            if request.source_span_id is None:
+                issues.append(
+                    TraceIssue(
+                        kind="ambiguous_invocation",
+                        detail=f"trace {trace_id}: {request.invocation_basis}; candidates: "
+                        f"{', '.join(request.candidate_span_ids) or 'none'}",
+                    )
+                )
+            else:
+                # The invocation, not the converter's container, is the episode's context.
+                root = decoded[request.source_span_id]
+                # It is the episode record, never one of its actions: a code-only
+                # invocation would otherwise also be kept as a pipeline step.
+                spans_by_trace[trace_id] = [
+                    pair for pair in collected if pair[1].span_id != request.source_span_id
+                ]
+            workflow_counts[request.task_status] += 1
+            # Every recorded step not already kept as a span is structure: steps
+            # containing calls, and the code-only records inside a kept pipeline
+            # step, whose output is often its own (a scoring, a search backend).
+            kept_as_span = steps if pipeline_steps else set()
+            nodes = tuple(
+                WorkflowNode(
+                    span_id=span.span_id,
+                    parent_span_id=span.parent_id,
+                    name=span.name,
+                    started_at=span.started_at,
+                    ended_at=span.ended_at,
+                    input=_io_value(span.attributes, _INPUT_VALUE_KEYS, unparsed),
+                    output=_io_value(span.attributes, _OUTPUT_VALUE_KEYS, unparsed),
+                    status=SpanStatus.ERROR if span.error else SpanStatus.OK,
+                    framework=_framework(span.attributes),
+                    attributes={
+                        key: value
+                        for key, value in span.attributes.items()
+                        if key not in _INPUT_VALUE_KEYS and key not in _OUTPUT_VALUE_KEYS
+                    },
+                )
+                for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
+                if span.role in (_STEP, _NONE)
+                and span.span_id not in kept_as_span
+                and span.span_id != request.source_span_id
+                and not _is_container(span)
+            )
+            turns: tuple[UserTurn, ...] = ()
+            if request.origin == "human" and request.task is not None:
+                turns = (UserTurn(text=request.task, after_span_id=None, origin="declared"),)
+            workflow_extras[trace_id] = {
+                "interaction": "workflow",
+                "request": request,
+                "workflow_nodes": nodes,
+                "user_turns": turns,
+                "task_source": (
+                    f"declared field {request.task_path} of span {request.source_span_id}"
+                    if request.task_path
+                    else None
+                ),
+            }
+            if request.task is not None:
+                task_by_trace[trace_id] = request.task
+            if root is not None:
+                episode_attributes[trace_id] = {
+                    **root.attributes,
+                    **_normalized_messages(root.attributes, root.events, prompt_is_text=False),
+                }
+            continue
         if root is not None:
             episode_attributes[trace_id] = {
                 **root.attributes,
@@ -1095,7 +1239,19 @@ def load_otlp_standard(
             )
         )
 
-    return assemble_corpus(
+    if workflow is not None:
+        for status in ("unresolved", "conflict"):
+            if workflow_counts[status]:
+                issues.append(
+                    TraceIssue(
+                        kind=f"task_{status}",
+                        detail=f"{workflow_counts[status]} workflow trace(s) have their task "
+                        f"{status}; see each trace's request.task_reason",
+                        location=str(path),
+                    )
+                )
+
+    corpus = assemble_corpus(
         spans_by_trace,
         task_by_trace=task_by_trace,
         lineage_by_trace=lineage_by_trace,
@@ -1104,4 +1260,14 @@ def load_otlp_standard(
         issues=issues,
         redaction_ruleset=ruleset_name,
         episode_attributes=episode_attributes,
+        trace_extras=workflow_extras,
     )
+    if workflow is None:
+        return corpus
+    from bandits.ingest.workflow import build_evidence
+
+    traces = tuple(
+        trace.replace(evidence=build_evidence(trace.spans, trace.workflow_nodes, trace.request))
+        for trace in corpus.traces
+    )
+    return corpus.replace(traces=traces, workflow=workflow)

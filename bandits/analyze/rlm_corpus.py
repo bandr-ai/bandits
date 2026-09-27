@@ -168,7 +168,8 @@ def _trajectory_messages(
     for turn in trace.user_turns:
         text = _strip_control_markers(turn.text, control_markers, removed)
         if text:
-            by_anchor.setdefault(turn.after_span_id, []).append(f"[user] {text}")
+            label = "[user, declared request]" if turn.origin == "declared" else "[user]"
+            by_anchor.setdefault(turn.after_span_id, []).append(f"{label} {text}")
 
     known = {span.span_id for span in trace.spans}
     lines: list[str] = list(by_anchor.pop(None, []))
@@ -180,6 +181,43 @@ def _trajectory_messages(
         lines.append(_render_span(span, removed))
         lines.extend(by_anchor.pop(span.span_id, []))
     return tuple(lines), tuple(sorted(removed))
+
+
+def _request_view(trace: Trace, control_markers: Sequence[str]) -> UserMessageView:
+    """A workflow's request record: the declared task, or the raw invocation input.
+
+    Never a model's prompt, and never a user turn: a workflow's request is what
+    the application run received, whoever sent it. An unresolved task is shown
+    as the raw input marked as such, for the miner to interpret.
+    """
+    request = trace.request
+    if request is None or request.source_span_id is None:
+        return UserMessageView(
+            trace_id=trace.trace_id,
+            readable=False,
+            unreadable_reason=(
+                "no workflow request record: the trace was not ingested as a workflow, "
+                "or no invocation could be selected"
+            ),
+        )
+    removed: set[str] = set()
+    if request.task is not None:
+        text = _strip_control_markers(request.task, control_markers, removed)
+        messages = (text,) if text else ()
+    else:
+        # Never cut: the request is the whole of this view, and a cut can remove
+        # the very field the miner needs while the view still reads as complete.
+        raw = json.dumps(_redact(request.raw_input, removed), sort_keys=True, default=str)
+        messages = (f"[raw request record, task {request.task_status}] {raw}",)
+    if not messages:
+        return UserMessageView(
+            trace_id=trace.trace_id,
+            readable=False,
+            unreadable_reason="the request record is empty",
+        )
+    return UserMessageView(
+        trace_id=trace.trace_id, messages=messages, withheld_fields=tuple(sorted(removed))
+    )
 
 
 def build_view(
@@ -204,6 +242,9 @@ def build_view(
     its own literal tokens through ``ReadOnlyCorpus``, at the boundary where
     that source-specific fact belongs — never baked in here for every caller.
     """
+    if view is TraceView.REQUEST:
+        return _request_view(trace, control_markers)
+
     if view is TraceView.FULL_TRAJECTORY:
         lines, withheld = _trajectory_messages(trace, control_markers)
         if not lines:

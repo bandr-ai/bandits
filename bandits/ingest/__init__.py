@@ -15,7 +15,7 @@ from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
-from bandits.traces import TraceCorpus
+from bandits.traces import TraceCorpus, WorkflowDeclaration
 
 CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "otlp-std", "chat-json", "claude-code", "trail")
 
@@ -38,11 +38,12 @@ def load_corpus(
     ruleset: RedactionRuleset = DEFAULT_RULESET,
     *,
     pipeline_steps: bool = True,
+    workflow: WorkflowDeclaration | None = None,
 ) -> TraceCorpus:
     """Read a raw export into a :class:`TraceCorpus` using the declared adapter.
 
-    ``pipeline_steps`` is read only by ``otlp-std``, the one source that
-    declares workflow steps apart from model and tool calls.
+    ``pipeline_steps`` and ``workflow`` are read only by ``otlp-std``, the one
+    source that declares workflow steps apart from model and tool calls.
     """
     loader = _LOADERS.get(source)
     if loader is None:
@@ -50,7 +51,11 @@ def load_corpus(
             f"unknown source {source!r}; declare one of {list(CANONICAL_SOURCES)}"
         )
     if source == "otlp-std":
-        return load_otlp_standard(Path(path), ruleset, pipeline_steps=pipeline_steps)
+        return load_otlp_standard(
+            Path(path), ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+        )
+    if workflow is not None:
+        raise ValueError(f"workflow mode is an otlp-std option; source {source!r} has none")
     if not pipeline_steps:
         raise ValueError(f"pipeline steps are an otlp-std option; source {source!r} has none")
     return loader(Path(path), ruleset)

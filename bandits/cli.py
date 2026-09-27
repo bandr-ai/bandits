@@ -95,6 +95,7 @@ from bandits.export import (
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
+from bandits.traces import WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -131,12 +132,60 @@ def ingest(
         help="otlp-std only. Keep declared workflow steps with no model or tool call "
         "beneath them (a retrieval, a rerank) as tool spans the agent did not call.",
     ),
+    mode: str = typer.Option(
+        "conversation",
+        "--mode",
+        help="otlp-std only. 'workflow': a program called the models, so no model "
+        "input becomes a user turn; the task comes only from --task-field.",
+    ),
+    task_field: list[str] = typer.Option(
+        [],
+        "--task-field",
+        help="Workflow only. Path into the invocation record holding the request, "
+        "e.g. input.query. Repeatable; the first present wins, and disagreeing "
+        "values leave the task unresolved. None: the task stays unresolved.",
+    ),
+    delivered_field: str = typer.Option(
+        None,
+        "--delivered-field",
+        help="Workflow only. Path into the invocation record holding what was "
+        "delivered, e.g. output.answer.",
+    ),
+    request_origin: str = typer.Option(
+        "unknown",
+        "--request-origin",
+        help="Workflow only. Who started the runs: human, machine or unknown. Only "
+        "'human' records the request as a (declared) user turn.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Load a trace export into the local artifact store."""
+    workflow = None
+    if mode not in ("conversation", "workflow"):
+        console.print(f"[red]error:[/red] --mode must be conversation or workflow, not {mode!r}")
+        raise typer.Exit(code=1)
+    if mode == "workflow":
+        if request_origin not in ("human", "machine", "unknown"):
+            console.print("[red]error:[/red] --request-origin must be human, machine or unknown")
+            raise typer.Exit(code=1)
+        workflow = WorkflowDeclaration(
+            task_fields=tuple(task_field),
+            delivered_field=delivered_field,
+            request_origin=request_origin,  # type: ignore[arg-type]
+        )
+    elif task_field or delivered_field or request_origin != "unknown":
+        console.print(
+            "[red]error:[/red] --task-field, --delivered-field and --request-origin "
+            "need --mode workflow"
+        )
+        raise typer.Exit(code=1)
     try:
         corpus = load_corpus(
-            path, source, ruleset_by_name(redaction), pipeline_steps=pipeline_steps
+            path,
+            source,
+            ruleset_by_name(redaction),
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
         )
     except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
         console.print(f"[red]error:[/red] {exc}")
@@ -454,6 +503,17 @@ def _corpus_traces(corpus_id: str, project: Path, trace_ids: tuple[str, ...] | N
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no corpus {corpus_id!r}")
         raise typer.Exit(code=1) from exc
+    if corpus.workflow is not None:
+        # Every caller here reads next-state turns, which pair each model call
+        # with whatever came after it in time. On a workflow that credits parallel
+        # stages with each other's results; stage-aware evaluation replaces it.
+        console.print(
+            f"[red]error:[/red] {corpus_id} was ingested as a workflow; next-state turn "
+            "judging does not support workflow corpora yet (it would pair calls by time, "
+            "not by recorded relationships). Its requests, nodes and evidence links can "
+            "be inspected, and mined with --view request."
+        )
+        raise typer.Exit(code=1)
     traces = corpus.traces
     if trace_ids is not None:
         wanted = set(trace_ids)
@@ -944,7 +1004,8 @@ def mine_rlm_command(
         "--view",
         help=(
             "user-messages (Path U), full-trajectory (Path F: adds assistant turns and "
-            "tool activity, rewards withheld), or first-user-message."
+            "tool activity, rewards withheld), first-user-message, or request "
+            "(workflow corpora: the request each run received, never its internal prompts)."
         ),
     ),
     chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
