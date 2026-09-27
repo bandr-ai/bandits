@@ -307,6 +307,54 @@ def import_predictions_command(
     console.print(f"rejected:      {len(run.rejections)}")
 
 
+@app.command(name="score-api")
+def score_api_command(
+    dataset_id: str,
+    output: Path = typer.Option(..., "--output", help="Resumable Jev prediction JSONL."),
+    split: str = typer.Option("test", "--split"),
+    allow_test: bool = typer.Option(False, "--allow-test", help="Required for the locked test split."),
+    model: str = typer.Option("jev-latest", "--model"),
+    workers: int = typer.Option(8, "--workers", min=1, max=64),
+    base_url: str = typer.Option("https://api.typesafe.ai", "--base-url"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Call Jev on a dataset split and save import-compatible predictions.
+
+    Reads JEV_API_KEY (or TYPESAFE_API_KEY). Each completed request is
+    appended immediately, so rerunning the same command resumes safely.
+    """
+    from bandits_jev.dataset import load_decision_dataset
+    from bandits_jev.jev_api import score_jev_api
+
+    if split not in _DECISION_SPLITS:
+        console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
+        raise typer.Exit(code=1)
+    if split == "test" and not allow_test:
+        console.print("[red]error:[/red] scoring the test split requires --allow-test")
+        raise typer.Exit(code=1)
+    try:
+        dataset = load_decision_dataset(dataset_id, _derived(project))
+        examples = [example for example in dataset.examples if example.split == split]
+        if not examples:
+            raise ValueError(f"no examples in split {split!r}")
+        rows, errors = score_jev_api(
+            examples,
+            output,
+            model=model,
+            base_url=base_url,
+            workers=workers,
+            progress=lambda done, total: console.print(f"scored: {done}/{total}"),
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"predictions: {len(rows)}/{len(examples)}")
+    console.print(f"output:      {output}")
+    if errors:
+        console.print(f"[yellow]failed after retries:[/yellow] {len(errors)}; rerun to retry")
+        raise typer.Exit(code=2)
+
+
 @app.command(name="calibrate")
 def calibrate_command(
     scorer_run_id: str = typer.Argument(..., help="A scorer run over the calibration split (trained model)."),
