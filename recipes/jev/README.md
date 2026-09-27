@@ -38,6 +38,7 @@ This takes a Bandits turn-judge run (or a dataset id from `jev import`) through 
 | `jev train <dataset>` | LoRA fine-tune on train; the best checkpoint is picked on dev |
 | `jev calibrate <scorer-run>` | Fit one temperature on the calibration split |
 | `jev import-predictions <file>` | Bring in another system's answers (e.g. real Jev) with its bill |
+| `jev score-api <dataset> --output jev.jsonl` | Call real Jev; resumable, reads `JEV_API_KEY` |
 | `jev verifier-cost <dataset> --ledger ...` | Price the verifier per decision from its ledger (prices are given, never guessed) |
 | `jev report ...` | The scorecard: verifier, majority baseline, untrained, trained, calibrated and Jev, with paired intervals, cost and latency |
 
