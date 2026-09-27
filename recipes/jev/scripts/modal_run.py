@@ -29,6 +29,7 @@ $0.01 cached in / $0.20 out per Mtok. Override them if your bill differs.
 from __future__ import annotations
 
 import collections
+import hashlib
 import os
 import subprocess
 from datetime import UTC, datetime
@@ -39,9 +40,13 @@ import modal
 if modal.is_local():
     REPO = Path(__file__).resolve().parents[3]
     WORK = Path(os.environ.get("JEV_WORK", REPO / "work")).resolve()
+    # JEV_IMPORT: a labeled JSONL (the `jev import` format) to train and score
+    # on instead of the judge runs. Read here because it goes into the image.
+    IMPORT = Path(os.environ["JEV_IMPORT"]).resolve() if os.environ.get("JEV_IMPORT") else None
 else:
     # In the container this file sits at /root, and the image is already built.
     REPO = WORK = Path("/")
+    IMPORT = None
 
 JUDGE_RUNS = "turn-judge-0044b8f5c041155c turn-judge-b83480800ad90a25 turn-judge-d450cf34d97b27a2"
 """TRAIL GAIA (v2), TRAIL SWE (v3) and tau2: the launch data (no shared traces)."""
@@ -93,6 +98,9 @@ image = (
         "cd /repo/recipes/jev && uv pip install flash-linear-attention",
     )
 )
+
+if IMPORT is not None:
+    image = image.add_local_file(str(IMPORT), "/work/import.jsonl", copy=True)
 
 runs = modal.Volume.from_name("jev-runs", create_if_missing=True)
 hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
@@ -191,6 +199,13 @@ def main(
     }
     if models:
         extra["MODELS"] = models
+    if IMPORT is not None:
+        # Its own project, keyed by the file's content, so an import run never
+        # shares artifacts with the judge-run project or another import.
+        digest = hashlib.sha256(IMPORT.read_bytes()).hexdigest()[:12]
+        extra.update({"IMPORT": "/work/import.jsonl", "PROJECT_DIR": f"/runs/jev-project-import-{digest}"})
+        extra.pop("LEDGERS")
+        tag = tag or f"import-{IMPORT.stem}"
     if held_out_swe:
         extra["HELD_OUT_RUNS"] = SWE_JUDGE_RUN
     if not tag and len(models.split()) == 1:
