@@ -46,6 +46,7 @@ Run `uv run jev <command> --help` for options.
 
 ## Docs
 
+- **[Locked test results](docs/launch-results.md): measured launch claims and caveats**
 - **[Launch plan](docs/launch-plan.md): the one plan for testing and launch**
 - **[Test plan and handoff](docs/run-plan.md): what each run is for, how to start it, where things stand**
 - [Original plan](docs/decision-models-plan.md) and [research notes](docs/decision-models-learnings.md)
