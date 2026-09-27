@@ -36,6 +36,8 @@
 #   DEVICE, DTYPE  default: cuda, bfloat16 (DEVICE=cpu DTYPE=float32 with a tiny model rehearses
 #                  the whole script without a GPU)
 #   SKIP_INSTALL=1 reuse the recipe's existing environment as is
+#   RESUME_FROM_STEP  continue an interrupted training from the checkpoint it saved at this step
+#                (with the same OUT, so the checkpoints are found; single-model runs only)
 #   PROJECT_DIR  default: $OUT/project. Point phase 2 at phase 1's project so its finished
 #                training runs and checkpoints are reused instead of retrained
 #   OUT          default: runs/jev-<UTC timestamp>
@@ -181,7 +183,8 @@ for spec in $MODELS; do
   jev run "$DATASET" --model "$model" --revision "$revision" --seed "$SEED" \
     --checkpoint-dir "$OUT/checkpoints/$name" --output "$OUT/reports/$name" \
     --two-order "${EVAL_ARGS[@]}" ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
-    2>&1 | tee "$OUT/run-$name.log"
+    ${RESUME_FROM_STEP:+--resume-from-step "$RESUME_FROM_STEP"} \
+    2>&1 | tee -a "$OUT/run-$name.log"
 
   if [[ -n "$TRAIN_WITHOUT_HELD_OUT" ]]; then
     held_args=()
