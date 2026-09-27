@@ -468,11 +468,21 @@ def judge_turns_command(
     temperature: float = typer.Option(0.0, "--temperature"),
     workers: int = typer.Option(8, "--workers", min=1),
     model: str = typer.Option(None, "--model"),
+    loop_rescue: bool = typer.Option(
+        True,
+        "--loop-rescue/--no-loop-rescue",
+        help="Retry a reply that boxed no score with a sampling penalty (see LOOP_RESCUES).",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Score every turn of every trace by what happened next."""
     from bandits.verify.judge import fireworks_completion
-    from bandits.verify.nextstate import DEFAULT_MODEL, judge_turns, save_turn_judge_run
+    from bandits.verify.nextstate import (
+        DEFAULT_MODEL,
+        LOOP_RESCUES,
+        judge_turns,
+        save_turn_judge_run,
+    )
 
     kind = _archetype(archetype)
     trace_ids = None
@@ -504,12 +514,15 @@ def judge_turns_command(
             kind,
             # The judge is told to think first; at the default budget one reply
             # in fifteen was cut off before the score.
-            predict=functools.partial(fireworks_completion, max_tokens=6000),
+            # A full-budget reply can queue for minutes under load; a short
+            # timeout abandoned and resent it, paying for each attempt.
+            predict=functools.partial(fireworks_completion, max_tokens=6000, timeout=600),
             model=model or DEFAULT_MODEL,
             votes=votes,
             temperature=temperature,
             workers=workers,
             on_progress=progress,
+            rescues=LOOP_RESCUES if loop_rescue else (),
         )
     envelope = save_turn_judge_run(run, _derived(project))
     console.print(f"turn_judge_run_id: {envelope.artifact_id}")
@@ -517,6 +530,7 @@ def judge_turns_command(
     console.print(f"traces:            {len(run.trace_ids)}")
     for key in ("turns", "scored", "negative", "failed"):
         console.print(f"{key + ':':<19}{envelope.summary[key]}")
+    console.print(f"rescued votes:     {sum(len(v.rescues) for v in run.verdicts)}")
     passing = sum(1 for s in run.signals if s.passes)
     console.print(f"passing traces:    {passing} of {len(run.signals)} (no negative turn)")
 
