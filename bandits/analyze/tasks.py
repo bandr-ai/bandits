@@ -56,7 +56,15 @@ def extract_task(trace: Trace) -> tuple[TaskCandidate, tuple[Evidence, ...]]:
             )
         )
     else:
-        limitations.append("source declared no instruction; the task input is unknown")
+        if trace.request is not None:
+            # A workflow whose task did not resolve still has its request record;
+            # say why rather than calling the input unknown.
+            limitations.append(
+                f"workflow task {trace.request.task_status}: "
+                f"{trace.request.task_reason or 'no reason recorded'}"
+            )
+        else:
+            limitations.append("source declared no instruction; the task input is unknown")
 
     if not trace.spans:
         limitations.append("trace has no spans; no trajectory or outcome can be read")

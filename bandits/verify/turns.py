@@ -57,6 +57,10 @@ def render_action(output: Any) -> str:
     return _as_text(output)
 
 
+class WorkflowTurnsError(ValueError):
+    """Next-state turns were asked of a workflow trace, which they cannot represent."""
+
+
 class Reaction(Contract):
     """One thing the environment or user did in response to an action."""
 
@@ -123,6 +127,12 @@ def extract_turns(trace: Trace) -> tuple[Turn, ...]:
     turns are placed by ``after_span_id`` and count as reactions to the action
     they followed.
     """
+    if trace.interaction == "workflow":
+        raise WorkflowTurnsError(
+            f"trace {trace.trace_id} is a workflow: its model calls are stages of one "
+            "program run, and pairing each with what came next in time credits parallel "
+            "stages with each other's results. Use its evidence links instead."
+        )
     user_after: dict[str | None, list[str]] = {}
     for turn in trace.user_turns:
         user_after.setdefault(turn.after_span_id, []).append(turn.text)
