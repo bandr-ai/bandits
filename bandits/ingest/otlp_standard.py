@@ -89,6 +89,7 @@ _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
             "chat": _MODEL,
             "text_completion": _MODEL,
             "generate_content": _MODEL,
+            "response": _MODEL,
             "execute_tool": _TOOL,
             "invoke_agent": _STEP,
             "invoke_workflow": _STEP,
@@ -156,6 +157,59 @@ _OUTPUT_VALUE_KEYS = (
     "gen_ai.completion",
 )
 _TOOL_NAME_KEYS = ("gen_ai.tool.name", "tool.name", "traceloop.entity.name")
+
+# Key candidates verified against the OTel/OpenInference conventions and the
+# MLflow translator tables. Every original key remains in attributes; this
+# small index is for callers that need a convention-independent view.
+_SCALAR_KEYS: dict[str, tuple[str, ...]] = {
+    "model": (
+        "gen_ai.response.model",
+        "gen_ai.request.model",
+        "llm.response.model_name",
+        "llm.model_name",
+        "llm.request.model_name",
+        "embedding.model_name",
+    ),
+    "provider": ("gen_ai.provider.name", "llm.provider", "gen_ai.system"),
+    "input_tokens": (
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.prompt_tokens",
+        "llm.token_count.prompt",
+    ),
+    "output_tokens": (
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.completion_tokens",
+        "llm.token_count.completion",
+    ),
+    "total_tokens": (
+        "gen_ai.usage.total_tokens",
+        "llm.token_count.total",
+        "llm.usage.total_tokens",
+    ),
+    "cache_read_tokens": (
+        "gen_ai.usage.cache_read.input_tokens",
+        "llm.token_count.prompt_details.cache_read",
+    ),
+    "cache_write_tokens": (
+        "gen_ai.usage.cache_creation.input_tokens",
+        "llm.token_count.prompt_details.cache_write",
+    ),
+    "reasoning_tokens": (
+        "gen_ai.usage.reasoning_tokens",
+        "llm.token_count.completion_details.reasoning",
+    ),
+    "finish_reasons": ("gen_ai.response.finish_reasons", "llm.finish_reason"),
+}
+
+
+def _scalar_index(attributes: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        name: {"source": key, "value": attributes[key]}
+        for name, keys in _SCALAR_KEYS.items()
+        if (found := _first_value(attributes, keys)) is not None
+        for key in (found[0],)
+    }
+
 
 _ROLE_ALIASES = {
     "human": "user",
@@ -480,9 +534,7 @@ def _event_messages(events: list[dict[str, Any]]) -> tuple[list | None, list | N
 
 
 def _first_value(attributes: dict[str, Any], keys: tuple[str, ...]) -> tuple[str, object] | None:
-    return next(
-        ((key, attributes[key]) for key in keys if attributes.get(key) not in (None, "")), None
-    )
+    return next(((key, attributes[key]) for key in keys if key in attributes), None)
 
 
 def _normalized_messages(
@@ -572,6 +624,7 @@ class _Decoded:
         "ended_at",
         "attributes",
         "events",
+        "source_context",
         "error",
         "role",
         "label",
@@ -723,11 +776,17 @@ def _decode_span(
 
     # A resource attribute describes every span it carries (service, session),
     # but a span's own declaration is the more specific claim.
-    attributes = {**resource, **_attributes(raw.get("attributes"))}
+    span_attributes = _attributes(raw.get("attributes"))
+    attributes = {**resource, **span_attributes}
     if isinstance(scope, dict) and isinstance(scope.get("name"), str):
         attributes.setdefault("otel.scope.name", scope["name"])
     events = [
-        {"name": event.get("name"), "attributes": _attributes(event.get("attributes"))}
+        {
+            "name": event.get("name"),
+            "attributes": _attributes(event.get("attributes")),
+            "timeUnixNano": event.get("timeUnixNano"),
+            "droppedAttributesCount": event.get("droppedAttributesCount"),
+        }
         for event in raw.get("events") or []
         if isinstance(event, dict) and isinstance(event.get("name"), str)
     ]
@@ -743,6 +802,14 @@ def _decode_span(
         ended_at=max(started_at, ended_at),
         attributes=attributes,
         events=events,
+        source_context={
+            "resource": resource,
+            "scope": scope,
+            "span_attributes": span_attributes,
+            "links": raw.get("links", []),
+            "events": raw.get("events", []),
+            "status": raw.get("status"),
+        },
         error=_is_error(raw.get("status"), attributes),
         role=role,
         label=label,
@@ -847,6 +914,9 @@ def _counted(key: str, value: object, unparsed: Counter[str]) -> object:
 
 def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Span:
     attributes = dict(decoded.attributes)
+    # Keep namespaces distinct. The flattened attributes above remain for
+    # existing convention translators; these are the recorded source facts.
+    attributes["bandits.otlp.source_context"] = decoded.source_context
     if decoded.events:
         attributes["otel.events"] = decoded.events
     attributes["bandits.declared_kind"] = decoded.label
@@ -861,6 +931,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
                 decoded.attributes, decoded.events, prompt_is_text=True, unparsed=unparsed
             )
         )
+        attributes["bandits.normalized_scalars"] = _scalar_index(decoded.attributes)
         output = _declared_completion(attributes)
         if output is None and attributes.get("gen_ai.output.messages") is None:
             # Only when no response message was found at all: a structured
@@ -1180,7 +1251,8 @@ def load_otlp_standard(
                         key: value
                         for key, value in span.attributes.items()
                         if key not in _INPUT_VALUE_KEYS and key not in _OUTPUT_VALUE_KEYS
-                    },
+                    }
+                    | {"bandits.otlp.source_context": span.source_context},
                 )
                 for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
                 if span.role in (_STEP, _NONE)
@@ -1208,12 +1280,14 @@ def load_otlp_standard(
                 episode_attributes[trace_id] = {
                     **root.attributes,
                     **_normalized_messages(root.attributes, root.events, prompt_is_text=False),
+                    "bandits.otlp.source_context": root.source_context,
                 }
             continue
         if root is not None:
             episode_attributes[trace_id] = {
                 **root.attributes,
                 **_normalized_messages(root.attributes, root.events, prompt_is_text=False),
+                "bandits.otlp.source_context": root.source_context,
             }
         ordered = [s for _, s in sorted(collected, key=lambda p: (p[1].started_at, p[0]))]
         task = _task(ordered, decoded)
