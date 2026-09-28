@@ -168,9 +168,12 @@ def _follows_escape(data: bytes, start: int) -> bool:
     return start > 0 and data[start - 1 : start] == b"\\"
 
 
-def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> RedactedSource:
-    """Read *path*, returning safe bytes while hashing the exact original bytes."""
-    original = path.read_bytes()
+def redact_bytes(
+    original: bytes,
+    location: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+) -> RedactedSource:
+    """Redact one source record; suitable for streaming independent JSONL lines."""
     spans = _matches(original, ruleset)
 
     chunks: list[bytes] = []
@@ -189,7 +192,7 @@ def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Re
             TraceIssue(
                 kind="redaction",
                 detail=f"redacted detected {kind}",
-                location=f"{path}:{line}",
+                location=f"{location}:{line}",
             )
         )
     chunks.append(original[cursor:])
@@ -200,3 +203,8 @@ def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Re
         ruleset=ruleset.name,
         issues=tuple(issues),
     )
+
+
+def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> RedactedSource:
+    """Read *path*, returning safe bytes while hashing the exact original bytes."""
+    return redact_bytes(path.read_bytes(), str(path), ruleset)

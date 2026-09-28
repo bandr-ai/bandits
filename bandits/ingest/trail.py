@@ -36,11 +36,6 @@ SOURCE = "trail"
 _KIND_KEY = "openinference.span.kind"
 _DURATION = re.compile(r"^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$")
 
-_MAX_TEXT = 4000
-"""Per-field cap on recorded text. Execution logs and page dumps run to tens of
-thousands of characters; a turn reader needs the head, and the source file is
-still there for anything else."""
-
 
 def _parse_duration(value: object) -> timedelta:
     if isinstance(value, (int, float)):
@@ -66,16 +61,8 @@ def _timestamp(value: object) -> datetime | None:
         return None
 
 
-def _clip(value: object, limit: int = _MAX_TEXT) -> Any:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        try:
-            value = json.dumps(value, default=str)
-        except (TypeError, ValueError):
-            value = str(value)
-    if len(value) > limit:
-        return value[:limit] + "…[truncated]"
+def _clip(value: object, limit: int = 4000) -> Any:
+    """Keep complete source values; previews belong in rendering, not ingest."""
     return value
 
 
@@ -157,7 +144,10 @@ def _span(
         status=status,
         arguments=arguments,
         output=output,
-        attributes={"trail.span_name": raw.get("span_name")},
+        attributes={
+            "trail.span_name": raw.get("span_name"),
+            "trail.source_record": {k: v for k, v in raw.items() if k != "child_spans"},
+        },
     )
 
 

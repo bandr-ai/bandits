@@ -11,13 +11,23 @@ from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
+from bandits.ingest.native import load_native
 from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
 from bandits.traces import TraceCorpus, WorkflowDeclaration
 
-CANONICAL_SOURCES: tuple[str, ...] = ("otlp", "otlp-std", "chat-json", "claude-code", "trail")
+CANONICAL_SOURCES: tuple[str, ...] = (
+    "otlp",
+    "otlp-std",
+    "chat-json",
+    "claude-code",
+    "trail",
+    "langfuse",
+    "langsmith",
+    "phoenix",
+)
 
 _LOADERS = {
     "otlp": load_otlp,
@@ -45,6 +55,10 @@ def load_corpus(
     ``pipeline_steps`` and ``workflow`` are read only by ``otlp-std``, the one
     source that declares workflow steps apart from model and tool calls.
     """
+    if source in ("langfuse", "langsmith", "phoenix"):
+        return load_native(
+            Path(path), source, ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+        )
     loader = _LOADERS.get(source)
     if loader is None:
         raise UnknownSourceError(
