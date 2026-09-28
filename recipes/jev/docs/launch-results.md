@@ -16,7 +16,7 @@ This supports "beats Jev on AgentProcessBench". It does not support a general "b
 
 > Trained on 1,097 steps labeled by Bandits' verifier (Nemotron-Lightning-3.5-30B-A3B), a 4B model agrees with the verifier on **77.9%** of 172 unseen steps. The verifier, re-run on the same steps, agrees with its own labels **75.6%** of the time. It answers **36× faster** (0.12 s vs 4.2 s median), with calibration error **0.047**.
 
-Real Jev has not been run on this split yet (#97, 172 steps).
+TypeSafe Jev (`jev-1.13.0`, #97) on the same 172 steps: 72.1% [63.0, 80.9]. Ours − TypeSafe Jev: +5.8 [−0.7, +11.7], ahead but not significant on this test set, so the launch claims "beats Jev" on AgentProcessBench only. By source: GAIA 73.8 vs 64.3, τ²-bench 90.0 vs 82.0, SWE-bench 71.1 vs 76.3 (2 traces).
 
 **3. Your own Jev beats DeepSeek-V4.1-Flash, a 763B-parameter model, at judging agent steps.**
 
