@@ -14,7 +14,7 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.workflow import delivery_status, resolve_task
-from bandits.traces import WorkflowDeclaration
+from bandits.traces import SpanStatus, WorkflowDeclaration
 from bandits.verify.turns import WorkflowTurnsError, extract_turns
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
@@ -146,6 +146,17 @@ def test_task_is_the_invocation_request_never_a_model_prompt(tmp_path) -> None:
     assert (request.task_status, request.task_path) == ("declared", "input.query")
     assert request.delivered == ANSWER
     assert request.raw_output == {"answer": ANSWER, "category": "benefits"}
+
+
+def test_failed_invocation_keeps_its_recorded_status(tmp_path) -> None:
+    spans = _workflow()
+    invocation = next(span for span in spans if span["spanId"] == "inv")
+    invocation["status"] = {"code": 2, "message": "workflow failed"}
+    trace = load_otlp_standard(
+        _write(tmp_path / "failed.jsonl", _request(spans)), workflow=DECLARED
+    ).traces[0]
+    assert trace.request is not None
+    assert trace.request.status == SpanStatus.ERROR
 
 
 def test_conversation_mode_is_unchanged_on_the_same_export(tmp_path) -> None:

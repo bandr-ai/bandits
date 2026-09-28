@@ -51,9 +51,11 @@ Seven independent OTLP captures from
 [genai-interlingua](https://github.com/Grace/genai-interlingua/tree/ece3efa13745f8fe0a8b596f162118192d85d22a/testdata)
 are included as regression inputs. They cover OpenInference, OpenLLMetry,
 Braintrust, LiteLLM, Vercel AI SDK, LangChain, and an older OpenLLMetry shape.
-The native LangSmith and Phoenix readers currently have constructed fixtures;
-their compatibility with independent exports remains unproven. No Collector
-or MLflow process is required.
+The LangSmith reader has also been checked against one independently published
+RunTree export. The Phoenix reader has a published API-contract check, but no
+Phoenix-generated export check yet. See [the validation record](ingest-validation.md)
+for the exact evidence and remaining limits. No Collector or MLflow process is
+required.
 
 The fixture tests check known mappings and archived bytes. They do not prove
 compatibility with every version of every platform export; unsupported records

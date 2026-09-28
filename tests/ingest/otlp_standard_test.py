@@ -80,6 +80,72 @@ def _only_trace(corpus):
     return corpus.traces[0]
 
 
+def test_nested_model_calls_with_conflicting_replies_are_not_collapsed(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "nested.jsonl",
+        _request(
+            [
+                _span(
+                    "parent",
+                    "outer",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": "same-model",
+                        "input.value": "question",
+                        "output.value": "first reply",
+                    },
+                ),
+                _span(
+                    "child",
+                    "inner",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": "same-model",
+                        "input.value": "follow-up",
+                        "output.value": "different reply",
+                    },
+                    parent="parent",
+                ),
+            ]
+        ),
+    )
+    corpus = load_otlp_standard(path)
+    assert [span.span_id for span in corpus.traces[0].spans if span.kind == SpanKind.MODEL] == [
+        "parent",
+        "child",
+    ]
+    assert not [issue for issue in corpus.issues if issue.kind == "duplicate_model_instrumentation"]
+
+
+def test_transport_response_repr_is_not_a_model_completion(tmp_path: Path) -> None:
+    recorded = "<APIResponse [200 OK] type=<class 'provider.ChatCompletion'>>"
+    path = _write(
+        tmp_path / "opaque.jsonl",
+        _request(
+            [
+                _span(
+                    "a",
+                    "provider call",
+                    {
+                        "openinference.span.kind": "LLM",
+                        "input.value": "question",
+                        "output.value": json.dumps(recorded),
+                        "output.mime_type": "application/json",
+                    },
+                )
+            ]
+        ),
+    )
+    model = _only_trace(load_otlp_standard(path)).spans[0]
+    assert model.kind is SpanKind.MODEL
+    assert model.output is None
+    assert model.attributes["output.value"] == json.dumps(recorded)
+    assert model.attributes["bandits.output_unusable_reason"] == "transport_response_object_repr"
+    check = CliRunner().invoke(app, ["check-source", str(path), "--mode", "conversation"])
+    assert check.exit_code == 1
+    assert "unusable recorded output: 1" in check.output
+
+
 def test_reads_genai_semconv_spans(tmp_path) -> None:
     messages = [{"role": "user", "parts": [{"type": "text", "content": "Refund order 7741"}]}]
     output = [{"role": "assistant", "parts": [{"type": "text", "content": "Refunded."}]}]
@@ -1062,4 +1128,95 @@ def test_a_faithful_agent_loop_keeps_its_row(tmp_path) -> None:
         "tool",
         "user",
         "assistant",
+    ]
+
+
+def test_gemini_request_contents_become_messages() -> None:
+    from bandits.ingest.otlp_standard import _messages
+
+    request = {
+        "model": "gemini-2.0-flash",
+        "config": {"system_instruction": "Greet with the tool."},
+        "contents": [
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {"role": "model", "parts": [{"function_call": {"name": "say_hello", "args": {}}}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "say_hello", "response": {"ok": 1}}}],
+            },
+        ],
+    }
+    messages = _messages(request)
+    assert [(m["role"], [p["type"] for p in m["parts"]]) for m in messages] == [
+        ("system", ["text"]),
+        ("user", ["text"]),
+        ("assistant", ["tool_call"]),
+        ("user", ["tool_call_response"]),
+    ]
+    assert messages[2]["parts"][0]["name"] == "say_hello"
+    assert _messages({"model": "gemini", "contents": "What is it?"}) == [
+        {"role": "user", "parts": [{"type": "text", "content": "What is it?"}]}
+    ]
+
+
+def test_role_less_messages_take_the_direction_role_only_when_none_is_named() -> None:
+    from bandits.ingest.otlp_standard import _messages
+
+    assert _messages([{"content": "Tell me a joke"}], default_role="user") == [
+        {"role": "user", "parts": [{"type": "text", "content": "Tell me a joke"}]}
+    ]
+    assert _messages([{"content": "no role"}]) is None
+    mixed = [{"role": "system", "content": "s"}, {"content": "x"}]
+    assert [m["role"] for m in _messages(mixed, default_role="user")] == ["system"]
+
+
+def test_langchain_messages_recorded_by_langfuse_keep_turns_and_calls() -> None:
+    """Shapes seen in public Langfuse LangChain/OpenAI traces."""
+    from bandits.ingest.otlp_standard import _messages
+
+    call = {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+    recorded = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": '[{"text": "Hi"}]'},
+        {"role": "assistant", "content": "", "additional_kwargs": {"tool_calls": [call]}},
+        {"role": "assistant", "content": None, "tool_calls": [json.dumps(call)]},
+        {"role": "tool", "content": "result"},
+        {"role": "tool", "content": {"name": "search", "description": "d", "input_schema": {}}},
+        {"role": "tool", "content": {"type": "function", "function": {"name": "search"}}},
+    ]
+    messages = _messages(recorded)
+    assert [(m["role"], [p["type"] for p in m["parts"]]) for m in messages] == [
+        ("system", ["text"]),
+        ("user", ["text"]),
+        ("assistant", ["tool_call"]),
+        ("assistant", ["tool_call"]),
+        ("tool", ["text"]),
+    ]
+    assert messages[1]["parts"][0]["content"] == "Hi"
+    assert (
+        _messages([{"role": "user", "content": "[1, 2] is a list"}])[0]["parts"][0]["content"]
+        == "[1, 2] is a list"
+    )
+
+
+def test_langfuse_otlp_key_value_io_is_decoded() -> None:
+    from bandits.ingest.otlp_standard import _recorded_attribute_value
+
+    recorded = [{"key": "gen_ai.completion", "value": {"stringValue": "Done."}}]
+    assert _recorded_attribute_value(recorded, "output") == "Done."
+    assert _recorded_attribute_value(recorded, "input") == recorded
+    assert _recorded_attribute_value([{"key": "x"}], "output") == [{"key": "x"}]
+
+
+def test_completion_request_prompts_are_user_input_only() -> None:
+    from bandits.ingest.otlp_standard import _messages
+
+    request = {"model": "m", "prompt": ["Say hi", "Say bye"], "temperature": 0}
+    assert [m["parts"][0]["content"] for m in _messages(request, default_role="user")] == [
+        "Say hi",
+        "Say bye",
+    ]
+    assert _messages({"prompts": ["q"]}, default_role="user")[0]["role"] == "user"
+    assert _messages({"prompt": "x"}, default_role="assistant") != [
+        {"role": "user", "parts": [{"type": "text", "content": "x"}]}
     ]
