@@ -204,6 +204,9 @@ def _request_view(trace: Trace, control_markers: Sequence[str]) -> UserMessageVi
     if request.task is not None:
         text = _strip_control_markers(request.task, control_markers, removed)
         messages = (text,) if text else ()
+    elif request.raw_input in (None, "", {}, []):
+        # Nothing was recorded; "null" is not a request the miner can read.
+        messages = ()
     else:
         # Never cut: the request is the whole of this view, and a cut can remove
         # the very field the miner needs while the view still reads as complete.

@@ -1,7 +1,7 @@
 # Trace inputs
 
 All readers produce the same `TraceCorpus`. `bandits ingest PATH` recognizes
-known source shapes automatically. `bandits check-source PATH` checks recognition
+known source shapes automatically. `bandits ingest PATH --dry-run` checks recognition
 and runs the reader without writing an artifact; it reports missing model input,
 output, task, the recorded kind attribute used to recognize each model call,
 and parsing issues without printing trace content. Use
