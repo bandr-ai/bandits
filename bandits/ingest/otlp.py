@@ -27,6 +27,7 @@ MODEL span, ``"execute_tool"`` is a TOOL span. Anything else is a
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -438,6 +439,37 @@ def _user_turns(spans: tuple[Span, ...]) -> tuple[UserTurn, ...]:
     return tuple(turns)
 
 
+def _root_user_turns(attributes: dict[str, Any]) -> tuple[UserTurn, ...]:
+    """User turns recorded only on a filtered episode root.
+
+    A wrapper's input precedes every retained action, so any trailing user
+    messages it alone records belong at the start of the reconstructed trace.
+    """
+    messages = _messages(attributes.get("gen_ai.input.messages"))
+    trailing: list[str] = []
+    for message in reversed(messages):
+        if message.get("role") not in ("user", "human"):
+            break
+        text = _message_text(message)
+        if text:
+            trailing.append(text)
+    return tuple(UserTurn(text=text) for text in reversed(trailing))
+
+
+def _merge_root_user_turns(
+    root_turns: tuple[UserTurn, ...], span_turns: tuple[UserTurn, ...]
+) -> tuple[UserTurn, ...]:
+    """Prepend root-only turns while preserving repeated turns from the source."""
+    remaining = Counter(turn.text for turn in span_turns)
+    missing: list[UserTurn] = []
+    for turn in root_turns:
+        if remaining[turn.text]:
+            remaining[turn.text] -= 1
+        else:
+            missing.append(turn)
+    return (*missing, *span_turns)
+
+
 def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
     """The toolset, system prompt and settings declared on the episode's root span.
 
@@ -580,6 +612,10 @@ def assemble_corpus(
                 ),
                 None,
             )
+        extras = (trace_extras or {}).get(trace_id, {})
+        user_turns = _user_turns(ordered)
+        if declared and extras.get("interaction") != "workflow":
+            user_turns = _merge_root_user_turns(_root_user_turns(declared), user_turns)
         traces.append(
             Trace(
                 trace_id=trace_id,
@@ -593,7 +629,7 @@ def assemble_corpus(
                 spans=ordered,
                 # A workflow's extras replace user turns entirely: a model's
                 # prompt is the program talking, never a person.
-                **{"user_turns": _user_turns(ordered), **(trace_extras or {}).get(trace_id, {})},
+                **{"user_turns": user_turns, **extras},
             )
         )
     return TraceCorpus(
