@@ -7,7 +7,9 @@ train rows, then prints one JSON summary. Fails (exit 1) when:
 
 - any row is rejected for a tokenizer reason (an option letter is not one
   distinct token in the answer context);
-- a training loss is not finite, or the loss does not fall on the same batch.
+- a training loss is not finite, or the loss does not fall on the same batch;
+- a training step on the longest train row runs out of GPU memory (the
+  summary reports that row's tokens and the step's peak GPU memory).
 
 Warns (exit 0) when the untrained model puts little of its probability on
 the answer letters at all (`letter_mass`), or picks one option for nearly
@@ -44,11 +46,14 @@ def main() -> int:
     parser.add_argument("--dtype", default="bfloat16")
     args = parser.parse_args()
 
+    import torch
+
     from bandits.store import DerivedStore
     from bandits_jev.dataset import load_decision_dataset
     from bandits_jev.hf_predictor import HFPredictor
     from bandits_jev.hf_trainer import HFTrainer
     from bandits_jev.metrics import gold_option
+    from bandits_jev.prompt import build_prompt
     from bandits_jev.scorer import score_dataset
     from bandits_jev.trainer import build_training_config, reject_unscorable
 
@@ -103,6 +108,21 @@ def main() -> int:
     losses = [trainer.train_step(train_rows) for _ in range(args.train_steps)]
 
     failures = []
+    # Real training reaches every kept row; the longest sets its peak memory.
+    longest_tokens, longest = max(
+        ((trainer.token_count(build_prompt(e.state, e.question, options)[0]), e) for e, options in kept),
+        key=lambda counted: counted[0],
+    )
+    peak_gpu_gib = None
+    on_cuda = args.device.startswith("cuda")
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        trainer.train_step([longest])
+    except torch.OutOfMemoryError:
+        failures.append(f"a training step on the longest train row ({longest_tokens} tokens) ran out of GPU memory")
+    if on_cuda:
+        peak_gpu_gib = round(torch.cuda.max_memory_allocated() / 2**30, 2)
     if not run.results:
         failures.append(f"no dev row could be scored ({len(run.rejections)} rejected)")
     if tokenizer_rejections:
@@ -130,6 +150,8 @@ def main() -> int:
                 "untrained_agreement_with_verifier": round(sum(agree) / len(agree), 4) if agree else None,
                 "untrained_choices": dict(chosen),
                 "train_losses": [round(loss, 4) for loss in losses],
+                "longest_train_tokens": longest_tokens,
+                "peak_gpu_gib": peak_gpu_gib,
                 "failures": failures,
                 "warnings": warnings,
                 "ok": not failures,
