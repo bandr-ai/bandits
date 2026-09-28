@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from bandits.store import DerivedStore
 from bandits.traces import Span, SpanKind, SpanStatus, Trace
 from bandits.verify.nextstate import (
+    LOOP_RESCUES,
     Archetype,
     TurnJudgeRun,
     judge_turn,
@@ -112,11 +113,42 @@ def test_votes_take_majority_and_tie_is_neutral() -> None:
         None, turn, Archetype.GENERIC, predict=lambda *a: next(replies), model="m", votes=3
     )
     assert verdict.score == -1 and verdict.votes == (-1, 1, -1) and verdict.hint == "a"
+    assert verdict.judge_votes == {"-1": 2 / 3, "0": 0.0, "1": 1 / 3}
     replies = iter(["\\boxed{-1}", "\\boxed{+1}"])
     verdict = judge_turn(
         None, turn, Archetype.GENERIC, predict=lambda *a: next(replies), model="m", votes=2
     )
     assert verdict.score == 0
+    assert verdict.judge_votes == {"-1": 0.5, "0": 0.0, "1": 0.5}
+
+
+def test_single_vote_is_dense_with_observed_zeros_on_the_other_labels() -> None:
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+    verdict = judge_turn(
+        None, turn, Archetype.GENERIC, predict=lambda *a: "\\boxed{+1}", model="m"
+    )
+    assert verdict.judge_votes == {"-1": 0.0, "0": 0.0, "1": 1.0}
+
+
+def test_judge_votes_is_none_when_unobserved_or_failed() -> None:
+    turn = Turn(trace_id="t", index=0, action_span_id="m", action="ACT")
+    verdict = judge_turn(None, turn, Archetype.GENERIC, predict=lambda *a: "\\boxed{+1}", model="m")
+    assert verdict.judge_votes is None
+    turn = Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+    verdict = judge_turn(None, turn, Archetype.GENERIC, predict=lambda *a: "no box", model="m")
+    assert verdict.judge_votes is None
 
 
 def test_judge_failure_is_recorded_not_raised() -> None:
@@ -229,3 +261,64 @@ def test_judge_run_model_validates() -> None:
         signals=(signal_for("a", turns, ()),),
     )
     assert run.signals[0].turns == 3
+
+
+def _observed_turn() -> Turn:
+    return Turn(
+        trace_id="t",
+        index=0,
+        action_span_id="m",
+        action="ACT",
+        reactions=(Reaction(span_id="x", kind="tool", name="e", text="r"),),
+    )
+
+
+def test_a_looping_reply_is_rescued_and_the_rescue_is_recorded() -> None:
+    calls = []
+
+    def predict(model, prompt, temperature, extra=None):
+        calls.append(extra)
+        # Loops with the run's own settings and with the first rescue.
+        if extra is None or extra == LOOP_RESCUES[0]:
+            return "The next_state is an error. " * 50
+        return "HINT: check the result\n\\boxed{-1}"
+
+    verdict = judge_turn(
+        None, _observed_turn(), Archetype.GENERIC, predict=predict, model="m", rescues=LOOP_RESCUES
+    )
+    assert verdict.score == -1 and verdict.failure is None
+    assert calls == [None, LOOP_RESCUES[0], LOOP_RESCUES[1]]
+    assert verdict.rescues == ("repetition_penalty=1.1",)
+
+
+def test_a_scored_reply_is_never_rescued() -> None:
+    calls = []
+
+    def predict(model, prompt, temperature, extra=None):
+        calls.append(extra)
+        return "\\boxed{+1}"
+
+    verdict = judge_turn(
+        None, _observed_turn(), Archetype.GENERIC, predict=predict, model="m", rescues=LOOP_RESCUES
+    )
+    assert verdict.score == 1 and verdict.rescues == () and calls == [None]
+
+
+def test_rescues_that_all_fail_leave_the_turn_unparseable() -> None:
+    def predict(model, prompt, temperature, extra=None):
+        if extra == LOOP_RESCUES[1]:
+            raise RuntimeError("down")
+        return "no box"
+
+    verdict = judge_turn(
+        None, _observed_turn(), Archetype.GENERIC, predict=predict, model="m", rescues=LOOP_RESCUES
+    )
+    assert verdict.score is None and verdict.failure.startswith("unparseable")
+    assert verdict.rescues == ()
+
+
+def test_without_rescues_predict_is_called_as_before() -> None:
+    # A three-argument predict (the Judge protocol) still works: no rescue
+    # passes it `extra=`.
+    verdict = judge_turn(None, _observed_turn(), Archetype.GENERIC, predict=lambda *a: "no box", model="m")
+    assert verdict.failure.startswith("unparseable") and verdict.rescues == ()
