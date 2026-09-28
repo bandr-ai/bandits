@@ -63,6 +63,12 @@ class HFTrainer:
         torch_dtype = getattr(torch, dtype)
         self._tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
         base_model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, dtype=torch_dtype)
+        # Without this, backward keeps every layer's activations for the whole
+        # prompt: a 3k-token row on a 4B model runs a 48 GB GPU out of memory.
+        # Recomputing them in backward costs time, not a different loss.
+        if base_model.supports_gradient_checkpointing:
+            base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            base_model.config.use_cache = False
         peft_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -138,7 +144,9 @@ class HFTrainer:
         letter_ids = letter_token_ids(self._tokenizer, prompt, letters.values(), model_label=model_label)
 
         inputs = encode_prompt(self._tokenizer, prompt, self.device, model_label=model_label)
-        outputs = self._model(**inputs)
+        # Only the answer position's logits are used; the full sequence's
+        # would be a (tokens x vocab) tensor kept for backward.
+        outputs = self._model(**inputs, logits_to_keep=1)
         logits = outputs.logits[0, -1, :].float()
 
         candidate_ids = [letter_ids[letters[option_id]] for option_id in options]
