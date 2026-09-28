@@ -111,7 +111,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "torch", marker = "extra == 'train'", specifier = ">=2.2" },
-    { name = "transformers", marker = "extra == 'train'", specifier = ">=4.44" },
+    { name = "transformers", marker = "extra == 'train'", specifier = ">=5.2" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["train", "dev"]
