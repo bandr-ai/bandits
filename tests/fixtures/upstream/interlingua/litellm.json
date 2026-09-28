@@ -1,0 +1,600 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.44.0"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "cbfd16f3-481d-4971-ae79-70314a498771"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          },
+          {
+            "key": "deployment.environment",
+            "value": {
+              "stringValue": "production"
+            }
+          },
+          {
+            "key": "model_id",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "litellm"
+          },
+          "spans": [
+            {
+              "traceId": "89443148be1f25c7347a6825210c17cd",
+              "spanId": "ba48e2429fb1cf09",
+              "name": "litellm_request",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1788788054134155008",
+              "endTimeUnixNano": "1788788054408071168",
+              "attributes": [
+                {
+                  "key": "metadata.user_api_key_hash",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_alias",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_spend",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_max_budget",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_budget_reset_at",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_user_spend",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_user_max_budget",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_team_spend",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_team_max_budget",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_team_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_org_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_org_alias",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_project_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_project_alias",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_user_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_team_alias",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_user_email",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_end_user_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_request_route",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.spend_logs_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.requester_ip_address",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_agent",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.requester_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.prompt_management_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.applied_guardrails",
+                  "value": {
+                    "stringValue": "[]"
+                  }
+                },
+                {
+                  "key": "metadata.mcp_tool_call_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.vector_store_request_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.routing_decision",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.usage_object",
+                  "value": {
+                    "stringValue": "{'completion_tokens': 27, 'prompt_tokens': 412, 'total_tokens': 439, 'completion_tokens_details': {'accepted_prediction_tokens': 0, 'audio_tokens': 0, 'reasoning_tokens': 8, 'rejected_prediction_tokens': 0}, 'prompt_tokens_details': {'audio_tokens': 0, 'cached_tokens': 256}}"
+                  }
+                },
+                {
+                  "key": "metadata.requester_custom_headers",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.cold_storage_object_key",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.user_api_key_auth_metadata",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.team_alias",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "metadata.team_id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "hidden_params",
+                  "value": {
+                    "stringValue": "{\"model_id\": null, \"cache_key\": null, \"api_base\": null, \"response_cost\": 5.88e-05, \"additional_headers\": {\"llm_provider-server\": \"BaseHTTP/0.6 Python/3.13.15\", \"llm_provider-date\": \"Mon, 07 Sep 2026 13:34:14 GMT\", \"llm_provider-content-type\": \"application/json\", \"llm_provider-content-length\": \"722\"}, \"litellm_overhead_time_ms\": null, \"batch_models\": null, \"batch_successful_requests\": null, \"batch_failed_requests\": null, \"litellm_model_name\": null, \"usage_object\": null}"
+                  }
+                },
+                {
+                  "key": "litellm.provider.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.input_cost",
+                  "value": {
+                    "doubleValue": 4.26e-05
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.output_cost",
+                  "value": {
+                    "doubleValue": 1.62e-05
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.total_cost",
+                  "value": {
+                    "doubleValue": 5.88e-05
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.tool_usage_cost",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.cache_read_cost",
+                  "value": {
+                    "doubleValue": 1.92e-05
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.reasoning_cost",
+                  "value": {
+                    "doubleValue": 4.8e-06
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.original_cost",
+                  "value": {
+                    "doubleValue": 5.88e-05
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.discount_percent",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.discount_amount",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.margin_percent",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.margin_fixed_amount",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.cost.margin_total_amount",
+                  "value": {
+                    "doubleValue": 0.0
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "llm.request.type",
+                  "value": {
+                    "stringValue": "completion"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "gen_ai.request.top_p",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "llm.is_streaming",
+                  "value": {
+                    "stringValue": "False"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.id",
+                  "value": {
+                    "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT"
+                  }
+                },
+                {
+                  "key": "litellm.call_id",
+                  "value": {
+                    "stringValue": "0d3f323c-bd38-4075-90ca-66a91b89c95e"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.total_tokens",
+                  "value": {
+                    "intValue": "439"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "27"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "412"
+                  }
+                },
+                {
+                  "key": "llm.request.functions.0.name",
+                  "value": {
+                    "stringValue": "lookup_order"
+                  }
+                },
+                {
+                  "key": "llm.request.functions.0.description",
+                  "value": {
+                    "stringValue": "Look up an order by its identifier."
+                  }
+                },
+                {
+                  "key": "llm.request.functions.0.parameters",
+                  "value": {
+                    "stringValue": "{\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\"}}, \"required\": [\"order_id\"]}"
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"system\", \"parts\": [{\"type\": \"text\", \"content\": \"You are a support agent. Use the tools you are given.\"}]}, {\"role\": \"user\", \"parts\": [{\"type\": \"text\", \"content\": \"Where is order A-1187?\"}]}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"assistant\", \"parts\": [], \"finish_reason\": \"tool_calls\"}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "stringValue": "[\"tool_calls\"]"
+                  }
+                },
+                {
+                  "key": "gen_ai.completion.0.function_call.arguments",
+                  "value": {
+                    "stringValue": "{\"order_id\": \"A-1187\"}"
+                  }
+                },
+                {
+                  "key": "gen_ai.completion.0.function_call.name",
+                  "value": {
+                    "stringValue": "lookup_order"
+                  }
+                }
+              ],
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "flags": 256
+            },
+            {
+              "traceId": "89443148be1f25c7347a6825210c17cd",
+              "spanId": "78c663565622603e",
+              "parentSpanId": "ba48e2429fb1cf09",
+              "name": "raw_gen_ai_request",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1788788054134155008",
+              "endTimeUnixNano": "1788788054408071168",
+              "attributes": [
+                {
+                  "key": "llm.openai.messages",
+                  "value": {
+                    "stringValue": "[{'role': 'system', 'content': 'You are a support agent. Use the tools you are given.'}, {'role': 'user', 'content': 'Where is order A-1187?'}]"
+                  }
+                },
+                {
+                  "key": "llm.openai.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "llm.openai.top_p",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "llm.openai.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "llm.openai.tools",
+                  "value": {
+                    "stringValue": "[{'type': 'function', 'function': {'name': 'lookup_order', 'description': 'Look up an order by its identifier.', 'parameters': {'type': 'object', 'properties': {'order_id': {'type': 'string'}}, 'required': ['order_id']}}}]"
+                  }
+                },
+                {
+                  "key": "llm.openai.extra_body",
+                  "value": {
+                    "stringValue": "{}"
+                  }
+                },
+                {
+                  "key": "llm.openai.id",
+                  "value": {
+                    "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT"
+                  }
+                },
+                {
+                  "key": "llm.openai.choices",
+                  "value": {
+                    "stringValue": "[{'finish_reason': 'tool_calls', 'index': 0, 'logprobs': None, 'message': {'content': None, 'refusal': None, 'role': 'assistant', 'annotations': None, 'audio': None, 'function_call': None, 'tool_calls': [{'id': 'call_9RtYbK2mXqLp', 'function': {'arguments': '{\"order_id\": \"A-1187\"}', 'name': 'lookup_order'}, 'type': 'function'}]}}]"
+                  }
+                },
+                {
+                  "key": "llm.openai.created",
+                  "value": {
+                    "intValue": "1789000000"
+                  }
+                },
+                {
+                  "key": "llm.openai.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "llm.openai.object",
+                  "value": {
+                    "stringValue": "chat.completion"
+                  }
+                },
+                {
+                  "key": "llm.openai.moderation",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "llm.openai.service_tier",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "llm.openai.system_fingerprint",
+                  "value": {
+                    "stringValue": "fp_capture0"
+                  }
+                },
+                {
+                  "key": "llm.openai.usage",
+                  "value": {
+                    "stringValue": "{'completion_tokens': 27, 'prompt_tokens': 412, 'total_tokens': 439, 'completion_tokens_details': {'accepted_prediction_tokens': 0, 'audio_tokens': 0, 'reasoning_tokens': 8, 'rejected_prediction_tokens': 0}, 'prompt_tokens_details': {'audio_tokens': 0, 'cache_write_tokens': None, 'cached_tokens': 256}}"
+                  }
+                }
+              ],
+              "status": {
+                "code": "STATUS_CODE_OK"
+              },
+              "flags": 256
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

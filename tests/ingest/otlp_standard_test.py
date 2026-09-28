@@ -309,9 +309,9 @@ def test_langfuse_pipeline_steps_are_outermost_action_free_nodes(tmp_path) -> No
     assert step.arguments == {"query": "leave days"}
     assert step.output == {"docs": ["20 days"]}
     assert step.call_recorded is False
-    unrepresented = [i for i in corpus.issues if i.kind == "unrepresented_span"]
-    assert [i.detail.split(" carry")[0] for i in unrepresented] == [
-        "1 span(s) with langfuse.observation.type=EVALUATOR"
+    excluded = [i for i in corpus.issues if i.kind == "excluded_evaluator"]
+    assert [i.detail for i in excluded] == [
+        "1 evaluator span(s) with langfuse.observation.type=EVALUATOR excluded from the action corpus"
     ]
 
     without = load_otlp_standard(path, pipeline_steps=False)
@@ -581,7 +581,7 @@ def test_an_evaluator_declaration_wins_over_any_other_convention(tmp_path) -> No
     corpus = load_otlp_standard(path)
 
     assert [s.span_id for s in _only_trace(corpus).spans] == ["a"]
-    assert any("EVALUATOR" in i.detail for i in corpus.issues if i.kind == "unrepresented_span")
+    assert any("EVALUATOR" in i.detail for i in corpus.issues if i.kind == "excluded_evaluator")
 
 
 def test_nothing_beneath_an_evaluator_enters_the_corpus(tmp_path) -> None:

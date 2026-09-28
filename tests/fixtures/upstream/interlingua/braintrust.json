@@ -1,0 +1,202 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.44.0"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "f51a5ebf-ea50-4cde-b4b5-e026c7c41cbe"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "capture"
+          },
+          "spans": [
+            {
+              "traceId": "f901bc9b93f32786e5c3d7603105d56e",
+              "spanId": "2cb92d1db9540ef5",
+              "name": "support_triage_agent",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1789123126232720000",
+              "endTimeUnixNano": "1789123126535647000",
+              "attributes": [
+                {
+                  "key": "braintrust.input_json",
+                  "value": {
+                    "stringValue": "[{\"role\": \"system\", \"content\": \"You are a support agent. Use the tools you are given.\"}, {\"role\": \"user\", \"content\": \"Where is order A-1187?\"}]"
+                  }
+                },
+                {
+                  "key": "braintrust.output_json",
+                  "value": {
+                    "stringValue": "[{\"content\": null, \"refusal\": null, \"role\": \"assistant\", \"annotations\": null, \"audio\": null, \"function_call\": null, \"tool_calls\": [{\"id\": \"call_9RtYbK2mXqLp\", \"function\": {\"arguments\": \"{\\\"order_id\\\": \\\"A-1187\\\"}\", \"name\": \"lookup_order\"}, \"type\": \"function\"}]}]"
+                  }
+                },
+                {
+                  "key": "braintrust.expected_json",
+                  "value": {
+                    "stringValue": "{\"tool\": \"lookup_order\"}"
+                  }
+                },
+                {
+                  "key": "braintrust.metrics",
+                  "value": {
+                    "stringValue": "{\"prompt_tokens\": 412, \"completion_tokens\": 27, \"tokens\": 439}"
+                  }
+                },
+                {
+                  "key": "braintrust.scores",
+                  "value": {
+                    "stringValue": "{\"correctness\": 1.0}"
+                  }
+                },
+                {
+                  "key": "braintrust.metadata",
+                  "value": {
+                    "stringValue": "{\"model\": \"gpt-4o-mini-2024-07-18\"}"
+                  }
+                },
+                {
+                  "key": "braintrust.tags",
+                  "value": {
+                    "stringValue": "[\"support\", \"triage\"]"
+                  }
+                },
+                {
+                  "key": "braintrust.span_attributes",
+                  "value": {
+                    "stringValue": "{\"type\": \"llm\", \"name\": \"support_triage_agent\"}"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "braintrust.context_json",
+                  "value": {
+                    "stringValue": "{\"span_origin\": {\"name\": \"braintrust.sdk.python\", \"version\": \"0.37.0\", \"instrumentation\": {\"name\": \"braintrust-python-otel\"}}}"
+                  }
+                }
+              ],
+              "status": {},
+              "flags": 256
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.44.0"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "f51a5ebf-ea50-4cde-b4b5-e026c7c41cbe"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "capture"
+          },
+          "spans": [
+            {
+              "traceId": "b1bee5e166a8594c4103d05e8d12ab68",
+              "spanId": "7232b78a274c8545",
+              "name": "scoring_span",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1789123126540008000",
+              "endTimeUnixNano": "1789123126540047000",
+              "attributes": [
+                {
+                  "key": "braintrust.scores",
+                  "value": {
+                    "stringValue": "{\"correctness\": 1.0, \"helpfulness\": 0.8, \"tone\": 0.9}"
+                  }
+                },
+                {
+                  "key": "braintrust.span_attributes",
+                  "value": {
+                    "stringValue": "{\"type\": \"score\", \"name\": \"scoring_span\"}"
+                  }
+                },
+                {
+                  "key": "braintrust.context_json",
+                  "value": {
+                    "stringValue": "{\"span_origin\": {\"name\": \"braintrust.sdk.python\", \"version\": \"0.37.0\", \"instrumentation\": {\"name\": \"braintrust-python-otel\"}}}"
+                  }
+                }
+              ],
+              "status": {},
+              "flags": 256
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

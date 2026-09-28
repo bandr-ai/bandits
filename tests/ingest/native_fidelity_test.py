@@ -8,8 +8,9 @@ import pytest
 from typer.testing import CliRunner
 
 from bandits.cli import app
-from bandits.ingest import load_corpus
+from bandits.ingest import detect_source, load_corpus
 from bandits.ingest.native import _ns
+from bandits.ingest.otlp_standard import _attributes
 from bandits.store import ArtifactStore
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
 
@@ -158,6 +159,27 @@ def test_native_langsmith_error_status(tmp_path: Path) -> None:
     assert span.status == SpanStatus.ERROR
 
 
+def test_langsmith_cli_export_run_id_shape(tmp_path: Path) -> None:
+    """LangSmith's trace export uses run_id in its JSONL example."""
+    run = {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "run_type": "llm",
+        "name": "chat",
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "inputs": {"messages": [{"role": "user", "content": "hello"}]},
+        "outputs": {"messages": [{"role": "assistant", "content": "hi"}]},
+    }
+    path = _file(tmp_path, "langsmith.jsonl", run)
+    assert detect_source(path).source == "langsmith"
+    corpus = load_corpus(path, "langsmith")
+    assert len(corpus.traces) == 1
+    assert len(corpus.traces[0].spans) == 1
+    assert not [issue for issue in corpus.issues if issue.kind != "redaction"]
+    assert json.loads(corpus.traces[0].spans[0].attributes["bandits.native.record"]) == run
+
+
 def test_native_langsmith_nested_child_runs(tmp_path: Path) -> None:
     child = {
         "id": "model",
@@ -216,6 +238,29 @@ def test_native_phoenix_preserves_openinference_and_links(tmp_path: Path) -> Non
     assert span.attributes["bandits.otlp.source_context"]["resource"] == {"service.name": "demo"}
     assert span.status == SpanStatus.ERROR
     _assert_archived(tmp_path, path, corpus)
+
+
+def test_openinference_logical_span_status_code(tmp_path: Path) -> None:
+    """The OpenInference logical span example has top-level status_code."""
+    raw = {
+        "name": "query",
+        "context": {"trace_id": "a" * 32, "span_id": "b" * 16},
+        "parent_id": None,
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "status_code": "ERROR",
+        "status_message": "failed",
+        "attributes": {
+            "openinference.span.kind": "LLM",
+            "input.value": "hello",
+            "output.value": "error",
+        },
+        "events": [],
+    }
+    path = _file(tmp_path, "phoenix.json", raw)
+    assert detect_source(path).source == "phoenix"
+    corpus = load_corpus(path, "phoenix")
+    assert corpus.traces[0].spans[0].status == SpanStatus.ERROR
 
 
 def test_native_timestamp_keeps_nanoseconds() -> None:
@@ -460,3 +505,98 @@ def test_upstream_interlingua_otlp_fixture_maps_without_loss(tmp_path: Path, dia
     store = ArtifactStore(tmp_path / ".bandits")
     artifact = store.write(corpus, source_path=str(source))
     assert store.read_source(artifact.artifact_id, "000000.json") == source.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "models", "tools"),
+    [
+        ("vercel", 1, 1),
+        ("braintrust", 1, 1),
+        ("litellm", 1, 0),
+        ("langchain", 1, 2),
+        ("openllmetry-legacy", 1, 1),
+    ],
+)
+def test_independent_captured_otel_dialects(
+    tmp_path: Path, dialect: str, models: int, tools: int
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "upstream"
+        / "interlingua"
+        / f"{dialect}.json"
+    )
+    assert detect_source(source).source == "otlp-std"
+    corpus = load_corpus(source, "otlp-std")
+    spans = [span for trace in corpus.traces for span in trace.spans]
+    assert sum(span.kind == SpanKind.MODEL for span in spans) == models
+    assert sum(span.kind == SpanKind.TOOL for span in spans) == tools
+    model = next(span for span in spans if span.kind == SpanKind.MODEL)
+    assert model.attributes.get("gen_ai.input.messages") is not None
+    assert model.attributes.get("gen_ai.output.messages") is not None
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(source))
+    assert store.read_source(artifact.artifact_id, "000000.json") == source.read_bytes()
+    if dialect == "vercel":
+        assert model.attributes["bandits.normalized_scalars"]["input_tokens"]["value"] == 412
+        assert any(
+            part["type"] == "tool_call"
+            for message in model.attributes["gen_ai.output.messages"]
+            for part in message["parts"]
+        )
+    if dialect == "braintrust":
+        assert not any(span.name == "scoring_span" for span in spans)
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        "openinference.otlp",
+        "openllmetry.otlp",
+        "vercel",
+        "braintrust",
+        "litellm",
+        "langchain",
+        "openllmetry-legacy",
+    ],
+)
+def test_captured_otel_keeps_every_attribute_of_retained_spans(dialect: str) -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "upstream"
+        / "interlingua"
+        / f"{dialect}.json"
+    )
+    raw = json.loads(source.read_text())
+    original = {
+        span["spanId"]: _attributes(span.get("attributes"))
+        for resource in raw["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for span in scope["spans"]
+    }
+    corpus = load_corpus(source, "otlp-std")
+    kept = [span for trace in corpus.traces for span in trace.spans]
+    assert kept
+    for span in (span for span in kept if span.span_id in original):
+        assert (
+            span.attributes["bandits.otlp.source_context"]["span_attributes"]
+            == original[span.span_id]
+        )
+
+    workflow = load_corpus(source, "otlp-std", workflow=WorkflowDeclaration(task_fields=()))
+    represented = {span.span_id for trace in workflow.traces for span in trace.spans} | {
+        node.span_id for trace in workflow.traces for node in trace.workflow_nodes
+    }
+    represented.update(
+        trace.request.source_span_id
+        for trace in workflow.traces
+        if trace.request and trace.request.source_span_id
+    )
+    missing = set(original) - represented
+    if dialect == "braintrust":
+        assert len(missing) == 1
+        assert any(issue.kind == "excluded_evaluator" for issue in workflow.issues)
+    else:
+        assert not missing
