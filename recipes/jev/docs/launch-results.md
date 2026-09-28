@@ -51,13 +51,13 @@ By source:
 | --- | --- | --- |
 | B1 beats the majority answer | +33.1 [+21.8, +46.1] | pass |
 | B2 ≥ 0.9 × verifier self-agreement (68.0%) | 77.9% | pass |
-| B3 beats a cheaper LLM judge | +8.7 [+3.6, +14.1] vs DeepSeek-V4.1-Flash | pass, but see below |
+| B3 beats a cheaper LLM judge | +7.0 [−0.8, +14.3] vs GLM-5.3-Flash | fail (lower bound below 0) |
 | B4 within 3 points of the verifier on TRAIL human labels | not run (#107) | — |
 | B5 ECE ≤ 0.05 | 0.047 | pass |
 | B6 ≥ 50× cheaper and ≥ 20× faster than the verifier | 5.3× cheaper, 36× faster | fail (cost) |
 
 - Self-agreement came from re-running the verifier once on the test steps (temperature 0), not from #106's three-vote runs. Your own Jev − verifier self-agreement: +2.3 [−3.1, +7.8].
-- B3's rule picks the cheapest Fireworks model whose output parses on 95% of 50 dev steps. DeepSeek-V4.1-Flash was not chosen by that rule, so B3 needs a rerun before it is quoted.
+- B3's cheap judge is picked by rule: the cheapest Fireworks model whose judge output parses on at least 95% of dev steps. The cheapest is the verifier itself (Nemotron, $0.05 / $0.20 per million tokens), so the rule takes the next: GLM-5.3-Flash ($0.15 / $0.50), which scored 271 of 271 dev steps. On test it agrees with the verifier 70.9% [64.4, 77.1]; ours 77.9%. The interval's lower bound is −0.8, so B3 fails and the post makes no claim against a cheaper judge. Measured, GLM-5.3-Flash was not cheaper than the verifier: its long reasoning cost $1.22 per 1,000 decisions, at 12 s per step. An earlier comparison against DeepSeek-V4.1-Flash (+8.7 [+3.6, +14.1]) is not a substitute, because the rule did not pick it.
 - B6 failed on cost, so the post drops the cost claim (§2: "a number whose bar failed is dropped").
 
 ## Speed and cost
