@@ -32,7 +32,7 @@ from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, Trace
 from bandits.verify.turns import Turn, extract_turns
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 PROMPT_VERSION = 3
 """2: −1 requires the reaction to show the action was wrong; routine content the
 action asked for defaults to 0. Under version 1 the judge scored 108 of 109
@@ -40,6 +40,21 @@ page-scrolls in TRAIL GAIA as −1 because the answer was not on the page yet.
 3: that rule applies per archetype (see ``ARCHETYPE_LENIENCY``), not to all."""
 
 Judge = Callable[[str, str, float], str]
+
+LOOP_RESCUES: tuple[dict[str, object], ...] = (
+    {"frequency_penalty": 0.3},
+    {"repetition_penalty": 1.1},
+    {"reasoning_effort": "low"},
+)
+"""Request fields retried, in order, when a reply boxed no score.
+
+At temperature 0 the Fireworks nemotron judge can loop ("The next_state is an
+error." 597 times) until it hits the token budget: 10 of 25 identical prompts
+on 2026-09-27, against 2 of 25 on 2026-09-13. Tried on three looping prompts,
+each of these scored some and none scored all, and raising the temperature to
+0.6 scored none; in this order the three scored all three. A rescued vote is
+recorded in ``TurnVerdict.rescues``. Needs a ``predict`` that takes
+``extra=``, such as ``fireworks_completion``."""
 """(model, prompt, temperature) -> reply text. Tests inject one; production
 passes ``bandits.verify.judge.fireworks_completion``."""
 
@@ -215,10 +230,21 @@ class TurnVerdict(Contract):
     score: int | None = None
     """+1, 0 or −1. None when the turn was unobserved or the judge failed."""
 
+    judge_votes: dict[str, float] | None = None
+    """Vote share for "-1", "0", "1" among the votes actually cast. None
+    wherever ``score`` is None: an unobserved or failed turn has no votes to
+    take a share of. This is disagreement among repeated calls to one judge,
+    not a calibrated or ground-truth probability -- with one vote it is a
+    one-hot; with several it shows how split the judge was, nothing more."""
+
     hint: str = ""
     votes: tuple[int, ...] = ()
     response: str = ""
     failure: str | None = None
+    rescues: tuple[str, ...] = ()
+    """For each vote a ``LOOP_RESCUES`` retry scored, the request fields
+    that did it (for example ``frequency_penalty=0.3``). Empty when every
+    vote scored with the run's own settings."""
 
 
 class TraceSignal(Contract):
@@ -303,6 +329,21 @@ def _majority(votes: Sequence[int]) -> int:
     return 0 if len(winners) > 1 else winners[0]
 
 
+def _vote_shares(votes: Sequence[int]) -> dict[str, float]:
+    """Fraction of votes landing on each label, dense over all three labels.
+
+    A label with zero votes among those cast reports 0.0, not an omitted key:
+    that 0.0 is the observed frequency of that outcome among the votes that
+    were actually taken, not a manufactured opinion. A consumer selecting
+    "-1" is selecting p(error) for every judged example this way, rather than
+    silently restricting itself to the subset that happened to see a
+    negative vote -- see the calibration report's use of this in
+    ``scripts/trail_nextstate_eval.py``.
+    """
+    n = len(votes)
+    return {str(label): votes.count(label) / n for label in (-1, 0, 1)}
+
+
 def judge_turn(
     task: str | None,
     turn: Turn,
@@ -313,6 +354,7 @@ def judge_turn(
     votes: int = 1,
     temperature: float = 0.0,
     previous_action: str | None = None,
+    rescues: Sequence[dict[str, object]] = (),
 ) -> TurnVerdict:
     base = {
         "trace_id": turn.trace_id,
@@ -327,14 +369,26 @@ def judge_turn(
     hints: list[str] = []
     responses: list[str] = []
     failures: list[str] = []
+    rescued: list[str] = []
     for _ in range(votes):
         try:
             reply = predict(model, prompt, temperature)
         except Exception as exc:  # noqa: BLE001 - one bad call must not lose the run
             failures.append(f"transport: {exc}")
             continue
-        responses.append(reply)
         score, hint = parse_verdict(reply)
+        for extra in rescues:
+            if score is not None:
+                break
+            try:
+                retry = predict(model, prompt, temperature, extra=extra)  # type: ignore[call-arg]
+            except Exception:  # noqa: BLE001 - a failed rescue keeps the unscored reply
+                continue
+            retry_score, retry_hint = parse_verdict(retry)
+            if retry_score is not None:
+                reply, score, hint = retry, retry_score, retry_hint
+                rescued.append(",".join(f"{k}={v}" for k, v in extra.items()))
+        responses.append(reply)
         if score is None:
             failures.append("unparseable: no boxed score")
             continue
@@ -355,10 +409,12 @@ def judge_turn(
     return TurnVerdict(
         **base,
         score=final,
+        judge_votes=_vote_shares(scores),
         hint=hint,
         votes=tuple(scores),
         response="\n---\n".join(responses)[-4000:],
         failure=None if len(scores) == votes else failure,
+        rescues=tuple(rescued),
     )
 
 
@@ -373,8 +429,10 @@ def judge_turns(
     temperature: float = 0.0,
     workers: int = 8,
     on_progress: Callable[[int, int], None] | None = None,
+    rescues: Sequence[dict[str, object]] = (),
 ) -> TurnJudgeRun:
-    """Judge every observed turn of every trace."""
+    """Judge every observed turn of every trace. ``rescues`` (for example
+    ``LOOP_RESCUES``) retries a reply that boxed no score; see ``judge_turn``."""
     jobs: list[tuple[Trace, Turn, str | None]] = []
     turns_of: dict[str, tuple[Turn, ...]] = {}
     for trace in traces:
@@ -396,6 +454,7 @@ def judge_turns(
                 votes=votes,
                 temperature=temperature,
                 previous_action=previous,
+                rescues=rescues,
             )
 
     verdicts: list[TurnVerdict] = []

@@ -33,7 +33,7 @@ from bandits.traces import Contract
 from bandits.verify.nextstate import ARCHETYPE_VOCABULARY, Archetype, TurnJudgeRun, TurnVerdict
 from bandits.verify.turns import Turn
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 PROMPT_VERSION = 1
 DEFAULT_MAX_TOKENS = 16000
 
