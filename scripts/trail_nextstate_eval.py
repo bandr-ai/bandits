@@ -78,6 +78,69 @@ def auc(pairs: list[tuple[float, bool]]) -> float | None:
     return wins / (len(pos) * len(neg))
 
 
+def brier(pairs: list[tuple[float, bool]]) -> float | None:
+    """Mean squared error of a predicted probability against a 0/1 outcome."""
+    if not pairs:
+        return None
+    return sum((p - (1.0 if y else 0.0)) ** 2 for p, y in pairs) / len(pairs)
+
+
+def reliability_bins(pairs: list[tuple[float, bool]], n_bins: int = 10) -> list[dict]:
+    """Fixed-width probability bins: each bin's range, count, mean prediction
+    and observed rate. Every bin from 0 to ``n_bins`` is reported, including
+    empty ones (``n``: 0, ``mean_predicted``/``observed_rate``: None) -- an
+    ECE number is easy to overread on a small slice without seeing which
+    bins actually held data.
+    """
+    bins: list[list[tuple[float, bool]]] = [[] for _ in range(n_bins)]
+    for p, y in pairs:
+        idx = min(int(p * n_bins), n_bins - 1)
+        bins[idx].append((p, y))
+    out = []
+    for i, bucket in enumerate(bins):
+        out.append(
+            {
+                "range": [i / n_bins, (i + 1) / n_bins],
+                "n": len(bucket),
+                "mean_predicted": sum(p for p, _ in bucket) / len(bucket) if bucket else None,
+                "observed_rate": sum(1.0 for _, y in bucket if y) / len(bucket)
+                if bucket
+                else None,
+            }
+        )
+    return out
+
+
+def ece(pairs: list[tuple[float, bool]], n_bins: int = 10) -> float | None:
+    """Expected calibration error: bin-size-weighted mean |predicted - observed|."""
+    if not pairs:
+        return None
+    bins = reliability_bins(pairs, n_bins)
+    total = len(pairs)
+    return sum(
+        b["n"] / total * abs(b["mean_predicted"] - b["observed_rate"]) for b in bins if b["n"]
+    )
+
+
+def calibration_pairs(
+    verdicts: dict[tuple[str, int], object], observed: set, truth_any: set
+) -> list[tuple[float, bool]]:
+    """(p(-1), was actually an error) for every observed, judged turn.
+
+    Every turn the judge produced a vote distribution for is included, even
+    one where every vote was "0" or "1" -- ``judge_votes`` is now dense, so
+    ``p(-1) = 0.0`` there is a real observed frequency, not a missing key.
+    Excluding those turns would restrict prevalence, Brier and ECE to the
+    subset that happened to draw at least one negative vote, which biases
+    every number the calibration report prints.
+    """
+    return [
+        (v.judge_votes.get("-1", 0.0), key in truth_any)
+        for key, v in verdicts.items()
+        if key in observed and v.judge_votes is not None
+    ]
+
+
 def prf(predicted: set, truth: set, universe: set) -> dict:
     tp = len(predicted & truth)
     precision = tp / len(predicted) if predicted else None
@@ -152,6 +215,12 @@ def main() -> None:
 
     verdicts = run.verdict_by_key()
     judged_negative = {k for k, v in verdicts.items() if v.score == -1 and k in observed}
+    calib_pairs = calibration_pairs(verdicts, observed, truth_any)
+    prevalence = sum(1.0 for _, y in calib_pairs if y) / len(calib_pairs) if calib_pairs else None
+    baseline_pairs = [(prevalence, y) for _, y in calib_pairs] if prevalence is not None else []
+    votes_valid = [
+        len(v.votes) for k, v in verdicts.items() if k in observed and v.judge_votes is not None
+    ]
     errored = {(t.trace_id, t.index) for turns in turns_of.values() for t in turns if t.errored}
     flagged = None
     if args.scores:
@@ -173,6 +242,21 @@ def main() -> None:
             errored & observed, truth_any & observed, observed
         ),
         "annotated errors on unobserved turns": len(truth_any - observed),
+        "calibration": {
+            "n": len(calib_pairs),
+            "error_prevalence": prevalence,
+            "votes_requested": run.votes,
+            "votes_valid_per_example": {
+                "min": min(votes_valid) if votes_valid else None,
+                "max": max(votes_valid) if votes_valid else None,
+                "mean": sum(votes_valid) / len(votes_valid) if votes_valid else None,
+            },
+            "brier(p(-1), any_error)": brier(calib_pairs),
+            "brier_baseline(prevalence, any_error)": brier(baseline_pairs),
+            "ece(p(-1), any_error)": ece(calib_pairs),
+            "ece_n_bins": 10,
+            "reliability_bins": reliability_bins(calib_pairs),
+        },
     }
     if flagged is not None:
         turn_level["verifier flagged vs any error (observed)"] = prf(
