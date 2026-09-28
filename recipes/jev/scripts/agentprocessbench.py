@@ -10,8 +10,11 @@ or -1. Each labeled step becomes one decision row:
   turn. The history is there because a label marks a step that builds on an
   earlier uncorrected error as -1, so the step alone is not enough.
 - target: +1 -> success, 0 -> unclear, -1 -> failure.
-- split: by task (a task's five trajectories share one), 60/10/10/20
-  train/dev/calibration/test from a hash of the task id, so it is fixed.
+- split: by task, 60/10/10/20 train/dev/calibration/test from a hash of the
+  task, so it is fixed. A task is its text: in tau2-bench, twelve query
+  indices (34, 39-49) are one task, and splitting by index put it in train,
+  dev and test. `--group-by index` reproduces that split, which the
+  2026-09-27 locked results used (they report the test set without it).
 
     uv run python scripts/agentprocessbench.py --out apb.jsonl
     JEV_IMPORT=apb.jsonl uvx modal run scripts/modal_run.py --phase 2 --tag apb ...
@@ -26,6 +29,7 @@ import argparse
 import collections
 import hashlib
 import json
+import re
 import urllib.request
 from pathlib import Path
 
@@ -62,9 +66,16 @@ def split_of(group: str) -> str:
     return "train" if x < 0.6 else "dev" if x < 0.7 else "calibration" if x < 0.8 else "test"
 
 
-def rows_for(trajectory: dict, source: str) -> list[dict]:
+def task_group(trajectory: dict, source: str, group_by: str) -> str:
+    if group_by == "index":
+        return f"{source}:{trajectory['query_index']}"
+    text = re.sub(r"\s+", " ", trajectory["question"]).strip().lower()
+    return f"{source}:task-{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+
+
+def rows_for(trajectory: dict, source: str, group_by: str = "task") -> list[dict]:
     messages = trajectory["messages"]
-    group = f"{source}:{trajectory['query_index']}"
+    group = task_group(trajectory, source, group_by)
     system = "\n".join(m["content"] or "" for m in messages if m["role"] == "system")
     rows = []
     for index_text, label in trajectory["step_labels"].items():
@@ -106,6 +117,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, default=Path("agentprocessbench"), help="Where the source files are or go.")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--group-by",
+        choices=("task", "index"),
+        default="task",
+        help="task: one group per distinct task text (default). index: per query index, as the 2026-09-27 run.",
+    )
     args = parser.parse_args()
 
     args.src.mkdir(parents=True, exist_ok=True)
@@ -115,7 +132,7 @@ def main() -> None:
         if not path.exists():
             urllib.request.urlretrieve(URL.format(source=source), path)
         for line in path.read_text(encoding="utf-8").splitlines():
-            rows += rows_for(json.loads(line), source)
+            rows += rows_for(json.loads(line), source, args.group_by)
 
     args.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
     counts = collections.Counter(r["split"] for r in rows)
