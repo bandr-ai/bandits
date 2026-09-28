@@ -28,12 +28,16 @@
 #   CACHED_INPUT_USD_PER_MTOK                the judge's cached-input price (recommended with LEDGERS:
 #                                            without it cached tokens are priced at the full rate)
 #   FAST_KERNELS=1                           also install flash-linear-attention and causal-conv1d
+#   IMPORT       a JSONL of labeled decisions (the `jev import` format) to train and score on
+#                instead of judge runs; PROJECTS, JUDGE_RUNS and HELD_OUT_RUNS are then not used
 #   HELD_OUT_RUNS  phase 2 only: judge run ids (a subset of JUDGE_RUNS) for the unseen-source
 #                  check; a second run per model trains without them and scores them as their
 #                  own report section
 #   DEVICE, DTYPE  default: cuda, bfloat16 (DEVICE=cpu DTYPE=float32 with a tiny model rehearses
 #                  the whole script without a GPU)
 #   SKIP_INSTALL=1 reuse the recipe's existing environment as is
+#   RESUME_FROM_STEP  continue an interrupted training from the checkpoint it saved at this step
+#                (with the same OUT, so the checkpoints are found; single-model runs only)
 #   PROJECT_DIR  default: $OUT/project. Point phase 2 at phase 1's project so its finished
 #                training runs and checkpoints are reused instead of retrained
 #   OUT          default: runs/jev-<UTC timestamp>
@@ -54,8 +58,14 @@ if [[ "$PHASE" == "1" && -n "${HELD_OUT_RUNS:-}" ]]; then
   echo "HELD_OUT_RUNS is for phase 2: held-out sources are test-only" >&2
   exit 1
 fi
-: "${PROJECTS:?set PROJECTS to the Bandits project dirs}"
-: "${JUDGE_RUNS:?set JUDGE_RUNS to the turn-judge run ids}"
+if [[ -n "${IMPORT:-}" ]]; then
+  [[ -z "${HELD_OUT_RUNS:-}" ]] || { echo "HELD_OUT_RUNS needs judge runs, not IMPORT" >&2; exit 1; }
+  PROJECTS=""
+  JUDGE_RUNS=""
+else
+  : "${PROJECTS:?set PROJECTS to the Bandits project dirs (or IMPORT to a labeled JSONL)}"
+  : "${JUDGE_RUNS:?set JUDGE_RUNS to the turn-judge run ids}"
+fi
 if [[ -n "${HELD_OUT_RUNS:-}" ]]; then
   training_runs=0
   for run in $JUDGE_RUNS; do [[ " $HELD_OUT_RUNS " == *" $run "* ]] || training_runs=$((training_runs + 1)); done
@@ -106,6 +116,9 @@ done
 
 log "dataset"
 datasets=()
+if [[ -n "${IMPORT:-}" ]]; then
+  datasets+=("$(dataset_id_of import "$(realpath "$IMPORT")" --project "$PROJECT")")
+fi
 for run in $JUDGE_RUNS; do
   id="$(dataset_id_of dataset "$run" --project "$PROJECT")"
   datasets+=("$id")
@@ -170,7 +183,8 @@ for spec in $MODELS; do
   jev run "$DATASET" --model "$model" --revision "$revision" --seed "$SEED" \
     --checkpoint-dir "$OUT/checkpoints/$name" --output "$OUT/reports/$name" \
     --two-order "${EVAL_ARGS[@]}" ${price_args[@]+"${price_args[@]}"} --device "$DEVICE" --dtype "$DTYPE" --project "$PROJECT" \
-    2>&1 | tee "$OUT/run-$name.log"
+    ${RESUME_FROM_STEP:+--resume-from-step "$RESUME_FROM_STEP"} \
+    2>&1 | tee -a "$OUT/run-$name.log"
 
   if [[ -n "$TRAIN_WITHOUT_HELD_OUT" ]]; then
     held_args=()

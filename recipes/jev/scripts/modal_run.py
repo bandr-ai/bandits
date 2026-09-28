@@ -29,6 +29,7 @@ $0.01 cached in / $0.20 out per Mtok. Override them if your bill differs.
 from __future__ import annotations
 
 import collections
+import hashlib
 import os
 import subprocess
 from datetime import UTC, datetime
@@ -39,9 +40,13 @@ import modal
 if modal.is_local():
     REPO = Path(__file__).resolve().parents[3]
     WORK = Path(os.environ.get("JEV_WORK", REPO / "work")).resolve()
+    # JEV_IMPORT: a labeled JSONL (the `jev import` format) to train and score
+    # on instead of the judge runs. Read here because it goes into the image.
+    IMPORT = Path(os.environ["JEV_IMPORT"]).resolve() if os.environ.get("JEV_IMPORT") else None
 else:
     # In the container this file sits at /root, and the image is already built.
     REPO = WORK = Path("/")
+    IMPORT = None
 
 JUDGE_RUNS = "turn-judge-0044b8f5c041155c turn-judge-b83480800ad90a25 turn-judge-d450cf34d97b27a2"
 """TRAIL GAIA (v2), TRAIL SWE (v3) and tau2: the launch data (no shared traces)."""
@@ -94,6 +99,9 @@ image = (
     )
 )
 
+if IMPORT is not None:
+    image = image.add_local_file(str(IMPORT), "/work/import.jsonl", copy=True)
+
 runs = modal.Volume.from_name("jev-runs", create_if_missing=True)
 hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
 app = modal.App("jev-launch-run", image=image)
@@ -109,7 +117,8 @@ SCRIPT_TIMEOUT_S = TIMEOUT_S - 10 * 60
 )
 def run_phase(phase: int, extra_env: dict[str, str], tag: str) -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    name = "-".join(
+    # Resuming reuses the interrupted run's directory, where its checkpoints are.
+    name = extra_env.pop("RESUME_OUT", "") or "-".join(
         part for part in (f"phase{phase}", f"seed{extra_env.get('SEED', '1')}", tag, stamp) if part
     )
     out = f"/runs/{name}"
@@ -134,7 +143,7 @@ def run_phase(phase: int, extra_env: dict[str, str], tag: str) -> str:
     ]
     try:
         with (
-            open(f"{out}.console.log", "w") as log,
+            open(f"{out}.console.log", "a") as log,
             subprocess.Popen(
                 cmd,
                 cwd="/repo",
@@ -176,6 +185,8 @@ def main(
     cached_input_usd_per_mtok: str = "0.01",
     output_usd_per_mtok: str = "0.20",
     tag: str = "",
+    resume_out: str = "",
+    resume_from_step: int = 0,
 ):
     """--models overrides gpu_run.sh's default (Base and Instruct 4B); pin a
     model's revision as model@sha (phase 2 passes the sha phase 1 printed).
@@ -191,8 +202,18 @@ def main(
     }
     if models:
         extra["MODELS"] = models
+    if IMPORT is not None:
+        # Its own project, keyed by the file's content, so an import run never
+        # shares artifacts with the judge-run project or another import.
+        digest = hashlib.sha256(IMPORT.read_bytes()).hexdigest()[:12]
+        extra.update({"IMPORT": "/work/import.jsonl", "PROJECT_DIR": f"/runs/jev-project-import-{digest}"})
+        extra.pop("LEDGERS")
+        tag = tag or f"import-{IMPORT.stem}"
     if held_out_swe:
         extra["HELD_OUT_RUNS"] = SWE_JUDGE_RUN
+    if resume_out:
+        # --resume-out <run dir, as `modal volume ls jev-runs /` shows it> --resume-from-step N
+        extra.update({"RESUME_OUT": resume_out, "RESUME_FROM_STEP": str(resume_from_step)})
     if not tag and len(models.split()) == 1:
         tag = models.split("@")[0].split("/")[-1]
     if held_out_swe:
