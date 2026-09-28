@@ -185,6 +185,16 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     # execution never answers two calls.
     claimed: set[str] = set()
     combined: list[Span] = []
+    # Explicit tool spans that recorded no result, by call id. A response in a
+    # later input is then the only record of it and fills the span in.
+    without_output: dict[str, str] = {
+        call_id: span.span_id
+        for span in spans
+        if span.kind is SpanKind.TOOL and span.output is None
+        for key in _TOOL_CALL_ID_KEYS
+        if isinstance(call_id := span.attributes.get(key), str)
+    }
+    filled: dict[str, object] = {}
 
     for span in spans:
         for message in _messages(span.attributes.get("gen_ai.input.messages")):
@@ -205,6 +215,9 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                         )
                 elif part_type == "tool_call_response" and isinstance(call_id, str):
                     if call_id in emitted:
+                        explicit = without_output.get(call_id)
+                        if explicit is not None and part.get("result") is not None:
+                            filled.setdefault(explicit, _tool_result(part.get("result")))
                         continue
                     call = calls.get(call_id)
                     name = part.get("name")
@@ -285,6 +298,16 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                 },
             )
         )
+    if filled:
+        combined = [
+            span.replace(
+                output=filled[span.span_id],
+                attributes={**span.attributes, "output_source": "gen_ai.input.messages"},
+            )
+            if span.span_id in filled
+            else span
+            for span in combined
+        ]
     if not unanswered:
         return tuple(combined)
     placed: list[Span] = []
@@ -598,7 +621,10 @@ def assemble_corpus(
             tools = root_tools if root_tools is not None else tools
             system_prompt = root_prompt if root_prompt is not None else system_prompt
             context = {**context, **root_context}
-        if system_prompt is None:
+        extras = (trace_extras or {}).get(trace_id, {})
+        # Each workflow stage runs under its own system message; none of them is
+        # the episode's policy, and each stays on its own span.
+        if system_prompt is None and extras.get("interaction") != "workflow":
             # Most exporters record the policy as the system message opening
             # each model call rather than on the root. The first call's is what
             # the episode started under; a later call under a different one is
@@ -612,7 +638,6 @@ def assemble_corpus(
                 ),
                 None,
             )
-        extras = (trace_extras or {}).get(trace_id, {})
         user_turns = _user_turns(ordered)
         if declared and extras.get("interaction") != "workflow":
             user_turns = _merge_root_user_turns(_root_user_turns(declared), user_turns)

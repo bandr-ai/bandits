@@ -307,9 +307,10 @@ def build_evidence(
         duplicate[call_id] = bool(text) and any(
             other != call_id and texts[other] == text for other in texts
         )
-    targets: list[tuple[str, Any, Any]] = [
-        (span.span_id, span.started_at, _span_input(span)) for span in spans
-    ] + [(node.span_id, node.started_at, node.input) for node in nodes]
+    # Each target's haystack once: later inputs carry the whole workflow state.
+    targets: list[tuple[str, Any, str]] = [
+        (span.span_id, span.started_at, _haystack(_span_input(span))) for span in spans
+    ] + [(node.span_id, node.started_at, _haystack(node.input)) for node in nodes]
     matched: dict[str, dict[str, int]] = defaultdict(dict)  # target -> call -> chars
     short: dict[str, bool] = {}
     for call in calls:
@@ -319,10 +320,9 @@ def build_evidence(
         long_leaves = [leaf for leaf in text if len(leaf) >= MIN_MATCH_CHARS]
         short[call.span_id] = not long_leaves
         needles = long_leaves or list(text)
-        for target_id, started_at, value in targets:
+        for target_id, started_at, haystack in targets:
             if target_id == call.span_id or started_at < call.ended_at:
                 continue
-            haystack = _haystack(value)
             if haystack and all(needle in haystack for needle in needles):
                 matched[target_id][call.span_id] = sum(len(n) for n in needles)
     unsure = {c: short.get(c, False) or duplicate.get(c, False) for c in texts}
