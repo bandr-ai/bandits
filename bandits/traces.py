@@ -180,6 +180,8 @@ class WorkflowRequest(Contract):
     candidate_span_ids: tuple[str, ...] = ()
     raw_input: Any = None
     raw_output: Any = None
+    status: SpanStatus | None = None
+    """Recorded status of the invocation span; None when no invocation was selected."""
 
     task: str | None = None
     task_status: Literal["declared", "unresolved", "conflict"] = "unresolved"

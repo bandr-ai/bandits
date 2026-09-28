@@ -86,7 +86,9 @@ def _shape(record: Any) -> tuple[str, str] | None:
     ):
         return "otlp-std", "OTLP resourceSpans/batches"
     if isinstance(record.get("observations"), list) and (
-        record.get("trace_id") or record.get("id")
+        record.get("trace_id")
+        or record.get("id")
+        or (isinstance(record.get("trace"), dict) and record["trace"].get("id"))
     ):
         return "langfuse", "Langfuse trace with observations"
     context = record.get("context")
@@ -101,6 +103,16 @@ def _shape(record: Any) -> tuple[str, str] | None:
             return "phoenix", "Phoenix spans with context IDs"
         if "span_attributes" in spans[0] and "span_id" in spans[0]:
             return "trail", "TRAIL nested span tree"
+    data = record.get("data")
+    if (
+        isinstance(data, list)
+        and data
+        and isinstance(data[0], dict)
+        and isinstance(data[0].get("context"), dict)
+        and data[0]["context"].get("trace_id")
+        and data[0]["context"].get("span_id")
+    ):
+        return "phoenix", "Phoenix getSpans data[] with context IDs"
     if (record.get("id") or record.get("run_id")) and record.get("run_type"):
         return "langsmith", "LangSmith Run id or run_id with run_type"
     if (

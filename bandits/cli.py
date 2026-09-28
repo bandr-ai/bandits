@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import time
 from collections import Counter
 from pathlib import Path
@@ -96,7 +97,7 @@ from bandits.export import (
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
-from bandits.traces import SpanKind, WorkflowDeclaration
+from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -150,6 +151,22 @@ def check_source(
     models = [
         span for trace in corpus.traces for span in trace.spans if span.kind == SpanKind.MODEL
     ]
+
+    def valid_messages(value: object) -> bool:
+        # A declared gen_ai.*.messages attribute stays the JSON string the
+        # producer wrote; only messages Bandits rebuilt are already lists.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return False
+        return isinstance(value, list) and all(
+            isinstance(message, dict)
+            and message.get("role") in ("system", "developer", "user", "assistant", "tool")
+            and isinstance(message.get("parts"), list)
+            for message in value
+        )
+
     missing_input = sum(
         not span.arguments
         and span.attributes.get("gen_ai.input.messages") is None
@@ -157,8 +174,31 @@ def check_source(
         for span in models
     )
     missing_output = sum(
-        span.output is None and span.attributes.get("gen_ai.output.messages") is None
+        span.status != SpanStatus.ERROR
+        and span.output is None
+        and span.attributes.get("gen_ai.output.messages") is None
+        and not span.attributes.get("bandits.output_unusable_reason")
         for span in models
+    )
+    unusable_output = sum(
+        span.status != SpanStatus.ERROR
+        and bool(span.attributes.get("bandits.output_unusable_reason"))
+        for span in models
+    )
+    failed_without_output = sum(
+        span.status == SpanStatus.ERROR
+        and span.output is None
+        and span.attributes.get("gen_ai.output.messages") is None
+        for span in models
+    )
+    malformed_messages = sum(
+        not valid_messages(value)
+        for span in models
+        for value in (
+            span.attributes.get("gen_ai.input.messages"),
+            span.attributes.get("gen_ai.output.messages"),
+        )
+        if value is not None
     )
     console.print(f"traces:      {len(corpus.traces)}")
     console.print(f"spans:       {sum(len(trace.spans) for trace in corpus.traces)}")
@@ -174,6 +214,9 @@ def check_source(
         )
     console.print(f"no input:    {missing_input}")
     console.print(f"no output:   {missing_output}")
+    console.print(f"unusable recorded output: {unusable_output}")
+    console.print(f"failed calls with no output: {failed_without_output}")
+    console.print(f"bad messages:{malformed_messages:>3}")
     console.print(f"no task:     {sum(trace.task is None for trace in corpus.traces)}")
     redactions = [issue for issue in corpus.issues if issue.kind == "redaction"]
     containers = [issue for issue in corpus.issues if issue.kind == "source_container"]
@@ -195,9 +238,16 @@ def check_source(
     console.print(f"evaluators: {len(evaluators)} exclusion notice(s)")
     console.print(f"issues:      {len(issues)}")
     console.print("scope:       decoding only; a retained field may still be misinterpreted")
+    console.print("quality:     not evaluated by check-source")
     for issue in issues[:_MAX_INLINE_ISSUES]:
         console.print(f"  - {issue.kind}: {issue.detail}")
-    if not corpus.traces or issues:
+    otlp_family = source in ("otlp", "otlp-std", "langfuse", "langsmith", "phoenix")
+    if (
+        not corpus.traces
+        or issues
+        or malformed_messages
+        or (otlp_family and (missing_input or missing_output or unusable_output))
+    ):
         raise typer.Exit(code=1)
 
 

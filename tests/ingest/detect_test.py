@@ -111,3 +111,62 @@ def test_check_reports_the_model_kind_used_by_the_reader() -> None:
     result = CliRunner().invoke(app, ["check-source", str(source), "--mode", "conversation"])
     assert "detected:    otlp-std" in result.output
     assert "via ai.operationId=ai.generateText.doGenerate" in result.output
+
+
+def _declared_chat(tmp_path: Path, input_messages: object) -> Path:
+    def attr(key: str, value: str) -> dict:
+        return {"key": key, "value": {"stringValue": value}}
+
+    span = {
+        "traceId": "0" * 31 + "1",
+        "spanId": "0" * 15 + "1",
+        "name": "chat",
+        "startTimeUnixNano": "1000",
+        "endTimeUnixNano": "2000",
+        "attributes": [
+            attr("gen_ai.operation.name", "chat"),
+            attr("gen_ai.input.messages", json.dumps(input_messages)),
+            attr(
+                "gen_ai.output.messages",
+                json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": "hi"}]}]),
+            ),
+        ],
+    }
+    return _write(
+        tmp_path / "chat.otlp.json",
+        {"resourceSpans": [{"scopeSpans": [{"spans": [span]}]}]},
+    )
+
+
+def test_check_reads_declared_messages_as_json(tmp_path: Path) -> None:
+    """Producers write gen_ai.*.messages as a JSON string; that is not malformed."""
+    source = _declared_chat(
+        tmp_path, [{"role": "user", "parts": [{"type": "text", "content": "hello"}]}]
+    )
+    result = CliRunner().invoke(app, ["check-source", str(source), "--mode", "conversation"])
+    assert "bad messages:  0" in result.output
+    assert result.exit_code == 0
+
+
+def test_check_flags_messages_without_roles_and_parts(tmp_path: Path) -> None:
+    source = _declared_chat(tmp_path, ["hello"])
+    result = CliRunner().invoke(app, ["check-source", str(source), "--mode", "conversation"])
+    assert "bad messages:  1" in result.output
+    assert result.exit_code == 1
+
+
+def test_check_does_not_call_an_errored_model_response_lost(tmp_path: Path) -> None:
+    source = _declared_chat(
+        tmp_path, [{"role": "user", "parts": [{"type": "text", "content": "hello"}]}]
+    )
+    record = json.loads(source.read_text())
+    span = record["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    span["attributes"] = [
+        item for item in span["attributes"] if item["key"] != "gen_ai.output.messages"
+    ]
+    span["status"] = {"code": 2, "message": "provider unavailable"}
+    source.write_text(json.dumps(record))
+    result = CliRunner().invoke(app, ["check-source", str(source), "--mode", "conversation"])
+    assert result.exit_code == 0, result.output
+    assert "no output:   0" in result.output
+    assert "failed calls with no output: 1" in result.output

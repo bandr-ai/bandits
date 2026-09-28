@@ -148,6 +148,7 @@ def build_request(
         candidate_span_ids=candidates,
         raw_input=record.get("input"),
         raw_output=record.get("output"),
+        status=record.get("status"),
         task=task,
         task_status=status,  # type: ignore[arg-type]
         task_path=path,

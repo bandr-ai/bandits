@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -81,6 +82,8 @@ _NONE = "none"
 _EXCLUDED = "excluded"
 """Classifications. ``_NONE`` is a span with no model or tool meaning;
 ``_EXCLUDED`` one that must not reach the corpus, nor anything beneath it."""
+
+_TRANSPORT_RESPONSE_REPR = re.compile(r"^<[^<>]+ \[[1-5]\d\d [A-Za-z ]+\] type=<class '[^']+'>>$")
 
 _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
     (
@@ -431,7 +434,15 @@ def _call_part(call: dict[str, Any]) -> dict[str, Any] | None:
 def _content_parts(content: object) -> list[dict[str, Any]]:
     """Text and tool parts from a message's content, across provider shapes."""
     if isinstance(content, str):
-        return [{"type": "text", "content": content}] if content else []
+        encoded = _json_value(content) if content.lstrip().startswith("[{") else None
+        if (
+            isinstance(encoded, list)
+            and encoded
+            and all(isinstance(p, dict) and ("text" in p or "type" in p) for p in encoded)
+        ):
+            content = encoded  # a parts list serialized into the content string
+        else:
+            return [{"type": "text", "content": content}] if content else []
     if isinstance(content, dict):
         content = [content]
     if not isinstance(content, list):
@@ -460,12 +471,12 @@ def _content_parts(content: object) -> list[dict[str, Any]]:
                     "result": item.get("content"),
                 }
             )
-        elif isinstance(item.get("functionCall"), dict):  # Gemini
-            part = _call_part(item["functionCall"])
+        elif isinstance(item.get("functionCall") or item.get("function_call"), dict):  # Gemini
+            part = _call_part(item.get("functionCall") or item["function_call"])
             if part:
                 parts.append(part)
-        elif isinstance(item.get("functionResponse"), dict):  # Gemini
-            response = item["functionResponse"]
+        elif isinstance(item.get("functionResponse") or item.get("function_response"), dict):
+            response = item.get("functionResponse") or item["function_response"]  # Gemini
             parts.append(
                 {
                     "type": "tool_call_response",
@@ -498,10 +509,16 @@ def _message(raw: object) -> dict[str, Any] | None:
             parts = [
                 {"type": "tool_call_response", "id": call_id, "result": text if text else source}
             ]
-    calls = raw.get("tool_calls")
-    if isinstance(raw.get("function_call"), dict):  # OpenAI legacy
-        calls = [*(calls or []), raw["function_call"]]
-    for call in calls or []:
+    # LangChain keeps the provider's calls in additional_kwargs when its own
+    # tool_calls field is empty.
+    extra = raw.get("additional_kwargs") if isinstance(raw.get("additional_kwargs"), dict) else {}
+    calls = _json_value(raw.get("tool_calls") or extra.get("tool_calls"))
+    calls = list(calls) if isinstance(calls, list) else []
+    function_call = _json_value(raw.get("function_call") or extra.get("function_call"))
+    if isinstance(function_call, dict):  # OpenAI legacy
+        calls.append(function_call)
+    for call in calls:
+        call = _json_value(call)  # some exporters serialize each call separately
         if isinstance(call, dict) and (part := _call_part(call)):
             parts.append(part)
     message: dict[str, Any] = {"role": role, "parts": parts}
@@ -510,14 +527,59 @@ def _message(raw: object) -> dict[str, Any] | None:
     return message
 
 
-def _messages(value: object) -> list[dict[str, Any]] | None:
-    """A message list, when *value* is one in any common shape; else None."""
+def _gemini_system(request: dict[str, Any]) -> list[dict[str, Any]]:
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+    system = next(
+        (
+            v
+            for v in (
+                request.get("system_instruction"),
+                request.get("systemInstruction"),
+                config.get("system_instruction"),
+                config.get("systemInstruction"),
+            )
+            if v
+        ),
+        None,
+    )
+    if isinstance(system, dict):  # Content object
+        system = system.get("parts")
+    parts = _content_parts(system)
+    return [{"role": "system", "parts": parts}] if parts else []
+
+
+def _messages(value: object, default_role: str | None = None) -> list[dict[str, Any]] | None:
+    """A message list, when *value* is one in any common shape; else None.
+
+    ``default_role`` applies only when no item in a list names a role: a
+    role-less ``[{"content": ...}]`` recorded as a call's input or output.
+    """
     value = _json_value(value)
     if value is _UNPARSED:
         return None
+    system: list[dict[str, Any]] = []
     if isinstance(value, dict):
         if isinstance(value.get("messages"), list):
             value = value["messages"]
+        elif default_role == "user" and _prompt_strings(value) is not None:
+            # A completion request: OpenAI ``prompt``, LangChain LLM ``prompts``.
+            value = [{"role": "user", "content": text} for text in _prompt_strings(value)]
+        elif isinstance(value.get("contents"), (list, str)):  # Gemini request
+            system = _gemini_system(value)
+            contents = value["contents"]
+            # The SDK accepts a bare string as one user turn.
+            value = (
+                [{"role": "user", "content": contents}] if isinstance(contents, str) else contents
+            )
+        elif isinstance(value.get("generations"), list):  # LangChain chat model result
+            generations = value["generations"]
+            value = [
+                generation.get("message")
+                or {"role": "assistant", "content": generation.get("text")}
+                for batch in generations
+                for generation in (batch if isinstance(batch, list) else [batch])
+                if isinstance(generation, dict)
+            ]
         elif isinstance(value.get("choices"), list):  # OpenAI response
             value = [c.get("message") for c in value["choices"] if isinstance(c, dict)]
         elif isinstance(value.get("candidates"), list):  # Gemini response
@@ -526,10 +588,80 @@ def _messages(value: object) -> list[dict[str, Any]] | None:
             value = [value]
     if not isinstance(value, list):
         return None
-    if len(value) == 1 and isinstance(value[0], list):  # LangChain batch of one
-        value = value[0]
-    messages = [m for m in (_message(item) for item in value) if m is not None]
-    return messages or None
+    if value and all(isinstance(item, list) for item in value):  # LangChain batches
+        value = [message for batch in value for message in batch]
+    if (
+        default_role
+        and value
+        and all(
+            isinstance(item, dict)
+            and "content" in item
+            and item.get("role") is None
+            and item.get("type") is None
+            for item in value
+        )
+    ):
+        value = [{**item, "role": default_role} for item in value]
+    messages = [
+        m for m in (_message(item) for item in value if not _tool_definition(item)) if m is not None
+    ]
+    return [*system, *messages] or None
+
+
+def _prompt_strings(request: dict[str, Any]) -> list[str] | None:
+    for key in ("prompt", "prompts"):
+        prompt = request.get(key)
+        if isinstance(prompt, str) and prompt:
+            return [prompt]
+        if isinstance(prompt, list) and prompt and all(isinstance(p, str) for p in prompt):
+            return prompt
+    return None
+
+
+def _tool_definition(item: object) -> bool:
+    """A tool schema some integrations list among messages as ``role: tool``.
+
+    It describes what could be called; it is not a turn. The raw value keeps it.
+    """
+    if not isinstance(item, dict) or item.get("role") != "tool":
+        return False
+    content = _json_value(item.get("content"))
+    if not isinstance(content, dict):
+        return False
+    if isinstance(content.get("name"), str) and (
+        "input_schema" in content or "parameters" in content
+    ):
+        return True  # Anthropic / bare function schema
+    function = content.get("function")
+    return (
+        content.get("type") == "function"
+        and isinstance(function, dict)
+        and isinstance(function.get("name"), str)
+        and "arguments" not in function
+    )
+
+
+def _recorded_attribute_value(value: object, direction: str) -> object:
+    """The message value inside an OTLP key/value list stored as an I/O value.
+
+    Langfuse keeps span-event attributes it received over OTLP this way, e.g.
+    ``[{"key": "gen_ai.prompt", "value": {"stringValue": ...}}]``. Anything else
+    is returned unchanged.
+    """
+    if not (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, dict) and set(item) == {"key", "value"} for item in value)
+    ):
+        return value
+    decoded = _attributes(value)
+    keys = (
+        ("gen_ai.input.messages", "gen_ai.prompt")
+        if direction == "input"
+        else ("gen_ai.output.messages", "gen_ai.completion")
+    )
+    found = _first_value(decoded, keys)
+    return _json_value(found[1]) if found is not None else value
 
 
 def _text_message(role: str, value: object) -> list[dict[str, Any]] | None:
@@ -637,10 +769,24 @@ def _normalized_messages(
         if attributes.get(key) is not None:
             if unparsed is not None and _json_value(attributes[key]) is _UNPARSED:
                 unparsed[key] += 1
-            continue
+            declared = _messages(attributes[key])
+            # A producer can declare an empty assistant message while also
+            # recording a real function call in flattened legacy attributes.
+            # Keep the declared bytes in source_context, but let substantive
+            # recorded content fill the normalized view.
+            if declared and any(message.get("parts") for message in declared):
+                continue
         candidates: list[tuple[str, Any]] = [
             (f"event:{key}", _messages(details.get(key))),
-            (f"{flat_legacy}.N", _messages(_unflatten(attributes, flat_legacy))),
+            (
+                f"{flat_legacy}.N",
+                _messages(
+                    [
+                        {**item, "role": item.get("role") or role}
+                        for item in _unflatten(attributes, flat_legacy)
+                    ]
+                ),
+            ),
             (
                 f"{flat_oi}.N",
                 _messages([_openinference_message(m) for m in _unflatten(attributes, flat_oi)]),
@@ -657,11 +803,15 @@ def _normalized_messages(
                     unparsed[declared[0]] += 1
                 found = None
             else:
-                found = _messages(parsed)
+                parsed = _recorded_attribute_value(parsed, direction)
+                found = _messages(parsed, default_role=role)
                 if found is None and prompt_is_text:
                     found = _text_message(role, parsed)
             candidates.append((declared[0], found))
-        origin, messages = next(((o, m) for o, m in candidates if m), (None, None))
+        origin, messages = next(
+            ((o, m) for o, m in candidates if m and any(message.get("parts") for message in m)),
+            (None, None),
+        )
         if messages:
             added[key] = messages
             added[f"bandits.{direction}_messages_from"] = origin
@@ -723,7 +873,26 @@ def _classify(attributes: dict[str, Any]) -> tuple[str, str]:
             return role, f"braintrust.span_attributes.type={kind}"
         if found is None and role is not None:
             return role, f"braintrust.span_attributes.type={kind}"
+    if (
+        found is not None
+        and found[0] == _MODEL
+        and attributes.get("gen_ai.operation.name") is None
+        and _embedding_model(attributes)
+    ):
+        # A generic "generation" kind (Langfuse GENERATION, OpenInference LLM)
+        # also covers embedding requests; an embedding has no reply to learn.
+        return _NONE, f"{found[1]} with embedding model"
     return found or (_NONE, first_declared or "no declared kind")
+
+
+_MODEL_NAME_KEYS = ("gen_ai.request.model", "llm.model_name", "langfuse.observation.model.name")
+
+
+def _embedding_model(attributes: dict[str, Any]) -> bool:
+    return any(
+        isinstance(attributes.get(key), str) and "embed" in attributes[key].lower()
+        for key in _MODEL_NAME_KEYS
+    )
 
 
 def _exclude_subtrees(spans: dict[str, _Decoded]) -> None:
@@ -951,6 +1120,92 @@ def _pipeline_steps(spans: dict[str, _Decoded]) -> set[str]:
     return selected
 
 
+def _collapse_model_wrappers(spans: dict[str, _Decoded]) -> list[tuple[_Decoded, _Decoded]]:
+    """Treat near-identical enclosing instrumentation as structure, not a second call.
+
+    A parent/child relation or shared model name alone does not establish this:
+    agents may genuinely nest model calls. We require a direct child, matching
+    model and status, nearly identical timing, and compatible recorded replies.
+    Both original records remain available (as a workflow node and raw source).
+    """
+    children: dict[str, list[_Decoded]] = {}
+    for span in spans.values():
+        if span.parent_id in spans:
+            children.setdefault(span.parent_id, []).append(span)
+
+    def model(span: _Decoded) -> str | None:
+        return next(
+            (
+                value
+                for key in (
+                    "gen_ai.request.model",
+                    "gen_ai.response.model",
+                    "llm.model_name",
+                    "llm.request.model_name",
+                )
+                if isinstance(value := span.attributes.get(key), str) and value
+            ),
+            None,
+        )
+
+    def reply(span: _Decoded) -> object:
+        attrs = {
+            **span.attributes,
+            **_normalized_messages(span.attributes, span.events, prompt_is_text=True),
+        }
+        return _declared_completion(attrs)
+
+    collapsed: list[tuple[_Decoded, _Decoded]] = []
+    for parent in spans.values():
+        if parent.role != _MODEL:
+            continue
+        model_children = [
+            child for child in children.get(parent.span_id, ()) if child.role == _MODEL
+        ]
+        if len(model_children) != 1:
+            continue
+        child = model_children[0]
+        if parent.error != child.error or model(parent) is None or model(parent) != model(child):
+            continue
+        duration = (parent.ended_at - parent.started_at).total_seconds()
+        tolerance = min(0.05, duration * 0.05)
+        if duration <= 0 or tolerance <= 0:
+            continue
+        start_gap = (child.started_at - parent.started_at).total_seconds()
+        end_gap = (parent.ended_at - child.ended_at).total_seconds()
+        if not (0 <= start_gap <= tolerance and 0 <= end_gap <= tolerance):
+            continue
+        parent_reply, child_reply = reply(parent), reply(child)
+        if parent_reply is not None and child_reply is not None and parent_reply != child_reply:
+            continue
+        if (parent_reply is None) != (child_reply is None) and child_reply != "None":
+            continue
+        # Two blank replies provide no independent evidence that the operations
+        # are the same. An enclosing tool call and an empty provider text are
+        # compatible: provider instrumentors often render a tool-only reply as
+        # the literal string "None".
+        if parent_reply is None and child_reply in (None, "None"):
+            parent_messages = _normalized_messages(
+                parent.attributes, parent.events, prompt_is_text=True
+            ).get("gen_ai.output.messages", parent.attributes.get("gen_ai.output.messages"))
+            parsed = _json_value(parent_messages)
+            if not (
+                isinstance(parsed, list)
+                and any(
+                    part.get("type") == "tool_call"
+                    for message in parsed
+                    if isinstance(message, dict)
+                    for part in message.get("parts", ())
+                    if isinstance(part, dict)
+                )
+            ):
+                continue
+        parent.role = _STEP
+        parent.attributes["bandits.duplicate_model_of"] = child.span_id
+        collapsed.append((parent, child))
+    return collapsed
+
+
 def _covered(spans: dict[str, _Decoded], selected: set[str]) -> set[str]:
     """Spans inside a selected step, which that step already represents."""
     covered = set()
@@ -1015,6 +1270,12 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
             output = _json_value(output[1]) if output is not None else None
             if output is _UNPARSED:
                 output = None
+        if isinstance(output, str) and _TRANSPORT_RESPONSE_REPR.fullmatch(output):
+            # Some instrumentors record a Python HTTP response object rather
+            # than its model completion. Keep the source field, but do not let
+            # this placeholder become a training target or a judge answer.
+            attributes["bandits.output_unusable_reason"] = "transport_response_object_repr"
+            output = None
         return Span(
             span_id=decoded.span_id,
             parent_span_id=decoded.parent_id,
@@ -1236,6 +1497,16 @@ def load_otlp_standard(
         if not decoded:
             continue
         _exclude_subtrees(decoded)
+        for wrapper, call in _collapse_model_wrappers(decoded):
+            issues.append(
+                TraceIssue(
+                    kind="duplicate_model_instrumentation",
+                    detail=f"trace {trace_id}: enclosing model span {wrapper.span_id} and "
+                    f"provider span {call.span_id} appear to record one call; "
+                    "the enclosing record is retained as structure",
+                    location=wrapper.location,
+                )
+            )
         steps = _pipeline_steps(decoded)
         covered = _covered(decoded, steps)
         collected: list[tuple[int, Span]] = []
@@ -1297,6 +1568,7 @@ def load_otlp_standard(
                 span_id: {
                     "input": _io_value(decoded[span_id].attributes, _INPUT_VALUE_KEYS, scratch),
                     "output": _io_value(decoded[span_id].attributes, _OUTPUT_VALUE_KEYS, scratch),
+                    "status": SpanStatus.ERROR if decoded[span_id].error else SpanStatus.OK,
                 }
                 for span_id in candidates
             }

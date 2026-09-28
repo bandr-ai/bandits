@@ -66,7 +66,10 @@ def _av(value: Any) -> dict[str, Any]:
 
 
 def _attrs(values: dict[str, Any]) -> list[dict[str, Any]]:
-    return [{"key": k, "value": _av(v)} for k, v in values.items()]
+    # An unrecorded value is an absent attribute. Encoding None would write the
+    # string "null", which the decoder reads as a message saying "null". The
+    # null itself stays visible in bandits.native.record and the source archive.
+    return [{"key": k, "value": _av(v)} for k, v in values.items() if v is not None]
 
 
 def _records(data: bytes) -> Iterator[dict[str, Any]]:
@@ -128,7 +131,8 @@ def _span(
 def _langfuse(record: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(record.get("observations"), list):
         raise ValueError("Langfuse input requires a trace with observations[]")
-    trace_id = record.get("trace_id") or record.get("id")
+    trace_record = record.get("trace") if isinstance(record.get("trace"), dict) else record
+    trace_id = trace_record.get("trace_id") or trace_record.get("id")
     if not trace_id:
         raise ValueError("Langfuse trace has no trace_id/id")
     spans: list[dict[str, Any]] = []
@@ -154,7 +158,7 @@ def _langfuse(record: dict[str, Any]) -> list[dict[str, Any]]:
         }
         if observation.get("parentObservationId") is None and enclosing_id is None:
             attributes["bandits.native.trace_record"] = {
-                k: v for k, v in record.items() if k != "observations"
+                k: v for k, v in trace_record.items() if k != "observations"
             }
         metadata = observation.get("metadata")
         if isinstance(metadata, dict):
@@ -202,11 +206,10 @@ def _langsmith(record: dict[str, Any]) -> list[dict[str, Any]]:
         "output.value": record.get("outputs"),
         "bandits.native.record": {k: v for k, v in record.items() if k != "child_runs"},
     }
-    inputs, outputs = record.get("inputs"), record.get("outputs")
-    if isinstance(inputs, dict) and isinstance(inputs.get("messages"), list):
-        attributes["gen_ai.input.messages"] = inputs["messages"]
-    if isinstance(outputs, dict) and isinstance(outputs.get("messages"), list):
-        attributes["gen_ai.output.messages"] = outputs["messages"]
+    # Keep the producer's structure in input.value/output.value. The shared
+    # decoder normalizes LangChain's nested message batches and generations;
+    # assigning them directly to gen_ai.* would falsely mark raw lists as
+    # already-normalized GenAI messages.
     status = str(record.get("status") or "").lower()
     extra = (
         {"status": {"code": 2, "message": str(record.get("error") or "")}}
@@ -235,6 +238,8 @@ def _phoenix(record: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(attributes, dict):
         raise ValueError("Phoenix span attributes must be an object")
     attributes = {**attributes, "bandits.native.record": record}
+    if "openinference.span.kind" not in attributes and isinstance(record.get("span_kind"), str):
+        attributes["openinference.span.kind"] = record["span_kind"]
     resource = record.get("resource") or {}
     scope = record.get("instrumentation_scope") or record.get("instrumentationScope") or {}
     status = record.get("status")
@@ -354,7 +359,7 @@ def load_native(
                 records = (
                     outer.get("runs")
                     if source_name == "langsmith"
-                    else outer.get("spans")
+                    else outer.get("spans") or outer.get("data")
                     if source_name == "phoenix"
                     else None
                 )
