@@ -122,7 +122,7 @@ def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> 
     )
 
     assert result.exit_code == 0
-    assert "redaction:   secrets-only-v2" in result.stdout
+    assert "redaction: secrets-only-v2" in result.stdout
     store = ArtifactStore(project / ".bandits")
     assert store.read(store.list()[0].artifact_id).redaction_ruleset == "secrets-only-v2"
 

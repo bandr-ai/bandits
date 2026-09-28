@@ -62,7 +62,7 @@ compatibility with every version of every platform export; unsupported records
 are reported as ingest issues. Auto-detection is a conservative structural
 check, not proof that a mapping is semantically correct. It samples up to ten
 records per file; the reader then checks the full export. If a sample record
-exceeds 8 MiB, pass `--source NAME` explicitly. Unknown or mixed sources stop
+exceeds 512 MiB, pass `--source NAME` explicitly. Unknown or mixed sources stop
 with a reason; no LLM proposes a mapping yet. A source archive preserves what
 was recorded, but it cannot restore content omitted upstream or removed by
 redaction. A format match and a successful decode are the first two checks;
