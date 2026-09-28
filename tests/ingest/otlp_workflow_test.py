@@ -464,6 +464,8 @@ def test_cli_rejects_workflow_options_without_workflow_mode(tmp_path) -> None:
             str(path),
             "--source",
             "otlp-std",
+            "--mode",
+            "conversation",
             "--task-field",
             "input.query",
             "--project",
@@ -471,6 +473,7 @@ def test_cli_rejects_workflow_options_without_workflow_mode(tmp_path) -> None:
         ],
     )
     assert result.exit_code == 1
+    assert "only apply to workflows" in result.output
 
 
 def test_workflow_mode_is_otlp_std_only(tmp_path) -> None:

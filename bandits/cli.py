@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import json
 import time
-from collections import Counter
 from pathlib import Path
 
 import typer
@@ -95,9 +94,11 @@ from bandits.export import (
     write_direct_sft,
 )
 from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
+from bandits.ingest.health import check as check_health
+from bandits.ingest.health import detect_request_fields
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
-from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
+from bandits.traces import WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -109,7 +110,23 @@ _SINGLETON_WARNING = 0.8
 """Fraction of one-trace families above which grouping is reported as inert."""
 
 
-@app.command(name="check-source")
+def _say(*objects: object) -> None:
+    # One line per message: wrapped IDs and paths cannot be copied.
+    console.print(*objects, soft_wrap=True)
+
+
+_WORKFLOW_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
+"""Sources that can be read as a workflow; the default for them is workflow mode."""
+
+
+def _fail(what: str, why: str, fix: str) -> None:
+    _say(f"[red]error:[/red] {what}")
+    _say(f"  why: {why}")
+    _say(f"  fix: {fix}")
+    raise typer.Exit(code=1)
+
+
+@app.command(name="check-source", hidden=True)
 def check_source(
     path: Path,
     source: str = typer.Option("auto", "--source"),
@@ -117,138 +134,20 @@ def check_source(
     task_field: list[str] = typer.Option([], "--task-field"),
     delivered_field: str = typer.Option(None, "--delivered-field"),
 ) -> None:
-    """Read-only schema and decoding check before importing a trace export."""
-    try:
-        if mode not in ("auto", "conversation", "workflow"):
-            raise ValueError("--mode must be auto, conversation or workflow")
-        if mode != "workflow" and (task_field or delivered_field):
-            raise ValueError("--task-field and --delivered-field need --mode workflow")
-        if source == "auto":
-            detection = detect_source(path)
-            source = detection.source
-            console.print(f"detected:    {source} ({detection.evidence})")
-            if mode == "auto" and source in (
-                "otlp",
-                "otlp-std",
-                "langfuse",
-                "langsmith",
-                "phoenix",
-            ):
-                raise ValueError(
-                    "file format does not establish whether model inputs are human "
-                    "conversation or workflow prompts; choose --mode conversation "
-                    "or --mode workflow"
-                )
-        workflow = (
-            WorkflowDeclaration(task_fields=tuple(task_field), delivered_field=delivered_field)
-            if mode == "workflow"
-            else None
-        )
-        corpus = load_corpus(path, source, workflow=workflow)
-    except (ValueError, FileNotFoundError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    models = [
-        span for trace in corpus.traces for span in trace.spans if span.kind == SpanKind.MODEL
-    ]
-
-    def valid_messages(value: object) -> bool:
-        # A declared gen_ai.*.messages attribute stays the JSON string the
-        # producer wrote; only messages Bandits rebuilt are already lists.
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                return False
-        return isinstance(value, list) and all(
-            isinstance(message, dict)
-            and message.get("role") in ("system", "developer", "user", "assistant", "tool")
-            and isinstance(message.get("parts"), list)
-            for message in value
-        )
-
-    missing_input = sum(
-        not span.arguments
-        and span.attributes.get("gen_ai.input.messages") is None
-        and span.attributes.get("input.value") is None
-        for span in models
+    """Same as `ingest --dry-run`."""
+    ingest(
+        path,
+        source=source,
+        redaction=DEFAULT_RULESET.name,
+        control_marker=[],
+        pipeline_steps=True,
+        mode=mode,
+        task_field=task_field,
+        delivered_field=delivered_field,
+        request_origin="unknown",
+        project=_DEFAULT_PROJECT,
+        dry_run=True,
     )
-    missing_output = sum(
-        span.status != SpanStatus.ERROR
-        and span.output is None
-        and span.attributes.get("gen_ai.output.messages") is None
-        and not span.attributes.get("bandits.output_unusable_reason")
-        for span in models
-    )
-    unusable_output = sum(
-        span.status != SpanStatus.ERROR
-        and bool(span.attributes.get("bandits.output_unusable_reason"))
-        for span in models
-    )
-    failed_without_output = sum(
-        span.status == SpanStatus.ERROR
-        and span.output is None
-        and span.attributes.get("gen_ai.output.messages") is None
-        for span in models
-    )
-    malformed_messages = sum(
-        not valid_messages(value)
-        for span in models
-        for value in (
-            span.attributes.get("gen_ai.input.messages"),
-            span.attributes.get("gen_ai.output.messages"),
-        )
-        if value is not None
-    )
-    console.print(f"traces:      {len(corpus.traces)}")
-    console.print(f"spans:       {sum(len(trace.spans) for trace in corpus.traces)}")
-    console.print(f"model calls: {len(models)}")
-    model_kinds = Counter(
-        str(span.attributes.get("bandits.declared_kind", "unknown")) for span in models
-    )
-    for declared_kind, count in model_kinds.most_common(5):
-        console.print(f"  model kind: {count} via {declared_kind}")
-    if len(model_kinds) > 5:
-        console.print(
-            f"  other model kinds: {sum(model_kinds.values()) - sum(n for _, n in model_kinds.most_common(5))}"
-        )
-    console.print(f"no input:    {missing_input}")
-    console.print(f"no output:   {missing_output}")
-    console.print(f"unusable recorded output: {unusable_output}")
-    console.print(f"failed calls with no output: {failed_without_output}")
-    console.print(f"bad messages:{malformed_messages:>3}")
-    console.print(f"no task:     {sum(trace.task is None for trace in corpus.traces)}")
-    redactions = [issue for issue in corpus.issues if issue.kind == "redaction"]
-    containers = [issue for issue in corpus.issues if issue.kind == "source_container"]
-    evaluators = [
-        issue
-        for issue in corpus.issues
-        if issue.kind in ("excluded_evaluator", "excluded_evaluator_trace")
-    ]
-    issues = [
-        issue
-        for issue in corpus.issues
-        if issue.kind
-        not in ("redaction", "source_container", "excluded_evaluator", "excluded_evaluator_trace")
-    ]
-    console.print(f"redactions:  {len(redactions)}")
-    console.print(f"containers:  {len(containers)} grouped notice(s)")
-    for notice in containers[:_MAX_INLINE_ISSUES]:
-        console.print(f"  - {notice.detail}")
-    console.print(f"evaluators: {len(evaluators)} exclusion notice(s)")
-    console.print(f"issues:      {len(issues)}")
-    console.print("scope:       decoding only; a retained field may still be misinterpreted")
-    console.print("quality:     not evaluated by check-source")
-    for issue in issues[:_MAX_INLINE_ISSUES]:
-        console.print(f"  - {issue.kind}: {issue.detail}")
-    otlp_family = source in ("otlp", "otlp-std", "langfuse", "langsmith", "phoenix")
-    if (
-        not corpus.traces
-        or issues
-        or malformed_messages
-        or (otlp_family and (missing_input or missing_output or unusable_output))
-    ):
-        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -281,21 +180,23 @@ def ingest(
     mode: str = typer.Option(
         "auto",
         "--mode",
-        help="Conversation or workflow. Auto source detection cannot determine this for "
-        "OTLP/native exports; declare it explicitly there.",
+        help="conversation: model inputs with role 'user' are a person's turns. "
+        "workflow: they are prompts the program built; the run's own input is the "
+        "request. Default for OTLP and platform exports: workflow, which never "
+        "labels text as typed by a person.",
     ),
     task_field: list[str] = typer.Option(
         [],
         "--task-field",
-        help="Workflow only. Path into the invocation record holding the request, "
-        "e.g. input.query. Repeatable; the first present wins, and disagreeing "
-        "values leave the task unresolved. None: the task stays unresolved.",
+        help="Workflow only. Path into the run's record holding the request, "
+        "e.g. input.query. Default: a common field (query, question, ...) that is "
+        "text in every run, if there is one.",
     ),
     delivered_field: str = typer.Option(
         None,
         "--delivered-field",
-        help="Workflow only. Path into the invocation record holding what was "
-        "delivered, e.g. output.answer.",
+        help="Workflow only. Path into the run's record holding what was delivered, "
+        "e.g. output.answer. Default: found like --task-field.",
     ),
     request_origin: str = typer.Option(
         "unknown",
@@ -304,76 +205,128 @@ def ingest(
         "'human' records the request as a (declared) user turn.",
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Read and check the file; save nothing."),
 ) -> None:
-    """Load a trace export into the local artifact store."""
-    auto_source = source == "auto"
-    if auto_source:
+    """Load a trace export: detect its format, read it, check it, save it."""
+    if mode not in ("auto", "conversation", "workflow"):
+        _fail(
+            f"--mode {mode!r} is not a mode",
+            "the mode says whether 'user' messages were typed by a person",
+            "use --mode conversation or --mode workflow, or leave it out",
+        )
+    if request_origin not in ("human", "machine", "unknown"):
+        _fail(
+            f"--request-origin {request_origin!r} is not an origin",
+            "it says who started each run",
+            "use human, machine or unknown",
+        )
+    if not path.exists():
+        _fail(f"{path} does not exist", "the path is wrong or the file moved", "check the path")
+    if source == "auto":
         try:
             detection = detect_source(path)
         except (ValueError, FileNotFoundError) as exc:
-            console.print(f"[red]error:[/red] {exc}")
-            raise typer.Exit(code=1) from exc
-        source = detection.source
-        console.print(
-            f"detected:    {source} ({detection.evidence}; {detection.files_checked} file(s))"
-        )
-    if mode == "auto":
-        if auto_source and source in ("otlp", "otlp-std", "langfuse", "langsmith", "phoenix"):
-            console.print(
-                "[red]error:[/red] File format does not establish whether inputs are "
-                "human conversation or workflow prompts; choose --mode conversation "
-                "or --mode workflow"
+            if "parse" in str(exc) or "malformed" in str(exc):
+                _fail(
+                    f"{path.name} is not valid JSON",
+                    str(exc),
+                    "the file is probably cut off or not JSON/JSONL; re-export it",
+                )
+            _fail(
+                "could not tell what format this file is",
+                str(exc),
+                f"pass --source NAME (one of: {', '.join(CANONICAL_SOURCES)}); if none "
+                "fits, this export needs a new reader",
             )
-            raise typer.Exit(code=1)
-        mode = "conversation"
+        source = detection.source
+        _say(f"format:   {source} ({detection.evidence})")
+    if mode == "auto":
+        mode = "workflow" if source in _WORKFLOW_SOURCES else "conversation"
+        if mode == "workflow":
+            _say(
+                "mode:     workflow (default: no text is labelled as typed by a person; "
+                "use --mode conversation if a person chatted with the agent)"
+            )
+    if mode != "workflow" and (task_field or delivered_field or request_origin != "unknown"):
+        _fail(
+            "--task-field, --delivered-field and --request-origin only apply to workflows",
+            f"this file is read in {mode} mode, where the request is the person's first message",
+            "drop them, or use --mode workflow (otlp-std and platform exports only)",
+        )
+
+    def load(workflow: WorkflowDeclaration | None):
+        try:
+            return load_corpus(
+                path,
+                source,
+                ruleset_by_name(redaction),
+                pipeline_steps=pipeline_steps,
+                workflow=workflow,
+            )
+        except (UnknownSourceError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            _fail(
+                f"could not read {path} as {source}",
+                str(exc),
+                "if the reason names an option, change that option; if it describes the "
+                "data, the file is not a complete export in this format (re-export it, or "
+                "try another --source)",
+            )
+
     workflow = None
-    if mode not in ("conversation", "workflow"):
-        console.print(f"[red]error:[/red] --mode must be conversation or workflow, not {mode!r}")
-        raise typer.Exit(code=1)
     if mode == "workflow":
-        if request_origin not in ("human", "machine", "unknown"):
-            console.print("[red]error:[/red] --request-origin must be human, machine or unknown")
-            raise typer.Exit(code=1)
         workflow = WorkflowDeclaration(
             task_fields=tuple(task_field),
             delivered_field=delivered_field,
             request_origin=request_origin,  # type: ignore[arg-type]
         )
-    elif task_field or delivered_field or request_origin != "unknown":
-        console.print(
-            "[red]error:[/red] --task-field, --delivered-field and --request-origin "
-            "need --mode workflow"
-        )
-        raise typer.Exit(code=1)
-    try:
-        corpus = load_corpus(
-            path,
-            source,
-            ruleset_by_name(redaction),
-            pipeline_steps=pipeline_steps,
-            workflow=workflow,
-        )
-    except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
+    corpus = load(workflow)
+    if workflow is not None and (not task_field or not delivered_field):
+        found_task, found_answer = detect_request_fields(corpus)
+        chosen_task = tuple(task_field) or ((found_task,) if found_task else ())
+        chosen_answer = delivered_field or found_answer
+        if chosen_task != workflow.task_fields or chosen_answer != workflow.delivered_field:
+            workflow = workflow.model_copy(
+                update={"task_fields": chosen_task, "delivered_field": chosen_answer}
+            )
+            corpus = load(workflow)
+        if not task_field:
+            _say(
+                f"task:     {found_task} (found; override with --task-field)"
+                if found_task
+                else "task:     not found (no common request field in every run; "
+                "use --task-field PATH)"
+            )
+        if not delivered_field and found_answer:
+            _say(f"answer:   {found_answer} (found; override with --delivered-field)")
     if control_marker:
         corpus = corpus.replace(control_markers=tuple(control_marker))
 
+    health = check_health(corpus, source)
+    _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
+    hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
+    _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
+    if health.fatal:
+        for problem in health.fatal:
+            _say(f"[red]error:[/red] {problem}")
+        for warning in health.warnings:
+            _say(f"  - {warning}")
+        _say("nothing was saved")
+        raise typer.Exit(code=1)
+    if health.warnings:
+        _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
+        for warning in health.warnings:
+            _say(f"  - {warning}")
+    else:
+        _say("problems: none")
+    if dry_run:
+        _say("dry run:  nothing saved")
+        return
+
     store = ArtifactStore(project / ".bandits")
     envelope = store.write(corpus, source_path=str(path))
-
-    console.print(f"artifact_id: {envelope.artifact_id}")
-    console.print(f"source:      {envelope.source}")
-    console.print(f"traces:      {envelope.trace_count}")
-    console.print(f"spans:       {envelope.span_count}")
-    console.print(f"issues:      {envelope.issue_count}")
-    console.print(f"redaction:   {corpus.redaction_ruleset}")
-    for issue in corpus.issues[:_MAX_INLINE_ISSUES]:
-        location = f" at {issue.location}" if issue.location else ""
-        console.print(f"  - {issue.kind}{location}: {issue.detail}")
-    remaining = envelope.issue_count - _MAX_INLINE_ISSUES
-    if remaining > 0:
-        console.print(f"  (+{remaining} more — see `bandits show {envelope.artifact_id} --issues`)")
+    _say(f"artifact_id: {envelope.artifact_id}")
+    if health.warnings:
+        _say(f"details:  bandits show {envelope.artifact_id} --issues")
 
 
 @app.command(name="list")

@@ -101,7 +101,7 @@ def test_native_langfuse_keeps_request_and_observation(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "traces:      1" in result.output
+    assert "read:     1 traces" in result.output
 
 
 def test_upstream_langfuse_trace_wrapper_preserves_all_observations() -> None:

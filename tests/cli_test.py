@@ -64,7 +64,7 @@ def test_ingest_prints_artifact_summary(tmp_path) -> None:
 
     assert result.exit_code == 0
     assert "artifact_id: corpus-" in plain(result.stdout)
-    assert "traces:      2" in plain(result.stdout)
+    assert "read:     2 traces" in plain(result.stdout)
 
 
 def test_ingest_unknown_source_exits_nonzero(tmp_path) -> None:

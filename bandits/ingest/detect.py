@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_MAX_SAMPLE = 8 * 1024 * 1024
+_MAX_SAMPLE = 512 * 1024 * 1024
+"""A single JSON document up to this size is parsed whole to recognize it; its
+reader loads it whole anyway. JSONL is sampled line by line."""
 
 
 class DetectionError(ValueError):

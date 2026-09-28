@@ -141,9 +141,11 @@ def test_transport_response_repr_is_not_a_model_completion(tmp_path: Path) -> No
     assert model.output is None
     assert model.attributes["output.value"] == json.dumps(recorded)
     assert model.attributes["bandits.output_unusable_reason"] == "transport_response_object_repr"
-    check = CliRunner().invoke(app, ["check-source", str(path), "--mode", "conversation"])
-    assert check.exit_code == 1
-    assert "unusable recorded output: 1" in check.output
+    check = CliRunner().invoke(app, ["ingest", str(path), "--dry-run"])
+    assert check.exit_code == 0, check.output
+    assert "1 model call(s) recorded an output that is not an answer" in " ".join(
+        check.output.split()
+    )
 
 
 def test_reads_genai_semconv_spans(tmp_path) -> None:
@@ -569,7 +571,7 @@ def test_dispatch_and_cli(tmp_path) -> None:
         app, ["ingest", str(path), "--source", "otlp-std", "--project", str(tmp_path)]
     )
     assert result.exit_code == 0, result.stdout
-    assert "traces:      1" in result.stdout
+    assert "read:     1 traces" in result.stdout
 
 
 def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
