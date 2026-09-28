@@ -133,6 +133,28 @@ _CONVENTIONS: tuple[tuple[str, dict[str, str]], ...] = (
             "EVENT": _NONE,
         },
     ),
+    # Vercel AI SDK telemetry: outer generateText/streamText spans enclose
+    # individual provider calls. Only doGenerate/doStream is a model action.
+    # Attribute names and operations follow MLflow's VercelAITranslator and
+    # https://ai-sdk.dev/docs/ai-sdk-core/telemetry.
+    (
+        "ai.operationId",
+        {
+            "ai.generateText": _STEP,
+            "ai.generateText.doGenerate": _MODEL,
+            "ai.streamText": _STEP,
+            "ai.streamText.doStream": _MODEL,
+            "ai.generateObject": _STEP,
+            "ai.generateObject.doGenerate": _MODEL,
+            "ai.streamObject": _STEP,
+            "ai.streamObject.doStream": _MODEL,
+            "ai.toolCall": _TOOL,
+            "ai.embed": _NONE,
+            "ai.embed.doEmbed": _NONE,
+            "ai.embedMany": _NONE,
+            "ai.embedMany.doEmbed": _NONE,
+        },
+    ),
 )
 """Checked in order; the first convention that declares a recognized value wins,
 except that an exclusion declared by any convention wins over all of them.
@@ -149,14 +171,23 @@ _INPUT_VALUE_KEYS = (
     "langfuse.observation.input",
     "traceloop.entity.input",
     "gen_ai.prompt",
+    "ai.prompt.messages",
+    "ai.prompt",
+    "ai.toolCall.args",
+    "braintrust.input_json",
 )
 _OUTPUT_VALUE_KEYS = (
     "output.value",
     "langfuse.observation.output",
     "traceloop.entity.output",
     "gen_ai.completion",
+    "ai.response.text",
+    "ai.response.object",
+    "ai.response.toolCalls",
+    "ai.toolCall.result",
+    "braintrust.output_json",
 )
-_TOOL_NAME_KEYS = ("gen_ai.tool.name", "tool.name", "traceloop.entity.name")
+_TOOL_NAME_KEYS = ("gen_ai.tool.name", "tool.name", "traceloop.entity.name", "ai.toolCall.name")
 
 # Key candidates verified against the OTel/OpenInference conventions and the
 # MLflow translator tables. Every original key remains in attributes; this
@@ -169,17 +200,21 @@ _SCALAR_KEYS: dict[str, tuple[str, ...]] = {
         "llm.model_name",
         "llm.request.model_name",
         "embedding.model_name",
+        "ai.response.model",
+        "ai.model.id",
     ),
-    "provider": ("gen_ai.provider.name", "llm.provider", "gen_ai.system"),
+    "provider": ("gen_ai.provider.name", "llm.provider", "gen_ai.system", "ai.model.provider"),
     "input_tokens": (
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.prompt_tokens",
         "llm.token_count.prompt",
+        "ai.usage.promptTokens",
     ),
     "output_tokens": (
         "gen_ai.usage.output_tokens",
         "gen_ai.usage.completion_tokens",
         "llm.token_count.completion",
+        "ai.usage.completionTokens",
     ),
     "total_tokens": (
         "gen_ai.usage.total_tokens",
@@ -188,17 +223,23 @@ _SCALAR_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "cache_read_tokens": (
         "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.cache_read_input_tokens",
         "llm.token_count.prompt_details.cache_read",
     ),
     "cache_write_tokens": (
         "gen_ai.usage.cache_creation.input_tokens",
+        "gen_ai.usage.cache_creation_input_tokens",
         "llm.token_count.prompt_details.cache_write",
     ),
     "reasoning_tokens": (
         "gen_ai.usage.reasoning_tokens",
         "llm.token_count.completion_details.reasoning",
     ),
-    "finish_reasons": ("gen_ai.response.finish_reasons", "llm.finish_reason"),
+    "finish_reasons": (
+        "gen_ai.response.finish_reasons",
+        "llm.finish_reason",
+        "ai.response.finishReason",
+    ),
 }
 
 
@@ -499,6 +540,28 @@ def _text_message(role: str, value: object) -> list[dict[str, Any]] | None:
     )
 
 
+def _vercel_output_messages(attributes: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Provider reply from the AI SDK's recorded text and tool-call fields."""
+    parts: list[dict[str, Any]] = []
+    text = attributes.get("ai.response.text")
+    if isinstance(text, str) and text:
+        parts.append({"type": "text", "content": text})
+    calls = _json_value(attributes.get("ai.response.toolCalls"))
+    if isinstance(calls, list):
+        for call in calls:
+            if not isinstance(call, dict) or not isinstance(call.get("toolName"), str):
+                continue
+            part: dict[str, Any] = {
+                "type": "tool_call",
+                "name": call["toolName"],
+                "arguments": _json_value(call.get("input")),
+            }
+            if isinstance(call.get("toolCallId"), str):
+                part["id"] = call["toolCallId"]
+            parts.append(part)
+    return [{"role": "assistant", "parts": parts}] if parts else None
+
+
 def _event_messages(events: list[dict[str, Any]]) -> tuple[list | None, list | None]:
     """Messages carried on span events, in the legacy GenAI event conventions."""
     inputs: list[dict[str, Any]] = []
@@ -584,6 +647,8 @@ def _normalized_messages(
             ),
             ("events", event_messages),
         ]
+        if direction == "output" and attributes.get("ai.operationId") is not None:
+            candidates.append(("ai.response", _vercel_output_messages(attributes)))
         declared = _first_value(attributes, value_keys)
         if declared is not None:
             parsed = _json_value(declared[1])
@@ -650,6 +715,14 @@ def _classify(attributes: dict[str, Any]) -> tuple[str, str]:
             first_declared = first_declared or label
         elif found is None:
             found = (role, label)
+    braintrust = _json_value(attributes.get("braintrust.span_attributes"))
+    if isinstance(braintrust, dict):
+        kind = braintrust.get("type")
+        role = {"llm": _MODEL, "tool": _TOOL, "task": _STEP, "score": _EXCLUDED}.get(kind)
+        if role == _EXCLUDED:
+            return role, f"braintrust.span_attributes.type={kind}"
+        if found is None and role is not None:
+            return role, f"braintrust.span_attributes.type={kind}"
     return found or (_NONE, first_declared or "no declared kind")
 
 
@@ -1141,6 +1214,8 @@ def load_otlp_standard(
     )
 
     unrepresented: Counter[str] = Counter()
+    containers: Counter[str] = Counter()
+    excluded: Counter[str] = Counter()
     unparsed: Counter[str] = Counter()
     spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
     task_by_trace: dict[str, str] = {}
@@ -1172,12 +1247,15 @@ def load_otlp_standard(
                     collected.append((span.index, _to_span(span, as_step=True, unparsed=unparsed)))
                 else:
                     unrepresented[span.label] += 1
-            elif span.role == _EXCLUDED or (
+            elif _is_container(span):
+                containers[span.label] += 1
+            elif span.role == _EXCLUDED:
+                excluded[span.label] += 1
+            elif (
                 span.role == _NONE
                 and span.span_id not in covered
-                # A workflow keeps these as structure (below); only a converter's
-                # container is left out, and it is reported.
-                and (workflow is None or _is_container(span))
+                # A workflow keeps these as structure (below).
+                and workflow is None
             ):
                 unrepresented[span.label] += 1
             # Otherwise a step with calls beneath it (represented by them) or a
@@ -1193,13 +1271,21 @@ def load_otlp_standard(
             if lineage is not None:
                 lineage_by_trace.setdefault(trace_id, lineage)
         if not collected:
-            issues.append(
-                TraceIssue(
-                    kind="empty_trace",
-                    detail=f"trace {trace_id} has no span declared as a model call, tool call "
-                    "or pipeline step",
+            if all(span.role == _EXCLUDED for span in decoded.values()):
+                issues.append(
+                    TraceIssue(
+                        kind="excluded_evaluator_trace",
+                        detail=f"trace {trace_id} contains only evaluator spans",
+                    )
                 )
-            )
+            else:
+                issues.append(
+                    TraceIssue(
+                        kind="empty_trace",
+                        detail=f"trace {trace_id} has no span declared as a model call, tool call "
+                        "or pipeline step",
+                    )
+                )
             lineage_by_trace.pop(trace_id, None)
             continue
         spans_by_trace[trace_id] = collected
@@ -1309,6 +1395,23 @@ def load_otlp_standard(
                 kind="unrepresented_span",
                 detail=f"{count} span(s) with {label} carry no model or tool call and are not "
                 "in the corpus",
+                location=str(path),
+            )
+        )
+    for label, count in sorted(containers.items()):
+        issues.append(
+            TraceIssue(
+                kind="source_container",
+                detail=f"{count} converter container span(s) with {label} are kept in the "
+                "source archive, not as application actions",
+                location=str(path),
+            )
+        )
+    for label, count in sorted(excluded.items()):
+        issues.append(
+            TraceIssue(
+                kind="excluded_evaluator",
+                detail=f"{count} evaluator span(s) with {label} excluded from the action corpus",
                 location=str(path),
             )
         )

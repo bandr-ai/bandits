@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import time
+from collections import Counter
 from pathlib import Path
 
 import typer
@@ -92,10 +93,10 @@ from bandits.export import (
     save_direct_sft,
     write_direct_sft,
 )
-from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
+from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
-from bandits.traces import WorkflowDeclaration
+from bandits.traces import SpanKind, WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -107,14 +108,109 @@ _SINGLETON_WARNING = 0.8
 """Fraction of one-trace families above which grouping is reported as inert."""
 
 
+@app.command(name="check-source")
+def check_source(
+    path: Path,
+    source: str = typer.Option("auto", "--source"),
+    mode: str = typer.Option("auto", "--mode"),
+    task_field: list[str] = typer.Option([], "--task-field"),
+    delivered_field: str = typer.Option(None, "--delivered-field"),
+) -> None:
+    """Read-only schema and decoding check before importing a trace export."""
+    try:
+        if mode not in ("auto", "conversation", "workflow"):
+            raise ValueError("--mode must be auto, conversation or workflow")
+        if mode != "workflow" and (task_field or delivered_field):
+            raise ValueError("--task-field and --delivered-field need --mode workflow")
+        if source == "auto":
+            detection = detect_source(path)
+            source = detection.source
+            console.print(f"detected:    {source} ({detection.evidence})")
+            if mode == "auto" and source in (
+                "otlp",
+                "otlp-std",
+                "langfuse",
+                "langsmith",
+                "phoenix",
+            ):
+                raise ValueError(
+                    "file format does not establish whether model inputs are human "
+                    "conversation or workflow prompts; choose --mode conversation "
+                    "or --mode workflow"
+                )
+        workflow = (
+            WorkflowDeclaration(task_fields=tuple(task_field), delivered_field=delivered_field)
+            if mode == "workflow"
+            else None
+        )
+        corpus = load_corpus(path, source, workflow=workflow)
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    models = [
+        span for trace in corpus.traces for span in trace.spans if span.kind == SpanKind.MODEL
+    ]
+    missing_input = sum(
+        not span.arguments
+        and span.attributes.get("gen_ai.input.messages") is None
+        and span.attributes.get("input.value") is None
+        for span in models
+    )
+    missing_output = sum(
+        span.output is None and span.attributes.get("gen_ai.output.messages") is None
+        for span in models
+    )
+    console.print(f"traces:      {len(corpus.traces)}")
+    console.print(f"spans:       {sum(len(trace.spans) for trace in corpus.traces)}")
+    console.print(f"model calls: {len(models)}")
+    model_kinds = Counter(
+        str(span.attributes.get("bandits.declared_kind", "unknown")) for span in models
+    )
+    for declared_kind, count in model_kinds.most_common(5):
+        console.print(f"  model kind: {count} via {declared_kind}")
+    if len(model_kinds) > 5:
+        console.print(
+            f"  other model kinds: {sum(model_kinds.values()) - sum(n for _, n in model_kinds.most_common(5))}"
+        )
+    console.print(f"no input:    {missing_input}")
+    console.print(f"no output:   {missing_output}")
+    console.print(f"no task:     {sum(trace.task is None for trace in corpus.traces)}")
+    redactions = [issue for issue in corpus.issues if issue.kind == "redaction"]
+    containers = [issue for issue in corpus.issues if issue.kind == "source_container"]
+    evaluators = [
+        issue
+        for issue in corpus.issues
+        if issue.kind in ("excluded_evaluator", "excluded_evaluator_trace")
+    ]
+    issues = [
+        issue
+        for issue in corpus.issues
+        if issue.kind
+        not in ("redaction", "source_container", "excluded_evaluator", "excluded_evaluator_trace")
+    ]
+    console.print(f"redactions:  {len(redactions)}")
+    console.print(f"containers:  {len(containers)} grouped notice(s)")
+    for notice in containers[:_MAX_INLINE_ISSUES]:
+        console.print(f"  - {notice.detail}")
+    console.print(f"evaluators: {len(evaluators)} exclusion notice(s)")
+    console.print(f"issues:      {len(issues)}")
+    console.print("scope:       decoding only; a retained field may still be misinterpreted")
+    for issue in issues[:_MAX_INLINE_ISSUES]:
+        console.print(f"  - {issue.kind}: {issue.detail}")
+    if not corpus.traces or issues:
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def ingest(
     path: Path,
-    source: str = typer.Option(..., "--source", help=f"One of: {', '.join(CANONICAL_SOURCES)}"),
+    source: str = typer.Option(
+        "auto", "--source", help=f"Auto-detect, or one of: {', '.join(CANONICAL_SOURCES)}"
+    ),
     redaction: str = typer.Option(
         DEFAULT_RULESET.name,
         "--redaction",
-        help="Redaction ruleset. 'secrets-only-v1' keeps email addresses, which are "
+        help="Redaction ruleset. 'secrets-only-v2' keeps email addresses, which are "
         "often the task's own identifier.",
     ),
     control_marker: list[str] = typer.Option(
@@ -133,10 +229,10 @@ def ingest(
         "beneath them (a retrieval, a rerank) as tool spans the agent did not call.",
     ),
     mode: str = typer.Option(
-        "conversation",
+        "auto",
         "--mode",
-        help="otlp-std only. 'workflow': a program called the models, so no model "
-        "input becomes a user turn; the task comes only from --task-field.",
+        help="Conversation or workflow. Auto source detection cannot determine this for "
+        "OTLP/native exports; declare it explicitly there.",
     ),
     task_field: list[str] = typer.Option(
         [],
@@ -160,6 +256,26 @@ def ingest(
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Load a trace export into the local artifact store."""
+    auto_source = source == "auto"
+    if auto_source:
+        try:
+            detection = detect_source(path)
+        except (ValueError, FileNotFoundError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        source = detection.source
+        console.print(
+            f"detected:    {source} ({detection.evidence}; {detection.files_checked} file(s))"
+        )
+    if mode == "auto":
+        if auto_source and source in ("otlp", "otlp-std", "langfuse", "langsmith", "phoenix"):
+            console.print(
+                "[red]error:[/red] File format does not establish whether inputs are "
+                "human conversation or workflow prompts; choose --mode conversation "
+                "or --mode workflow"
+            )
+            raise typer.Exit(code=1)
+        mode = "conversation"
     workflow = None
     if mode not in ("conversation", "workflow"):
         console.print(f"[red]error:[/red] --mode must be conversation or workflow, not {mode!r}")
@@ -866,9 +982,7 @@ def score_traces_command(
     tasks = {trace.trace_id: trace.task for trace in traces}
     checks = (
         tuple(
-            c
-            for c in verifier.checks
-            if c.survived and c.decision not in ("rejected", "revised")
+            c for c in verifier.checks if c.survived and c.decision not in ("rejected", "revised")
         )
         if survivors
         else None
@@ -943,7 +1057,9 @@ def export_nextstate_command(
     console.print(f"positive:   {bundle.positive}")
     console.print(f"negative:   {bundle.negative}")
     console.print(f"unresolved: {len(bundle.unresolved)}")
-    reviewed_label = "yes" if bundle.all_checks_reviewed else "no (--survivors or unreviewed checks)"
+    reviewed_label = (
+        "yes" if bundle.all_checks_reviewed else "no (--survivors or unreviewed checks)"
+    )
     console.print(f"reviewed:   {reviewed_label}")
     console.print(f"output:     {rows_path}")
     console.print(f"quarantine: {unresolved_path}")
@@ -1293,8 +1409,7 @@ def audit_rlm_command(
         # nothing ever told it otherwise.
         interrupted["flag"] = True
         console.print(
-            "\n[yellow]stopping after the contract in flight; "
-            "progress so far is saved[/yellow]"
+            "\n[yellow]stopping after the contract in flight; progress so far is saved[/yellow]"
         )
 
     import signal
@@ -1403,9 +1518,7 @@ def materialize_rlm_taskset_command(
     )
 
 
-def _find_session(
-    mining_store: SessionStore, audit_store: AuditSessionStore, session_id: str
-):
+def _find_session(mining_store: SessionStore, audit_store: AuditSessionStore, session_id: str):
     """Locate a session by id in whichever store actually has it.
 
     Session ids are self-describing (``rlm-audit-...`` vs ``rlm-...``) but
@@ -1448,13 +1561,17 @@ def rlm_session_command(
                 return
             kind, latest = max(candidates, key=lambda pair: pair[1].updated_at)
             session_id = latest.session_id
-            _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
+            _watch_session(
+                kind, mining_store if kind == "mining" else audit_store, session_id, interval
+            )
             return
         kind, _ = _find_session(mining_store, audit_store, session_id)
         if kind is None:
             console.print(f"[red]error:[/red] no session {session_id!r}")
             raise typer.Exit(code=1)
-        _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
+        _watch_session(
+            kind, mining_store if kind == "mining" else audit_store, session_id, interval
+        )
         return
 
     if session_id is None:
@@ -1501,9 +1618,7 @@ def rlm_session_command(
             console.print(f"resumed from: {state.resumed_from}")
         for finding in state.findings:
             colour = "yellow" if finding.demands_action else "dim"
-            console.print(
-                f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}"
-            )
+            console.print(f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}")
         if state.last_error:
             console.print(f"[red]last error:[/red] {state.last_error}")
     else:
@@ -1582,7 +1697,9 @@ def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
             resume_command = f"bandits audit-rlm {state.run_id} --resume {session_id}"
         else:
             resume_command = f"bandits mine-rlm {state.analysis_id} --resume {session_id}"
-        console.print(f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]")
+        console.print(
+            f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]"
+        )
 
 
 @app.command(name="rlm-families")

@@ -1,8 +1,7 @@
 """Ingest adapters: turn a raw trace export into a :class:`~bandits.traces.TraceCorpus`.
 
-Format is always declared by the caller, never guessed from file content — a
-mislabeled export would otherwise parse into a corpus with the wrong spans in it
-and look like a valid, if odd, trace rather than an error.
+Known export shapes may be recognized from their structure. Ambiguous inputs
+require an explicit source rather than a guessed interpretation.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
+from bandits.ingest.detect import DetectionError, detect_source
 from bandits.ingest.native import load_native
 from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
@@ -44,17 +44,30 @@ class UnknownSourceError(ValueError):
 
 def load_corpus(
     path: str | Path,
-    source: str,
+    source: str = "auto",
     ruleset: RedactionRuleset = DEFAULT_RULESET,
     *,
     pipeline_steps: bool = True,
     workflow: WorkflowDeclaration | None = None,
 ) -> TraceCorpus:
-    """Read a raw export into a :class:`TraceCorpus` using the declared adapter.
+    """Read a raw export into a :class:`TraceCorpus` using a recognized adapter.
 
-    ``pipeline_steps`` and ``workflow`` are read only by ``otlp-std``, the one
-    source that declares workflow steps apart from model and tool calls.
+    ``pipeline_steps`` and ``workflow`` apply to OTLP and the native readers
+    routed through it.
     """
+    if source == "auto":
+        source = detect_source(Path(path)).source
+        if workflow is None and source in (
+            "otlp",
+            "otlp-std",
+            "langfuse",
+            "langsmith",
+            "phoenix",
+        ):
+            raise ValueError(
+                f"auto-detected {source!r}, but interaction mode is not in the file format; "
+                "declare the source and whether this is a conversation or workflow"
+            )
     if source in ("langfuse", "langsmith", "phoenix"):
         return load_native(
             Path(path), source, ruleset, pipeline_steps=pipeline_steps, workflow=workflow
@@ -77,6 +90,8 @@ def load_corpus(
 
 __all__ = [
     "CANONICAL_SOURCES",
+    "DetectionError",
     "UnknownSourceError",
+    "detect_source",
     "load_corpus",
 ]

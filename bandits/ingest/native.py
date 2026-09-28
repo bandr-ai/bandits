@@ -193,8 +193,9 @@ _LANGSMITH_KIND = {
 
 
 def _langsmith(record: dict[str, Any]) -> list[dict[str, Any]]:
-    if not record.get("id") or not record.get("run_type"):
-        raise ValueError("LangSmith run requires id and run_type")
+    run_id = record.get("id") or record.get("run_id")
+    if not run_id or not record.get("run_type"):
+        raise ValueError("LangSmith run requires id/run_id and run_type")
     attributes = {
         "openinference.span.kind": _LANGSMITH_KIND.get(str(record["run_type"]).lower(), "UNKNOWN"),
         "input.value": record.get("inputs"),
@@ -213,8 +214,8 @@ def _langsmith(record: dict[str, Any]) -> list[dict[str, Any]]:
         else None
     )
     span = _span(
-        record.get("trace_id") or record["id"],
-        record["id"],
+        record.get("trace_id") or run_id,
+        run_id,
         record.get("parent_run_id"),
         record.get("name"),
         record.get("start_time"),
@@ -237,6 +238,11 @@ def _phoenix(record: dict[str, Any]) -> list[dict[str, Any]]:
     resource = record.get("resource") or {}
     scope = record.get("instrumentation_scope") or record.get("instrumentationScope") or {}
     status = record.get("status")
+    if status is None and record.get("status_code") is not None:
+        status = {
+            "status_code": record["status_code"],
+            "message": record.get("status_message"),
+        }
     if isinstance(status, dict) and str(
         status.get("status_code") or status.get("code") or ""
     ).upper() in ("ERROR", "STATUS_CODE_ERROR"):
@@ -270,13 +276,13 @@ _CONVERTERS = {"langfuse": _langfuse, "langsmith": _langsmith, "phoenix": _phoen
 
 def _langsmith_runs(record: dict[str, Any]) -> Iterator[dict[str, Any]]:
     """Flatten documented child_runs without turning nesting into time order."""
-    stack = [(record, None, record.get("trace_id") or record.get("id"))]
+    stack = [(record, None, record.get("trace_id") or record.get("id") or record.get("run_id"))]
     seen: set[str] = set()
     while stack:
         run, enclosing, trace_id = stack.pop()
         if not isinstance(run, dict):
             continue
-        native_id = str(run.get("id"))
+        native_id = str(run.get("id") or run.get("run_id"))
         if native_id in seen:
             continue
         seen.add(native_id)
@@ -286,7 +292,7 @@ def _langsmith_runs(record: dict[str, Any]) -> Iterator[dict[str, Any]]:
             run = {**run, "trace_id": trace_id}
         yield run
         for child in reversed(run.get("child_runs") or []):
-            stack.append((child, run.get("id"), trace_id))
+            stack.append((child, run.get("id") or run.get("run_id"), trace_id))
 
 
 def load_native(
