@@ -27,6 +27,7 @@ Every bold number comes from the locked test run (§6, phase 2). A number whose 
 | Report: verifier, majority, untrained, trained, calibrated, Jev; paired intervals; cost and latency | `jev report`, `jev verifier-cost` | PR #99, #101, #102 |
 | One command, resumable | `jev run` | PR #103 |
 | GPU script + real-model smoke test | `scripts/gpu_run.sh`, `scripts/smoke.py` | PR #104 |
+| Real Jev on the same steps (#97), resumable | `jev score-api` | built |
 
 Rehearsed end to end on the real data with a tiny model on CPU. Nothing has trained on a real model at scale yet.
 
