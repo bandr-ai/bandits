@@ -13,14 +13,15 @@ import json
 import os
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 from bandits import ledger
 from bandits.traces import SpanKind, SpanStatus, Trace
 from bandits.transport import request_with_retry
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 
 _MAX_OUTPUT_CHARS = 400
 
@@ -96,12 +97,19 @@ def fireworks_completion(
     *,
     system_prompt: str | None = None,
     max_tokens: int = 2000,
+    timeout: float = 90,
+    extra: Mapping[str, Any] | None = None,
 ) -> str:
     """Call Fireworks with a prompt and an optional higher-priority policy.
 
     ``max_tokens`` is the whole budget, reasoning included. The next-state
     judge, which is told to think first, ran out of it 29 times in 436 and
     lost the boxed score each time.
+
+    ``timeout`` is per attempt, and a timed-out attempt is retried from
+    scratch: under load a full-budget reply queued for minutes, so a 90 s
+    timeout abandoned and resent it up to five times. ``extra`` adds request
+    fields (a sampling penalty, say) and is recorded with the call.
     """
     api_key = resolve_api_key()
 
@@ -121,13 +129,14 @@ def fireworks_completion(
                 # truncated real structured SFT reviews halfway through JSON.
                 "max_tokens": max_tokens,
                 "messages": messages,
+                **(extra or {}),
             }
         ).encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
 
     def send() -> object:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
     with ledger.model_call(
@@ -137,6 +146,7 @@ def fireworks_completion(
             "temperature": temperature,
             "max_tokens": max_tokens,
             "messages": messages,
+            **(extra or {}),
         },
     ) as call:
         try:
