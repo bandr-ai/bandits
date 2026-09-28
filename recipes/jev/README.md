@@ -38,6 +38,7 @@ This takes a Bandits turn-judge run (or a dataset id from `jev import`) through 
 | `jev train <dataset>` | LoRA fine-tune on train; the best checkpoint is picked on dev |
 | `jev calibrate <scorer-run>` | Fit one temperature on the calibration split |
 | `jev import-predictions <file>` | Bring in another system's answers (e.g. real Jev) with its bill |
+| `jev score-api <dataset> --output jev.jsonl` | Call real Jev; resumable, reads `JEV_API_KEY` |
 | `jev verifier-cost <dataset> --ledger ...` | Price the verifier per decision from its ledger (prices are given, never guessed) |
 | `jev report ...` | The scorecard: verifier, majority baseline, untrained, trained, calibrated and Jev, with paired intervals, cost and latency |
 
@@ -45,6 +46,7 @@ Run `uv run jev <command> --help` for options.
 
 ## Docs
 
+- **[Locked test results](docs/launch-results.md): measured launch claims and caveats**
 - **[Launch plan](docs/launch-plan.md): the one plan for testing and launch**
 - **[Test plan and handoff](docs/run-plan.md): what each run is for, how to start it, where things stand**
 - [Original plan](docs/decision-models-plan.md) and [research notes](docs/decision-models-learnings.md)
