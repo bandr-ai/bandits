@@ -9,6 +9,7 @@ shift the reported location of a later one.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ class RedactionRuleset:
 
     name: str
     rules: tuple[Rule, ...]
+    decode_json: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,15 +123,25 @@ _SECRET_RULES: tuple[Rule, ...] = (
     _NAMED_VALUE,
 )
 
-DEFAULT_RULESET = RedactionRuleset("default-v1", _SECRET_RULES + (_EMAIL,))
+LEGACY_DEFAULT_RULESET = RedactionRuleset("default-v1", _SECRET_RULES + (_EMAIL,))
+DEFAULT_RULESET = RedactionRuleset("default-v2", _SECRET_RULES + (_EMAIL,), decode_json=True)
 
 # An email is sometimes the task's own identifier rather than incidental personal
 # data — the instruction names an account, and redacting it leaves an instruction
 # that identifies nothing. Callers who need those instructions intact can drop
 # that one rule and still redact every secret.
-SECRETS_ONLY_RULESET = RedactionRuleset("secrets-only-v1", _SECRET_RULES)
+LEGACY_SECRETS_ONLY_RULESET = RedactionRuleset("secrets-only-v1", _SECRET_RULES)
+SECRETS_ONLY_RULESET = RedactionRuleset("secrets-only-v2", _SECRET_RULES, decode_json=True)
 
-_RULESETS = {r.name: r for r in (DEFAULT_RULESET, SECRETS_ONLY_RULESET)}
+_RULESETS = {
+    r.name: r
+    for r in (
+        LEGACY_DEFAULT_RULESET,
+        LEGACY_SECRETS_ONLY_RULESET,
+        DEFAULT_RULESET,
+        SECRETS_ONLY_RULESET,
+    )
+}
 
 
 def ruleset_by_name(name: str) -> RedactionRuleset:
@@ -138,7 +150,9 @@ def ruleset_by_name(name: str) -> RedactionRuleset:
     return _RULESETS[name]
 
 
-def _matches(data: bytes, ruleset: RedactionRuleset) -> list[tuple[int, int, str]]:
+def _matches(
+    data: bytes, ruleset: RedactionRuleset, *, serialized_json: bool = True
+) -> list[tuple[int, int, str]]:
     """Every span to replace, resolved against the original bytes and non-overlapping."""
     spans = [
         (*match.span(rule.group), rule.kind)
@@ -149,7 +163,7 @@ def _matches(data: bytes, ruleset: RedactionRuleset) -> list[tuple[int, int, str
         # A replacement starting one byte after a backslash leaves that backslash
         # attached to the marker. In JSON that is an invalid escape, and the
         # record carrying it is lost entirely rather than merely redacted.
-        and not _follows_escape(data, match.span(rule.group)[0])
+        and (not serialized_json or not _follows_escape(data, match.span(rule.group)[0]))
     ]
     # Longest match wins where two rules overlap, so a key inside a larger
     # credential block is not replaced twice or split in half.
@@ -168,31 +182,140 @@ def _follows_escape(data: bytes, start: int) -> bool:
     return start > 0 and data[start - 1 : start] == b"\\"
 
 
-def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> RedactedSource:
-    """Read *path*, returning safe bytes while hashing the exact original bytes."""
-    original = path.read_bytes()
+def _redact_decoded_string(
+    value: str, ruleset: RedactionRuleset, depth: int
+) -> tuple[str, list[str]]:
+    """Redact after JSON unescaping, when serialized bytes hid a match."""
+    if depth < 8 and value.lstrip().startswith(("{", "[")):
+        try:
+            nested = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            changed, kinds = _rewrite_json_value(nested, ruleset, depth + 1)
+            if kinds:
+                return json.dumps(changed, ensure_ascii=False, separators=(",", ":")), kinds
+    original = value.encode("utf-8")
+    matches = _matches(original, ruleset, serialized_json=False)
+    if not matches:
+        return value, []
+    chunks: list[bytes] = []
+    cursor = 0
+    for start, end, kind in matches:
+        chunks.extend((original[cursor:start], _REPLACEMENT % kind.encode()))
+        cursor = end
+    chunks.append(original[cursor:])
+    return b"".join(chunks).decode("utf-8"), [kind for _, _, kind in matches]
+
+
+def _rewrite_json_value(
+    value: object, ruleset: RedactionRuleset, depth: int = 0
+) -> tuple[object, list[str]]:
+    if isinstance(value, str):
+        return _redact_decoded_string(value, ruleset, depth)
+    if isinstance(value, list):
+        result: list[object] = []
+        kinds: list[str] = []
+        for item in value:
+            changed, found = _rewrite_json_value(item, ruleset, depth + 1)
+            result.append(changed)
+            kinds.extend(found)
+        return result, kinds
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        kinds = []
+        for key, item in value.items():
+            changed, found = _rewrite_json_value(item, ruleset, depth + 1)
+            result[key] = changed
+            kinds.extend(found)
+        return result, kinds
+    return value, []
+
+
+def _redact_decoded_json(
+    data: bytes, location: str, ruleset: RedactionRuleset
+) -> tuple[bytes, list[TraceIssue]]:
+    """Repair matches hidden by JSON escapes without changing unrelated records."""
+
+    try:
+        parsed = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return data, []
+    changed, kinds = _rewrite_json_value(parsed, ruleset)
+    if not kinds:
+        return data, []
+    trailing_newline = b"\n" if data.endswith(b"\n") else b""
+    output = json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    issues = [
+        TraceIssue(kind="redaction", detail=f"redacted decoded {kind}", location=location)
+        for kind in kinds
+    ]
+    return output + trailing_newline, issues
+
+
+def redact_bytes(
+    original: bytes,
+    location: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+) -> RedactedSource:
+    """Redact one source record; suitable for streaming independent JSONL lines."""
     spans = _matches(original, ruleset)
 
     chunks: list[bytes] = []
     issues: list[TraceIssue] = []
     cursor = 0
+    # Matches arrive in order, so each line number is counted on from the last
+    # one; counting from the top every time is quadratic on a large export.
+    line, counted_to = 1, 0
     for start, end, kind in spans:
         chunks.append(original[cursor:start])
         chunks.append(_REPLACEMENT % kind.encode())
         cursor = end
-        line = original.count(_NEWLINE, 0, start) + 1
+        line += original.count(_NEWLINE, counted_to, start)
+        counted_to = start
         issues.append(
             TraceIssue(
                 kind="redaction",
                 detail=f"redacted detected {kind}",
-                location=f"{path}:{line}",
+                location=f"{location}:{line}",
             )
         )
     chunks.append(original[cursor:])
 
+    byte_redacted = b"".join(chunks)
+    if not ruleset.decode_json:
+        return RedactedSource(
+            data=byte_redacted,
+            source_digest=hashlib.sha256(original).hexdigest(),
+            ruleset=ruleset.name,
+            issues=tuple(issues),
+        )
+    # A JSON string can spell a newline as \\n immediately before an address.
+    # Scanning serialized bytes then sees an extra "n" at the start of the
+    # address and cannot safely replace it without breaking the JSON escape.
+    # Decode each record, redact its actual string values, and re-encode only
+    # records where that second pass found something.
+    try:
+        json.loads(byte_redacted)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        records = byte_redacted.splitlines(keepends=True)
+        fixed: list[bytes] = []
+        for number, record in enumerate(records, start=1):
+            rewritten, found = _redact_decoded_json(record, f"{location}:{number}", ruleset)
+            fixed.append(rewritten)
+            issues.extend(found)
+        safe = b"".join(fixed)
+    else:
+        safe, found = _redact_decoded_json(byte_redacted, location, ruleset)
+        issues.extend(found)
     return RedactedSource(
-        data=b"".join(chunks),
+        data=safe,
         source_digest=hashlib.sha256(original).hexdigest(),
         ruleset=ruleset.name,
         issues=tuple(issues),
     )
+
+
+def redact_source(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> RedactedSource:
+    """Read *path*, returning safe bytes while hashing the exact original bytes."""
+    return redact_bytes(path.read_bytes(), str(path), ruleset)

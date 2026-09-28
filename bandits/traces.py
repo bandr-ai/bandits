@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -132,6 +132,122 @@ class UserTurn(Contract):
     after_span_id: str | None = None
     """The span this turn followed. None means it opened the episode."""
 
+    origin: Literal["recorded", "declared"] = "recorded"
+    """``recorded``: the source recorded a person saying this. ``declared``: a
+    workflow request that ingest was told (``--request-origin human``) came from
+    a person; the source itself recorded it as the invocation's input, not as a
+    message. Kept apart so a declared request is never mistaken for a recorded
+    conversation turn."""
+
+
+class WorkflowDeclaration(Contract):
+    """What was declared at ingest about a workflow source. Never inferred.
+
+    Stored on the corpus so every artifact built from it carries the semantics
+    it was built under; a corpus ingested with other selectors is a different
+    artifact, not the same one reread.
+    """
+
+    task_fields: tuple[str, ...] = ()
+    """Paths into the invocation record (``input.query``, ``input.payload.query``);
+    the first that resolves supplies the task. Empty: the task stays unresolved."""
+
+    delivered_field: str | None = None
+    """Path into the invocation record holding what was delivered (``output.answer``)."""
+
+    request_origin: Literal["human", "machine", "unknown"] = "unknown"
+    """Who started the runs. A workflow has no human follow-ups inside a run; that
+    says nothing about who started it."""
+
+    derivation_version: int = 1
+    """Bumped whenever how requests, nodes or links are derived changes."""
+
+
+class WorkflowRequest(Contract):
+    """The application invocation of a workflow episode: what came in, what went out.
+
+    Distinct from the structural root (an exporter's container span) and from
+    the task (the request inside the input). Kept even when no task resolves,
+    so analysis can still read the recorded input.
+    """
+
+    source_span_id: str | None
+    """The invocation span. None when no candidate or several did (see ``invocation_basis``)."""
+
+    invocation_basis: str
+    """Why this span is the invocation, or why none was chosen."""
+
+    candidate_span_ids: tuple[str, ...] = ()
+    raw_input: Any = None
+    raw_output: Any = None
+    status: SpanStatus | None = None
+    """Recorded status of the invocation span; None when no invocation was selected."""
+
+    task: str | None = None
+    task_status: Literal["declared", "unresolved", "conflict"] = "unresolved"
+    task_path: str | None = None
+    task_reason: str | None = None
+    """Why the task is unresolved or in conflict; None when declared."""
+
+    origin: Literal["human", "machine", "unknown"] = "unknown"
+
+    delivered: Any = None
+    """The value at the declared delivered field, as recorded; None if undeclared or absent."""
+
+
+class WorkflowNode(Contract):
+    """A recorded workflow step that contains model calls: structure, not an action.
+
+    Nobody chose to call it the way a model chooses a tool; the program ran it.
+    It is kept so a model call's enclosing result and execution round survive,
+    and it never enters the action/reaction sequence.
+    """
+
+    span_id: str
+    parent_span_id: str | None = None
+    name: str
+    started_at: datetime
+    ended_at: datetime
+    input: Any = None
+    output: Any = None
+    status: SpanStatus = SpanStatus.OK
+    """Whether the source recorded the step as failed. A failed step is not a
+    successful one with an odd output."""
+
+    framework: dict[str, Any] = Field(default_factory=dict)
+    """Framework metadata the source recorded on the node (e.g. ``langgraph_step``),
+    lifted out for convenience; the same keys remain in ``attributes``."""
+
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    """Every attribute the source declared on the step (status messages, levels,
+    custom metadata), except the input/output values already in ``input``/``output``."""
+
+
+class EvidenceLink(Contract):
+    """One recorded relationship from a model call to something observed later.
+
+    A link says what the record supports and on what basis — never that one
+    thing caused another. ``ambiguous`` marks a match that could as well belong
+    elsewhere; unknown relationships are simply absent.
+    """
+
+    call_span_id: str
+    kind: Literal[
+        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery"
+    ]
+    target_span_id: str | None = None
+    """The span or node the call links to; None for ``delivery`` (the request record)."""
+
+    basis: str
+    match_chars: int | None = None
+    ambiguous: bool = False
+    shared_with: tuple[str, ...] = ()
+    """Other calls whose output the same target also contains (``shared_result``).
+
+    Overlap, not contribution: a framework that passes its whole state forward
+    repeats every earlier output in every later input. ``shared_result`` says the
+    texts appear there together — never that these calls caused that result."""
+
 
 class TraceIssue(Contract):
     """One source record that could not be normalized. Never silently dropped."""
@@ -153,6 +269,31 @@ class Trace(Contract):
 
     task: str | None = None
     """The user-facing instruction, when the source declares one."""
+
+    task_source: str | None = None
+    """Where ``task`` was read from and on what basis, when an adapter chose it
+    from candidates rather than a declared field. None means no such choice."""
+
+    interaction: Literal["conversation", "workflow"] = "conversation"
+    """How the episode was driven, as declared at ingest — never inferred.
+
+    ``conversation``: a person and the agent take turns, so a user-role message
+    is someone speaking. ``workflow``: a program called the models, building
+    each prompt itself, and nobody spoke inside the run; a user-role message in
+    a model's input is the program's instruction to that call. Workflow says
+    nothing about who *started* the run — that is ``request.origin``. Reading a
+    workflow as a conversation turns every later prompt into a person reacting
+    to the call before it.
+    """
+
+    request: WorkflowRequest | None = None
+    """Workflow only: the application invocation (its recorded input and output)."""
+
+    workflow_nodes: tuple[WorkflowNode, ...] = ()
+    """Workflow only: recorded steps containing model calls, kept as structure."""
+
+    evidence: tuple[EvidenceLink, ...] = ()
+    """Workflow only: recorded relationships from each model call to later records."""
 
     lineage_id: str | None = None
     """Session, ticket, or retry chain this episode belongs to.
@@ -206,6 +347,9 @@ class TraceCorpus(Contract):
     source: str
     traces: tuple[Trace, ...]
     issues: tuple[TraceIssue, ...] = ()
+
+    workflow: WorkflowDeclaration | None = None
+    """Set when the corpus was ingested as a workflow, with what was declared."""
 
     redaction_ruleset: str | None = None
     """Which redaction ruleset produced these bytes.

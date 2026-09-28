@@ -12,6 +12,7 @@ from collections import Counter
 from typing import Any
 
 from bandits.export.models import ToolCall, ToolFunction, TrainingMessage
+from bandits.genai import PIPELINE_STEP, input_units, system_prompt_of
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, UserTurn
 
 
@@ -39,6 +40,40 @@ def _call_arguments(span: Span, carrier: Span | None) -> dict[str, Any]:
     if carrier is not None:
         return carrier.arguments
     return {}
+
+
+def _merged(units: list[tuple[str, str] | None]) -> list[tuple[str, str]]:
+    """Adjacent same-role messages as one, whitespace runs as one space.
+
+    Sources split one turn into several messages, or several into one, with
+    no difference in what the model read; a ``None`` keeps its neighbors apart.
+    """
+    merged: list[tuple[str, str]] = []
+    previous: str | None = None
+    for unit in units:
+        if unit is None:
+            previous = None
+            continue
+        role, text = unit
+        text = " ".join(text.split())
+        if role == previous:
+            merged[-1] = (role, f"{merged[-1][1]} {text}")
+        else:
+            merged.append((role, text))
+        previous = role
+    return merged
+
+
+def _in_order(recorded: list[tuple[str, str]], shown: list[tuple[str, str]]) -> bool:
+    """Whether every recorded message appears in *shown*, in order, each once."""
+    position = 0
+    for unit in recorded:
+        while position < len(shown) and shown[position] != unit:
+            position += 1
+        if position == len(shown):
+            return False
+        position += 1
+    return True
 
 
 def _tool_call_id(span: Span) -> str:
@@ -125,6 +160,18 @@ def build_transcript(
             "trace does not represent"
         )
 
+    # A transcript carries one system prompt. A call that recorded running
+    # under another was answering a policy this row would not show, and
+    # training on it teaches that answer as a response to the wrong one.
+    for span in trace.spans:
+        if span.kind is SpanKind.MODEL:
+            recorded = system_prompt_of(span.attributes)
+            if recorded is not None and recorded.strip() != (trace.system_prompt or "").strip():
+                defects.append(
+                    "a model call ran under a system prompt the transcript does not carry"
+                )
+                break
+
     messages: list[TrainingMessage] = []
     if trace.system_prompt:
         # The instructions the episode ran under, where the source recorded
@@ -149,6 +196,14 @@ def build_transcript(
 
     for span in trace.spans:
         if span.kind is SpanKind.TOOL:
+            if span.attributes.get(PIPELINE_STEP):
+                # Work the pipeline did, not a call the model made. What it
+                # returned can only have reached a model through that call's
+                # recorded input, and the check on model spans below refuses
+                # the row if the transcript does not show all of that input.
+                warnings.append(f"pipeline step {span.name!r} is not a model call; left out")
+                close_turn(span.span_id)
+                continue
             if not span.call_recorded:
                 # A result the source never paired with a call. The only way to
                 # put it in a transcript is to write the assistant turn that
@@ -201,6 +256,20 @@ def build_transcript(
             )
             close_turn(span.span_id)
             continue
+
+        # What the model answered is only a demonstration of answering what
+        # the transcript shows it. Every message the call recorded receiving
+        # must be there, in order, under its role, as often as recorded: an
+        # example turn, evidence handed over as an unpaired tool message, or
+        # an injected context block the row has no place for would leave the
+        # answer resting on input the row never shows.
+        recorded = _merged(input_units(span.attributes))
+        if recorded:
+            shown = _merged([(m.role, m.content) if m.content else None for m in messages])
+            if not _in_order(recorded, shown):
+                defects.append(
+                    "a model call's recorded input holds messages the transcript does not show"
+                )
 
         if span.output is not None:
             messages.append(

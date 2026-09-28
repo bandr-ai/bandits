@@ -1,0 +1,483 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ],
+        "droppedAttributesCount": 0
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "ai"
+          },
+          "spans": [
+            {
+              "traceId": "4ef604eea4bfdd5d35d597bf95347808",
+              "spanId": "3a02c9353bcbd929",
+              "parentSpanId": "7d432baf4483b988",
+              "name": "ai.generateText.doGenerate",
+              "kind": 1,
+              "startTimeUnixNano": "1789123131206000000",
+              "endTimeUnixNano": "1789123131238221667",
+              "attributes": [
+                {
+                  "key": "operation.name",
+                  "value": {
+                    "stringValue": "ai.generateText.doGenerate support_triage_agent"
+                  }
+                },
+                {
+                  "key": "resource.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.operationId",
+                  "value": {
+                    "stringValue": "ai.generateText.doGenerate"
+                  }
+                },
+                {
+                  "key": "ai.telemetry.functionId",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.model.provider",
+                  "value": {
+                    "stringValue": "openai.chat"
+                  }
+                },
+                {
+                  "key": "ai.model.id",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "ai.settings.maxOutputTokens",
+                  "value": {
+                    "intValue": 1024
+                  }
+                },
+                {
+                  "key": "ai.settings.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "ai.settings.topP",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "ai.settings.maxRetries",
+                  "value": {
+                    "intValue": 2
+                  }
+                },
+                {
+                  "key": "ai.request.headers.user-agent",
+                  "value": {
+                    "stringValue": "ai/5.0.253"
+                  }
+                },
+                {
+                  "key": "ai.prompt.messages",
+                  "value": {
+                    "stringValue": "[{\"role\":\"system\",\"content\":\"You are a support agent. Use the tools you are given.\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Where is order A-1187?\"}]}]"
+                  }
+                },
+                {
+                  "key": "ai.prompt.tools",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "{\"type\":\"function\",\"name\":\"lookup_order\",\"description\":\"Look up an order by its identifier.\",\"inputSchema\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"type\":\"object\",\"properties\":{\"order_id\":{\"type\":\"string\"}},\"required\":[\"order_id\"],\"additionalProperties\":false}}"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "ai.prompt.toolChoice",
+                  "value": {
+                    "stringValue": "{\"type\":\"auto\"}"
+                  }
+                },
+                {
+                  "key": "gen_ai.system",
+                  "value": {
+                    "stringValue": "openai.chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": 1024
+                  }
+                },
+                {
+                  "key": "gen_ai.request.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "gen_ai.request.top_p",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "ai.response.finishReason",
+                  "value": {
+                    "stringValue": "tool-calls"
+                  }
+                },
+                {
+                  "key": "ai.response.toolCalls",
+                  "value": {
+                    "stringValue": "[{\"toolCallId\":\"call_9RtYbK2mXqLp\",\"toolName\":\"lookup_order\",\"input\":\"{\\\"order_id\\\": \\\"A-1187\\\"}\"}]"
+                  }
+                },
+                {
+                  "key": "ai.response.id",
+                  "value": {
+                    "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT"
+                  }
+                },
+                {
+                  "key": "ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "ai.response.timestamp",
+                  "value": {
+                    "stringValue": "2026-09-10T00:26:40.000Z"
+                  }
+                },
+                {
+                  "key": "ai.response.providerMetadata",
+                  "value": {
+                    "stringValue": "{\"openai\":{\"acceptedPredictionTokens\":0,\"rejectedPredictionTokens\":0}}"
+                  }
+                },
+                {
+                  "key": "ai.usage.promptTokens",
+                  "value": {
+                    "intValue": 412
+                  }
+                },
+                {
+                  "key": "ai.usage.completionTokens",
+                  "value": {
+                    "intValue": 27
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "tool-calls"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.response.id",
+                  "value": {
+                    "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": 412
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": 27
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "events": [],
+              "droppedEventsCount": 0,
+              "status": {
+                "code": 0
+              },
+              "links": [],
+              "droppedLinksCount": 0,
+              "flags": 257
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ],
+        "droppedAttributesCount": 0
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "ai"
+          },
+          "spans": [
+            {
+              "traceId": "4ef604eea4bfdd5d35d597bf95347808",
+              "spanId": "7d432baf4483b988",
+              "name": "ai.generateText",
+              "kind": 1,
+              "startTimeUnixNano": "1789123131203000000",
+              "endTimeUnixNano": "1789123131243146917",
+              "attributes": [
+                {
+                  "key": "operation.name",
+                  "value": {
+                    "stringValue": "ai.generateText support_triage_agent"
+                  }
+                },
+                {
+                  "key": "resource.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.operationId",
+                  "value": {
+                    "stringValue": "ai.generateText"
+                  }
+                },
+                {
+                  "key": "ai.telemetry.functionId",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.model.provider",
+                  "value": {
+                    "stringValue": "openai.chat"
+                  }
+                },
+                {
+                  "key": "ai.model.id",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "ai.settings.maxOutputTokens",
+                  "value": {
+                    "intValue": 1024
+                  }
+                },
+                {
+                  "key": "ai.settings.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "ai.settings.topP",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "ai.settings.maxRetries",
+                  "value": {
+                    "intValue": 2
+                  }
+                },
+                {
+                  "key": "ai.request.headers.user-agent",
+                  "value": {
+                    "stringValue": "ai/5.0.253"
+                  }
+                },
+                {
+                  "key": "ai.prompt",
+                  "value": {
+                    "stringValue": "{\"system\":\"You are a support agent. Use the tools you are given.\",\"prompt\":\"Where is order A-1187?\"}"
+                  }
+                },
+                {
+                  "key": "ai.response.finishReason",
+                  "value": {
+                    "stringValue": "tool-calls"
+                  }
+                },
+                {
+                  "key": "ai.response.toolCalls",
+                  "value": {
+                    "stringValue": "[{\"toolCallId\":\"call_9RtYbK2mXqLp\",\"toolName\":\"lookup_order\",\"input\":\"{\\\"order_id\\\": \\\"A-1187\\\"}\"}]"
+                  }
+                },
+                {
+                  "key": "ai.response.providerMetadata",
+                  "value": {
+                    "stringValue": "{\"openai\":{\"acceptedPredictionTokens\":0,\"rejectedPredictionTokens\":0}}"
+                  }
+                },
+                {
+                  "key": "ai.usage.promptTokens",
+                  "value": {
+                    "intValue": 412
+                  }
+                },
+                {
+                  "key": "ai.usage.completionTokens",
+                  "value": {
+                    "intValue": 27
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "events": [],
+              "droppedEventsCount": 0,
+              "status": {
+                "code": 0
+              },
+              "links": [],
+              "droppedLinksCount": 0,
+              "flags": 257
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ],
+        "droppedAttributesCount": 0
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "ai"
+          },
+          "spans": [
+            {
+              "traceId": "4ef604eea4bfdd5d35d597bf95347808",
+              "spanId": "8be7df145a4757d4",
+              "parentSpanId": "7d432baf4483b988",
+              "name": "ai.toolCall",
+              "kind": 1,
+              "startTimeUnixNano": "1789123131240000000",
+              "endTimeUnixNano": "1789123131240180875",
+              "attributes": [
+                {
+                  "key": "operation.name",
+                  "value": {
+                    "stringValue": "ai.toolCall support_triage_agent"
+                  }
+                },
+                {
+                  "key": "resource.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.operationId",
+                  "value": {
+                    "stringValue": "ai.toolCall"
+                  }
+                },
+                {
+                  "key": "ai.telemetry.functionId",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "ai.toolCall.name",
+                  "value": {
+                    "stringValue": "lookup_order"
+                  }
+                },
+                {
+                  "key": "ai.toolCall.id",
+                  "value": {
+                    "stringValue": "call_9RtYbK2mXqLp"
+                  }
+                },
+                {
+                  "key": "ai.toolCall.args",
+                  "value": {
+                    "stringValue": "{\"order_id\":\"A-1187\"}"
+                  }
+                },
+                {
+                  "key": "ai.toolCall.result",
+                  "value": {
+                    "stringValue": "{\"order_id\":\"A-1187\",\"status\":\"in transit\"}"
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "events": [],
+              "droppedEventsCount": 0,
+              "status": {
+                "code": 0
+              },
+              "links": [],
+              "droppedLinksCount": 0,
+              "flags": 257
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
