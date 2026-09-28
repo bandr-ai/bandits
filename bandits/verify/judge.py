@@ -21,7 +21,7 @@ from bandits import ledger
 from bandits.traces import SpanKind, SpanStatus, Trace
 from bandits.transport import request_with_retry
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
 
 _MAX_OUTPUT_CHARS = 400
 
