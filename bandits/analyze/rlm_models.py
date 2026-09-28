@@ -69,6 +69,11 @@ class TraceView(str, Enum):
     task-family label.
     """
 
+    REQUEST = "request"
+    """A workflow's request record only: the declared task, or the raw invocation
+    input when no task resolved. For workflows, whose model prompts are the
+    program talking and whose runs need not have been started by a person."""
+
     @property
     def reads_agent_behavior(self) -> bool:
         """Whether this arm shows the miner what the agent did.
@@ -90,6 +95,12 @@ VIEW_PREAMBLES: dict[TraceView, str] = {
         "You see ONLY the user's opening request for each trace. You do not see later "
         "user turns, what any agent did, what tools it called, how any episode ended, "
         "or any existing label. Do not speculate about any of those."
+    ),
+    TraceView.REQUEST: (
+        "You see ONLY the request each workflow run received: the declared request text, "
+        "or, when none was declared, the raw request record marked as such. You do not "
+        "see what the workflow did, its internal prompts, how any run ended, or any "
+        "existing label. Do not speculate about any of those."
     ),
     TraceView.FULL_TRAJECTORY: (
         "You see the FULL trajectory of each episode: the user's messages, the "

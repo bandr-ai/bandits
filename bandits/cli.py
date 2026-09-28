@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import time
 from pathlib import Path
 
@@ -92,9 +93,12 @@ from bandits.export import (
     save_direct_sft,
     write_direct_sft,
 )
-from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, load_corpus
+from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
+from bandits.ingest.health import check as check_health
+from bandits.ingest.health import detect_request_fields
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
+from bandits.traces import WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -106,14 +110,56 @@ _SINGLETON_WARNING = 0.8
 """Fraction of one-trace families above which grouping is reported as inert."""
 
 
+def _say(*objects: object) -> None:
+    # One line per message: wrapped IDs and paths cannot be copied.
+    console.print(*objects, soft_wrap=True)
+
+
+_WORKFLOW_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
+"""Sources that can be read as a workflow; the default for them is workflow mode."""
+
+
+def _fail(what: str, why: str, fix: str) -> None:
+    _say(f"[red]error:[/red] {what}")
+    _say(f"  why: {why}")
+    _say(f"  fix: {fix}")
+    raise typer.Exit(code=1)
+
+
+@app.command(name="check-source", hidden=True)
+def check_source(
+    path: Path,
+    source: str = typer.Option("auto", "--source"),
+    mode: str = typer.Option("auto", "--mode"),
+    task_field: list[str] = typer.Option([], "--task-field"),
+    delivered_field: str = typer.Option(None, "--delivered-field"),
+) -> None:
+    """Same as `ingest --dry-run`."""
+    ingest(
+        path,
+        source=source,
+        redaction=DEFAULT_RULESET.name,
+        control_marker=[],
+        pipeline_steps=True,
+        mode=mode,
+        task_field=task_field,
+        delivered_field=delivered_field,
+        request_origin="unknown",
+        project=_DEFAULT_PROJECT,
+        dry_run=True,
+    )
+
+
 @app.command()
 def ingest(
     path: Path,
-    source: str = typer.Option(..., "--source", help=f"One of: {', '.join(CANONICAL_SOURCES)}"),
+    source: str = typer.Option(
+        "auto", "--source", help=f"Auto-detect, or one of: {', '.join(CANONICAL_SOURCES)}"
+    ),
     redaction: str = typer.Option(
         DEFAULT_RULESET.name,
         "--redaction",
-        help="Redaction ruleset. 'secrets-only-v1' keeps email addresses, which are "
+        help="Redaction ruleset. 'secrets-only-v2' keeps email addresses, which are "
         "often the task's own identifier.",
     ),
     control_marker: list[str] = typer.Option(
@@ -125,32 +171,162 @@ def ingest(
         "RLM command to remember: every mining, audit and assignment run "
         "reading this corpus strips it before a model ever sees it.",
     ),
+    pipeline_steps: bool = typer.Option(
+        True,
+        "--pipeline-steps/--no-pipeline-steps",
+        help="otlp-std only. Keep declared workflow steps with no model or tool call "
+        "beneath them (a retrieval, a rerank) as tool spans the agent did not call.",
+    ),
+    mode: str = typer.Option(
+        "auto",
+        "--mode",
+        help="conversation: model inputs with role 'user' are a person's turns. "
+        "workflow: they are prompts the program built; the run's own input is the "
+        "request. Default for OTLP and platform exports: workflow, which never "
+        "labels text as typed by a person.",
+    ),
+    task_field: list[str] = typer.Option(
+        [],
+        "--task-field",
+        help="Workflow only. Path into the run's record holding the request, "
+        "e.g. input.query. Default: a common field (query, question, ...) that is "
+        "text in every run, if there is one.",
+    ),
+    delivered_field: str = typer.Option(
+        None,
+        "--delivered-field",
+        help="Workflow only. Path into the run's record holding what was delivered, "
+        "e.g. output.answer. Default: found like --task-field.",
+    ),
+    request_origin: str = typer.Option(
+        "unknown",
+        "--request-origin",
+        help="Workflow only. Who started the runs: human, machine or unknown. Only "
+        "'human' records the request as a (declared) user turn.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Read and check the file; save nothing."),
 ) -> None:
-    """Load a trace export into the local artifact store."""
-    try:
-        corpus = load_corpus(path, source, ruleset_by_name(redaction))
-    except (UnknownSourceError, ValueError, FileNotFoundError) as exc:
-        console.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
+    """Load a trace export: detect its format, read it, check it, save it."""
+    if mode not in ("auto", "conversation", "workflow"):
+        _fail(
+            f"--mode {mode!r} is not a mode",
+            "the mode says whether 'user' messages were typed by a person",
+            "use --mode conversation or --mode workflow, or leave it out",
+        )
+    if request_origin not in ("human", "machine", "unknown"):
+        _fail(
+            f"--request-origin {request_origin!r} is not an origin",
+            "it says who started each run",
+            "use human, machine or unknown",
+        )
+    if not path.exists():
+        _fail(f"{path} does not exist", "the path is wrong or the file moved", "check the path")
+    if source == "auto":
+        try:
+            detection = detect_source(path)
+        except (ValueError, FileNotFoundError) as exc:
+            if "parse" in str(exc) or "malformed" in str(exc):
+                _fail(
+                    f"{path.name} is not valid JSON",
+                    str(exc),
+                    "the file is probably cut off or not JSON/JSONL; re-export it",
+                )
+            _fail(
+                "could not tell what format this file is",
+                str(exc),
+                f"pass --source NAME (one of: {', '.join(CANONICAL_SOURCES)}); if none "
+                "fits, this export needs a new reader",
+            )
+        source = detection.source
+        _say(f"format:   {source} ({detection.evidence})")
+    if mode == "auto":
+        mode = "workflow" if source in _WORKFLOW_SOURCES else "conversation"
+        if mode == "workflow":
+            _say(
+                "mode:     workflow (default: no text is labelled as typed by a person; "
+                "use --mode conversation if a person chatted with the agent)"
+            )
+    if mode != "workflow" and (task_field or delivered_field or request_origin != "unknown"):
+        _fail(
+            "--task-field, --delivered-field and --request-origin only apply to workflows",
+            f"this file is read in {mode} mode, where the request is the person's first message",
+            "drop them, or use --mode workflow (otlp-std and platform exports only)",
+        )
+
+    def load(workflow: WorkflowDeclaration | None):
+        try:
+            return load_corpus(
+                path,
+                source,
+                ruleset_by_name(redaction),
+                pipeline_steps=pipeline_steps,
+                workflow=workflow,
+            )
+        except (UnknownSourceError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            _fail(
+                f"could not read {path} as {source}",
+                str(exc),
+                "if the reason names an option, change that option; if it describes the "
+                "data, the file is not a complete export in this format (re-export it, or "
+                "try another --source)",
+            )
+
+    workflow = None
+    if mode == "workflow":
+        workflow = WorkflowDeclaration(
+            task_fields=tuple(task_field),
+            delivered_field=delivered_field,
+            request_origin=request_origin,  # type: ignore[arg-type]
+        )
+    corpus = load(workflow)
+    if workflow is not None and (not task_field or not delivered_field):
+        found_task, found_answer = detect_request_fields(corpus)
+        chosen_task = tuple(task_field) or ((found_task,) if found_task else ())
+        chosen_answer = delivered_field or found_answer
+        if chosen_task != workflow.task_fields or chosen_answer != workflow.delivered_field:
+            workflow = workflow.model_copy(
+                update={"task_fields": chosen_task, "delivered_field": chosen_answer}
+            )
+            corpus = load(workflow)
+        if not task_field:
+            _say(
+                f"task:     {found_task} (found; override with --task-field)"
+                if found_task
+                else "task:     not found (no common request field in every run; "
+                "use --task-field PATH)"
+            )
+        if not delivered_field and found_answer:
+            _say(f"answer:   {found_answer} (found; override with --delivered-field)")
     if control_marker:
         corpus = corpus.replace(control_markers=tuple(control_marker))
 
+    health = check_health(corpus, source)
+    _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
+    hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
+    _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
+    if health.fatal:
+        for problem in health.fatal:
+            _say(f"[red]error:[/red] {problem}")
+        for warning in health.warnings:
+            _say(f"  - {warning}")
+        _say("nothing was saved")
+        raise typer.Exit(code=1)
+    if health.warnings:
+        _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
+        for warning in health.warnings:
+            _say(f"  - {warning}")
+    else:
+        _say("problems: none")
+    if dry_run:
+        _say("dry run:  nothing saved")
+        return
+
     store = ArtifactStore(project / ".bandits")
     envelope = store.write(corpus, source_path=str(path))
-
-    console.print(f"artifact_id: {envelope.artifact_id}")
-    console.print(f"source:      {envelope.source}")
-    console.print(f"traces:      {envelope.trace_count}")
-    console.print(f"spans:       {envelope.span_count}")
-    console.print(f"issues:      {envelope.issue_count}")
-    console.print(f"redaction:   {corpus.redaction_ruleset}")
-    for issue in corpus.issues[:_MAX_INLINE_ISSUES]:
-        location = f" at {issue.location}" if issue.location else ""
-        console.print(f"  - {issue.kind}{location}: {issue.detail}")
-    remaining = envelope.issue_count - _MAX_INLINE_ISSUES
-    if remaining > 0:
-        console.print(f"  (+{remaining} more — see `bandits show {envelope.artifact_id} --issues`)")
+    _say(f"artifact_id: {envelope.artifact_id}")
+    if health.warnings:
+        _say(f"details:  bandits show {envelope.artifact_id} --issues")
 
 
 @app.command(name="list")
@@ -446,6 +622,17 @@ def _corpus_traces(corpus_id: str, project: Path, trace_ids: tuple[str, ...] | N
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no corpus {corpus_id!r}")
         raise typer.Exit(code=1) from exc
+    if corpus.workflow is not None:
+        # Every caller here reads next-state turns, which pair each model call
+        # with whatever came after it in time. On a workflow that credits parallel
+        # stages with each other's results; stage-aware evaluation replaces it.
+        console.print(
+            f"[red]error:[/red] {corpus_id} was ingested as a workflow; next-state turn "
+            "judging does not support workflow corpora yet (it would pair calls by time, "
+            "not by recorded relationships). Its requests, nodes and evidence links can "
+            "be inspected, and mined with --view request."
+        )
+        raise typer.Exit(code=1)
     traces = corpus.traces
     if trace_ids is not None:
         wanted = set(trace_ids)
@@ -812,9 +999,7 @@ def score_traces_command(
     tasks = {trace.trace_id: trace.task for trace in traces}
     checks = (
         tuple(
-            c
-            for c in verifier.checks
-            if c.survived and c.decision not in ("rejected", "revised")
+            c for c in verifier.checks if c.survived and c.decision not in ("rejected", "revised")
         )
         if survivors
         else None
@@ -889,7 +1074,9 @@ def export_nextstate_command(
     console.print(f"positive:   {bundle.positive}")
     console.print(f"negative:   {bundle.negative}")
     console.print(f"unresolved: {len(bundle.unresolved)}")
-    reviewed_label = "yes" if bundle.all_checks_reviewed else "no (--survivors or unreviewed checks)"
+    reviewed_label = (
+        "yes" if bundle.all_checks_reviewed else "no (--survivors or unreviewed checks)"
+    )
     console.print(f"reviewed:   {reviewed_label}")
     console.print(f"output:     {rows_path}")
     console.print(f"quarantine: {unresolved_path}")
@@ -950,7 +1137,8 @@ def mine_rlm_command(
         "--view",
         help=(
             "user-messages (Path U), full-trajectory (Path F: adds assistant turns and "
-            "tool activity, rewards withheld), or first-user-message."
+            "tool activity, rewards withheld), first-user-message, or request "
+            "(workflow corpora: the request each run received, never its internal prompts)."
         ),
     ),
     chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
@@ -1238,8 +1426,7 @@ def audit_rlm_command(
         # nothing ever told it otherwise.
         interrupted["flag"] = True
         console.print(
-            "\n[yellow]stopping after the contract in flight; "
-            "progress so far is saved[/yellow]"
+            "\n[yellow]stopping after the contract in flight; progress so far is saved[/yellow]"
         )
 
     import signal
@@ -1348,9 +1535,7 @@ def materialize_rlm_taskset_command(
     )
 
 
-def _find_session(
-    mining_store: SessionStore, audit_store: AuditSessionStore, session_id: str
-):
+def _find_session(mining_store: SessionStore, audit_store: AuditSessionStore, session_id: str):
     """Locate a session by id in whichever store actually has it.
 
     Session ids are self-describing (``rlm-audit-...`` vs ``rlm-...``) but
@@ -1393,13 +1578,17 @@ def rlm_session_command(
                 return
             kind, latest = max(candidates, key=lambda pair: pair[1].updated_at)
             session_id = latest.session_id
-            _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
+            _watch_session(
+                kind, mining_store if kind == "mining" else audit_store, session_id, interval
+            )
             return
         kind, _ = _find_session(mining_store, audit_store, session_id)
         if kind is None:
             console.print(f"[red]error:[/red] no session {session_id!r}")
             raise typer.Exit(code=1)
-        _watch_session(kind, mining_store if kind == "mining" else audit_store, session_id, interval)
+        _watch_session(
+            kind, mining_store if kind == "mining" else audit_store, session_id, interval
+        )
         return
 
     if session_id is None:
@@ -1446,9 +1635,7 @@ def rlm_session_command(
             console.print(f"resumed from: {state.resumed_from}")
         for finding in state.findings:
             colour = "yellow" if finding.demands_action else "dim"
-            console.print(
-                f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}"
-            )
+            console.print(f"  [{colour}]{finding.recommendation}[/{colour}] {finding.contract_id}")
         if state.last_error:
             console.print(f"[red]last error:[/red] {state.last_error}")
     else:
@@ -1527,7 +1714,9 @@ def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
             resume_command = f"bandits audit-rlm {state.run_id} --resume {session_id}"
         else:
             resume_command = f"bandits mine-rlm {state.analysis_id} --resume {session_id}"
-        console.print(f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]")
+        console.print(
+            f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]"
+        )
 
 
 @app.command(name="rlm-families")

@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from bandits.cli import app
 from bandits.ingest import load_corpus
-from bandits.redact import SECRETS_ONLY_RULESET, redact_source
+from bandits.redact import SECRETS_ONLY_RULESET, redact_source, ruleset_by_name
 from bandits.store import ArtifactStore
 
 runner = CliRunner()
@@ -96,8 +96,8 @@ def test_secrets_only_ruleset_keeps_a_task_identifying_email(tmp_path: Path) -> 
     corpus = load_corpus(source, "otlp", SECRETS_ONLY_RULESET)
 
     assert corpus.traces[0].task == "Refund the order for alice@realmail.io"
-    assert corpus.redaction_ruleset == "secrets-only-v1"
-    assert load_corpus(source, "otlp").redaction_ruleset == "default-v1"
+    assert corpus.redaction_ruleset == "secrets-only-v2"
+    assert load_corpus(source, "otlp").redaction_ruleset == "default-v2"
 
 
 def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> None:
@@ -114,7 +114,7 @@ def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> 
             "--source",
             "otlp",
             "--redaction",
-            "secrets-only-v1",
+            "secrets-only-v2",
             "--project",
             str(project),
         ],
@@ -122,9 +122,9 @@ def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> 
     )
 
     assert result.exit_code == 0
-    assert "redaction:   secrets-only-v1" in result.stdout
+    assert "redaction: secrets-only-v2" in result.stdout
     store = ArtifactStore(project / ".bandits")
-    assert store.read(store.list()[0].artifact_id).redaction_ruleset == "secrets-only-v1"
+    assert store.read(store.list()[0].artifact_id).redaction_ruleset == "secrets-only-v2"
 
 
 def test_unknown_ruleset_exits_nonzero(tmp_path: Path) -> None:
@@ -186,6 +186,24 @@ def test_a_real_address_is_still_redacted(tmp_path: Path) -> None:
 
     assert b"alice.smith@realmail.io" not in result.data
     assert b"[REDACTED:email_address]" in result.data
+
+
+def test_nested_json_escaped_newline_does_not_hide_address(tmp_path: Path) -> None:
+    """OTLP output.value can be JSON text nested inside another JSON record."""
+    source = tmp_path / "trace.jsonl"
+    answer = {"answer": "Contact\nalice.smith@realmail.io"}
+    source.write_text(json.dumps({"output.value": json.dumps(answer)}) + "\n")
+
+    result = redact_source(source)
+
+    assert b"alice.smith@realmail.io" not in result.data
+    outer = json.loads(result.data)
+    inner = json.loads(outer["output.value"])
+    assert inner["answer"] == "Contact\n[REDACTED:email_address]"
+    assert any(issue.kind == "redaction" for issue in result.issues)
+    assert result.ruleset == "default-v2"
+    legacy = redact_source(source, ruleset_by_name("default-v1"))
+    assert b"alice.smith@realmail.io" in legacy.data
 
 
 def test_a_long_dotted_run_does_not_backtrack(tmp_path: Path) -> None:

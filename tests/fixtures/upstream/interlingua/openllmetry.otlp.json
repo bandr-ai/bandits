@@ -1,0 +1,282 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.44.0"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "33a9a3cb-5a7c-4139-a4c0-be847616f12d"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.openai.v1",
+            "version": "0.62.3"
+          },
+          "spans": [
+            {
+              "traceId": "94d178dcee3abcd02e1c666bd4d23d2a",
+              "spanId": "a655f94fa46ed655",
+              "parentSpanId": "7ba832e1dd776d9d",
+              "name": "openai.chat",
+              "kind": "SPAN_KIND_CLIENT",
+              "startTimeUnixNano": "1789123129326646000",
+              "endTimeUnixNano": "1789123129353698000",
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "traceloop.workflow.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "openai"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.max_tokens",
+                  "value": {
+                    "intValue": "1024"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.temperature",
+                  "value": {
+                    "doubleValue": 0.7
+                  }
+                },
+                {
+                  "key": "gen_ai.request.top_p",
+                  "value": {
+                    "doubleValue": 0.95
+                  }
+                },
+                {
+                  "key": "gen_ai.is_streaming",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "gen_ai.openai.api_base",
+                  "value": {
+                    "stringValue": "http://127.0.0.1:8080/v1/"
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"system\", \"parts\": [{\"content\": \"You are a support agent. Use the tools you are given.\", \"type\": \"text\"}]}, {\"role\": \"user\", \"parts\": [{\"content\": \"Where is order A-1187?\", \"type\": \"text\"}]}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.tool.definitions",
+                  "value": {
+                    "stringValue": "[{\"type\": \"function\", \"name\": \"lookup_order\", \"description\": \"Look up an order by its identifier.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\"}}, \"required\": [\"order_id\"]}}]"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "gpt-4o-mini-2024-07-18"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.id",
+                  "value": {
+                    "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.finish_reasons",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "stringValue": "tool_call"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.openai.response.system_fingerprint",
+                  "value": {
+                    "stringValue": "fp_capture0"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.total_tokens",
+                  "value": {
+                    "intValue": "439"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "27"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "412"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.cache_read.input_tokens",
+                  "value": {
+                    "intValue": "256"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.reasoning_tokens",
+                  "value": {
+                    "intValue": "8"
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "stringValue": "[{\"role\": \"assistant\", \"parts\": [{\"type\": \"tool_call\", \"name\": \"lookup_order\", \"id\": \"call_9RtYbK2mXqLp\", \"arguments\": {\"order_id\": \"A-1187\"}}], \"finish_reason\": \"tool_call\"}]"
+                  }
+                }
+              ],
+              "status": {},
+              "flags": 256
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "python"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.44.0"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "33a9a3cb-5a7c-4139-a4c0-be847616f12d"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "capture"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "traceloop.tracer"
+          },
+          "spans": [
+            {
+              "traceId": "94d178dcee3abcd02e1c666bd4d23d2a",
+              "spanId": "7ba832e1dd776d9d",
+              "name": "support_triage_agent.workflow",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1789123129326528000",
+              "endTimeUnixNano": "1789123129359121000",
+              "attributes": [
+                {
+                  "key": "traceloop.workflow.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "traceloop.span.kind",
+                  "value": {
+                    "stringValue": "workflow"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.name",
+                  "value": {
+                    "stringValue": "support_triage_agent"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.input",
+                  "value": {
+                    "stringValue": "{\"args\": [], \"kwargs\": {}}"
+                  }
+                },
+                {
+                  "key": "traceloop.entity.output",
+                  "value": {
+                    "stringValue": "\"{\\n  \\\"id\\\": \\\"chatcmpl-CD8yqQ2y3kZs1o0Wm7bT\\\",\\n  \\\"choices\\\": [\\n    {\\n      \\\"finish_reason\\\": \\\"tool_calls\\\",\\n      \\\"index\\\": 0,\\n      \\\"logprobs\\\": null,\\n      \\\"message\\\": {\\n        \\\"content\\\": null,\\n        \\\"role\\\": \\\"assistant\\\",\\n        \\\"tool_calls\\\": [\\n          {\\n            \\\"id\\\": \\\"call_9RtYbK2mXqLp\\\",\\n            \\\"function\\\": {\\n              \\\"arguments\\\": \\\"{\\\\\\\"order_id\\\\\\\": \\\\\\\"A-1187\\\\\\\"}\\\",\\n              \\\"name\\\": \\\"lookup_order\\\"\\n            },\\n            \\\"type\\\": \\\"function\\\"\\n          }\\n        ]\\n      }\\n    }\\n  ],\\n  \\\"created\\\": 1789000000,\\n  \\\"model\\\": \\\"gpt-4o-mini-2024-07-18\\\",\\n  \\\"object\\\": \\\"chat.completion\\\",\\n  \\\"system_fingerprint\\\": \\\"fp_capture0\\\",\\n  \\\"usage\\\": {\\n    \\\"completion_tokens\\\": 27,\\n    \\\"prompt_tokens\\\": 412,\\n    \\\"total_tokens\\\": 439,\\n    \\\"completion_tokens_details\\\": {\\n      \\\"accepted_prediction_tokens\\\": 0,\\n      \\\"audio_tokens\\\": 0,\\n      \\\"reasoning_tokens\\\": 8,\\n      \\\"rejected_prediction_tokens\\\": 0\\n    },\\n    \\\"prompt_tokens_details\\\": {\\n      \\\"audio_tokens\\\": 0,\\n      \\\"cached_tokens\\\": 256\\n    }\\n  }\\n}\""
+                  }
+                }
+              ],
+              "status": {},
+              "flags": 256
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

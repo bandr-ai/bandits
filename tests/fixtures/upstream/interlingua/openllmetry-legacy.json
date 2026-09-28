@@ -1,0 +1,108 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "support-triage-agent" } },
+          { "key": "telemetry.sdk.language", "value": { "stringValue": "python" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "opentelemetry.instrumentation.openai",
+            "version": "0.48.2"
+          },
+          "spans": [
+            {
+              "traceId": "5b8efff798038103d269b633813fc60c",
+              "spanId": "eee19b7ec3c1b174",
+              "parentSpanId": "eee19b7ec3c1b173",
+              "name": "openai.chat",
+              "kind": 3,
+              "startTimeUnixNano": "1749823200000000000",
+              "endTimeUnixNano": "1749823201482000000",
+              "attributes": [
+                { "key": "gen_ai.system", "value": { "stringValue": "OpenAI" } },
+                { "key": "llm.request.type", "value": { "stringValue": "chat" } },
+                { "key": "gen_ai.request.model", "value": { "stringValue": "gpt-4o-mini" } },
+                { "key": "gen_ai.request.max_tokens", "value": { "intValue": "1024" } },
+                { "key": "gen_ai.request.temperature", "value": { "doubleValue": 0.7 } },
+                { "key": "gen_ai.request.top_p", "value": { "doubleValue": 0.95 } },
+                { "key": "llm.is_streaming", "value": { "boolValue": false } },
+                {
+                  "key": "llm.chat.stop_sequences",
+                  "value": { "arrayValue": { "values": [{ "stringValue": "\n\nObservation:" }] } }
+                },
+                { "key": "llm.request.functions.0.name", "value": { "stringValue": "lookup_order" } },
+                {
+                  "key": "llm.request.functions.0.description",
+                  "value": { "stringValue": "Look up an order by its identifier." }
+                },
+                {
+                  "key": "llm.request.functions.0.parameters",
+                  "value": {
+                    "stringValue": "{\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\"}}, \"required\": [\"order_id\"]}"
+                  }
+                },
+                { "key": "gen_ai.prompt.0.role", "value": { "stringValue": "system" } },
+                {
+                  "key": "gen_ai.prompt.0.content",
+                  "value": { "stringValue": "You are a support agent. Use the tools you are given." }
+                },
+                { "key": "gen_ai.prompt.1.role", "value": { "stringValue": "user" } },
+                {
+                  "key": "gen_ai.prompt.1.content",
+                  "value": { "stringValue": "Where is order A-1187?" }
+                },
+                { "key": "gen_ai.completion.0.role", "value": { "stringValue": "assistant" } },
+                { "key": "gen_ai.completion.0.finish_reason", "value": { "stringValue": "tool_calls" } },
+                {
+                  "key": "gen_ai.completion.0.tool_calls.0.id",
+                  "value": { "stringValue": "call_9RtYbK2mXqLp" }
+                },
+                {
+                  "key": "gen_ai.completion.0.tool_calls.0.name",
+                  "value": { "stringValue": "lookup_order" }
+                },
+                {
+                  "key": "gen_ai.completion.0.tool_calls.0.arguments",
+                  "value": { "stringValue": "{\"order_id\": \"A-1187\"}" }
+                },
+                { "key": "gen_ai.response.model", "value": { "stringValue": "gpt-4o-mini-2024-07-18" } },
+                { "key": "gen_ai.response.id", "value": { "stringValue": "chatcmpl-CD8yqQ2y3kZs1o0Wm7bT" } },
+                { "key": "gen_ai.usage.prompt_tokens", "value": { "intValue": "412" } },
+                { "key": "gen_ai.usage.completion_tokens", "value": { "intValue": "27" } },
+                { "key": "gen_ai.usage.cache_creation_input_tokens", "value": { "intValue": "1024" } },
+                { "key": "gen_ai.usage.total_tokens", "value": { "intValue": "439" } },
+                { "key": "traceloop.workflow.name", "value": { "stringValue": "support_triage_agent" } },
+                { "key": "traceloop.prompt.key", "value": { "stringValue": "order_status" } },
+                { "key": "traceloop.prompt.version", "value": { "intValue": "3" } },
+                {
+                  "key": "traceloop.association.properties.user_id",
+                  "value": { "stringValue": "u-7741" }
+                }
+              ],
+              "status": {}
+            },
+            {
+              "traceId": "5b8efff798038103d269b633813fc60c",
+              "spanId": "eee19b7ec3c1b175",
+              "parentSpanId": "eee19b7ec3c1b174",
+              "name": "POST",
+              "kind": 3,
+              "startTimeUnixNano": "1749823200004000000",
+              "endTimeUnixNano": "1749823201480000000",
+              "attributes": [
+                { "key": "http.request.method", "value": { "stringValue": "POST" } },
+                { "key": "server.address", "value": { "stringValue": "api.openai.com" } },
+                { "key": "http.response.status_code", "value": { "intValue": "200" } }
+              ],
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

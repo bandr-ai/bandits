@@ -51,11 +51,14 @@ Bandits writes immutable artifacts to `.bandits/` in the selected project direct
 
 | Source | Flag | Expected shape |
 | --- | --- | --- |
-| OpenTelemetry | `--source otlp` | OTLP JSON or JSONL span exports |
+| OpenTelemetry (flat) | `--source otlp` | One flat span object per line, `gen_ai.operation.name` of `chat` or `execute_tool` |
+| OpenTelemetry (standard) | `--source otlp-std` | OTLP/JSON `ExportTraceServiceRequest`s (`resourceSpans`): a file, JSONL, or a directory of them |
 | Chat transcripts | `--source chat-json` | One JSON conversation or an array of conversations |
 | Claude Code | `--source claude-code` | One session JSONL file or a directory of sessions |
 
 The input format is always explicit. Bandits does not guess and risk accepting a plausible-looking misparse.
+
+`otlp-std` reads what an OTel exporter or collector file exporter writes. Model and tool spans are recognized from whichever convention the instrumentation declared: the OTel GenAI semantic conventions (current and legacy `gen_ai.prompt.N.*` / span events), OpenInference, OpenLLMetry/Traceloop, or Langfuse. Messages in OpenAI, Anthropic, Gemini or LangChain shape are normalized into `gen_ai.input.messages`, and the span's own attributes are kept as-is. A declared workflow step with no model or tool call beneath it (a retrieval, a rerank, a filter node) becomes a tool span marked `call_recorded=False`: the judge can see its result, but it is never exported as a call the model chose. Those steps are left out of SFT transcripts with a warning, and `--no-pipeline-steps` leaves them out of the corpus. An evaluator span, and everything beneath it, never enters the corpus under any convention, so a grade cannot leak into the trajectory. Spans with no model or tool meaning are counted as `unrepresented_span` issues, and values that look like cut-off JSON as `unparsed_value`, never read as message text.
 
 ## Workflow
 

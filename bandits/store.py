@@ -10,12 +10,15 @@ of silently overwriting.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
+from bandits.redact import redact_bytes, ruleset_by_name
 from bandits.traces import TraceCorpus
 
 
@@ -68,6 +71,7 @@ class ArtifactStore:
                 raise ArtifactConflict(
                     f"artifact {artifact_id} already exists with different content"
                 )
+            self._archive_source(artifact_dir, source_path, corpus)
             return self.read_envelope(artifact_id)
 
         artifact_dir.mkdir(parents=True)
@@ -82,7 +86,91 @@ class ArtifactStore:
         )
         _atomic_write(artifact_dir / "corpus.json", corpus_bytes)
         _atomic_write(artifact_dir / "envelope.json", envelope.model_dump_json().encode("utf-8"))
+        self._archive_source(artifact_dir, source_path, corpus)
         return envelope
+
+    def _archive_source(self, artifact_dir: Path, source_path: str, corpus: TraceCorpus) -> None:
+        """Store redacted source bytes next to the normalized corpus.
+
+        A digest alone cannot recover fields a reader did not map. The archive
+        keeps them available without reintroducing secrets removed at ingest.
+        """
+        manifest_path = artifact_dir / "source-manifest.json"
+        if manifest_path.exists():
+            return
+        source = Path(source_path)
+        if not source.exists():
+            # Some derived/test corpora have a logical source name, not a file.
+            # CLI ingest passes an existing path and receives an archive.
+            return
+        if source.is_file():
+            files = [source]
+        elif corpus.source == "trail":
+            files = sorted(source.glob("*.json"))
+        elif corpus.source == "claude-code":
+            files = sorted(source.rglob("*.jsonl"))
+        else:
+            files = sorted(
+                p for p in source.rglob("*") if p.is_file() and p.suffix in (".json", ".jsonl")
+            )
+        ruleset = ruleset_by_name(corpus.redaction_ruleset or "default-v1")
+        archive = artifact_dir / "source"
+        archive.mkdir(exist_ok=True)
+        manifest: list[dict[str, str | int]] = []
+        for index, file in enumerate(files):
+            name = f"{index:06d}.json"
+            archive_path = archive / name
+            source_hash = hashlib.sha256()
+            redacted_hash = hashlib.sha256()
+            redacted_bytes = 0
+            with file.open("rb") as stream:
+                first = stream.readline()
+                jsonl = (
+                    file.suffix == ".jsonl"
+                    and first.lstrip().startswith(b"{")
+                    and first.rstrip().endswith(b"}")
+                )
+                if jsonl:
+                    with archive_path.with_suffix(".tmp").open("wb") as output:
+                        for line in chain((first,), stream):
+                            source_hash.update(line)
+                            data = redact_bytes(line, str(file), ruleset).data
+                            output.write(data)
+                            redacted_hash.update(data)
+                            redacted_bytes += len(data)
+                    os.replace(archive_path.with_suffix(".tmp"), archive_path)
+                else:
+                    original = first + stream.read()
+                    source_hash.update(original)
+                    redacted = redact_bytes(original, str(file), ruleset)
+                    _atomic_write(archive_path, redacted.data)
+                    redacted_hash.update(redacted.data)
+                    redacted_bytes = len(redacted.data)
+            if (
+                source.is_file()
+                and corpus.traces
+                and any(trace.source_digest != source_hash.hexdigest() for trace in corpus.traces)
+            ):
+                raise ValueError(f"source file changed after ingest: {file}")
+            manifest.append(
+                {
+                    "path": str(file.relative_to(source)) if source.is_dir() else file.name,
+                    "archive": name,
+                    "source_sha256": source_hash.hexdigest(),
+                    "redacted_sha256": redacted_hash.hexdigest(),
+                    "redacted_bytes": redacted_bytes,
+                }
+            )
+        _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
+
+    def source_manifest(self, artifact_id: str) -> list[dict[str, str | int]]:
+        return json.loads((self._dir(artifact_id) / "source-manifest.json").read_text())
+
+    def read_source(self, artifact_id: str, archive_name: str) -> bytes:
+        names = {str(item["archive"]) for item in self.source_manifest(artifact_id)}
+        if archive_name not in names:
+            raise ValueError(f"unknown archived source {archive_name!r}")
+        return (self._dir(artifact_id) / "source" / archive_name).read_bytes()
 
     def read(self, artifact_id: str) -> TraceCorpus:
         return TraceCorpus.model_validate_json(
