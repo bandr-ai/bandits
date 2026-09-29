@@ -311,6 +311,10 @@ def load_native(
     """Import one native JSON/JSONL file without an external conversion script."""
     if source_name not in _CONVERTERS:
         raise ValueError(f"unknown native source {source_name!r}")
+    if path.is_dir():
+        raise ValueError(
+            f"{source_name} reads one export file; {path} is a directory — ingest each file"
+        )
     issues: list[TraceIssue] = []
     source_hash = hashlib.sha256()
 

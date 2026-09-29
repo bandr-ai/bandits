@@ -542,3 +542,35 @@ def test_a_code_only_invocation_is_the_request_not_an_action(tmp_path) -> None:
 
     assert trace.request.source_span_id == "inv"
     assert "inv" not in {s.span_id for s in trace.spans}
+
+
+def _set(span: dict, key: str, value: str | None) -> None:
+    attributes = [a for a in span["attributes"] if a["key"] != key]
+    if value is not None:
+        attributes.append({"key": key, "value": {"stringValue": value}})
+    span["attributes"] = attributes
+
+
+def test_no_stage_system_prompt_becomes_the_workflow_policy(tmp_path) -> None:
+    _, trace = _load(tmp_path, _workflow())
+    assert trace.system_prompt is None
+    assert any(s.attributes.get("gen_ai.input.messages") for s in trace.spans)
+
+
+def test_a_cut_off_invocation_input_is_reported(tmp_path) -> None:
+    spans = _workflow()
+    _set(spans[1], "input.value", '{"query": "If an employee leaves mid')
+    corpus, _ = _load(tmp_path, spans)
+    assert any(
+        issue.kind == "unparsed_value" and "input.value" in issue.detail for issue in corpus.issues
+    )
+
+
+def test_an_invocation_with_no_recorded_input_is_unreadable(tmp_path) -> None:
+    spans = _workflow()
+    _set(spans[1], "input.value", None)
+    _, trace = _load(tmp_path, spans, WorkflowDeclaration())
+    assert trace.request.source_span_id == "inv"
+    view = build_view(trace, TraceView.REQUEST)
+    assert not view.readable
+    assert view.unreadable_reason == "the request record is empty"

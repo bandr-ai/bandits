@@ -210,7 +210,7 @@ def main() -> int:
         print_audit(report)
         reports.append(report)
     if args.json:
-        args.json.write_text(json.dumps(reports, indent=1))
+        args.json.write_text(json.dumps(reports, indent=1), encoding="utf-8")
     bad = any(
         r["counts"].get(f"{d}.{kind}")
         for r in reports
