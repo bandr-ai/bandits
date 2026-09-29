@@ -178,7 +178,7 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised untouched
         status = "error"
         error = {"type": type(exc).__name__, "message": str(exc)}
-        code = getattr(exc, "code", None)
+        code = _http_status(exc)
         if code is not None:
             error["http_status"] = code
         raise
@@ -228,14 +228,20 @@ def record_attempt(*, attempt: int, error: Exception, delay: float) -> None:
         "message": str(error),
         "computed_delay_seconds": round(delay, 3),
     }
-    code = getattr(error, "code", None)
+    from bandits.transport import response_header
+
+    code = _http_status(error)
     if code is not None:
         event["http_status"] = code
-    headers = getattr(error, "headers", None)
-    if headers is not None:
-        # The only header worth keeping: it is the server stating a number the
-        # backoff then obeys, so a delay that looks wrong can be traced to it.
-        asked = headers.get("Retry-After")
-        if asked:
-            event["retry_after"] = str(asked)
+    # The only header worth keeping: it is the server stating a number the
+    # backoff then obeys, so a delay that looks wrong can be traced to it.
+    asked = response_header(error, "Retry-After")
+    if asked:
+        event["retry_after"] = asked
     record(event)
+
+
+def _http_status(error: BaseException) -> int | None:
+    from bandits.transport import http_status
+
+    return http_status(error)

@@ -394,7 +394,7 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     )
     monkeypatch.setattr(
         direct_sft,
-        "fireworks_completion",
+        "model_complete",
         lambda model, prompt, temperature: reply,
     )
     output = tmp_path / "direct-dataset"

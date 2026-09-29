@@ -157,9 +157,13 @@ def interlingua_binary() -> str | None:
 def interlingua_spans(path: Path, binary: str) -> tuple[dict[str, dict[str, Any]], Counter]:
     decoded: dict[str, dict[str, Any]] = {}
     dialects: Counter = Counter()
-    files = sorted(path.rglob("*.json*")) if path.is_dir() else [path]
+    files = (
+        sorted(p for p in path.rglob("*") if p.is_file() and p.suffix in (".json", ".jsonl"))
+        if path.is_dir()
+        else [path]
+    )
     for file in files:
-        raw = file.read_text()
+        raw = file.read_text(encoding="utf-8")
         documents = (
             [raw] if file.suffix == ".json" else [ln for ln in raw.splitlines() if ln.strip()]
         )
@@ -169,6 +173,7 @@ def interlingua_spans(path: Path, binary: str) -> tuple[dict[str, dict[str, Any]
                 input=document,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True,
             )
             for resource in json.loads(result.stdout).get("resourceSpans", []):
@@ -202,9 +207,13 @@ def _hex_id(value: str) -> str:
 def source_facts(path: Path) -> dict[str, dict[str, Any]]:
     """Content visible in raw OTLP that both decoders might otherwise miss."""
     facts: dict[str, dict[str, Any]] = {}
-    files = sorted(path.rglob("*.json*")) if path.is_dir() else [path]
+    files = (
+        sorted(p for p in path.rglob("*") if p.is_file() and p.suffix in (".json", ".jsonl"))
+        if path.is_dir()
+        else [path]
+    )
     for file in files:
-        raw = file.read_text()
+        raw = file.read_text(encoding="utf-8")
         documents = (
             [raw] if file.suffix == ".json" else [ln for ln in raw.splitlines() if ln.strip()]
         )
@@ -405,7 +414,9 @@ def run(paths: list[Path], session_of: dict[str, str], out: Path | None) -> int:
     print(f"source losses in bandits: {len(report['source_losses_bandits'])}")
     print(f"source losses in interlingua: {len(report['source_losses_interlingua'])}")
     if out:
-        out.write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str))
+        out.write_text(
+            json.dumps(report, indent=1, ensure_ascii=False, default=str), encoding="utf-8"
+        )
         print(f"full report: {out}")
     return int(
         bool(
@@ -440,7 +451,7 @@ def main() -> int:
         for shard in args.shards:
             path = Path(tmp) / f"{shard}.jsonl"
             count = 0
-            with path.open("w") as stream:
+            with path.open("w", encoding="utf-8") as stream:
                 for batch in pq.ParquetFile(args.data / f"{shard}.parquet").iter_batches(
                     batch_size=4, columns=["session_id", "spans"]
                 ):

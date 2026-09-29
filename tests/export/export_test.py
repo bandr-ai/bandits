@@ -147,6 +147,34 @@ def test_a_trace_that_lost_a_user_turn_is_refused() -> None:
     assert any("does not represent" in defect for defect in defects)
 
 
+def test_a_recorded_textless_tool_call_missing_from_the_transcript_is_refused() -> None:
+    trace = _trace("good-1", 100, "changed")
+    final = trace.spans[-1].replace(
+        attributes={
+            "gen_ai.input.messages": json.dumps(
+                [
+                    {"role": "user", "parts": [{"type": "text", "content": trace.task}]},
+                    {
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool_call",
+                                "id": "missing-call",
+                                "name": "lookup_customer",
+                                "arguments": {"customer_id": 7},
+                            }
+                        ],
+                    },
+                ]
+            )
+        }
+    )
+
+    _, defects, _ = build_transcript(trace.replace(spans=(*trace.spans[:-1], final)))
+
+    assert any("tool calls the transcript does not show" in defect for defect in defects)
+
+
 def test_a_user_turn_with_no_recorded_response_is_refused() -> None:
     """A dangling instruction has no behavior to imitate after it."""
     trace = load_chat_json(MULTI_TURN_FIXTURE).traces[0]
