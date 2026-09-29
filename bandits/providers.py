@@ -34,10 +34,20 @@ DEFAULT_MODEL = os.environ.get("BANDITS_MODEL") or FIREWORKS_DEFAULT
 """Every stage's default model. ``BANDITS_MODEL`` moves them all at once, so a
 different provider does not mean passing ``--model`` to every command."""
 
-_KEY_OVERRIDES: dict[str, str] = {"fireworks_ai": "FIREWORKS_API_KEY"}
-"""Providers whose key LiteLLM does not report as missing. It says Fireworks
-needs nothing even with no key set, which would surface as a 401 per call
-instead of one clear error before the first."""
+_REQUIRED: dict[str, dict[str, str]] = {
+    "fireworks_ai": {"FIREWORKS_API_KEY": "api_key"},
+    "hosted_vllm": {"HOSTED_VLLM_API_BASE": "api_base"},
+    "litellm_proxy": {"LITELLM_PROXY_API_BASE": "api_base"},
+}
+"""What these providers need, which LiteLLM does not report as missing: it says
+all three need nothing even with nothing set, which would surface as a 401 or a
+connection error per call instead of one clear error before the first."""
+
+_OPTIONAL: dict[str, dict[str, str]] = {
+    "hosted_vllm": {"HOSTED_VLLM_API_KEY": "api_key"},
+    "litellm_proxy": {"LITELLM_PROXY_API_KEY": "api_key"},
+}
+"""Passed when set, for a server that asks for a key."""
 
 
 class ProviderError(RuntimeError):
@@ -98,17 +108,24 @@ def credentials(ref: ModelRef) -> dict[str, str]:
     """Keyword arguments carrying whatever this provider needs and the
     environment does not already supply to LiteLLM.
 
-    A variable already exported is left for LiteLLM to read itself. One that
+    The providers in ``_REQUIRED`` always get theirs passed explicitly. For the
+    rest, a variable already exported is left for LiteLLM to read itself. One that
     is only in ``.env`` is passed explicitly: an ``*_API_BASE`` as
     ``api_base``, a key or token as ``api_key``. Anything else (a cloud
     provider's several credentials, say) must be exported.
     """
-    override = _KEY_OVERRIDES.get(ref.provider)
-    if override is not None:
-        value = env_value(override)
-        if not value:
-            raise ProviderError(f"{override} is not set and was not found in .env")
-        return {"api_key": value}
+    if ref.provider in _REQUIRED:
+        found = {}
+        for name, argument in _REQUIRED[ref.provider].items():
+            value = env_value(name)
+            if not value:
+                raise ProviderError(f"{name} is not set and was not found in .env")
+            found[argument] = value
+        for name, argument in _OPTIONAL.get(ref.provider, {}).items():
+            value = env_value(name)
+            if value:
+                found[argument] = value
+        return found
 
     missing = load_litellm().validate_environment(ref.litellm_id).get("missing_keys") or []
     found: dict[str, str] = {}
