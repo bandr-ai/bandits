@@ -16,6 +16,19 @@ uv sync --extra dev              # data, calibration, report, tests
 uv sync --extra dev --extra train  # plus scoring and training a real model (GPU)
 ```
 
+## Browser UI
+
+For a local browser interface, install the training extra and start:
+
+```bash
+uv sync --extra train
+uv run jev ui --project /path/to/your/bandits/project
+```
+
+Open `http://127.0.0.1:8765`. Upload labeled decision JSONL or choose an existing decision dataset or turn-judge run, enter a base model and its pinned Hugging Face revision, then start training. The page shows the CLI pipeline's live output and links to its report. Runs and checkpoints are saved under `<project>/.bandits/jev-web/`; the artifact store records the resulting datasets, scores, and reports. Keep the server local: the UI has no account system and training uses the host's compute and model access.
+
+![Jev training UI after a completed run](docs/jev-ui-preview.png)
+
 ## One command
 
 ```bash
