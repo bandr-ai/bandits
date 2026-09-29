@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from bandits import ledger
+from bandits import ledger, providers
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_models import (
     VIEW_PREAMBLES,
@@ -41,7 +41,7 @@ from bandits.analyze.rlm_models import (
 )
 from bandits.store import DerivedEnvelope, DerivedStore
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = providers.DEFAULT_MODEL
 DEFAULT_MAX_TOKENS = 24000
 PROMPT_VERSION = 2
 
@@ -138,12 +138,10 @@ def build_predictor(
 
     from bandits.analyze.rlm_history import scoped_to_history
     from bandits.analyze.rlm_mine import with_cost
-    from bandits.verify.judge import resolve_api_key
 
-    key = api_key or resolve_api_key()
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=key,
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=0.0,
         max_tokens=max_tokens,
     )

@@ -34,6 +34,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import Field, model_validator
 
+from bandits import providers
 from bandits.emulate.models import (
     ActionCall,
     HiddenUserProfile,
@@ -901,11 +902,10 @@ def build_tool_world_predictor(
             "the grounded world model needs the 'emulate' extra: uv sync --extra emulate"
         ) from exc
 
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         # The environment is not being asked to be creative. Run-to-run
         # variation is measured across seeds, never sampled per transition.
         temperature=0.0,
@@ -962,11 +962,10 @@ def build_user_policy_predictor(
             "the grounded world model needs the 'emulate' extra: uv sync --extra emulate"
         ) from exc
 
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=0.0,
         max_tokens=max_tokens,
     )
