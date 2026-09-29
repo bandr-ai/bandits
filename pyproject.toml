@@ -10,16 +10,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+llm = [
+    # Every model call goes through LiteLLM (see bandits/providers.py). Optional
+    # so the core install and the Jev recipe's environment never pull it in.
+    "litellm>=1.100",
+]
 audit = [
     # RLM mining and its advisory audit only. Kept out of the core install so the
     # pipeline keeps its three runtime dependencies and CI never needs a model
     # or a REPL sandbox; their tests inject a predictor instead.
     "dspy[deno]>=3.3.1",
+    "litellm>=1.100",
 ]
 emulate = [
     # Prompt optimization and schema-checked trace-grounded world simulation.
     "dspy[deno]>=3.3.1",
     "jsonschema>=4.23",
+    "litellm>=1.100",
 ]
 dev = [
     "pytest>=8.0",

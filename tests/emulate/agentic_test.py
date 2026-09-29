@@ -1309,7 +1309,7 @@ def test_react_can_build_its_fallback_signature(monkeypatch) -> None:
             return dspy.Prediction(observation={}, abstain=True, abstain_reason="probe")
 
     monkeypatch.setattr(dspy, "Predict", _Stage)
-    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    predict = build_agentic_tool_world_predictor(model="fireworks_ai/test-model", api_key="dummy-key")
     predict(instruction="probe", context=_reservation_context())
 
 
@@ -1355,7 +1355,7 @@ def test_selection_failure_still_runs_extraction(monkeypatch) -> None:
         return _Select(signature) if "next_tool_name" in fields else _Extract(signature)
 
     monkeypatch.setattr(dspy, "Predict", _fake_predict)
-    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    predict = build_agentic_tool_world_predictor(model="fireworks_ai/test-model", api_key="dummy-key")
     raw, trace = predict(instruction="probe", context=_reservation_context())
 
     # Extraction ran despite the selection failure, and the grounding call
@@ -1387,7 +1387,7 @@ def test_controller_stages_get_separate_token_budgets(monkeypatch) -> None:
 
     monkeypatch.setattr(dspy, "Predict", _Stage)
     predict = build_agentic_tool_world_predictor(
-        model="test-model", api_key="dummy-key", select_max_tokens=512, extract_max_tokens=2048
+        model="fireworks_ai/test-model", api_key="dummy-key", select_max_tokens=512, extract_max_tokens=2048
     )
     predict(instruction="probe", context=_reservation_context())
 
@@ -1416,7 +1416,7 @@ def test_unknown_tool_name_is_an_observation_not_a_crash(monkeypatch) -> None:
             return dspy.Prediction(next_thought="done", next_tool_name="finish", next_tool_args={})
 
     monkeypatch.setattr(dspy, "Predict", _Stage)
-    predict = build_agentic_tool_world_predictor(model="test-model", api_key="dummy-key")
+    predict = build_agentic_tool_world_predictor(model="fireworks_ai/test-model", api_key="dummy-key")
     _raw, trace = predict(instruction="probe", context=_reservation_context())
 
     assert trace.controller_error is None
@@ -1589,7 +1589,7 @@ def test_repeated_selection_failures_stop_early(monkeypatch) -> None:
 
     monkeypatch.setattr(dspy, "Predict", _Stage)
     predict = build_agentic_tool_world_predictor(
-        model="test-model", api_key="dummy-key", max_iters=8, max_select_retries=1
+        model="fireworks_ai/test-model", api_key="dummy-key", max_iters=8, max_select_retries=1
     )
     _raw, trace = predict(instruction="probe", context=_reservation_context())
 
