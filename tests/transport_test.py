@@ -73,3 +73,30 @@ def test_timeouts_are_retryable_and_http_400_is_not() -> None:
     assert is_retryable(TimeoutError("t"))
     assert is_retryable(_http(429))
     assert not is_retryable(_http(401))
+
+
+def _litellm_error(name: str, retry_after: str | None = None) -> Exception:
+    litellm = pytest.importorskip("litellm")
+    error = getattr(litellm, name)("boom", llm_provider="fireworks_ai", model="m")
+    if retry_after is not None:
+        error.litellm_response_headers = {"retry-after": retry_after}
+    return error
+
+
+@pytest.mark.parametrize(
+    ("name", "retryable"),
+    [
+        ("RateLimitError", True),
+        ("ServiceUnavailableError", True),
+        ("InternalServerError", True),
+        ("Timeout", True),
+        ("BadRequestError", False),
+        ("AuthenticationError", False),
+    ],
+)
+def test_litellm_errors_retry_by_their_status(name: str, retryable: bool) -> None:
+    assert is_retryable(_litellm_error(name)) is retryable
+
+
+def test_litellm_retry_after_is_honoured() -> None:
+    assert backoff_delay(1, _litellm_error("RateLimitError", "12")) == 12.0
