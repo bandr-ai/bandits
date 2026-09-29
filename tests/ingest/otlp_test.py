@@ -3,10 +3,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bandits.ingest.otlp import load_otlp
-from bandits.traces import SpanKind, SpanStatus
+from bandits.ingest.otlp import _merge_root_user_turns, load_otlp
+from bandits.traces import SpanKind, SpanStatus, UserTurn
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "traces.otlp.jsonl"
+
+
+def test_root_turn_deduplication_does_not_drop_a_later_repeated_turn() -> None:
+    merged = _merge_root_user_turns(
+        (UserTurn(text="Retry"),),
+        (
+            UserTurn(text="Continue"),
+            UserTurn(text="Retry", after_span_id="first-call"),
+        ),
+    )
+
+    assert [(turn.text, turn.after_span_id) for turn in merged] == [
+        ("Retry", None),
+        ("Continue", None),
+        ("Retry", "first-call"),
+    ]
 
 
 def test_groups_spans_into_traces() -> None:
