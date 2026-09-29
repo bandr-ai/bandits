@@ -34,6 +34,6 @@ jobs:
       - run: uv sync --extra dev
       # CPU-only torch wheel: the default PyPI wheel pulls ~3 GB of CUDA libs.
       - run: uv pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
-      - run: uv pip install "transformers>=4.44" "peft>=0.12"
+      - run: uv pip install "transformers>=5.2" "peft>=0.12"
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync pytest
