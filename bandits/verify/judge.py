@@ -10,18 +10,15 @@ the request ledger entry are made once rather than once per caller.
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
-import urllib.request
 from collections.abc import Callable, Mapping
-from pathlib import Path
 from typing import Any
 
-from bandits import ledger
+from bandits import ledger, providers
 from bandits.traces import SpanKind, SpanStatus, Trace
 from bandits.transport import request_with_retry
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = providers.DEFAULT_MODEL
 
 _MAX_OUTPUT_CHARS = 400
 
@@ -68,29 +65,15 @@ Completion = Callable[[str, str, float], str]
 
 
 def resolve_api_key() -> str:
-    """The Fireworks key, read per call so it is never held in an artifact.
-
-    Shared with the family audit, which reaches the same backend through a
-    different client: two lookups would drift and one of them would start
-    reporting a missing key that is plainly there.
-    """
-    api_key = os.environ.get("FIREWORKS_API_KEY")
-    if not api_key:
-        # Keep local dogfooding one command wide without executing arbitrary
-        # shell from .env. Only the one key this backend owns is read.
-        env_path = Path(".env")
-        if env_path.is_file():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                key, separator, value = line.partition("=")
-                if separator and key.strip() == "FIREWORKS_API_KEY":
-                    api_key = value.strip().strip("'\"")
-                    break
+    """The Fireworks key. Kept for callers outside this package: a model's own
+    credentials now come from ``providers.credentials``."""
+    api_key = providers.env_value("FIREWORKS_API_KEY")
     if not api_key:
         raise JudgeError("FIREWORKS_API_KEY is not set and was not found in .env")
     return api_key
 
 
-def fireworks_completion(
+def complete(
     model: str,
     prompt: str,
     temperature: float,
@@ -100,7 +83,8 @@ def fireworks_completion(
     timeout: float = 90,
     extra: Mapping[str, Any] | None = None,
 ) -> str:
-    """Call Fireworks with a prompt and an optional higher-priority policy.
+    """Call ``model`` on any LiteLLM provider with a prompt and an optional
+    higher-priority policy.
 
     ``max_tokens`` is the whole budget, reasoning included. The next-state
     judge, which is told to think first, ran out of it 29 times in 436 and
@@ -110,50 +94,73 @@ def fireworks_completion(
     scratch: under load a full-budget reply queued for minutes, so a 90 s
     timeout abandoned and resent it up to five times. ``extra`` adds request
     fields (a sampling penalty, say) and is recorded with the call.
+
+    Retries are ours, not LiteLLM's (``num_retries`` and the OpenAI client's
+    ``max_retries`` are both 0), so each failed attempt still reaches the
+    ledger as a ``retry`` event. A field in ``extra`` that LiteLLM does not map
+    for this provider is sent as-is in the body rather than dropped: Fireworks
+    takes ``repetition_penalty`` and ``reasoning_effort`` that way, and a
+    provider that rejects one fails that call visibly instead of silently
+    sending a different request than the one recorded.
     """
-    api_key = resolve_api_key()
+    try:
+        litellm = providers.load_litellm()
+        ref = providers.resolve(model)
+        reach = providers.credentials(ref)
+    except providers.ProviderError as exc:
+        raise JudgeError(str(exc)) from exc
+    import openai
 
     messages = []
     if system_prompt is not None:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    request = urllib.request.Request(
-        "https://api.fireworks.ai/inference/v1/chat/completions",
-        data=json.dumps(
-            {
-                "model": model,
-                "temperature": temperature,
-                # Reasoning models may spend a substantial part of this budget
-                # before emitting their short visible answer. Seven hundred
-                # truncated real structured SFT reviews halfway through JSON.
-                "max_tokens": max_tokens,
-                "messages": messages,
-                **(extra or {}),
-            }
-        ).encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    fields = dict(extra or {})
+    mapped = set(
+        litellm.get_supported_openai_params(model=ref.litellm_id, custom_llm_provider=ref.provider)
+        or ()
     )
+    named = {key: value for key, value in fields.items() if key in mapped}
+    raw = {key: value for key, value in fields.items() if key not in mapped}
 
     def send() -> object:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.load(response)
+        response = litellm.completion(
+            model=ref.litellm_id,
+            messages=messages,
+            temperature=temperature,
+            # Reasoning models may spend a substantial part of this budget
+            # before emitting their short visible answer. Seven hundred
+            # truncated real structured SFT reviews halfway through JSON.
+            max_tokens=max_tokens,
+            timeout=timeout,
+            num_retries=0,
+            max_retries=0,
+            **reach,
+            **named,
+            **({"extra_body": raw} if raw else {}),
+        )
+        return response.model_dump(mode="json")
 
     with ledger.model_call(
-        provider="fireworks",
+        provider=ref.provider,
         model=model,
         request={
             "temperature": temperature,
             "max_tokens": max_tokens,
             "messages": messages,
-            **(extra or {}),
+            **fields,
         },
     ) as call:
         try:
             payload = request_with_retry(send)
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (openai.APIError, urllib.error.URLError, TimeoutError) as exc:
             raise JudgeError(f"judge request failed: {exc}") from exc
         # The whole body, not the text read out of it: `usage` is the only
         # record of what the call cost, and it was discarded one line later.
         call["response"] = payload
-    return payload["choices"][0]["message"]["content"]
+    return payload["choices"][0]["message"]["content"] or ""
+
+
+fireworks_completion = complete
+"""The name this had while Fireworks was the only backend. Deprecated."""
