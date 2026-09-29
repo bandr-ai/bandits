@@ -11,7 +11,14 @@ pytest.importorskip("litellm")
 from bandits import providers  # noqa: E402
 from bandits.providers import ProviderError, credentials, resolve  # noqa: E402
 
-_KEYS = ("FIREWORKS_API_KEY", "ANTHROPIC_API_KEY", "OLLAMA_API_BASE", "BANDITS_MODEL")
+_KEYS = (
+    "FIREWORKS_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OLLAMA_API_BASE",
+    "HOSTED_VLLM_API_BASE",
+    "HOSTED_VLLM_API_KEY",
+    "BANDITS_MODEL",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +99,20 @@ def test_a_base_url_only_in_dotenv_is_passed_as_api_base(tmp_path) -> None:
     (tmp_path / ".env").write_text("OLLAMA_API_BASE=http://gpu:11434\n")
 
     assert credentials(resolve("ollama/llama3")) == {"api_base": "http://gpu:11434"}
+
+
+def test_a_vllm_server_without_a_base_is_one_clear_error() -> None:
+    with pytest.raises(ProviderError, match="HOSTED_VLLM_API_BASE"):
+        credentials(resolve("hosted_vllm/my-judge"))
+
+
+def test_a_vllm_base_and_optional_key_come_from_dotenv(tmp_path) -> None:
+    (tmp_path / ".env").write_text("HOSTED_VLLM_API_BASE=http://gpu:8000/v1\nHOSTED_VLLM_API_KEY=t\n")
+
+    assert credentials(resolve("hosted_vllm/my-judge")) == {
+        "api_base": "http://gpu:8000/v1",
+        "api_key": "t",
+    }
 
 
 def test_bandits_model_moves_the_default(monkeypatch) -> None:
