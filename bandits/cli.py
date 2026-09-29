@@ -396,7 +396,7 @@ def build_sft_command(
         None, "--trace", help="Trace to consider. Repeat to select several; omit for all."
     ),
     output: Path = typer.Option(..., "--output", help="Directory for the three review buckets."),
-    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Fireworks review model."),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Review model, as <provider>/<model>."),
     samples: int = typer.Option(3, "--samples", min=1, help="Independent LLM reviews per trace."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
@@ -476,7 +476,7 @@ def judge_turns_command(
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Score every turn of every trace by what happened next."""
-    from bandits.verify.judge import fireworks_completion
+    from bandits.verify.judge import complete
     from bandits.verify.nextstate import (
         DEFAULT_MODEL,
         LOOP_RESCUES,
@@ -516,7 +516,7 @@ def judge_turns_command(
             # in fifteen was cut off before the score.
             # A full-budget reply can queue for minutes under load; a short
             # timeout abandoned and resent it, paying for each attempt.
-            predict=functools.partial(fireworks_completion, max_tokens=6000, timeout=600),
+            predict=functools.partial(complete, max_tokens=6000, timeout=600),
             model=model or DEFAULT_MODEL,
             votes=votes,
             temperature=temperature,
