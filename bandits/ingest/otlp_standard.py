@@ -1563,16 +1563,25 @@ def load_otlp_standard(
         root = _episode_root(decoded)
         if workflow is not None:
             candidates = _invocation_candidates(decoded)
-            scratch: Counter[str] = Counter()
+            # Cut-off values are counted per candidate, and only the chosen
+            # invocation's reach the report: it is left out of the workflow nodes,
+            # so nothing else would name why its task could not be read.
+            scratch: dict[str, Counter[str]] = {span_id: Counter() for span_id in candidates}
             records = {
                 span_id: {
-                    "input": _io_value(decoded[span_id].attributes, _INPUT_VALUE_KEYS, scratch),
-                    "output": _io_value(decoded[span_id].attributes, _OUTPUT_VALUE_KEYS, scratch),
+                    "input": _io_value(
+                        decoded[span_id].attributes, _INPUT_VALUE_KEYS, scratch[span_id]
+                    ),
+                    "output": _io_value(
+                        decoded[span_id].attributes, _OUTPUT_VALUE_KEYS, scratch[span_id]
+                    ),
                     "status": SpanStatus.ERROR if decoded[span_id].error else SpanStatus.OK,
                 }
                 for span_id in candidates
             }
             request = build_request(candidates=candidates, records=records, declaration=workflow)
+            if request.source_span_id is not None:
+                unparsed.update(scratch.get(request.source_span_id, Counter()))
             if request.source_span_id is None:
                 issues.append(
                     TraceIssue(

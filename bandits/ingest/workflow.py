@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 from bandits.ingest.otlp import _TOOL_CALL_ID_KEYS, _messages, _parts
@@ -307,24 +307,32 @@ def build_evidence(
         duplicate[call_id] = bool(text) and any(
             other != call_id and texts[other] == text for other in texts
         )
-    targets: list[tuple[str, Any, Any]] = [
-        (span.span_id, span.started_at, _span_input(span)) for span in spans
-    ] + [(node.span_id, node.started_at, node.input) for node in nodes]
     matched: dict[str, dict[str, int]] = defaultdict(dict)  # target -> call -> chars
     short: dict[str, bool] = {}
+    needles_by_call: dict[str, tuple[Span, list[str]]] = {}
     for call in calls:
         text = texts[call.span_id]
         if not text:
             continue
         long_leaves = [leaf for leaf in text if len(leaf) >= MIN_MATCH_CHARS]
         short[call.span_id] = not long_leaves
-        needles = long_leaves or list(text)
-        for target_id, started_at, value in targets:
-            if target_id == call.span_id or started_at < call.ended_at:
-                continue
-            haystack = _haystack(value)
-            if haystack and all(needle in haystack for needle in needles):
-                matched[target_id][call.span_id] = sum(len(n) for n in needles)
+        needles_by_call[call.span_id] = (call, long_leaves or list(text))
+
+    def targets() -> Iterator[tuple[str, Any, Any]]:
+        yield from ((span.span_id, span.started_at, _span_input(span)) for span in spans)
+        yield from ((node.span_id, node.started_at, node.input) for node in nodes)
+
+    # Inputs can be cumulative and large. Expand one target at a time, then
+    # release it before moving to the next rather than retaining every joined
+    # haystack for the whole workflow.
+    for target_id, started_at, value in targets():
+        haystack = _haystack(value)
+        if haystack:
+            for call_id, (call, needles) in needles_by_call.items():
+                if target_id == call_id or started_at < call.ended_at:
+                    continue
+                if all(needle in haystack for needle in needles):
+                    matched[target_id][call_id] = sum(len(needle) for needle in needles)
     unsure = {c: short.get(c, False) or duplicate.get(c, False) for c in texts}
     for target_id, by_call in matched.items():
         for call_id, chars in by_call.items():

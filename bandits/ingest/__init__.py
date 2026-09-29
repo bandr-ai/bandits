@@ -57,8 +57,8 @@ def load_corpus(
     """
     if source == "auto":
         source = detect_source(Path(path)).source
+        # Legacy flat OTLP has no workflow mode, so there is nothing to declare.
         if workflow is None and source in (
-            "otlp",
             "otlp-std",
             "langfuse",
             "langsmith",

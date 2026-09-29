@@ -76,6 +76,50 @@ def _in_order(recorded: list[tuple[str, str]], shown: list[tuple[str, str]]) -> 
     return True
 
 
+def _canonical_arguments(value: object) -> str:
+    """Put recorded and reconstructed tool arguments in one comparable form."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _recorded_tool_calls(attributes: dict[str, Any]) -> list[tuple[str, str]]:
+    """Tool calls present in a model's recorded input message history."""
+    raw = attributes.get("gen_ai.input.messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    calls: list[tuple[str, str]] = []
+    for message in raw:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "tool_call":
+                continue
+            name = part.get("name")
+            if isinstance(name, str) and name:
+                calls.append((name, _canonical_arguments(part.get("arguments"))))
+    return calls
+
+
+def _shown_tool_calls(messages: list[TrainingMessage]) -> list[tuple[str, str]]:
+    return [
+        (call.function.name, _canonical_arguments(call.function.arguments))
+        for message in messages
+        for call in message.tool_calls
+    ]
+
+
 def _tool_call_id(span: Span) -> str:
     """Stable within a trace, and derived from a span so two runs never collide."""
     return f"call-{span.span_id}"
@@ -270,6 +314,11 @@ def build_transcript(
                 defects.append(
                     "a model call's recorded input holds messages the transcript does not show"
                 )
+        recorded_calls = _recorded_tool_calls(span.attributes)
+        if recorded_calls and not _in_order(recorded_calls, _shown_tool_calls(messages)):
+            defects.append(
+                "a model call's recorded input holds tool calls the transcript does not show"
+            )
 
         if span.output is not None:
             messages.append(

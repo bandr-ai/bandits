@@ -25,7 +25,7 @@ was fixed; it now exposes the disagreement and exits nonzero. Its
 source-content checks do not yet cover every non-GenAI convention.
 
 **Error spans:** on a real Exgentic session with two failed model calls,
-`check-source` now reports `failed calls with no output: 2` and exits 0. An
+`ingest --dry-run` now reports `failed calls with no output: 2` and exits 0. An
 errored provider call without a reply is not a decoder loss. A successful call
 with no usable recorded output still fails the check. A separate fixture
 verifies that a transport response object's string representation is kept in
@@ -37,7 +37,7 @@ input and output.
 **Duplicate spans:** the reader does not merge spans just because they nest or
 use the same model. A direct model child must nearly fill its parent in time,
 match model and status, and have a compatible recorded reply. The outer record
-is retained as structure and `check-source` reports the pair. This rule found
+is retained as structure and `ingest --dry-run` reports the pair. This rule found
 the two Agno pairs and no pairs in the public OpenInference dataset; broader
 false-positive measurement is still needed.
 

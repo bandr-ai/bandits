@@ -3,10 +3,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bandits.ingest.otlp import load_otlp
-from bandits.traces import SpanKind, SpanStatus
+from bandits.ingest.otlp import _merge_root_user_turns, load_otlp
+from bandits.traces import SpanKind, SpanStatus, UserTurn
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "traces.otlp.jsonl"
+
+
+def test_root_turn_deduplication_does_not_drop_a_later_repeated_turn() -> None:
+    merged = _merge_root_user_turns(
+        (UserTurn(text="Retry"),),
+        (
+            UserTurn(text="Continue"),
+            UserTurn(text="Retry", after_span_id="first-call"),
+        ),
+    )
+
+    assert [(turn.text, turn.after_span_id) for turn in merged] == [
+        ("Retry", None),
+        ("Continue", None),
+        ("Retry", "first-call"),
+    ]
 
 
 def test_groups_spans_into_traces() -> None:
@@ -265,3 +281,79 @@ def test_user_turns_come_from_trailing_user_messages(tmp_path) -> None:
         ("the second one", "c1"),
         ("#W2", "c1"),
     ]
+
+
+def test_auto_detection_reads_a_legacy_flat_export(tmp_path) -> None:
+    from bandits.ingest import load_corpus
+
+    # The fixture's malformed line would stop detection; keep the good ones.
+    lines = []
+    for line in FIXTURE.read_text().splitlines():
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        lines.append(line)
+    path = tmp_path / "legacy.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+
+    # Legacy flat OTLP has no workflow mode, so auto must not demand one.
+    assert load_corpus(path).source == "otlp"
+
+
+def test_an_explicit_tool_span_without_output_takes_the_recorded_response(tmp_path) -> None:
+    call = {"type": "tool_call", "id": "call-1", "name": "lookup", "arguments": "{}"}
+    response = {"type": "tool_call_response", "id": "call-1", "result": '{"found": true}'}
+    first_input = [{"role": "user", "parts": [{"type": "text", "content": "Find it."}]}]
+    first_output = [{"role": "assistant", "parts": [call]}]
+
+    def record(span_id: str, at: int, attributes: dict) -> dict:
+        return {
+            "trace_id": "t",
+            "span_id": span_id,
+            "name": span_id,
+            "start_time": f"2026-01-01T00:00:0{at}Z",
+            "end_time": f"2026-01-01T00:00:0{at}Z",
+            "attributes": attributes,
+            "status": {"code": 1},
+        }
+
+    records = [
+        record(
+            "chat-1",
+            0,
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": json.dumps(first_input),
+                "gen_ai.output.messages": json.dumps(first_output),
+            },
+        ),
+        record(
+            "tool-1",
+            1,
+            {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "lookup",
+                "gen_ai.tool.call.id": "call-1",
+            },
+        ),
+        record(
+            "chat-2",
+            2,
+            {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.input.messages": json.dumps(
+                    [*first_input, *first_output, {"role": "tool", "parts": [response]}]
+                ),
+            },
+        ),
+    ]
+    path = tmp_path / "explicit.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    (trace,) = load_otlp(path).traces
+    tools = [s for s in trace.spans if s.kind is SpanKind.TOOL]
+
+    assert [s.span_id for s in tools] == ["tool-1"]
+    assert tools[0].output == {"found": True}
+    assert tools[0].attributes["output_source"] == "gen_ai.input.messages"

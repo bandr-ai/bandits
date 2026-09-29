@@ -184,6 +184,16 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
     # execution never answers two calls.
     claimed: set[str] = set()
     combined: list[Span] = []
+    # Explicit tool spans that recorded no result, by call id. A response in a
+    # later input is then the only record of it and fills the span in.
+    without_output: dict[str, str] = {
+        call_id: span.span_id
+        for span in spans
+        if span.kind is SpanKind.TOOL and span.output is None
+        for key in _TOOL_CALL_ID_KEYS
+        if isinstance(call_id := span.attributes.get(key), str)
+    }
+    filled: dict[str, object] = {}
 
     for span in spans:
         for message in _messages(span.attributes.get("gen_ai.input.messages")):
@@ -204,6 +214,9 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                         )
                 elif part_type == "tool_call_response" and isinstance(call_id, str):
                     if call_id in emitted:
+                        explicit = without_output.get(call_id)
+                        if explicit is not None and part.get("result") is not None:
+                            filled.setdefault(explicit, _tool_result(part.get("result")))
                         continue
                     call = calls.get(call_id)
                     name = part.get("name")
@@ -284,6 +297,16 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                 },
             )
         )
+    if filled:
+        combined = [
+            span.replace(
+                output=filled[span.span_id],
+                attributes={**span.attributes, "output_source": "gen_ai.input.messages"},
+            )
+            if span.span_id in filled
+            else span
+            for span in combined
+        ]
     if not unanswered:
         return tuple(combined)
     placed: list[Span] = []
@@ -438,6 +461,40 @@ def _user_turns(spans: tuple[Span, ...]) -> tuple[UserTurn, ...]:
     return tuple(turns)
 
 
+def _root_user_turns(attributes: dict[str, Any]) -> tuple[UserTurn, ...]:
+    """User turns recorded only on a filtered episode root.
+
+    A wrapper's input precedes every retained action, so any trailing user
+    messages it alone records belong at the start of the reconstructed trace.
+    """
+    messages = _messages(attributes.get("gen_ai.input.messages"))
+    trailing: list[str] = []
+    for message in reversed(messages):
+        if message.get("role") not in ("user", "human"):
+            break
+        text = _message_text(message)
+        if text:
+            trailing.append(text)
+    return tuple(UserTurn(text=text) for text in reversed(trailing))
+
+
+def _merge_root_user_turns(
+    root_turns: tuple[UserTurn, ...], span_turns: tuple[UserTurn, ...]
+) -> tuple[UserTurn, ...]:
+    """Prefer the root's opening turns without losing later repeated text.
+
+    A child can repeat the root's opening message in its own input history. Only
+    that matching opening prefix is a duplicate: the same text after a retained
+    span is a later user turn and must remain in the reconstructed trace.
+    """
+    overlap = 0
+    for root, span in zip(root_turns, span_turns, strict=False):
+        if span.after_span_id is not None or root.text != span.text:
+            break
+        overlap += 1
+    return (*root_turns, *span_turns[overlap:])
+
+
 def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:
     """The toolset, system prompt and settings declared on the episode's root span.
 
@@ -566,7 +623,10 @@ def assemble_corpus(
             tools = root_tools if root_tools is not None else tools
             system_prompt = root_prompt if root_prompt is not None else system_prompt
             context = {**context, **root_context}
-        if system_prompt is None:
+        extras = (trace_extras or {}).get(trace_id, {})
+        # Each workflow stage runs under its own system message; none of them is
+        # the episode's policy, and each stays on its own span.
+        if system_prompt is None and extras.get("interaction") != "workflow":
             # Most exporters record the policy as the system message opening
             # each model call rather than on the root. The first call's is what
             # the episode started under; a later call under a different one is
@@ -580,6 +640,9 @@ def assemble_corpus(
                 ),
                 None,
             )
+        user_turns = _user_turns(ordered)
+        if declared and extras.get("interaction") != "workflow":
+            user_turns = _merge_root_user_turns(_root_user_turns(declared), user_turns)
         traces.append(
             Trace(
                 trace_id=trace_id,
@@ -593,7 +656,7 @@ def assemble_corpus(
                 spans=ordered,
                 # A workflow's extras replace user turns entirely: a model's
                 # prompt is the program talking, never a person.
-                **{"user_turns": _user_turns(ordered), **(trace_extras or {}).get(trace_id, {})},
+                **{"user_turns": user_turns, **extras},
             )
         )
     return TraceCorpus(
