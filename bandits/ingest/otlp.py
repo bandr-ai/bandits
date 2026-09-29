@@ -27,7 +27,6 @@ MODEL span, ``"execute_tool"`` is a TOOL span. Anything else is a
 from __future__ import annotations
 
 import json
-from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -482,15 +481,18 @@ def _root_user_turns(attributes: dict[str, Any]) -> tuple[UserTurn, ...]:
 def _merge_root_user_turns(
     root_turns: tuple[UserTurn, ...], span_turns: tuple[UserTurn, ...]
 ) -> tuple[UserTurn, ...]:
-    """Prepend root-only turns while preserving repeated turns from the source."""
-    remaining = Counter(turn.text for turn in span_turns)
-    missing: list[UserTurn] = []
-    for turn in root_turns:
-        if remaining[turn.text]:
-            remaining[turn.text] -= 1
-        else:
-            missing.append(turn)
-    return (*missing, *span_turns)
+    """Prefer the root's opening turns without losing later repeated text.
+
+    A child can repeat the root's opening message in its own input history. Only
+    that matching opening prefix is a duplicate: the same text after a retained
+    span is a later user turn and must remain in the reconstructed trace.
+    """
+    overlap = 0
+    for root, span in zip(root_turns, span_turns, strict=False):
+        if span.after_span_id is not None or root.text != span.text:
+            break
+        overlap += 1
+    return (*root_turns, *span_turns[overlap:])
 
 
 def _declared_context(spans: tuple[Span, ...]) -> tuple[object, object, dict]:

@@ -173,6 +173,7 @@ def interlingua_spans(path: Path, binary: str) -> tuple[dict[str, dict[str, Any]
                 input=document,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True,
             )
             for resource in json.loads(result.stdout).get("resourceSpans", []):
