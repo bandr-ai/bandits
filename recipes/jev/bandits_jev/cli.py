@@ -24,6 +24,18 @@ console = Console()
 _DEFAULT_PROJECT = Path(".")
 
 
+@app.command(name="ui")
+def ui_command(
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project", help="Bandits project directory."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind."),
+    port: int = typer.Option(8765, "--port", min=1, max=65535),
+) -> None:
+    """Open the local training UI."""
+    from bandits_jev.web import serve
+
+    serve(project, host, port)
+
+
 def _derived(project: Path) -> DerivedStore:
     return DerivedStore(project / ".bandits")
 
