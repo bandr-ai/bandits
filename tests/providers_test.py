@@ -115,6 +115,25 @@ def test_a_vllm_base_and_optional_key_come_from_dotenv(tmp_path) -> None:
     }
 
 
+def test_an_explicit_key_still_gets_the_base_url_from_dotenv(tmp_path) -> None:
+    (tmp_path / ".env").write_text("HOSTED_VLLM_API_BASE=http://gpu:8000/v1\nHOSTED_VLLM_API_KEY=file\n")
+
+    assert credentials(resolve("hosted_vllm/my-judge"), api_key="mine") == {
+        "api_base": "http://gpu:8000/v1",
+        "api_key": "mine",
+    }
+
+
+def test_an_explicit_key_needs_no_key_in_the_environment() -> None:
+    assert credentials(resolve("accounts/fireworks/models/x"), api_key="k") == {"api_key": "k"}
+    assert credentials(resolve("anthropic/claude-sonnet-5"), api_key="k") == {"api_key": "k"}
+
+
+def test_an_explicit_key_does_not_excuse_a_missing_base_url() -> None:
+    with pytest.raises(ProviderError, match="HOSTED_VLLM_API_BASE"):
+        credentials(resolve("hosted_vllm/my-judge"), api_key="k")
+
+
 def test_bandits_model_moves_the_default(monkeypatch) -> None:
     monkeypatch.setenv("BANDITS_MODEL", "anthropic/claude-sonnet-5")
     try:
