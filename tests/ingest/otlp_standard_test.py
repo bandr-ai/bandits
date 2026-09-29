@@ -593,12 +593,15 @@ def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
             ),
             "gen_ai.tool.definitions": json.dumps(tools),
             "gen_ai.request.model": "gpt-5",
+            "gen_ai.input.messages": json.dumps(
+                [{"role": "user", "content": "Refund order 7741"}]
+            ),
         },
     )
     chat = _span(
         "c",
         "chat",
-        {"gen_ai.operation.name": "chat", "input.value": "Refund 7741"},
+        {"gen_ai.operation.name": "chat", "output.value": "Refunded."},
         parent="agent",
     )
     path = _write(tmp_path / "agent.jsonl", _request([root, chat]))
@@ -609,6 +612,27 @@ def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
     assert trace.system_prompt == "Refund only paid orders."
     assert [t.name for t in trace.tools_available or ()] == ["refund"]
     assert trace.runtime_context == {"gen_ai.request.model": "gpt-5"}
+    assert [turn.text for turn in trace.user_turns] == ["Refund order 7741"]
+
+
+def test_a_filtered_root_does_not_duplicate_a_turn_repeated_by_a_child(tmp_path) -> None:
+    messages = json.dumps([{"role": "user", "content": "Refund order 7741"}])
+    root = _span(
+        "agent",
+        "invoke_agent support",
+        {"gen_ai.operation.name": "invoke_agent", "gen_ai.input.messages": messages},
+    )
+    chat = _span(
+        "c",
+        "chat",
+        {"gen_ai.operation.name": "chat", "gen_ai.input.messages": messages},
+        parent="agent",
+    )
+    path = _write(tmp_path / "agent.jsonl", _request([root, chat]))
+
+    trace = _only_trace(load_otlp_standard(path))
+
+    assert [turn.text for turn in trace.user_turns] == ["Refund order 7741"]
 
 
 def test_cyclic_parent_ids_are_issues_not_a_hang(tmp_path) -> None:
