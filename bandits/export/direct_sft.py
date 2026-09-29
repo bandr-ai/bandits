@@ -16,7 +16,8 @@ from pydantic import Field, model_validator
 from bandits.export.sft import _quality_reasons, build_transcript, generating_policy
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, Trace, TraceCorpus
-from bandits.verify.judge import DEFAULT_MODEL, JudgeError, fireworks_completion, render_transcript
+from bandits.verify.judge import DEFAULT_MODEL, JudgeError, render_transcript
+from bandits.verify.judge import complete as model_complete
 
 
 class SFTBucket(str, Enum):
@@ -147,7 +148,7 @@ def review_trace(
 ) -> AggregatedSFTReview:
     if samples < 1:
         raise ValueError("samples must be at least 1")
-    completion = complete or fireworks_completion
+    completion = complete or model_complete
     parsed_items: list[ModelSFTReview] = []
     failures = 0
     backend_errors: list[str] = []
