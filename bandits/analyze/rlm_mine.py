@@ -53,7 +53,7 @@ from bandits.analyze.rlm_models import (
 )
 from bandits.store import DerivedEnvelope, DerivedStore
 
-DEFAULT_MODEL = providers.DEFAULT_MODEL
+DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 """Matches the family audit's default, so one credential covers both paths."""
 
 DEFAULT_CHUNK_SIZE = 20

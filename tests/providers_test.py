@@ -131,3 +131,9 @@ def test_dspy_lm_calls_the_resolved_id() -> None:
     lm = providers.dspy_lm("accounts/fireworks/models/x", api_key="k", temperature=0.0)
 
     assert lm.model == "fireworks_ai/accounts/fireworks/models/x"
+
+
+def test_a_stage_keeps_its_own_fallback_unless_bandits_model_is_set(monkeypatch) -> None:
+    assert providers.default_model("rlm/fallback") == "rlm/fallback"
+    monkeypatch.setenv("BANDITS_MODEL", "anthropic/claude-sonnet-5")
+    assert providers.default_model("rlm/fallback") == "anthropic/claude-sonnet-5"
