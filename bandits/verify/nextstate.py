@@ -54,9 +54,9 @@ on 2026-09-27, against 2 of 25 on 2026-09-13. Tried on three looping prompts,
 each of these scored some and none scored all, and raising the temperature to
 0.6 scored none; in this order the three scored all three. A rescued vote is
 recorded in ``TurnVerdict.rescues``. Needs a ``predict`` that takes
-``extra=``, such as ``fireworks_completion``."""
+``extra=``, such as ``complete``."""
 """(model, prompt, temperature) -> reply text. Tests inject one; production
-passes ``bandits.verify.judge.fireworks_completion``."""
+passes ``bandits.verify.judge.complete``."""
 
 
 class Archetype(str, Enum):
