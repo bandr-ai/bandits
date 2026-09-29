@@ -72,7 +72,7 @@ A model is `<provider>/<model>` in LiteLLM's naming. Fireworks' own `accounts/fi
 
 | Model string | Needs |
 | --- | --- |
-| `accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b` (default) | `FIREWORKS_API_KEY` |
+| `accounts/fireworks/models/deepseek-v4p1-flash` (default) | `FIREWORKS_API_KEY` |
 | `anthropic/claude-sonnet-5` | `ANTHROPIC_API_KEY` |
 | `openai/gpt-5` | `OPENAI_API_KEY` |
 | `hosted_vllm/<served-name>` | `HOSTED_VLLM_API_BASE`, e.g. `http://gpu:8000/v1` |

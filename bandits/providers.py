@@ -28,11 +28,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-FIREWORKS_DEFAULT = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+FIREWORKS_DEFAULT = "accounts/fireworks/models/deepseek-v4p1-flash"
+"""The judge's default: Nemotron loops at temperature 0 until it runs out of
+tokens, and this does not."""
 
-DEFAULT_MODEL = os.environ.get("BANDITS_MODEL") or FIREWORKS_DEFAULT
-"""Every stage's default model. ``BANDITS_MODEL`` moves them all at once, so a
-different provider does not mean passing ``--model`` to every command."""
+RLM_FIREWORKS_DEFAULT = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+"""RLM mining and its audit stay on Nemotron: the judge's move to DeepSeek
+did not include them."""
+
+
+def default_model(fallback: str = FIREWORKS_DEFAULT) -> str:
+    """``BANDITS_MODEL`` when set, which moves every stage at once so a
+    different provider does not mean passing ``--model`` to every command;
+    otherwise the stage's own ``fallback``."""
+    return os.environ.get("BANDITS_MODEL") or fallback
+
+
+DEFAULT_MODEL = default_model()
 
 _REQUIRED: dict[str, dict[str, str]] = {
     "fireworks_ai": {"FIREWORKS_API_KEY": "api_key"},

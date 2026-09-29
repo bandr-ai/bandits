@@ -41,7 +41,7 @@ from bandits.analyze.rlm_models import (
 )
 from bandits.store import DerivedEnvelope, DerivedStore
 
-DEFAULT_MODEL = providers.DEFAULT_MODEL
+DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 DEFAULT_MAX_TOKENS = 24000
 PROMPT_VERSION = 2
 
