@@ -291,11 +291,11 @@ def build_endpoint_candidate(spec: CandidateSpec, *, api_key: str | None = None)
             "running a model candidate needs the 'emulate' extra: uv sync --extra emulate"
         ) from exc
 
-    from bandits.verify.judge import resolve_api_key
+    from bandits import providers
 
-    language_model = dspy.LM(
-        spec.endpoint or f"fireworks_ai/{spec.model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        spec.endpoint or spec.model,
+        api_key=api_key,
         temperature=spec.temperature,
         max_tokens=spec.max_tokens,
         seed=spec.seed,

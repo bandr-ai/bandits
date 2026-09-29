@@ -37,6 +37,7 @@ import random
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from bandits import providers
 from bandits.emulate.fidelity import FidelityReport
 from bandits.emulate.models import GroundingTransition
 from bandits.traces import Contract
@@ -475,11 +476,10 @@ def build_reflective_proposer(
             "prompt optimization needs the 'emulate' extra: uv sync --extra emulate"
         ) from exc
 
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=1.0,
         # Proposals are the one place variation is wanted: an optimizer that
         # returns the same revision every round has stopped searching.

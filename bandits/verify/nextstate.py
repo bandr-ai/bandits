@@ -27,12 +27,12 @@ from enum import Enum
 
 from pydantic import Field
 
-from bandits import ledger
+from bandits import ledger, providers
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, Trace
 from bandits.verify.turns import Turn, extract_turns
 
-DEFAULT_MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
+DEFAULT_MODEL = providers.DEFAULT_MODEL
 PROMPT_VERSION = 3
 """2: −1 requires the reaction to show the action was wrong; routine content the
 action asked for defaults to 0. Under version 1 the judge scored 108 of 109
