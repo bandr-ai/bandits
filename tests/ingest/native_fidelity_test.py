@@ -21,6 +21,13 @@ def _file(tmp_path: Path, name: str, payload: object) -> Path:
     return path
 
 
+def test_native_reader_rejects_a_directory_through_its_public_error_path(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="reads one export file"):
+        load_corpus(tmp_path, "langfuse")
+
+
 def _assert_archived(tmp_path: Path, path: Path, corpus) -> None:
     store = ArtifactStore(tmp_path / ".bandits")
     artifact = store.write(corpus, source_path=str(path))
