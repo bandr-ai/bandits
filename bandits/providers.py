@@ -116,7 +116,16 @@ def env_value(name: str) -> str | None:
     return None
 
 
-def credentials(ref: ModelRef) -> dict[str, str]:
+def _argument(name: str) -> str | None:
+    """The LiteLLM keyword an environment variable is passed as, if any."""
+    if name.endswith(("_API_BASE", "_BASE_URL")):
+        return "api_base"
+    if "KEY" in name or "TOKEN" in name:
+        return "api_key"
+    return None
+
+
+def credentials(ref: ModelRef, *, api_key: str | None = None) -> dict[str, str]:
     """Keyword arguments carrying whatever this provider needs and the
     environment does not already supply to LiteLLM.
 
@@ -125,32 +134,35 @@ def credentials(ref: ModelRef) -> dict[str, str]:
     is only in ``.env`` is passed explicitly: an ``*_API_BASE`` as
     ``api_base``, a key or token as ``api_key``. Anything else (a cloud
     provider's several credentials, say) must be exported.
+
+    An explicit ``api_key`` replaces the key lookup only. A vLLM server's base
+    URL is still needed, and still read from ``.env``, when the caller brought
+    its own key.
     """
     if ref.provider in _REQUIRED:
-        found = {}
-        for name, argument in _REQUIRED[ref.provider].items():
-            value = env_value(name)
-            if not value:
-                raise ProviderError(f"{name} is not set and was not found in .env")
-            found[argument] = value
-        for name, argument in _OPTIONAL.get(ref.provider, {}).items():
-            value = env_value(name)
-            if value:
-                found[argument] = value
-        return found
+        needed = dict(_REQUIRED[ref.provider])
+        optional = dict(_OPTIONAL.get(ref.provider, {}))
+    else:
+        missing = load_litellm().validate_environment(ref.litellm_id).get("missing_keys") or []
+        needed = {name: _argument(name) for name in missing}
+        optional = {}
 
-    missing = load_litellm().validate_environment(ref.litellm_id).get("missing_keys") or []
     found: dict[str, str] = {}
-    for name in missing:
+    for name, argument in needed.items():
+        if argument == "api_key" and api_key:
+            continue
         value = env_value(name)
         if not value:
             raise ProviderError(f"{name} is not set and was not found in .env ({ref.model})")
-        if name.endswith(("_API_BASE", "_BASE_URL")):
-            found["api_base"] = value
-        elif "KEY" in name or "TOKEN" in name:
-            found["api_key"] = value
-        else:
+        if argument is None:
             raise ProviderError(f"{name} was found in .env, but {ref.provider} needs it exported")
+        found[argument] = value
+    for name, argument in optional.items():
+        value = env_value(name)
+        if value:
+            found[argument] = value
+    if api_key:
+        found["api_key"] = api_key
     return found
 
 
@@ -159,5 +171,4 @@ def dspy_lm(model: str, *, api_key: str | None = None, **kwargs: Any) -> Any:
     import dspy
 
     ref = resolve(model)
-    reach = {"api_key": api_key} if api_key else credentials(ref)
-    return dspy.LM(ref.litellm_id, **reach, **kwargs)
+    return dspy.LM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)
