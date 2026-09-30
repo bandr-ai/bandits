@@ -1,0 +1,31 @@
+% Shared preamble for the README figures. Build with `docs/figures/build.sh`.
+\usepackage[T1]{fontenc}
+\usepackage{libertinus}
+\setmonofont{Inconsolatazi4-Regular.otf}[Scale=0.86,BoldFont=Inconsolatazi4-Bold.otf]
+\usepackage{amsmath}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds,decorations.pathreplacing,shapes.geometric,patterns}
+
+\definecolor{ink}{gray}{0.11}
+\definecolor{mute}{gray}{0.40}
+\definecolor{faint}{gray}{0.62}
+\definecolor{rule}{gray}{0.80}
+\definecolor{fill}{gray}{0.955}
+\definecolor{neg}{RGB}{164,38,44}
+\definecolor{negfill}{RGB}{247,229,228}
+\pagecolor{white}
+\color{ink}
+
+\tikzset{
+  >={Stealth[length=5pt,width=4pt]},
+  every picture/.style={line width=0.55pt, draw=ink},
+  panel/.style={draw=rule, line width=0.6pt, fill=white},
+  box/.style={draw=ink, fill=white, inner sep=3pt, font=\footnotesize},
+  soft/.style={draw=rule, fill=fill, inner sep=3pt, font=\footnotesize},
+  lab/.style={font=\footnotesize\color{mute}, inner sep=0pt},
+  flow/.style={->, draw=ink, line width=0.7pt},
+  code/.style={draw=rule, fill=fill, align=left, inner sep=4pt, font=\ttfamily\scriptsize, execute at begin node={\hyphenpenalty=10000\relax\exhyphenpenalty=10000\relax}},
+}
+\newcommand{\plabel}[2]{\textbf{(#1)}\,\textsc{#2}}
