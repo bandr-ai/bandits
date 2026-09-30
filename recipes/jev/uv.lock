@@ -71,6 +71,9 @@ requires-dist = [
     { name = "dspy", extras = ["deno"], marker = "extra == 'audit'", specifier = ">=3.3.1" },
     { name = "dspy", extras = ["deno"], marker = "extra == 'emulate'", specifier = ">=3.3.1" },
     { name = "jsonschema", marker = "extra == 'emulate'", specifier = ">=4.23" },
+    { name = "litellm", marker = "extra == 'audit'", specifier = ">=1.100" },
+    { name = "litellm", marker = "extra == 'emulate'", specifier = ">=1.100" },
+    { name = "litellm", marker = "extra == 'llm'", specifier = ">=1.100" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
@@ -78,7 +81,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["audit", "emulate", "dev"]
+provides-extras = ["llm", "audit", "emulate", "dev"]
 
 [[package]]
 name = "bandits-jev"
@@ -119,7 +122,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'tinker'", specifier = ">=2.2" },
     { name = "torch", marker = "extra == 'train'", specifier = ">=2.2" },
     { name = "transformers", marker = "extra == 'tinker'", specifier = ">=4.44" },
-    { name = "transformers", marker = "extra == 'train'", specifier = ">=4.44" },
+    { name = "transformers", marker = "extra == 'train'", specifier = ">=5.2" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["train", "tinker", "dev"]

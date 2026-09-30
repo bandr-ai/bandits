@@ -7,6 +7,7 @@ from bandits.verify.judge import (
 from bandits.verify.judge import (
     Completion,
     JudgeError,
+    complete,
     fireworks_completion,
     render_transcript,
     resolve_api_key,
@@ -56,6 +57,7 @@ __all__ = [
     "JudgeError",
     "TurnJudgeRun",
     "TurnVerdict",
+    "complete",
     "compute_judge_run_id",
     "fireworks_completion",
     "judge_turns",

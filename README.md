@@ -57,6 +57,32 @@ Bandits writes immutable artifacts to `.bandits/` in the selected project direct
 
 The input format is always explicit. Bandits does not guess and risk accepting a plausible-looking misparse.
 
+### Models and providers
+
+Every step that calls a model (the next-state judge, direct review, RLM mining and its audit, check proposal, emulation) goes through [LiteLLM](https://docs.litellm.ai/docs/providers), so any provider it supports works:
+
+```bash
+uv sync --extra llm      # the audit and emulate extras include it
+```
+
+A model is `<provider>/<model>` in LiteLLM's naming. Fireworks' own `accounts/fireworks/models/...` form is also accepted and is the default.
+
+| Model string | Needs |
+| --- | --- |
+| `accounts/fireworks/models/deepseek-v4p1-flash` (default) | `FIREWORKS_API_KEY` |
+| `anthropic/claude-sonnet-5` | `ANTHROPIC_API_KEY` |
+| `openai/gpt-5` | `OPENAI_API_KEY` |
+| `hosted_vllm/<served-name>` | `HOSTED_VLLM_API_BASE`, e.g. `http://gpu:8000/v1` |
+| `litellm_proxy/<name>` | `LITELLM_PROXY_API_BASE`, plus `LITELLM_PROXY_API_KEY` if the proxy asks for one |
+| `ollama/<name>` | `OLLAMA_API_BASE` |
+
+```bash
+uv run bandits judge-turns <corpus-id> --archetype support --model anthropic/claude-sonnet-5
+export BANDITS_MODEL=anthropic/claude-sonnet-5   # or move every stage's default at once
+```
+
+A missing key fails once, before the first request, naming the variable. Keys are read from the environment, or from a `.env` in the working directory. A bare name such as `gpt-5` is refused rather than routed to a guessed provider. Artifacts and the ledger (`BANDITS_LEDGER`) record the model string as typed, and the ledger also records the provider that answered.
+
 ## Workflow
 
 Use this to build a verifier that reads what happened after an action, not what the agent claims about it.
@@ -210,8 +236,9 @@ and reaches a model:
 uv sync --extra audit
 ```
 
-The test suite injects a predictor instead of calling one, so neither the extra
-nor a credential is needed to run it.
+The test suite injects a predictor instead of calling one, so no credential is
+needed to run it. Tests that drive LiteLLM run against a local stub server and
+are skipped without the extra.
 
 The test suite exercises ingestion fidelity, redaction, content-addressed storage, RLM task-family mining, the next-state judge and its RLM-proposed checks, and both export paths.
 
@@ -223,6 +250,7 @@ bandits/
 ├── analyze/     # task extraction, evidence, and RLM family discovery
 ├── verify/      # turns, the next-state judge, RLM-proposed checks, and their review
 ├── export/      # next-state SFT export, and the direct LLM-reviewed exporter
+├── providers.py # model strings to LiteLLM providers and their credentials
 ├── traces.py    # immutable canonical trace contracts
 ├── store.py     # content-addressed corpus and derived-artifact storage
 ├── redact.py    # deterministic redaction policies
