@@ -11,8 +11,8 @@
 </div>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/jev-anim-dark.gif">
-  <img src="docs/assets/jev-anim-light.gif" alt="Label each step of your agent's traces (+1, 0, -1), by you or by a big verifier. Post-train Qwen3.5-4B on those labels: 79.1% on 1,920 held-out AgentProcessBench steps vs TypeSafe Jev's 66.8%. One forward pass per new step gives a calibrated probability for success, unclear and failure." width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/jev-anim-dark.webp">
+  <img src="docs/assets/jev-anim-light.webp" alt="Label each step of your agent's traces (+1, 0, -1), by you or by a big verifier. Post-train Qwen3.5-4B on those labels: 79.1% on 1,920 held-out AgentProcessBench steps vs TypeSafe Jev's 66.8%. One forward pass per new step gives a calibrated probability for success, unclear and failure." width="100%">
 </picture>
 
 Your agent's traces already hold the work: the request, the decisions, the tool calls, and what came back. Bandits turns that history into **labeled SFT data** and **cheap, reviewable success checks**.
