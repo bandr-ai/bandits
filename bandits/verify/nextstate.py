@@ -27,12 +27,12 @@ from enum import Enum
 
 from pydantic import Field
 
-from bandits import ledger
+from bandits import ledger, providers
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract, Trace
 from bandits.verify.turns import Turn, extract_turns
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = providers.DEFAULT_MODEL
 PROMPT_VERSION = 3
 """2: −1 requires the reaction to show the action was wrong; routine content the
 action asked for defaults to 0. Under version 1 the judge scored 108 of 109
@@ -54,9 +54,9 @@ on 2026-09-27, against 2 of 25 on 2026-09-13. Tried on three looping prompts,
 each of these scored some and none scored all, and raising the temperature to
 0.6 scored none; in this order the three scored all three. A rescued vote is
 recorded in ``TurnVerdict.rescues``. Needs a ``predict`` that takes
-``extra=``, such as ``fireworks_completion``."""
+``extra=``, such as ``complete``."""
 """(model, prompt, temperature) -> reply text. Tests inject one; production
-passes ``bandits.verify.judge.fireworks_completion``."""
+passes ``bandits.verify.judge.complete``."""
 
 
 class Archetype(str, Enum):

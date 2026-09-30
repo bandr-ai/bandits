@@ -34,6 +34,7 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Any, ForwardRef, Protocol
 
+from bandits import providers
 from bandits.emulate.models import (
     ActionCall,
     GroundingKind,
@@ -1223,11 +1224,10 @@ def build_agentic_tool_world_predictor(
         ) from exc
 
     from bandits.emulate.world import ProposedCallOutcome, StateDelta, WorldModelError
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=0.0,
         max_tokens=max_tokens,
     )

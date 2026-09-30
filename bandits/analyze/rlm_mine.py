@@ -35,7 +35,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
-from bandits import ledger
+from bandits import ledger, providers
 from bandits.analyze.rlm_corpus import ReadOnlyCorpus
 from bandits.analyze.rlm_models import (
     VIEW_PREAMBLES,
@@ -53,7 +53,7 @@ from bandits.analyze.rlm_models import (
 )
 from bandits.store import DerivedEnvelope, DerivedStore
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 """Matches the family audit's default, so one credential covers both paths."""
 
 DEFAULT_CHUNK_SIZE = 20
@@ -274,12 +274,10 @@ def build_predictor(
         raise MiningError("RLM mining needs the 'audit' extra: uv sync --extra audit") from exc
 
     from bandits.analyze.rlm_history import scoped_to_history
-    from bandits.verify.judge import resolve_api_key
 
-    key = api_key or resolve_api_key()
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=key,
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         # The root model writes code rather than prose, and a sampled plan
         # rereads the same chunk differently for no gain a reviewer can use.
         # Run-to-run variation is measured across seeds, not sampled per call.

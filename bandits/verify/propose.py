@@ -28,12 +28,13 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel
 
+from bandits import providers
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
 from bandits.verify.nextstate import ARCHETYPE_VOCABULARY, Archetype, TurnJudgeRun, TurnVerdict
 from bandits.verify.turns import Turn
 
-DEFAULT_MODEL = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+DEFAULT_MODEL = providers.DEFAULT_MODEL
 PROMPT_VERSION = 1
 DEFAULT_MAX_TOKENS = 16000
 
@@ -128,11 +129,10 @@ def build_proposer(
     except ImportError as exc:  # pragma: no cover - depends on the extra
         raise ProposalError("proposing needs the 'audit' extra: uv sync --extra audit") from exc
 
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=0.0,
         max_tokens=max_tokens,
         # LiteLLM's own retries, before the backoff below sees anything. Three
@@ -271,11 +271,10 @@ def build_reviser(
     except ImportError as exc:  # pragma: no cover - depends on the extra
         raise ProposalError("revising needs the 'audit' extra: uv sync --extra audit") from exc
 
-    from bandits.verify.judge import resolve_api_key
 
-    language_model = dspy.LM(
-        f"fireworks_ai/{model}",
-        api_key=api_key or resolve_api_key(),
+    language_model = providers.dspy_lm(
+        model,
+        api_key=api_key,
         temperature=0.0,
         max_tokens=max_tokens,
         num_retries=8,
