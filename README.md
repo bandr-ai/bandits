@@ -10,9 +10,10 @@
 
 </div>
 
-<p align="center">
-  <img src="docs/assets/fig1-evidence-pipeline.png" alt="Figure 1. Bandits evidence pipeline: OTLP, chat JSON, and Claude Code traces are normalized and redacted into an immutable corpus. Observed action-reaction turns feed a reaction judge; its verdicts are distilled into checks, sandbox-tested, and human-reviewed. Scoring exports positive, negative, and unresolved traces with source lineage. Task families are optional." width="100%">
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/jev-anim-dark.gif">
+  <img src="docs/assets/jev-anim-light.gif" alt="Label each step of your agent's traces (+1, 0, -1), by you or by a big verifier. Post-train Qwen3.5-4B on those labels: 79.1% on 1,920 held-out AgentProcessBench steps vs TypeSafe Jev's 66.8%. One forward pass per new step gives a calibrated probability for success, unclear and failure." width="100%">
+</picture>
 
 Your agent's traces already hold the work: the request, the decisions, the tool calls, and what came back. Bandits turns that history into **labeled SFT data** and **cheap, reviewable success checks**.
 
@@ -42,7 +43,11 @@ Bandits sits **downstream of your tracer** and **upstream of your trainer**. Kee
 
 ## 🔄 Method
 
-Figure 1 shows the main flow. The steps below explain it in more detail.
+<p align="center">
+  <img src="docs/assets/fig1-evidence-pipeline.png" alt="Figure 1. Bandits evidence pipeline: OTLP, chat JSON, and Claude Code traces are normalized and redacted into an immutable corpus. Observed action-reaction turns feed a reaction judge; its verdicts are distilled into checks, sandbox-tested, and human-reviewed. Scoring exports positive, negative, and unresolved traces with source lineage. Task families are optional." width="100%">
+</p>
+
+The figure above shows the main flow. The steps below explain it in more detail.
 
 **(a) Ingest.** Any supported format is normalized into a corpus $\mathcal{C}$ whose id is a hash of the normalized content and the redaction ruleset. Re-ingesting the same data yields the same id. Records that don't parse are counted as issues, never repaired by a guess. Evaluator spans never enter the corpus, so a grade cannot leak into a trajectory.
 
