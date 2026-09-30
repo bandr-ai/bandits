@@ -153,6 +153,27 @@ def import_command(
         console.print(f"quarantine:          {quarantine_path}")
 
 
+
+_BACKENDS = ("hf", "tinker")
+
+
+def _backend_settings(backend: str, revision: str | None, device: str, dtype: str) -> tuple[str, str, str]:
+    """The (revision, device, dtype) a run records. Tinker names its base model
+    instead of pinning a revision and runs on no local device, so those are fixed
+    there; a local model must say which revision it is."""
+    if backend not in _BACKENDS:
+        console.print(f"[red]error:[/red] --backend must be one of {_BACKENDS}, got {backend!r}")
+        raise typer.Exit(code=1)
+    if backend == "tinker":
+        from bandits_jev.tinker_backend import DEFAULT_TINKER_REVISION
+
+        return revision or DEFAULT_TINKER_REVISION, "tinker", "tinker"
+    if revision is None:
+        console.print("[red]error:[/red] --revision is required for --backend hf")
+        raise typer.Exit(code=1)
+    return revision, device, dtype
+
+
 _DECISION_SPLITS = ("train", "dev", "calibration", "test")
 
 
@@ -160,7 +181,13 @@ _DECISION_SPLITS = ("train", "dev", "calibration", "test")
 def score_command(
     dataset_id: str,
     model: str = typer.Option(..., "--model", help="Hugging Face model id, e.g. Qwen/Qwen3.5-4B."),
-    revision: str = typer.Option(..., "--revision", help="Pinned model revision (commit SHA)."),
+    revision: str = typer.Option(None, "--revision", help="Pinned model revision (commit SHA); required for --backend hf."),
+    backend: str = typer.Option(
+        "hf",
+        "--backend",
+        help="hf: a local Hugging Face model on this machine's device. tinker: the Tinker API "
+        "(needs TINKER_API_KEY and the `tinker` extra); --revision, --device and --dtype do not apply.",
+    ),
     split: str = typer.Option("dev", "--split", help="Which split to score: train/dev/calibration/test."),
     allow_test: bool = typer.Option(
         False,
@@ -186,7 +213,6 @@ def score_command(
     base, or the base plus a trained adapter: one forward pass per example,
     softmax over the option-letter logits."""
     from bandits_jev.dataset import load_decision_dataset
-    from bandits_jev.hf_predictor import HFPredictor
     from bandits_jev.scorer import (
         adapter_digest,
         adapter_training_dataset_id,
@@ -194,6 +220,7 @@ def score_command(
         score_dataset,
     )
 
+    revision, device, dtype = _backend_settings(backend, revision, device, dtype)
     if split not in _DECISION_SPLITS:
         console.print(f"[red]error:[/red] --split must be one of {_DECISION_SPLITS}, got {split!r}")
         raise typer.Exit(code=1)
@@ -225,13 +252,15 @@ def score_command(
         except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
             console.print(f"[red]error:[/red] {adapter} is not a saved adapter: {exc}")
             raise typer.Exit(code=1) from exc
-    predictor = HFPredictor(
-        model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-        adapter_path=str(adapter) if adapter is not None else None,
-    )
+    adapter_path = str(adapter) if adapter is not None else None
+    if backend == "tinker":
+        from bandits_jev.tinker_backend import TinkerPredictor
+
+        predictor = TinkerPredictor.from_service(model, revision=revision, adapter_path=adapter_path)
+    else:
+        from bandits_jev.hf_predictor import HFPredictor
+
+        predictor = HFPredictor(model, revision=revision, device=device, dtype=dtype, adapter_path=adapter_path)
     mode = "two_order_average" if two_order else "single_order"
     run = score_dataset(
         predictor,
@@ -586,8 +615,14 @@ def run_command(
         help="One or more Bandits turn-judge run ids (verifier labels from traces) and/or "
         "decision dataset ids (e.g. from `jev import`). Several are merged into one dataset.",
     ),
-    model: str = typer.Option(..., "--model", help="Hugging Face base model id, e.g. Qwen/Qwen3.5-4B."),
-    revision: str = typer.Option(..., "--revision", help="Pinned base model revision (commit SHA)."),
+    model: str = typer.Option(..., "--model", help="Base model id: Hugging Face (e.g. Qwen/Qwen3.5-4B) or, with --backend tinker, a Tinker model name."),
+    revision: str = typer.Option(None, "--revision", help="Pinned base model revision (commit SHA); required for --backend hf."),
+    backend: str = typer.Option(
+        "hf",
+        "--backend",
+        help="hf: a local Hugging Face model on this machine's device. tinker: the Tinker API "
+        "(needs TINKER_API_KEY and the `tinker` extra); --revision, --device and --dtype do not apply.",
+    ),
     seed: int = typer.Option(..., "--seed", help="Training data-order and shuffle seed."),
     checkpoint_dir: Path = typer.Option(..., "--checkpoint-dir", help="Where LoRA checkpoints are saved."),
     output: Path = typer.Option(..., "--output", help="Directory for report.json, report.md and charts."),
@@ -599,6 +634,7 @@ def run_command(
     effective_batch: int = typer.Option(8, "--effective-batch"),
     lora_rank: int = typer.Option(16, "--lora-rank"),
     lora_alpha: int = typer.Option(32, "--lora-alpha"),
+    lora_dropout: float = typer.Option(None, "--lora-dropout", help="Default 0.05 for --backend hf; Tinker has no dropout, so it must be 0 there."),
     max_prompt_tokens: int = typer.Option(8_000, "--max-prompt-tokens"),
     two_order: bool = typer.Option(False, "--two-order", help="Also score the untrained base with two option orders."),
     ledger: list[Path] = typer.Option(
@@ -653,6 +689,8 @@ def run_command(
     from bandits_jev.pipeline import run_pipeline
     from bandits_jev.trainer import build_training_config
 
+    revision, device, dtype = _backend_settings(backend, revision, device, dtype)
+    lora_dropout = lora_dropout if lora_dropout is not None else (0.0 if backend == "tinker" else 0.05)
     if eval_split not in ("dev", "test"):
         console.print(f"[red]error:[/red] --eval-split must be dev or test, got {eval_split!r}")
         raise typer.Exit(code=1)
@@ -740,6 +778,7 @@ def run_command(
             eval_every_steps=eval_every_steps,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
             learning_rate=learning_rate,
             effective_batch=effective_batch,
             epochs=epochs,
@@ -751,11 +790,19 @@ def run_command(
         console.print(f"[red]error:[/red] invalid training settings: {exc}")
         raise typer.Exit(code=1) from exc
 
-    from bandits_jev.hf_predictor import HFPredictor
-    from bandits_jev.hf_trainer import HFTrainer
+    if backend == "tinker":
+        from bandits_jev.tinker_backend import make_predictor_factory, make_trainer
 
-    def make_predictor(adapter_path: str | None):
-        return HFPredictor(model, revision=revision, device=device, dtype=dtype, adapter_path=adapter_path)
+        make_predictor = make_predictor_factory(model, revision=revision)
+        make_trainable = make_trainer
+    else:
+        from bandits_jev.hf_predictor import HFPredictor
+        from bandits_jev.hf_trainer import HFTrainer
+
+        def make_predictor(adapter_path: str | None):
+            return HFPredictor(model, revision=revision, device=device, dtype=dtype, adapter_path=adapter_path)
+
+        make_trainable = HFTrainer.from_config
 
     try:
         result = run_pipeline(
@@ -765,7 +812,7 @@ def run_command(
             checkpoint_dir=str(checkpoint_dir),
             output=output,
             make_predictor=make_predictor,
-            make_trainable=HFTrainer.from_config,
+            make_trainable=make_trainable,
             two_order=two_order,
             verifier_cost_id=verifier_cost_id,
             gpu_usd_per_hour=gpu_usd_per_hour,
@@ -787,8 +834,14 @@ def run_command(
 @app.command(name="train")
 def train_command(
     dataset_id: str,
-    model: str = typer.Option(..., "--model", help="Hugging Face base model id, e.g. Qwen/Qwen3.5-4B."),
-    revision: str = typer.Option(..., "--revision", help="Pinned base model revision (commit SHA)."),
+    model: str = typer.Option(..., "--model", help="Base model id: Hugging Face (e.g. Qwen/Qwen3.5-4B) or, with --backend tinker, a Tinker model name."),
+    revision: str = typer.Option(None, "--revision", help="Pinned base model revision (commit SHA); required for --backend hf."),
+    backend: str = typer.Option(
+        "hf",
+        "--backend",
+        help="hf: a local Hugging Face model on this machine's device. tinker: the Tinker API "
+        "(needs TINKER_API_KEY and the `tinker` extra); --revision, --device and --dtype do not apply.",
+    ),
     seed: int = typer.Option(..., "--seed", help="Data-order and option-shuffle seed. Required, not defaulted, "
     "so a reproducible run is a deliberate choice, not an accident."),
     eval_every_steps: int = typer.Option(50, "--eval-every-steps", help="Score dev every N steps; 0 disables "
@@ -797,7 +850,7 @@ def train_command(
     "saved at that step in --checkpoint-dir (weights, optimizer, schedule, history); same flags required."),
     lora_rank: int = typer.Option(16, "--lora-rank"),
     lora_alpha: int = typer.Option(32, "--lora-alpha"),
-    lora_dropout: float = typer.Option(0.05, "--lora-dropout"),
+    lora_dropout: float = typer.Option(None, "--lora-dropout", help="Default 0.05 for --backend hf; Tinker has no dropout, so it must be 0 there."),
     learning_rate: float = typer.Option(5e-5, "--learning-rate"),
     warmup_ratio: float = typer.Option(0.1, "--warmup-ratio", help="Fraction of steps warming up linearly "
     "to --learning-rate; linear decay to zero after."),
@@ -815,7 +868,6 @@ def train_command(
     from pydantic import ValidationError
 
     from bandits_jev.dataset import load_decision_dataset
-    from bandits_jev.hf_trainer import HFTrainer
     from bandits_jev.trainer import (
         build_training_config,
         check_checkpoint_dir,
@@ -823,6 +875,8 @@ def train_command(
         train,
     )
 
+    revision, device, dtype = _backend_settings(backend, revision, device, dtype)
+    lora_dropout = lora_dropout if lora_dropout is not None else (0.0 if backend == "tinker" else 0.05)
     store = _derived(project)
     try:
         dataset = load_decision_dataset(dataset_id, store)
@@ -865,7 +919,18 @@ def train_command(
     except ValueError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    trainer = HFTrainer.from_config(config)
+    try:
+        if backend == "tinker":
+            from bandits_jev.tinker_backend import make_trainer
+
+            trainer = make_trainer(config)
+        else:
+            from bandits_jev.hf_trainer import HFTrainer
+
+            trainer = HFTrainer.from_config(config)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     try:
         run = train(
             trainer,
