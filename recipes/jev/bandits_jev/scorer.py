@@ -325,12 +325,16 @@ def score_dataset(
 def adapter_digest(adapter_path: str | Path) -> str:
     """Digest of a saved LoRA adapter: its config and weight files, by name
     and content. Optimizer state and training progress saved beside them in
-    a checkpoint directory are not part of the model and are ignored."""
+    a checkpoint directory are not part of the model and are ignored. A Tinker
+    checkpoint keeps its weights on Tinker; its ``tinker_checkpoint.json``,
+    which names them, stands in for the weight files."""
     root = Path(adapter_path)
     files = sorted(
-        p for p in root.iterdir() if p.is_file() and p.name.startswith(("adapter_config", "adapter_model"))
+        p
+        for p in root.iterdir()
+        if p.is_file() and p.name.startswith(("adapter_config", "adapter_model", "tinker_checkpoint"))
     )
-    if not any(p.name.startswith("adapter_model") for p in files):
+    if not any(p.name.startswith(("adapter_model", "tinker_checkpoint")) for p in files):
         raise FileNotFoundError(f"no adapter_model file in {root}")
     digest = hashlib.sha256()
     for path in files:

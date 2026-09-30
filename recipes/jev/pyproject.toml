@@ -21,6 +21,14 @@ train = [
     "transformers>=5.2",  # first release with Qwen3.5
     "peft>=0.12",
 ]
+tinker = [
+    # Train and score through the Tinker API instead of a local GPU. torch runs
+    # the custom loss client-side and transformers loads the tokenizer; neither
+    # needs a GPU.
+    "tinker>=0.31",
+    "torch>=2.2",
+    "transformers>=4.44",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
