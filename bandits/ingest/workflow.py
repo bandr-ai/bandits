@@ -327,7 +327,9 @@ def build_evidence(
             # Short labels must match a complete field, never a substring such
             # as "tools" inside "powertools".
             leaves = {_norm(leaf) for leaf in _leaves(value)}
-            present = [n for n in needles if (n in leaves if short[call.span_id] else n in haystack)]
+            present = [
+                n for n in needles if (n in leaves if short[call.span_id] else n in haystack)
+            ]
             if present:
                 matched[target_id][call.span_id] = sum(len(n) for n in present)
     unsure = {c: short.get(c, False) or duplicate.get(c, False) for c in texts}
@@ -361,14 +363,16 @@ def build_evidence(
             needles = {_norm(t) for t in _leaves(output) if len(_norm(t)) >= MIN_MATCH_CHARS}
             present = [t for t in needles if t in haystack]
             if present:
-                links.append(EvidenceLink(
-                    call_span_id=call.span_id,
-                    kind="input_context",
-                    target_span_id=source_id,
-                    basis="text from this earlier pipeline result appears verbatim in the call's input; "
-                    "containment does not prove the call used it",
-                    match_chars=sum(map(len, present)),
-                ))
+                links.append(
+                    EvidenceLink(
+                        call_span_id=call.span_id,
+                        kind="input_context",
+                        target_span_id=source_id,
+                        basis="text from this earlier pipeline result appears verbatim in the call's input; "
+                        "containment does not prove the call used it",
+                        match_chars=sum(map(len, present)),
+                    )
+                )
 
     # Delivery: the declared delivered value contains the call's output.
     if request is not None and isinstance(request.delivered, str):

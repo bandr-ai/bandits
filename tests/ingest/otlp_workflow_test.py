@@ -115,9 +115,7 @@ def _workflow(
         ),
     ]
     if container:
-        spans.insert(
-            0, _span("box", "handle_request", {"langfuse.synthetic_span": "trace_record"})
-        )
+        spans.insert(0, _span("box", "handle_request", {"langfuse.synthetic_span": "trace_record"}))
     return spans
 
 
@@ -367,7 +365,9 @@ def test_short_outputs_do_not_make_a_result_shared(tmp_path) -> None:
 
 def test_a_node_with_several_calls_encloses_each(tmp_path) -> None:
     spans = _workflow()
-    spans.append(_gen("m_draft2", "DRAFT", "second attempt", DRAFT + " Again.", parent="n_draft", at=2))
+    spans.append(
+        _gen("m_draft2", "DRAFT", "second attempt", DRAFT + " Again.", parent="n_draft", at=2)
+    )
     _, trace = _load(tmp_path, spans)
 
     enclosing = {
@@ -500,7 +500,9 @@ def test_code_only_records_inside_a_kept_step_are_preserved(tmp_path) -> None:
     # has an output of its own that nothing else records.
     spans.append(_chain("sort_results", "sort_results", parent="graph", at=5))
     spans.append(
-        _chain("scoring", "sort_scoring", parent="sort_results", at=5, output={"scores": [0.91, 0.12]})
+        _chain(
+            "scoring", "sort_scoring", parent="sort_results", at=5, output={"scores": [0.91, 0.12]}
+        )
     )
     corpus, trace = _load(tmp_path, spans)
 
@@ -560,33 +562,62 @@ def test_query_fields_match_independently_and_labels_do_not_match_substrings(tmp
         "Find the delivery fee rules for orders shipped to remote addresses",
     ]
     spans = _workflow()
-    spans.extend([
-        _gen("outline", "OUTLINE", QUESTION, json.dumps({"queries": queries}),
-             parent="graph", at=0),
-        _gen("label", "LABEL", QUESTION, "billing", parent="graph", at=0),
-        _chain("search_one", "lookup", parent="graph", at=3,
-               input={"query": queries[0], "source": "fastbilling"}),
-        _chain("search_two", "lookup", parent="graph", at=3,
-               input={"query": queries[1], "source": "fastbilling"}),
-    ])
+    spans.extend(
+        [
+            _gen(
+                "outline",
+                "OUTLINE",
+                QUESTION,
+                json.dumps({"queries": queries}),
+                parent="graph",
+                at=0,
+            ),
+            _gen("label", "LABEL", QUESTION, "billing", parent="graph", at=0),
+            _chain(
+                "search_one",
+                "lookup",
+                parent="graph",
+                at=3,
+                input={"query": queries[0], "source": "fastbilling"},
+            ),
+            _chain(
+                "search_two",
+                "lookup",
+                parent="graph",
+                at=3,
+                input={"query": queries[1], "source": "fastbilling"},
+            ),
+        ]
+    )
     _, trace = _load(tmp_path, spans)
     links = [link for link in trace.evidence if link.target_span_id in {"search_one", "search_two"}]
     assert {(link.call_span_id, link.target_span_id) for link in links} == {
-        ("outline", "search_one"), ("outline", "search_two")
+        ("outline", "search_one"),
+        ("outline", "search_two"),
     }
-    assert all(link.match_chars == len(queries[0 if link.target_span_id == "search_one" else 1])
-               for link in links)
+    assert all(
+        link.match_chars == len(queries[0 if link.target_span_id == "search_one" else 1])
+        for link in links
+    )
 
 
 def test_retrieved_documents_link_to_model_input_only_after_result(tmp_path) -> None:
     spans = _workflow()
     document = "A late parcel qualifies for a full delivery fee refund within thirty days."
-    spans.extend([
-        _chain("gathered_docs", "gather_docs", parent="graph", at=3, output={"docs": [document]}),
-        _gen("grounded", "RESPOND", document, ANSWER, parent="inv", at=5),
-        _chain("future_docs", "gather_docs", parent="graph", at=7, output={"docs": [document]}),
-    ])
+    spans.extend(
+        [
+            _chain(
+                "gathered_docs", "gather_docs", parent="graph", at=3, output={"docs": [document]}
+            ),
+            _gen("grounded", "RESPOND", document, ANSWER, parent="inv", at=5),
+            _chain("future_docs", "gather_docs", parent="graph", at=7, output={"docs": [document]}),
+        ]
+    )
     _, trace = _load(tmp_path, spans)
-    links = [link for link in trace.evidence if link.kind == "input_context" and link.call_span_id == "grounded"]
+    links = [
+        link
+        for link in trace.evidence
+        if link.kind == "input_context" and link.call_span_id == "grounded"
+    ]
     assert [link.target_span_id for link in links] == ["gathered_docs"]
     assert links[0].match_chars == len(document)
