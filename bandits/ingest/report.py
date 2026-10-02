@@ -98,12 +98,17 @@ class IngestReport:
     """Trace structure (``otlp_standard.shape_id``) and what the traces of each
     shape yielded."""
 
+    unmapped_shapes: int = 0
+    """Traces whose shape the applied mapping was not confirmed on."""
+
     # Counted per chunk, issued once per ingest (see ``aggregate_issues``).
     unparsed: Counter[str] = field(default_factory=Counter)
     unrepresented: Counter[str] = field(default_factory=Counter)
     containers: Counter[str] = field(default_factory=Counter)
     excluded: Counter[str] = field(default_factory=Counter)
     task_status: Counter[str] = field(default_factory=Counter)
+    excluded_by_mapping: Counter[str] = field(default_factory=Counter)
+    override_not_applicable: Counter[str] = field(default_factory=Counter)
 
     def add_shape(
         self, shape: str, trace_id: str, model_calls: int, task_status: str | None
@@ -134,8 +139,11 @@ class IngestReport:
             "containers",
             "excluded",
             "task_status",
+            "excluded_by_mapping",
+            "override_not_applicable",
         ):
             getattr(self, name).update(getattr(other, name))
+        self.unmapped_shapes += other.unmapped_shapes
         self.unconvertible_examples.extend(
             other.unconvertible_examples[: EXAMPLES - len(self.unconvertible_examples)]
         )
@@ -174,6 +182,7 @@ class IngestReport:
             "traces_with_absent_parents": self.traces_with_absent_parents,
             "max_top_steps": self.max_top_steps,
             "absent_parent_examples": self.absent_parent_examples,
+            "unmapped_shapes": self.unmapped_shapes,
             "shape_count": len(self.shapes),
             "shapes": [
                 {
@@ -207,7 +216,9 @@ class IngestReport:
         return lines
 
 
-def aggregate_issues(report: IngestReport, location: str, *, workflow: bool) -> list[TraceIssue]:
+def aggregate_issues(
+    report: IngestReport, location: str, *, workflow: bool, mapping_name: str | None = None
+) -> list[TraceIssue]:
     """One issue per kind and label for the whole ingest, never one per chunk."""
     issues = [
         TraceIssue(
@@ -266,6 +277,38 @@ def aggregate_issues(report: IngestReport, location: str, *, workflow: bool) -> 
                     location=location,
                 )
             )
+    if report.excluded_by_mapping:
+        issues.append(
+            TraceIssue(
+                kind="excluded_by_mapping",
+                detail=f"mapping {mapping_name} excluded "
+                + ", ".join(
+                    f"{count} span(s) of {key}"
+                    for key, count in sorted(report.excluded_by_mapping.items())
+                )
+                + " (with everything beneath them); they stay in the source archive",
+                location=location,
+            )
+        )
+    issues += [
+        TraceIssue(
+            kind="mapping_override_not_applicable",
+            detail=f"mapping {mapping_name} marks {key} as 'tool', but {count} such span(s) "
+            "have model or tool calls beneath them, which represent them; left as recorded",
+            location=location,
+        )
+        for key, count in sorted(report.override_not_applicable.items())
+    ]
+    if report.unmapped_shapes:
+        issues.append(
+            TraceIssue(
+                kind="shape_not_in_mapping",
+                detail=f"{report.unmapped_shapes} trace(s) have shapes mapping {mapping_name} "
+                "wasn't confirmed on; they were ingested with its rules. Review with "
+                "`bandits mapping propose ... --force`",
+                location=location,
+            )
+        )
     if report.unconvertible_examples:
         lost = report.buckets["unconvertible"] + report.buckets["duplicate_native"]
         issues.append(

@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from bandits.genai import PIPELINE_STEP
+from bandits.ingest.mapping import LABEL_PREFIX, IngestMapping
 from bandits.ingest.otlp import (
     _LINEAGE_KEYS,
     _declared_completion,
@@ -1113,9 +1114,14 @@ def _cyclic(spans: dict[str, _Decoded]) -> set[str]:
     return looped
 
 
-def _pipeline_steps(spans: dict[str, _Decoded]) -> tuple[set[str], dict[str, bool]]:
+def _pipeline_steps(
+    spans: dict[str, _Decoded], structure: frozenset[str] = frozenset()
+) -> tuple[set[str], dict[str, bool]]:
     """Declared steps with no model or tool call beneath them, outermost only,
-    and whether each span has a model or tool call at or beneath it."""
+    and whether each span has a model or tool call at or beneath it.
+
+    ``structure`` are spans a mapping declared structure: never pipeline steps.
+    """
     children: dict[str, list[str]] = {}
     for span in spans.values():
         if span.parent_id is not None:
@@ -1139,7 +1145,12 @@ def _pipeline_steps(spans: dict[str, _Decoded]) -> tuple[set[str], dict[str, boo
     def eligible(span_id: str) -> bool:
         span = spans[span_id]
         # The root is the episode itself, not a step inside it.
-        return span.role == _STEP and span.parent_id is not None and not has_action[span_id]
+        return (
+            span.role == _STEP
+            and span.parent_id is not None
+            and not has_action[span_id]
+            and span_id not in structure
+        )
 
     selected = set()
     for span_id in spans:
@@ -1595,6 +1606,49 @@ def shape_id(spans: dict[str, _Decoded]) -> str:
     return hashlib.sha256(f"({top})".encode()).hexdigest()[:12]
 
 
+def _apply_step_kinds(
+    spans: dict[str, _Decoded], kinds: dict[str, str], not_applicable: Counter[str]
+) -> tuple[set[str], frozenset[str]]:
+    """A mapping's role overrides, applied over the classified roles.
+
+    ``step`` makes a model or tool call structure; ``exclude`` removes the span
+    and everything beneath it, as an evaluator is; ``tool`` makes a span a
+    pipeline step the agent did not call, but only where no model or tool call
+    sits beneath it (a step with calls beneath is represented by them), else
+    the override is left unapplied and counted. Returns the spans forced to be
+    pipeline steps and those declared structure.
+    """
+    tools: dict[str, str] = {}
+    structure: set[str] = set()
+    for span in spans.values():
+        kind = kinds.get(f"{span.label}|{span.name}")
+        if kind is None or span.role == _EXCLUDED:
+            continue
+        if kind == "exclude":
+            span.role, span.label = _EXCLUDED, f"{LABEL_PREFIX}{span.label}|{span.name}"
+        elif kind == "step":
+            span.role = _STEP
+            structure.add(span.span_id)
+        elif kind == "tool":
+            tools[span.span_id] = span.role
+            span.role = _STEP
+    _exclude_subtrees(spans)
+    if not tools:
+        return set(), frozenset(structure)
+    _, has_action = _pipeline_steps(spans)
+    forced = set()
+    for span_id, original in tools.items():
+        span = spans[span_id]
+        if span.role == _EXCLUDED:  # beneath an excluded span; exclusion wins
+            continue
+        if has_action[span_id]:
+            span.role = original
+            not_applicable[f"{span.label}|{span.name}"] += 1
+        else:
+            forced.add(span_id)
+    return forced, frozenset(structure)
+
+
 def _absent_parent_example(trace_id: str, top: list[tuple[_Decoded, str]]) -> str:
     steps = ", ".join(
         f"{span.name}({span.label.rsplit('=', 1)[-1]})→{parent}"
@@ -1612,6 +1666,7 @@ def load_otlp_standard(
     workflow: WorkflowDeclaration | None = None,
     report: IngestReport | None = None,
     defer_aggregate_issues: bool = False,
+    mapping: IngestMapping | None = None,
 ) -> TraceCorpus:
     """Read a standard OTLP/JSON export (a file or a directory) into one corpus.
 
@@ -1623,6 +1678,10 @@ def load_otlp_standard(
     ``report`` receives what was seen and where each span went (summed into it).
     ``defer_aggregate_issues`` leaves the per-ingest summary issues to a caller
     that reads one export in several calls, so they are issued once.
+
+    ``mapping`` is a confirmed mapping (``bandits.ingest.mapping``): its role
+    overrides, its invocation identities and its confirmed shapes are applied.
+    Its fields arrive through ``workflow``; nothing is discovered here.
     """
     from bandits.ingest.workflow import build_request
 
@@ -1641,9 +1700,22 @@ def load_otlp_standard(
         local.buckets["cyclic"] += looped
         if not decoded:
             continue
+        # The export's own structure: drift compares it before any override.
         shape = shape_id(decoded)
+        forced: set[str] = set()
+        structure: frozenset[str] = frozenset()
+        if mapping is not None:
+            if shape not in mapping.shape_ids:
+                local.unmapped_shapes += 1
+            if mapping.step_kinds:
+                forced, structure = _apply_step_kinds(
+                    decoded, mapping.step_kinds, local.override_not_applicable
+                )
         models = sum(span.role == _MODEL for span in decoded.values())
-        steps, has_action = _pipeline_steps(decoded)
+        steps, has_action = _pipeline_steps(decoded, structure)
+        if forced:
+            steps |= forced
+            steps -= _covered(decoded, steps)  # outermost only
         covered = _covered(decoded, steps)
         bucket: dict[str, str] = {}
         collected: list[tuple[int, Span]] = []
@@ -1661,7 +1733,10 @@ def load_otlp_standard(
                 else:
                     bucket[span.span_id] = "node"  # kept as structure (below)
             elif span.role == _EXCLUDED:
-                local.excluded[span.label] += 1
+                if span.label.startswith(LABEL_PREFIX):
+                    local.excluded_by_mapping[span.label.removeprefix(LABEL_PREFIX)] += 1
+                else:
+                    local.excluded[span.label] += 1
                 bucket[span.span_id] = "excluded"
             elif _is_container(span):
                 local.containers[span.label] += 1
@@ -1742,7 +1817,18 @@ def load_otlp_standard(
                 }
                 for span_id in candidates
             }
-            request = build_request(candidates=candidates, records=records, declaration=workflow)
+            allowed = None
+            if mapping is not None and mapping.invocation:
+                identities = mapping.invocation_keys
+                allowed = [
+                    c for c in candidates if (decoded[c].label, decoded[c].name) in identities
+                ]
+            request = build_request(
+                candidates=candidates,
+                records=records,
+                declaration=workflow,
+                allowed=allowed,
+            )
             if request.source_span_id is not None:
                 unparsed.update(scratch.get(request.source_span_id, Counter()))
             if request.source_span_id is None:
@@ -1836,7 +1922,14 @@ def load_otlp_standard(
             f"({dict(local.buckets)}); this is a bandits bug"
         )
     if not defer_aggregate_issues:
-        issues.extend(aggregate_issues(local, str(path), workflow=workflow is not None))
+        issues.extend(
+            aggregate_issues(
+                local,
+                str(path),
+                workflow=workflow is not None,
+                mapping_name=workflow.mapping_name if workflow is not None else None,
+            )
+        )
     if report is not None:
         report.merge(local)
 

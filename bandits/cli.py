@@ -100,8 +100,19 @@ from bandits.ingest import (
     detect_source,
     load_corpus,
 )
-from bandits.ingest.discovery import Discovery, discover, discover_requests
+from bandits.ingest.discovery import Discovery, discover, discover_requests, restricted
 from bandits.ingest.health import check as check_health
+from bandits.ingest.mapping import (
+    Identity,
+    IngestMapping,
+    MappingError,
+    ShapeRef,
+    applicable,
+    load_mapping,
+    mapping_path,
+    save_mapping,
+)
+from bandits.ingest.mapping import confirm as confirm_mapping
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
 from bandits.traces import WorkflowDeclaration
@@ -151,6 +162,7 @@ def check_source(
         task_field=task_field,
         delivered_field=delivered_field,
         request_origin="unknown",
+        mapping_name=None,
         project=_DEFAULT_PROJECT,
         dry_run=True,
     )
@@ -211,6 +223,13 @@ def ingest(
         help="Workflow only. Who started the runs: human, machine or unknown. Only "
         "'human' records the request as a (declared) user turn.",
     ),
+    mapping_name: str = typer.Option(
+        None,
+        "--mapping",
+        help="Workflow only. Apply a confirmed mapping (bandits mapping propose/confirm): "
+        "its fields, invocation identities and step kinds. Nothing is discovered. "
+        "--task-field/--delivered-field still override its fields.",
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Read and check the file; save nothing."),
 ) -> None:
@@ -254,9 +273,12 @@ def ingest(
                 "mode:     workflow (default: no text is labelled as typed by a person; "
                 "use --mode conversation if a person chatted with the agent)"
             )
-    if mode != "workflow" and (task_field or delivered_field or request_origin != "unknown"):
+    if mode != "workflow" and (
+        task_field or delivered_field or request_origin != "unknown" or mapping_name
+    ):
         _fail(
-            "--task-field, --delivered-field and --request-origin only apply to workflows",
+            "--task-field, --delivered-field, --request-origin and --mapping only apply to "
+            "workflows",
             f"this file is read in {mode} mode, where the request is the person's first message",
             "drop them, or use --mode workflow (otlp-std and platform exports only)",
         )
@@ -274,6 +296,7 @@ def ingest(
                 pipeline_steps=pipeline_steps,
                 workflow=workflow,
                 report=report,
+                mapping=mapping,
             )
         except (UnknownSourceError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
             _fail(
@@ -286,13 +309,26 @@ def ingest(
 
     workflow = None
     found = Discovery()
+    mapping: IngestMapping | None = None
+    if mapping_name:
+        try:
+            mapping = applicable(load_mapping(project, mapping_name), mapping_name, source)
+        except MappingError as exc:
+            _fail(f"cannot apply mapping {mapping_name!r}", str(exc), "fix or confirm the mapping")
     if mode == "workflow":
         workflow = WorkflowDeclaration(
-            task_fields=tuple(task_field),
-            delivered_field=delivered_field,
+            task_fields=tuple(task_field) or (mapping.task_fields if mapping else ()),
+            delivered_field=delivered_field or (mapping.delivered_field if mapping else None),
             request_origin=request_origin,  # type: ignore[arg-type]
+            mapping_name=mapping_name if mapping else None,
+            mapping_digest=mapping.confirmed_digest if mapping else None,
         )
-    if workflow is not None and (not task_field or not delivered_field):
+        if mapping is not None:
+            # Fully explicit: what was confirmed is what is applied.
+            _say(f"mapping:  {mapping_name} (confirmed {mapping.confirmed_at})")
+            _say(f"task:     {', '.join(workflow.task_fields) or 'none'}")
+            _say(f"answer:   {workflow.delivered_field or 'none'}")
+    if workflow is not None and mapping is None and (not task_field or not delivered_field):
         # A pre-pass reads the export for the request fields, so the corpus is
         # built once, with them.
         try:
@@ -356,6 +392,8 @@ def ingest(
             _say(f"  - {warning}")
     else:
         _say("problems: none")
+    if workflow is not None and mapping is None:
+        _say(f"to save these choices: bandits mapping propose {path} --source {source} --name NAME")
     if dry_run:
         _say("dry run:  nothing saved")
         return
@@ -382,6 +420,127 @@ def _say_found(what: str, flag: str, chosen: tuple[str, ...], options: list) -> 
         # Never picked between: several fields settle every run, or none does.
         _say(f"{label}not chosen: {' · '.join(o.describe() for o in options)}")
         _say(f"          pass {flag} PATH to say which")
+
+
+mapping_app = typer.Typer(help="Save the choices an export needs, confirm them, reuse them.")
+app.add_typer(mapping_app, name="mapping")
+
+
+@mapping_app.command(name="propose")
+def mapping_propose(
+    path: Path,
+    source: str = typer.Option(..., "--source"),
+    name: str = typer.Option(..., "--name"),
+    invocation: list[str] = typer.Option(
+        [],
+        "--invocation",
+        help="KIND_LABEL|NAME of the run that is the invocation. Repeatable. Only needed "
+        "when discovery found several; the options are printed.",
+    ),
+    redaction: str = typer.Option(DEFAULT_RULESET.name, "--redaction"),
+    force: bool = typer.Option(False, "--force", help="Replace an existing mapping."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Profile an export and write an unconfirmed mapping of its choices."""
+    try:
+        target = mapping_path(project, name)
+        identities = [Identity.parse(text) for text in invocation]
+    except MappingError as exc:
+        _fail("cannot propose this mapping", str(exc), "fix the option")
+    if target.exists() and not force:
+        _fail(
+            f"mapping {name!r} already exists",
+            "propose never overwrites a mapping",
+            "pass --force to replace it (it will need confirming again)",
+        )
+    try:
+        summary = discover_requests(path, source, ruleset_by_name(redaction))
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+        _fail(f"could not read {path} as {source}", str(exc), "check --source")
+    keys = {(i.kind_label, i.name) for i in identities}
+    found = discover(restricted(summary, keys) if keys else summary)
+    offered = discover(summary).task_options
+    chosen = next((o for o in found.task_options if o.paths == found.task_fields), None)
+    if not identities and chosen is not None:
+        identities = [Identity(kind_label=k, name=n) for k, n in chosen.identities]
+    shapes: dict[str, list[str]] = {}
+    for trace in summary.traces:
+        shapes.setdefault(trace.shape_id, []).append(trace.trace_id)
+    mapping = IngestMapping(
+        source=source,
+        task_fields=found.task_fields,
+        delivered_field=found.delivered_field,
+        invocation=tuple(identities),
+        candidate_identities=tuple(
+            sorted(
+                {Identity(kind_label=k, name=n) for o in offered for k, n in o.identities},
+                key=lambda i: i.key,
+            )
+        ),
+        shapes=tuple(
+            ShapeRef(shape_id=shape, example_trace_id=ids[0], trace_count=len(ids))
+            for shape, ids in sorted(shapes.items(), key=lambda item: -len(item[1]))
+        ),
+    )
+    save_mapping(project, name, mapping, overwrite=True)
+    _say(f"proposed: {target} (not confirmed)")
+    _say_mapping(mapping)
+    if not found.task_fields:
+        _say("[yellow]unresolved:[/yellow] no single request field; choose the invocation:")
+        for option in found.task_options or offered:
+            for kind, span_name in option.identities:
+                _say(
+                    f'  --invocation "{kind}|{span_name}"  '
+                    f"({', '.join(option.paths)}; {option.covered}/{option.total})"
+                )
+    if not found.delivered_field and found.answer_options:
+        _say(
+            "[yellow]unresolved:[/yellow] no single answer field: "
+            + " · ".join(o.describe() for o in found.answer_options)
+        )
+    _say(f"next:     review it, then: bandits mapping confirm {name}")
+
+
+@mapping_app.command(name="confirm")
+def mapping_confirm(name: str, project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
+    """Confirm a mapping as it stands; ingest --mapping then applies exactly this."""
+    try:
+        mapping = confirm_mapping(load_mapping(project, name))
+        save_mapping(project, name, mapping, overwrite=True)
+    except MappingError as exc:
+        _fail(f"cannot confirm mapping {name!r}", str(exc), "edit the mapping or re-propose it")
+    _say_mapping(mapping)
+    _say(f"confirmed: {name} ({mapping.confirmed_digest[:12]})")
+
+
+@mapping_app.command(name="show")
+def mapping_show(name: str, project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
+    """Print a mapping and whether it is confirmed and unmodified."""
+    try:
+        mapping = load_mapping(project, name)
+    except MappingError as exc:
+        _fail(f"cannot read mapping {name!r}", str(exc), "check the name")
+    _say_mapping(mapping)
+    _say(
+        "status:   "
+        + (
+            "confirmed, unmodified"
+            if mapping.unmodified
+            else "changed since it was confirmed"
+            if mapping.confirmed
+            else "not confirmed"
+        )
+    )
+
+
+def _say_mapping(mapping: IngestMapping) -> None:
+    _say(f"source:   {mapping.source}")
+    _say(f"task:     {', '.join(mapping.task_fields) or 'none'}")
+    _say(f"answer:   {mapping.delivered_field or 'none'}")
+    _say(f"invocation: {', '.join(i.key for i in mapping.invocation) or 'any'}")
+    for key, kind in sorted(mapping.step_kinds.items()):
+        _say(f"step kind: {key} → {kind}")
+    _say(f"shapes:   {len(mapping.shapes)} ({sum(s.trace_count for s in mapping.shapes)} traces)")
 
 
 @app.command(name="list")
