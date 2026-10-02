@@ -91,6 +91,53 @@ def code_version() -> tuple[str, str | None, bool | None]:
     return bandits.__version__, commit, (None if status is None else bool(status))
 
 
+_WRAPPERS = ("observations", "spans", "data", "runs")
+_NESTED = (*_WRAPPERS, "children", "child_runs")
+_ID_KEYS = ("id", "run_id", "span_id")
+
+
+def resolve_record(data: bytes, pointer: dict | str) -> dict:
+    """The native record a span's ``bandits.source.record`` pointer names in *data*.
+
+    *data* is the archived (redacted) source file. ``line`` is the physical
+    1-based line, ``index`` a position in a JSON array (on that line, or the
+    whole file), ``document`` the whole file. The record found there may wrap
+    the observation (a trace with ``observations``, a ``spans``/``runs``
+    list), so it is searched for the object whose ``id``, ``run_id``,
+    ``span_id`` or ``context.span_id`` is the pointer's ``observation_id``.
+
+    Lines are split with ``bytes.splitlines``, as the archive's whole-file
+    redaction path does, so a file using a bare ``\r`` as a line break would
+    shift line numbers; such exports have not been seen.
+    """
+    if isinstance(pointer, str):
+        pointer = json.loads(pointer)
+    if "line" in pointer:
+        record = json.loads(data.splitlines()[pointer["line"] - 1])
+        if "index" in pointer:
+            record = record[pointer["index"]]
+    else:
+        record = json.loads(data)
+        if "index" in pointer:
+            record = record[pointer["index"]]
+    wanted = str(pointer["observation_id"])
+    stack: list[object] = [record]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(reversed(node))
+            continue
+        if not isinstance(node, dict):
+            continue
+        wrapper = any(isinstance(node.get(key), list) for key in _WRAPPERS)
+        context = node.get("context") if isinstance(node.get("context"), dict) else {}
+        ids = [node.get(key) for key in _ID_KEYS] + [context.get("span_id")]
+        if not wrapper and wanted in {str(i) for i in ids if i is not None}:
+            return node
+        stack.extend(node[key] for key in reversed(_NESTED) if isinstance(node.get(key), list))
+    raise LookupError(f"no observation {wanted} at {pointer} in the source archive")
+
+
 class ArtifactConflict(ValueError):
     """An existing artifact at this id has different content than what was just written."""
 
@@ -259,6 +306,13 @@ class ArtifactStore:
         if archive_name not in names:
             raise ValueError(f"unknown archived source {archive_name!r}")
         return (self._dir(artifact_id) / "source" / archive_name).read_bytes()
+
+    def read_native_record(self, artifact_id: str, pointer: dict | str) -> dict:
+        """The archived native record a span's ``bandits.source.record`` points to."""
+        manifest = self.source_manifest(artifact_id)
+        if len(manifest) != 1:
+            raise ValueError("a native record pointer needs a single-file source archive")
+        return resolve_record(self.read_source(artifact_id, str(manifest[0]["archive"])), pointer)
 
     def read(self, artifact_id: str) -> TraceCorpus:
         return TraceCorpus.model_validate_json(
