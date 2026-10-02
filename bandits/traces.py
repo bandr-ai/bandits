@@ -159,6 +159,12 @@ class WorkflowDeclaration(Contract):
     """Who started the runs. A workflow has no human follow-ups inside a run; that
     says nothing about who started it."""
 
+    mapping_name: str | None = None
+    mapping_digest: str | None = None
+    """The confirmed ingest mapping these choices came from, and its digest; None
+    when they were passed as flags or found. A different mapping is a different
+    artifact even when it happens to choose the same fields."""
+
     derivation_version: int = 2
     """Bumped whenever how requests, nodes or links are derived changes.
 
