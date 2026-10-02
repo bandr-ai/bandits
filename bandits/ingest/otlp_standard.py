@@ -1562,6 +1562,39 @@ def _top_steps(spans: dict[str, _Decoded]) -> list[tuple[_Decoded, str]]:
     return out
 
 
+def shape_id(spans: dict[str, _Decoded]) -> str:
+    """A short id for how one trace is structured, independent of order and repeats.
+
+    Each span is ``role|declared kind|name`` over the set of its children's
+    signatures, so the same step repeated, or siblings recorded in another
+    order, give the same shape; different nesting gives a different one. Every
+    span whose parent is not in the trace hangs off one virtual root, so a
+    trace with several top-level steps is one shape; the absent parent ids
+    themselves never enter it. Children are combined by digest, sorted, which
+    keeps a deep trace's signature bounded.
+    """
+    children: dict[str | None, list[str]] = {}
+    for span in spans.values():
+        parent = span.parent_id if span.parent_id in spans else None
+        children.setdefault(parent, []).append(span.span_id)
+    digest: dict[str, str] = {}
+    stack: list[tuple[str, bool]] = [(root, False) for root in children.get(None, ())]
+    while stack:  # iterative post-order; exported trees can be deep
+        node, expanded = stack.pop()
+        if node in digest:
+            continue
+        if not expanded:
+            stack.append((node, True))
+            stack.extend((c, False) for c in children.get(node, ()) if c not in digest)
+            continue
+        span = spans[node]
+        below = ",".join(sorted({digest[c] for c in children.get(node, ())}))
+        signature = f"{span.role}|{span.label}|{span.name}({below})"
+        digest[node] = hashlib.sha256(signature.encode()).hexdigest()
+    top = ",".join(sorted({digest[root] for root in children.get(None, ())}))
+    return hashlib.sha256(f"({top})".encode()).hexdigest()[:12]
+
+
 def _absent_parent_example(trace_id: str, top: list[tuple[_Decoded, str]]) -> str:
     steps = ", ".join(
         f"{span.name}({span.label.rsplit('=', 1)[-1]})→{parent}"
@@ -1608,6 +1641,8 @@ def load_otlp_standard(
         local.buckets["cyclic"] += looped
         if not decoded:
             continue
+        shape = shape_id(decoded)
+        models = sum(span.role == _MODEL for span in decoded.values())
         steps, has_action = _pipeline_steps(decoded)
         covered = _covered(decoded, steps)
         bucket: dict[str, str] = {}
@@ -1678,6 +1713,7 @@ def load_otlp_standard(
             local.buckets.update(
                 "excluded" if name == "excluded" else "empty_trace" for name in bucket.values()
             )
+            local.add_shape(shape, trace_id, models, None)
             lineage_by_trace.pop(trace_id, None)
             continue
         spans_by_trace[trace_id] = collected
@@ -1727,6 +1763,7 @@ def load_otlp_standard(
                     pair for pair in collected if pair[1].span_id != request.source_span_id
                 ]
             local.task_status[request.task_status] += 1
+            local.add_shape(shape, trace_id, models, request.task_status)
             # Every recorded step not already kept as a span is structure: steps
             # containing calls, and the code-only records inside a kept pipeline
             # step, whose output is often its own (a scoring, a search backend).
@@ -1780,6 +1817,7 @@ def load_otlp_standard(
                 }
             continue
         local.buckets.update(bucket.values())
+        local.add_shape(shape, trace_id, models, None)
         if root is not None:
             episode_attributes[trace_id] = {
                 **root.attributes,

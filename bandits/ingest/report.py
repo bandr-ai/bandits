@@ -59,6 +59,16 @@ the source archive keeps). Everything else is dropped and counted."""
 
 EXAMPLES = 3
 STEPS_PER_EXAMPLE = 5
+SHAPES_KEPT = 50
+"""Shapes saved in ``report.json``; the total count is always kept."""
+
+
+@dataclass
+class ShapeStats:
+    traces: int = 0
+    example_trace_id: str = ""
+    model_calls: int = 0
+    task_status: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass
@@ -84,6 +94,10 @@ class IngestReport:
     max_top_steps: int = 0
     absent_parent_examples: list[str] = field(default_factory=list)
 
+    shapes: dict[str, ShapeStats] = field(default_factory=dict)
+    """Trace structure (``otlp_standard.shape_id``) and what the traces of each
+    shape yielded."""
+
     # Counted per chunk, issued once per ingest (see ``aggregate_issues``).
     unparsed: Counter[str] = field(default_factory=Counter)
     unrepresented: Counter[str] = field(default_factory=Counter)
@@ -91,7 +105,26 @@ class IngestReport:
     excluded: Counter[str] = field(default_factory=Counter)
     task_status: Counter[str] = field(default_factory=Counter)
 
+    def add_shape(
+        self, shape: str, trace_id: str, model_calls: int, task_status: str | None
+    ) -> None:
+        stats = self.shapes.setdefault(shape, ShapeStats(example_trace_id=trace_id))
+        stats.traces += 1
+        stats.model_calls += model_calls
+        if task_status is not None:
+            stats.task_status[task_status] += 1
+
+    def ranked_shapes(self) -> list[tuple[str, ShapeStats]]:
+        return sorted(self.shapes.items(), key=lambda item: (-item[1].traces, item[0]))
+
     def merge(self, other: IngestReport) -> None:
+        for shape, theirs in other.shapes.items():
+            mine = self.shapes.setdefault(
+                shape, ShapeStats(example_trace_id=theirs.example_trace_id)
+            )
+            mine.traces += theirs.traces
+            mine.model_calls += theirs.model_calls
+            mine.task_status.update(theirs.task_status)
         self.spans_seen += other.spans_seen
         for name in (
             "buckets",
@@ -141,7 +174,37 @@ class IngestReport:
             "traces_with_absent_parents": self.traces_with_absent_parents,
             "max_top_steps": self.max_top_steps,
             "absent_parent_examples": self.absent_parent_examples,
+            "shape_count": len(self.shapes),
+            "shapes": [
+                {
+                    "shape_id": shape,
+                    "traces": stats.traces,
+                    "example_trace_id": stats.example_trace_id,
+                    "model_calls": stats.model_calls,
+                    "task_status": dict(stats.task_status),
+                }
+                for shape, stats in self.ranked_shapes()[:SHAPES_KEPT]
+            ],
         }
+
+    def shape_lines(self, top: int = 5) -> list[str]:
+        """The most common shapes, one line each, for printing."""
+        total = sum(stats.traces for stats in self.shapes.values())
+        ranked = self.ranked_shapes()
+        lines = [
+            f"{shape}  {stats.traces / total:>4.0%}  {stats.traces} trace(s), "
+            f"{stats.model_calls} model calls"
+            + (
+                ", tasks " + " ".join(f"{k} {v}" for k, v in sorted(stats.task_status.items()))
+                if stats.task_status
+                else ""
+            )
+            + f"; e.g. trace {stats.example_trace_id}"
+            for shape, stats in ranked[:top]
+        ]
+        if len(ranked) > top:
+            lines.append(f"+{len(ranked) - top} more shapes")
+        return lines
 
 
 def aggregate_issues(report: IngestReport, location: str, *, workflow: bool) -> list[TraceIssue]:

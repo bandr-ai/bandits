@@ -60,6 +60,13 @@ spans inside them cannot be counted. Records are decoded records, so the
 from model messages. The same report is saved as `report.json` beside the
 corpus, outside its id.
 
+It also groups traces by shape: each span as role, declared kind and name
+over the set of its children, with every top-level step under one root, so
+repeated steps and sibling order do not split a shape but different nesting
+does. The five most common shapes are printed with their share, model calls,
+task results and an example trace id; `report.json` keeps the top 50 and the
+total count.
+
 Issue kinds added with this report:
 
 | kind | class | meaning |
