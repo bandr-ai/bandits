@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections import Counter
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -1963,8 +1964,6 @@ def load_otlp_standard(
                 mapping_name=workflow.mapping_name if workflow is not None else None,
             )
         )
-    if report is not None:
-        report.merge(local)
 
     corpus = assemble_corpus(
         spans_by_trace,
@@ -1978,11 +1977,18 @@ def load_otlp_standard(
         trace_extras=workflow_extras,
     )
     if workflow is None:
+        if report is not None:
+            report.merge(local)
         return corpus
     from bandits.ingest.workflow import build_evidence
 
-    traces = tuple(
-        trace.replace(evidence=build_evidence(trace.spans, trace.workflow_nodes, trace.request))
-        for trace in corpus.traces
-    )
-    return corpus.replace(traces=traces, workflow=workflow)
+    traces = []
+    started = time.perf_counter()
+    for trace in corpus.traces:
+        links = build_evidence(trace.spans, trace.workflow_nodes, trace.request)
+        local.add_evidence(links)
+        traces.append(trace.replace(evidence=links))
+    local.evidence_seconds += time.perf_counter() - started
+    if report is not None:
+        report.merge(local)
+    return corpus.replace(traces=tuple(traces), workflow=workflow)

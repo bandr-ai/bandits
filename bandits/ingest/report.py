@@ -13,6 +13,7 @@ hold is a bandits bug, reported in ``accounting_errors`` and treated as fatal.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -98,6 +99,15 @@ class IngestReport:
     """Trace structure (``otlp_standard.shape_id``) and what the traces of each
     shape yielded."""
 
+    evidence_links: Counter[str] = field(default_factory=Counter)
+    """Workflow evidence links by kind, over all traces."""
+
+    evidence_max_per_trace: Counter[str] = field(default_factory=Counter)
+    """The most links of each kind any one trace has."""
+
+    evidence_seconds: float = 0.0
+    """Time spent building evidence links."""
+
     unmapped_shapes: int = 0
     """Traces whose shape the applied mapping was not confirmed on."""
 
@@ -118,6 +128,24 @@ class IngestReport:
         stats.model_calls += model_calls
         if task_status is not None:
             stats.task_status[task_status] += 1
+
+    def add_evidence(self, links: Iterable[Any]) -> None:
+        kinds = Counter(link.kind for link in links)
+        self.evidence_links.update(kinds)
+        for kind, count in kinds.items():
+            self.evidence_max_per_trace[kind] = max(self.evidence_max_per_trace[kind], count)
+
+    def evidence_line(self) -> str:
+        total = sum(self.evidence_links.values())
+        kinds = ", ".join(
+            f"{count} {kind} (max {self.evidence_max_per_trace[kind]}/trace)"
+            for kind, count in self.evidence_links.most_common()
+        )
+        return (
+            f"{total} links"
+            + (f": {kinds}" if kinds else "")
+            + (f"; built in {self.evidence_seconds:.1f} s")
+        )
 
     def ranked_shapes(self) -> list[tuple[str, ShapeStats]]:
         return sorted(self.shapes.items(), key=lambda item: (-item[1].traces, item[0]))
@@ -144,6 +172,10 @@ class IngestReport:
         ):
             getattr(self, name).update(getattr(other, name))
         self.unmapped_shapes += other.unmapped_shapes
+        self.evidence_links.update(other.evidence_links)
+        for kind, count in other.evidence_max_per_trace.items():
+            self.evidence_max_per_trace[kind] = max(self.evidence_max_per_trace[kind], count)
+        self.evidence_seconds += other.evidence_seconds
         self.unconvertible_examples.extend(
             other.unconvertible_examples[: EXAMPLES - len(self.unconvertible_examples)]
         )
@@ -183,6 +215,9 @@ class IngestReport:
             "max_top_steps": self.max_top_steps,
             "absent_parent_examples": self.absent_parent_examples,
             "unmapped_shapes": self.unmapped_shapes,
+            "evidence_links": dict(self.evidence_links),
+            "evidence_max_per_trace": dict(self.evidence_max_per_trace),
+            "evidence_seconds": round(self.evidence_seconds, 3),
             "shape_count": len(self.shapes),
             "shapes": [
                 {

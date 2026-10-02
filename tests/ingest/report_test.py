@@ -265,3 +265,28 @@ def test_buckets_are_kept_or_dropped() -> None:
     from bandits.ingest.report import BUCKETS
 
     assert KEPT < set(BUCKETS)
+
+
+def test_evidence_links_are_counted_per_kind_with_the_most_in_one_trace(tmp_path) -> None:
+    traces = [_workflow(), _workflow()]
+    traces[1].append(_gen("m_more", "MORE", "q", "x" * 50, parent="graph", at=6))
+    for i, spans in enumerate(traces):
+        for span in spans:
+            span["traceId"] = str(i + 1) * 32
+    report = IngestReport()
+    corpus = load_otlp_standard(
+        _write(tmp_path / "wf.jsonl", *(_request(t) for t in traces)),
+        workflow=WORKFLOW,
+        report=report,
+    )
+    expected: dict[str, int] = {}
+    for trace in corpus.traces:
+        for link in trace.evidence:
+            expected[link.kind] = expected.get(link.kind, 0) + 1
+    assert dict(report.evidence_links) == expected
+    assert report.evidence_max_per_trace["enclosing_result"] == max(
+        sum(link.kind == "enclosing_result" for link in t.evidence) for t in corpus.traces
+    )
+    assert report.evidence_seconds >= 0
+    assert report.evidence_line().startswith(f"{sum(expected.values())} links: ")
+    assert report.as_dict()["evidence_links"] == expected

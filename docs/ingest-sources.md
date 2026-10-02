@@ -67,6 +67,10 @@ does. The five most common shapes are printed with their share, model calls,
 task results and an example trace id; `report.json` keeps the top 50 and the
 total count.
 
+In workflow mode it also counts evidence links by kind, with the most any one
+trace has and the time spent building them (`evidence:` line). This is a
+measurement only: link rules are unchanged.
+
 Issue kinds added with this report:
 
 | kind | class | meaning |
