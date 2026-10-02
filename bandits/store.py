@@ -143,8 +143,11 @@ class ArtifactConflict(ValueError):
 
 
 def compute_artifact_id(corpus: TraceCorpus) -> str:
-    digest = hashlib.sha256(corpus.model_dump_json().encode("utf-8")).hexdigest()
-    return f"corpus-{digest[:16]}"
+    return _id_of(corpus.model_dump_json().encode("utf-8"))
+
+
+def _id_of(corpus_bytes: bytes) -> str:
+    return f"corpus-{hashlib.sha256(corpus_bytes).hexdigest()[:16]}"
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -175,9 +178,11 @@ class ArtifactStore:
         ``report.json`` beside it, outside the id: the same corpus read twice
         is the same artifact, and an existing report is never replaced.
         """
-        artifact_id = compute_artifact_id(corpus)
-        artifact_dir = self._dir(artifact_id)
+        # Serialized once: a large corpus is the biggest object an ingest holds,
+        # and its id is the digest of exactly these bytes.
         corpus_bytes = corpus.model_dump_json().encode("utf-8")
+        artifact_id = _id_of(corpus_bytes)
+        artifact_dir = self._dir(artifact_id)
 
         if artifact_dir.exists():
             existing_bytes = (artifact_dir / "corpus.json").read_bytes()

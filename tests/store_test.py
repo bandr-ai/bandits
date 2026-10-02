@@ -34,7 +34,7 @@ def test_rewriting_identical_corpus_is_a_noop(tmp_path) -> None:
 
 def test_conflicting_content_at_the_same_id_raises(tmp_path, monkeypatch) -> None:
     store = ArtifactStore(tmp_path / ".bandits")
-    monkeypatch.setattr("bandits.store.compute_artifact_id", lambda corpus: "corpus-forced")
+    monkeypatch.setattr("bandits.store._id_of", lambda data: "corpus-forced")
 
     store.write(_corpus(source="otlp"), source_path="a.jsonl")
     with pytest.raises(ArtifactConflict):
@@ -44,10 +44,10 @@ def test_conflicting_content_at_the_same_id_raises(tmp_path, monkeypatch) -> Non
 def test_list_orders_newest_first(tmp_path, monkeypatch) -> None:
     store = ArtifactStore(tmp_path / ".bandits")
 
-    monkeypatch.setattr("bandits.store.compute_artifact_id", lambda corpus: "corpus-first")
+    monkeypatch.setattr("bandits.store._id_of", lambda data: "corpus-first")
     store.write(_corpus(source="otlp"), source_path="a.jsonl")
     time.sleep(0.01)
-    monkeypatch.setattr("bandits.store.compute_artifact_id", lambda corpus: "corpus-second")
+    monkeypatch.setattr("bandits.store._id_of", lambda data: "corpus-second")
     store.write(_corpus(source="chat-json"), source_path="b.jsonl")
 
     envelopes = store.list()
@@ -182,3 +182,17 @@ def test_code_version_reads_bandits_own_checkout(tmp_path, monkeypatch) -> None:
         assert store.code_version()[2] is True
     finally:
         store.code_version.cache_clear()
+
+
+def test_write_serializes_the_corpus_once(tmp_path, monkeypatch) -> None:
+    calls = []
+    real = TraceCorpus.model_dump_json
+
+    def counted(self, *args, **kwargs):
+        calls.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(TraceCorpus, "model_dump_json", counted)
+    envelope = ArtifactStore(tmp_path / ".bandits").write(_corpus(), source_path="a.jsonl")
+    assert len(calls) == 1
+    assert envelope.artifact_id == compute_artifact_id(_corpus())
