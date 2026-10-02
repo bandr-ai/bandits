@@ -11,6 +11,7 @@ from pathlib import Path
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.detect import DetectionError, detect_source
+from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.native import load_native
 from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
@@ -51,11 +52,13 @@ def load_corpus(
     pipeline_steps: bool = True,
     workflow: WorkflowDeclaration | None = None,
     report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
 ) -> TraceCorpus:
     """Read a raw export into a :class:`TraceCorpus` using a recognized adapter.
 
     ``pipeline_steps`` and ``workflow`` apply to OTLP and the native readers
-    routed through it; so does ``report``, which the other readers leave empty.
+    routed through it; so do ``report``, which the other readers leave empty,
+    and a confirmed ``mapping``.
     """
     if source == "auto":
         source = detect_source(Path(path)).source
@@ -78,6 +81,7 @@ def load_corpus(
             pipeline_steps=pipeline_steps,
             workflow=workflow,
             report=report,
+            mapping=mapping,
         )
     loader = _LOADERS.get(source)
     if loader is None:
@@ -86,9 +90,14 @@ def load_corpus(
         )
     if source == "otlp-std":
         return load_otlp_standard(
-            Path(path), ruleset, pipeline_steps=pipeline_steps, workflow=workflow, report=report
+            Path(path),
+            ruleset,
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
+            report=report,
+            mapping=mapping,
         )
-    if workflow is not None:
+    if workflow is not None or mapping is not None:
         raise ValueError(f"workflow mode is an otlp-std option; source {source!r} has none")
     if not pipeline_steps:
         raise ValueError(f"pipeline steps are an otlp-std option; source {source!r} has none")

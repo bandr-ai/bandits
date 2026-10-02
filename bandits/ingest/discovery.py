@@ -163,6 +163,18 @@ def discover_requests(
     return summary
 
 
+def restricted(summary: RequestSummary, identities: set[tuple[str, str]]) -> RequestSummary:
+    """The same traces with only candidates of the given identities."""
+    return RequestSummary(
+        [
+            TraceRequests(
+                t.trace_id, [c for c in t.candidates if c.identity in identities], t.shape_id
+            )
+            for t in summary.traces
+        ]
+    )
+
+
 def pick_path(record: dict[str, Any], root: str, keys: tuple[str, ...]) -> str | None:
     """The one path on *record* a field search would read: the whole value when
     it is text, else the first key in priority order, shallowest first."""

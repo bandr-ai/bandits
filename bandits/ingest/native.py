@@ -19,6 +19,7 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
@@ -530,6 +531,7 @@ def load_native(
     workflow: WorkflowDeclaration | None = None,
     pipeline_steps: bool = True,
     report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
 ) -> TraceCorpus:
     """Import one native JSON/JSONL file without an external conversion script.
 
@@ -552,6 +554,7 @@ def load_native(
             workflow=workflow,
             report=decoded,
             defer_aggregate_issues=True,
+            mapping=mapping,
         )
         ids = {trace.trace_id for trace in chunk.traces}
         decoded.split_trace_ids += len(ids & seen_ids)
@@ -559,7 +562,12 @@ def load_native(
         converted_traces.extend(chunk.traces)
         converted_issues.extend(chunk.issues)
     internal = conversion.finish(decoded)
-    deferred = aggregate_issues(internal, str(path), workflow=workflow is not None)
+    deferred = aggregate_issues(
+        internal,
+        str(path),
+        workflow=workflow is not None,
+        mapping_name=workflow.mapping_name if workflow is not None else None,
+    )
     if report is not None:
         report.merge(internal)
     return TraceCorpus(

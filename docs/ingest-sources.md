@@ -99,6 +99,34 @@ task:     not chosen: input.payload.query → app(SPAN) 5/5 · input.question �
 The answer field is then read on the chosen runs only, and chosen only when
 one path covers all of them. Declared flags are always used as given.
 
+## Saved mappings
+
+The choices an export needs can be saved once and reused:
+
+```
+bandits mapping propose FILE --source S --name NAME   # profile it, write an unconfirmed mapping
+bandits mapping confirm NAME                          # confirm it as it stands
+bandits ingest FILE --source S --mapping NAME         # apply exactly what was confirmed
+bandits mapping show NAME
+```
+
+A mapping (`.bandits/mappings/NAME.json`) holds the source, `task_fields`,
+`delivered_field` (may stay null), the identities (`KIND_LABEL|NAME`) allowed as
+the invocation, optional `step_kinds` overrides (`tool`, `step`, `exclude`
+per identity), and the trace shapes it was confirmed on. `propose` runs the
+field discovery above; when that is ambiguous it lists the candidate runs, and
+`propose --invocation "KIND_LABEL|NAME" --force` discovers within that run.
+`confirm` refuses a mapping without task fields and records a digest of the
+choices; a file edited afterwards is refused until confirmed again, as is one
+made for another `--source`. Applying a mapping discovers nothing: an
+invocation is chosen only when exactly one candidate has a listed identity,
+`--task-field`/`--delivered-field` still override its fields, traces whose shape
+it was not confirmed on are ingested and reported (`shape_not_in_mapping`),
+spans it excludes stay in the source archive (`excluded_by_mapping`), and a
+`tool` override on a span with calls beneath it is left unapplied
+(`mapping_override_not_applicable`). The corpus records the mapping's name and
+digest.
+
 `envelope.json` records which code wrote the corpus (`bandits_version`, and
 `git_commit`/`git_dirty` when bandits runs from its own checkout), the workflow
 `derivation_version`, and `problem_count` (the warnings printed at ingest)

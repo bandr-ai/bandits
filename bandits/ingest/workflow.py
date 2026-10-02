@@ -102,6 +102,7 @@ def build_request(
     candidates: Sequence[str],
     records: dict[str, dict[str, Any]],
     declaration: WorkflowDeclaration,
+    allowed: Sequence[str] | None = None,
 ) -> WorkflowRequest:
     """Choose the invocation among outermost candidates and read its request.
 
@@ -109,10 +110,22 @@ def build_request(
     declared task field resolves; if that leaves exactly one, it is chosen and
     the basis says so. Otherwise nothing is chosen — an ambiguous invocation is
     recorded, not guessed.
+
+    ``allowed`` is the candidates a confirmed mapping names as invocations:
+    exactly one is chosen on that basis; none or several choose nothing.
     """
     candidates = tuple(candidates)
     chosen: str | None = None
-    if len(candidates) == 1:
+    if allowed is not None:
+        name = declaration.mapping_name
+        if len(allowed) == 1:
+            chosen, basis = allowed[0], f"mapping {name}: invocation identity"
+        else:
+            basis = (
+                f"ambiguous: mapping {name} matches {len(allowed)} of {len(candidates)} "
+                f"outermost candidates ({', '.join(allowed) or 'none'})"
+            )
+    elif len(candidates) == 1:
         chosen, basis = candidates[0], "sole outermost non-container span"
     elif not candidates:
         basis = "no outermost span that is not a container, model call or tool call"
