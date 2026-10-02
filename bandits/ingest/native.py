@@ -3,7 +3,9 @@
 OpenInference is an OTLP convention, not a separate file format. Phoenix's
 Span JSON and LangSmith's Run JSON are native formats; Langfuse's bundled
 trace/observation JSON is another. This module converts their recorded fields
-to OTLP internally and retains each native record in a namespaced attribute.
+to OTLP internally. Each span carries ``bandits.source.record``, a pointer to
+its native record in the redacted source archive (``ArtifactStore.read_native_record``),
+rather than a copy of it.
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ def _av(value: Any) -> dict[str, Any]:
 def _attrs(values: dict[str, Any]) -> list[dict[str, Any]]:
     # An unrecorded value is an absent attribute. Encoding None would write the
     # string "null", which the decoder reads as a message saying "null". The
-    # null itself stays visible in bandits.native.record and the source archive.
+    # null itself stays visible in the source archive.
     return [{"key": k, "value": _av(v)} for k, v in values.items() if v is not None]
 
 
@@ -195,7 +197,7 @@ def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str
             "output.value": observation.get("output"),
             "gen_ai.request.model": observation.get("model"),
             "langfuse.observation.level": observation.get("level"),
-            "bandits.native.record": {k: v for k, v in observation.items() if k != "children"},
+            "bandits.source.record": {**position, "observation_id": str(native_id)},
         }
         if observation.get("parentObservationId") is None and enclosing_id is None:
             attributes["bandits.native.trace_record"] = {
@@ -250,7 +252,7 @@ def _langsmith(record: dict[str, Any], position: Position) -> tuple[list[dict[st
         "openinference.span.kind": _LANGSMITH_KIND.get(str(record["run_type"]).lower(), "UNKNOWN"),
         "input.value": record.get("inputs"),
         "output.value": record.get("outputs"),
-        "bandits.native.record": {k: v for k, v in record.items() if k != "child_runs"},
+        "bandits.source.record": {**position, "observation_id": str(run_id)},
     }
     # Keep the producer's structure in input.value/output.value. The shared
     # decoder normalizes LangChain's nested message batches and generations;
@@ -286,7 +288,10 @@ def _phoenix(record: dict[str, Any], position: Position) -> tuple[list[dict[str,
     attributes = record.get("attributes") or {}
     if not isinstance(attributes, dict):
         raise ValueError("Phoenix span attributes must be an object")
-    attributes = {**attributes, "bandits.native.record": record}
+    attributes = {
+        **attributes,
+        "bandits.source.record": {**position, "observation_id": str(context["span_id"])},
+    }
     if "openinference.span.kind" not in attributes and isinstance(record.get("span_kind"), str):
         attributes["openinference.span.kind"] = record["span_kind"]
     resource = record.get("resource") or {}

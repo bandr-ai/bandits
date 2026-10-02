@@ -11,7 +11,7 @@ from bandits.cli import app
 from bandits.ingest import detect_source, load_corpus
 from bandits.ingest.native import _ns
 from bandits.ingest.otlp_standard import _attributes
-from bandits.store import ArtifactStore
+from bandits.store import ArtifactStore, resolve_record
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
 
 
@@ -86,7 +86,9 @@ def test_native_langfuse_keeps_request_and_observation(tmp_path: Path) -> None:
     assert trace.request.delivered == "Dental."
     assert trace.user_turns == ()
     assert len(trace.spans) == 1 and trace.spans[0].kind == SpanKind.MODEL
-    assert json.loads(trace.spans[0].attributes["bandits.native.record"]) == model
+    pointer = trace.spans[0].attributes["bandits.source.record"]
+    assert json.loads(pointer) == {"line": 1, "observation_id": "a2"}
+    assert resolve_record(path.read_bytes(), pointer) == model
     assert trace.request.raw_input == observation["input"]
     assert trace.spans[0].attributes["bandits.otlp.source_context"]["resource"] == {}
     _assert_archived(tmp_path, path, corpus)
@@ -172,7 +174,8 @@ def test_phoenix_sdk_server_export_retains_request_model_and_parent() -> None:
     assert model.parent_span_id == trace.request.source_span_id
     assert model.kind == SpanKind.MODEL
     assert model.attributes["openinference.span.kind"] == "LLM"
-    assert json.loads(model.attributes["bandits.native.record"])["attributes"]["input.value"] == (
+    record = resolve_record(source.read_bytes(), model.attributes["bandits.source.record"])
+    assert record["attributes"]["input.value"] == (
         '[{"role":"user","content":"Where is the order?"}]'
     )
     assert {span["context"]["span_id"] for span in raw["data"]} == {
@@ -219,7 +222,7 @@ def test_native_langsmith_maps_run_tree_and_messages(tmp_path: Path) -> None:
     assert span.attributes["gen_ai.output.messages"] == [
         {"role": "assistant", "parts": [{"type": "text", "content": "hi"}]}
     ]
-    assert json.loads(span.attributes["bandits.native.record"]) == llm
+    assert resolve_record(path.read_bytes(), span.attributes["bandits.source.record"]) == llm
     assert (
         span.parent_span_id == hashlib.sha256(f"langsmith:span:{root_id}".encode()).hexdigest()[:16]
     )
@@ -292,7 +295,8 @@ def test_langsmith_cli_export_run_id_shape(tmp_path: Path) -> None:
     assert len(corpus.traces) == 1
     assert len(corpus.traces[0].spans) == 1
     assert not [issue for issue in corpus.issues if issue.kind != "redaction"]
-    assert json.loads(corpus.traces[0].spans[0].attributes["bandits.native.record"]) == run
+    pointer = corpus.traces[0].spans[0].attributes["bandits.source.record"]
+    assert resolve_record(path.read_bytes(), pointer) == run
 
 
 def test_phoenix_getspans_response_uses_top_level_span_kind(tmp_path: Path) -> None:
@@ -375,7 +379,7 @@ def test_native_phoenix_preserves_openinference_and_links(tmp_path: Path) -> Non
     corpus = load_corpus(path, "phoenix")
     span = corpus.traces[0].spans[0]
     assert span.kind == SpanKind.MODEL
-    assert json.loads(span.attributes["bandits.native.record"]) == raw
+    assert resolve_record(path.read_bytes(), span.attributes["bandits.source.record"]) == raw
     assert span.attributes["bandits.otlp.source_context"]["links"] == raw["links"]
     assert span.attributes["bandits.otlp.source_context"]["resource"] == {"service.name": "demo"}
     assert span.status == SpanStatus.ERROR
@@ -722,10 +726,13 @@ def test_captured_otel_keeps_every_attribute_of_retained_spans(dialect: str) -> 
     kept = [span for trace in corpus.traces for span in trace.spans]
     assert kept
     for span in (span for span in kept if span.span_id in original):
-        assert (
-            span.attributes["bandits.otlp.source_context"]["span_attributes"]
-            == original[span.span_id]
-        )
+        # Every declared attribute is either in the attributes as declared, or
+        # kept in the source context with its declared value; nothing else is.
+        declared = original[span.span_id]
+        context = span.attributes["bandits.otlp.source_context"]["span_attributes"]
+        assert set(context) <= set(declared)
+        for key, value in declared.items():
+            assert span.attributes.get(key) == value or context.get(key) == value, key
 
     workflow = load_corpus(source, "otlp-std", workflow=WorkflowDeclaration(task_fields=()))
     represented = {span.span_id for trace in workflow.traces for span in trace.spans} | {
@@ -762,7 +769,9 @@ def test_langfuse_null_io_is_absent_not_the_text_null(tmp_path: Path) -> None:
     assert "gen_ai.input.messages" not in span.attributes
     assert "gen_ai.output.messages" not in span.attributes
     assert span.output is None
-    assert json.loads(span.attributes["bandits.native.record"])["input"] is None
+    assert (
+        resolve_record(path.read_bytes(), span.attributes["bandits.source.record"])["input"] is None
+    )
 
 
 def test_langfuse_embedding_generation_is_not_a_model_call(tmp_path: Path) -> None:
