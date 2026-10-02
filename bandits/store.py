@@ -9,15 +9,19 @@ of silently overwriting.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
+import subprocess
+import tomllib
 from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
+import bandits
 from bandits.redact import redact_bytes, ruleset_by_name
 from bandits.traces import TraceCorpus
 
@@ -27,7 +31,9 @@ class Contract(BaseModel):
 
 
 class ArtifactEnvelope(Contract):
-    schema_version: int = 1
+    schema_version: int = 2
+    """Informational. 1: written before the fields below existed (all None)."""
+
     artifact_id: str
     created_at: str
     source_path: str
@@ -35,6 +41,54 @@ class ArtifactEnvelope(Contract):
     trace_count: int
     span_count: int
     issue_count: int
+    """Every corpus issue, redactions and notices included; see ``problem_count``."""
+
+    derivation_version: int | None = None
+    """The workflow declaration's derivation version; None for non-workflow corpora."""
+
+    bandits_version: str | None = None
+    git_commit: str | None = None
+    git_dirty: bool | None = None
+    """The bandits checkout that wrote this corpus. None when bandits does not run
+    from its own git checkout (an installed package), never another repo's commit."""
+
+    problem_count: int | None = None
+    """Health warnings plus fatal problems at ingest, as printed then."""
+
+    redaction_count: int | None = None
+
+
+@functools.cache
+def code_version() -> tuple[str, str | None, bool | None]:
+    """``(bandits_version, git_commit, git_dirty)`` of the running code.
+
+    The commit is recorded only when the enclosing checkout is bandits' own:
+    an installed copy inside some project's virtualenv must not report that
+    project's commit. Dirty means tracked changes under the package or
+    ``pyproject.toml``; untracked work elsewhere does not mark every corpus.
+    """
+    package = Path(bandits.__file__).resolve().parent
+
+    def git(*args: str, cwd: Path = package) -> str | None:
+        try:
+            done = subprocess.run(
+                ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    try:
+        declared = tomllib.loads((Path(top) / "pyproject.toml").read_text())  # type: ignore[arg-type]
+    except (TypeError, OSError, tomllib.TOMLDecodeError):
+        declared = {}
+    if top is None or declared.get("project", {}).get("name") != "bandits":
+        return bandits.__version__, None, None
+    commit = git("rev-parse", "HEAD")
+    # Pathspecs resolve against the working directory, so run from the top.
+    status = git("status", "--porcelain", "-uno", "--", "bandits", "pyproject.toml", cwd=Path(top))
+    return bandits.__version__, commit, (None if status is None else bool(status))
 
 
 class ArtifactConflict(ValueError):
@@ -60,7 +114,9 @@ class ArtifactStore:
     def _dir(self, artifact_id: str) -> Path:
         return self._artifacts_dir / artifact_id
 
-    def write(self, corpus: TraceCorpus, *, source_path: str) -> ArtifactEnvelope:
+    def write(
+        self, corpus: TraceCorpus, *, source_path: str, problem_count: int | None = None
+    ) -> ArtifactEnvelope:
         artifact_id = compute_artifact_id(corpus)
         artifact_dir = self._dir(artifact_id)
         corpus_bytes = corpus.model_dump_json().encode("utf-8")
@@ -75,6 +131,7 @@ class ArtifactStore:
             return self.read_envelope(artifact_id)
 
         artifact_dir.mkdir(parents=True)
+        version, commit, dirty = code_version()
         envelope = ArtifactEnvelope(
             artifact_id=artifact_id,
             created_at=datetime.now(UTC).isoformat(),
@@ -83,6 +140,14 @@ class ArtifactStore:
             trace_count=len(corpus.traces),
             span_count=sum(len(t.spans) for t in corpus.traces),
             issue_count=len(corpus.issues),
+            derivation_version=(
+                corpus.workflow.derivation_version if corpus.workflow is not None else None
+            ),
+            bandits_version=version,
+            git_commit=commit,
+            git_dirty=dirty,
+            problem_count=problem_count,
+            redaction_count=sum(issue.kind == "redaction" for issue in corpus.issues),
         )
         _atomic_write(artifact_dir / "corpus.json", corpus_bytes)
         _atomic_write(artifact_dir / "envelope.json", envelope.model_dump_json().encode("utf-8"))

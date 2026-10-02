@@ -13,19 +13,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from bandits.traces import SpanKind, SpanStatus, TraceCorpus
+from bandits.traces import NOTICE_ISSUE_KINDS, SpanKind, SpanStatus, TraceCorpus
 
-# Notices about handling, not problems with the data.
-_NOTICE_KINDS = frozenset(
-    {
-        "redaction",
-        "source_container",
-        "excluded_evaluator",
-        "excluded_evaluator_trace",
-        "duplicate_model_instrumentation",
-        "task_unresolved",  # reported as no_task, with the fix
-    }
-)
 _ROLES = ("system", "developer", "user", "assistant", "tool")
 _EXAMPLES = 3
 
@@ -105,7 +94,7 @@ def check(corpus: TraceCorpus, source: str) -> Health:
                 health.note("failed_no_output" if failed else "output_missing", where)
             if any(not _valid(v) for v in (in_msgs, out_msgs) if v is not None and v != []):
                 health.note("bad_messages", where)
-    other = Counter(i.kind for i in corpus.issues if i.kind not in _NOTICE_KINDS)
+    other = Counter(i.kind for i in corpus.issues if i.kind not in NOTICE_ISSUE_KINDS)
 
     if not corpus.traces:
         health.fatal.append("no traces could be read from this file")

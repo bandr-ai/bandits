@@ -94,3 +94,91 @@ def test_derived_artifacts_are_not_listed_as_corpora(tmp_path) -> None:
 
     assert [e.artifact_id for e in DerivedStore(project).list(kind="analysis")] == ["analysis-1"]
     assert all(e.artifact_id.startswith("corpus-") for e in ArtifactStore(project).list())
+
+
+def test_envelope_records_counts_and_code_version(tmp_path) -> None:
+    from bandits.traces import TraceIssue, WorkflowDeclaration
+
+    corpus = TraceCorpus(
+        source="otlp-std",
+        traces=(),
+        issues=(
+            TraceIssue(kind="redaction", detail="x"),
+            TraceIssue(kind="malformed_span", detail="y"),
+        ),
+        workflow=WorkflowDeclaration(),
+    )
+    envelope = ArtifactStore(tmp_path / ".bandits").write(
+        corpus, source_path="a.jsonl", problem_count=1
+    )
+    assert envelope.schema_version == 2
+    assert (envelope.issue_count, envelope.problem_count, envelope.redaction_count) == (2, 1, 1)
+    assert envelope.derivation_version == WorkflowDeclaration().derivation_version
+    assert envelope.bandits_version
+    # Run from this checkout, so the commit is this repo's.
+    assert envelope.git_commit is not None and len(envelope.git_commit) == 40
+
+
+def test_envelope_derivation_is_none_without_a_workflow(tmp_path) -> None:
+    envelope = ArtifactStore(tmp_path / ".bandits").write(_corpus(), source_path="a.jsonl")
+    assert envelope.derivation_version is None and envelope.problem_count is None
+
+
+def test_an_old_envelope_still_validates() -> None:
+    from bandits.store import ArtifactEnvelope
+
+    old = ArtifactEnvelope.model_validate_json(
+        '{"schema_version":1,"artifact_id":"corpus-x","created_at":"t","source_path":"p",'
+        '"source":"otlp","trace_count":0,"span_count":0,"issue_count":3}'
+    )
+    assert old.derivation_version is None and old.git_commit is None
+
+
+def test_code_version_ignores_another_projects_checkout(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import bandits
+    from bandits import store
+
+    package = tmp_path / "project" / ".venv" / "bandits"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (tmp_path / "project" / "pyproject.toml").write_text('[project]\nname = "other"\n')
+    subprocess.run(["git", "init", "-q", str(tmp_path / "project")], check=True)
+    monkeypatch.setattr(bandits, "__file__", str(package / "__init__.py"))
+    store.code_version.cache_clear()
+    try:
+        assert store.code_version() == (bandits.__version__, None, None)
+    finally:
+        store.code_version.cache_clear()
+
+
+def test_code_version_reads_bandits_own_checkout(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import bandits
+    from bandits import store
+
+    repo = tmp_path / "checkout"
+    package = repo / "bandits"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (repo / "pyproject.toml").write_text('[project]\nname = "bandits"\n')
+    (repo / "notes.md").write_text("")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    monkeypatch.setattr(bandits, "__file__", str(package / "__init__.py"))
+    try:
+        store.code_version.cache_clear()
+        _, commit, dirty = store.code_version()
+        assert commit is not None and dirty is False
+        (repo / "notes.md").write_text("elsewhere")  # outside the package: not dirty
+        store.code_version.cache_clear()
+        assert store.code_version()[2] is False
+        (package / "__init__.py").write_text("# changed")
+        store.code_version.cache_clear()
+        assert store.code_version()[2] is True
+    finally:
+        store.code_version.cache_clear()

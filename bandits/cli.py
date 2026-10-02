@@ -323,7 +323,11 @@ def ingest(
         return
 
     store = ArtifactStore(project / ".bandits")
-    envelope = store.write(corpus, source_path=str(path))
+    envelope = store.write(
+        corpus,
+        source_path=str(path),
+        problem_count=len(health.warnings) + len(health.fatal),
+    )
     _say(f"artifact_id: {envelope.artifact_id}")
     if health.warnings:
         _say(f"details:  bandits show {envelope.artifact_id} --issues")
@@ -333,17 +337,32 @@ def ingest(
 def list_artifacts(project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
     """List every artifact in the local store."""
     store = ArtifactStore(project / ".bandits")
-    table = Table("artifact_id", "source", "traces", "spans", "issues", "created_at")
-    for envelope in store.list():
+    envelopes = store.list()
+    table = Table(
+        "artifact_id", "source", "traces", "spans", "problems", "derivation", "created_at"
+    )
+    for envelope in envelopes:
         table.add_row(
             envelope.artifact_id[:19],
             envelope.source,
             str(envelope.trace_count),
             str(envelope.span_count),
-            str(envelope.issue_count),
+            "-" if envelope.problem_count is None else str(envelope.problem_count),
+            # Envelopes written before the field existed cannot say; newer
+            # ones leave it None only for non-workflow corpora.
+            str(envelope.derivation_version)
+            if envelope.derivation_version is not None
+            else ("?" if envelope.schema_version < 2 else "-"),
             envelope.created_at,
         )
     console.print(table)
+    versions = sorted({e.derivation_version for e in envelopes if e.derivation_version is not None})
+    if len(versions) > 1:
+        _say(
+            f"[yellow]warning:[/yellow] workflow corpora here were derived by different "
+            f"versions ({', '.join(map(str, versions))}); re-ingest the older ones before "
+            "comparing them"
+        )
 
 
 @app.command()

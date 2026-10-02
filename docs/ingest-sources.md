@@ -39,6 +39,13 @@ including JSON serialized inside an OTLP attribute; `default-v1` remains
 available to reproduce old artifacts. It does not promise to find every kind
 of sensitive data.
 
+`envelope.json` records which code wrote the corpus (`bandits_version`, and
+`git_commit`/`git_dirty` when bandits runs from its own checkout), the workflow
+`derivation_version`, and `problem_count` (the warnings printed at ingest)
+apart from `redaction_count`. `bandits list` shows problems, not raw issue
+counts, and warns when workflow corpora in one project were derived by
+different versions; envelopes written before these fields show `?`.
+
 Parsed OTLP spans also keep separate resource, scope, span, event and link records in
 `bandits.otlp.source_context`. A recorded link is preserved as a link; ingest
 does not call it feedback or causation.
