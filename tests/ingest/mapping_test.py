@@ -402,3 +402,80 @@ def test_drift_compares_the_export_before_overrides(tmp_path) -> None:
     )
     _, report = _load(path, mapping)
     assert report.unmapped_shapes == 0 and set(report.shapes) == {shape}
+
+
+def _shared_name(trace: str) -> list[dict]:
+    # Two top-level runs with one name; only one records the request field.
+    return [
+        _span(
+            "a",
+            "run",
+            {"langfuse.observation.type": "SPAN", "input.value": json.dumps({"query": "q"})},
+            parent="gone-1",
+            trace=trace,
+        ),
+        _span(
+            "b",
+            "run",
+            {"langfuse.observation.type": "SPAN", "input.value": json.dumps({"other": "x"})},
+            parent="gone-2",
+            trace=trace,
+        ),
+        _span(
+            "m",
+            "call",
+            {"gen_ai.operation.name": "chat", "input.value": "q", "output.value": "a"},
+            parent="a",
+            trace=trace,
+        ),
+    ]
+
+
+def test_a_proposal_applies_as_it_was_resolved(tmp_path) -> None:
+    path = _file(tmp_path, _shared_name("1" * 32), _shared_name("2" * 32))
+    project = str(tmp_path)
+    proposed = _cli(
+        "mapping", "propose", str(path), "--source", "otlp-std", "--name", "m", "--project", project
+    )
+    assert "invocation left open" in _out(proposed)
+    mapping = load_mapping(tmp_path, "m")
+    assert mapping.task_fields == ("input.query",) and mapping.invocation == ()
+    assert _cli("mapping", "confirm", "m", "--project", project).exit_code == 0
+    corpus, _ = _load(path, load_mapping(tmp_path, "m"))
+    assert [t.request.source_span_id for t in corpus.traces] == ["a", "a"]
+
+
+def test_an_explicit_invocation_that_cannot_choose_is_warned(tmp_path) -> None:
+    path = _file(tmp_path, _shared_name("1" * 32))
+    result = _cli(
+        "mapping",
+        "propose",
+        str(path),
+        "--source",
+        "otlp-std",
+        "--name",
+        "m",
+        "--invocation",
+        f"{SPAN}|run",
+        "--project",
+        str(tmp_path),
+    )
+    assert "picks exactly one run in only 0/1 traces" in " ".join(_out(result).split())
+
+
+@pytest.mark.parametrize("key", ["invalid-key", "|name", "label|", ""])
+def test_step_kind_keys_must_name_an_identity(tmp_path, key) -> None:
+    with pytest.raises(ValueError, match="KIND_LABEL"):
+        IngestMapping(source="otlp-std", step_kinds={key: "exclude"})
+    path = mapping_path(tmp_path, "m")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"source": "otlp-std", "step_kinds": {key: "exclude"}}))
+    with pytest.raises(MappingError, match="not valid"):
+        load_mapping(tmp_path, "m")
+
+
+def test_a_key_that_matches_nothing_is_reported(tmp_path) -> None:
+    path = _file(tmp_path, _pipeline())
+    corpus, _ = _load(path, _mapping(step_kinds={"kind=SPAN|absent": "exclude"}))
+    (issue,) = [i for i in corpus.issues if i.kind == "mapping_key_unmatched"]
+    assert "kind=SPAN|absent" in issue.detail

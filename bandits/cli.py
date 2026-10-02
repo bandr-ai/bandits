@@ -100,7 +100,13 @@ from bandits.ingest import (
     detect_source,
     load_corpus,
 )
-from bandits.ingest.discovery import Discovery, discover, discover_requests, restricted
+from bandits.ingest.discovery import (
+    Discovery,
+    discover,
+    discover_requests,
+    identity_coverage,
+    restricted,
+)
 from bandits.ingest.health import check as check_health
 from bandits.ingest.mapping import (
     Identity,
@@ -464,7 +470,25 @@ def mapping_propose(
     offered = discover(summary).task_options
     chosen = next((o for o in found.task_options if o.paths == found.task_fields), None)
     if not identities and chosen is not None:
-        identities = [Identity(kind_label=k, name=n) for k, n in chosen.identities]
+        # Saved only when the names alone choose the run, as applying the
+        # mapping will check: names shared by several runs in one trace would
+        # make the confirmed mapping refuse what discovery resolved by field.
+        names = {(k, n) for k, n in chosen.identities}
+        single, total = identity_coverage(summary, names)
+        if single == total:
+            identities = [Identity(kind_label=k, name=n) for k, n in sorted(names)]
+        else:
+            _say(
+                f"note:     invocation left open: its name matches several runs in "
+                f"{total - single}/{total} traces; the task field chooses the run"
+            )
+    elif identities:
+        single, total = identity_coverage(summary, keys)
+        if single != total:
+            _say(
+                f"[yellow]warning:[/yellow] --invocation picks exactly one run in only "
+                f"{single}/{total} traces; applying this mapping leaves the rest ambiguous"
+            )
     shapes: dict[str, list[str]] = {}
     for trace in summary.traces:
         shapes.setdefault(trace.shape_id, []).append(trace.trace_id)

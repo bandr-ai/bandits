@@ -1639,7 +1639,10 @@ def shape_id(spans: dict[str, _Decoded]) -> str:
 
 
 def _apply_step_kinds(
-    spans: dict[str, _Decoded], kinds: dict[str, str], not_applicable: Counter[str]
+    spans: dict[str, _Decoded],
+    kinds: dict[str, str],
+    not_applicable: Counter[str],
+    hits: Counter[str],
 ) -> tuple[set[str], frozenset[str]]:
     """A mapping's role overrides, applied over the classified roles.
 
@@ -1654,7 +1657,10 @@ def _apply_step_kinds(
     structure: set[str] = set()
     for span in spans.values():
         kind = kinds.get(f"{span.label}|{span.name}")
-        if kind is None or span.role == _EXCLUDED:
+        if kind is None:
+            continue
+        hits[f"{span.label}|{span.name}"] += 1
+        if span.role == _EXCLUDED:
             continue
         if kind == "exclude":
             span.role, span.label = _EXCLUDED, f"{LABEL_PREFIX}{span.label}|{span.name}"
@@ -1741,7 +1747,7 @@ def load_otlp_standard(
                 local.unmapped_shapes += 1
             if mapping.step_kinds:
                 forced, structure = _apply_step_kinds(
-                    decoded, mapping.step_kinds, local.override_not_applicable
+                    decoded, mapping.step_kinds, local.override_not_applicable, local.step_kind_hits
                 )
         models = sum(span.role == _MODEL for span in decoded.values())
         steps, has_action = _pipeline_steps(decoded, structure)
@@ -1962,6 +1968,7 @@ def load_otlp_standard(
                 str(path),
                 workflow=workflow is not None,
                 mapping_name=workflow.mapping_name if workflow is not None else None,
+                step_kinds=mapping.step_kinds if mapping is not None else (),
             )
         )
 

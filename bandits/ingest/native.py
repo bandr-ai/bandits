@@ -576,6 +576,7 @@ def load_native(
         str(path),
         workflow=workflow is not None,
         mapping_name=workflow.mapping_name if workflow is not None else None,
+        step_kinds=mapping.step_kinds if mapping is not None else (),
     )
     if report is not None:
         report.merge(internal)

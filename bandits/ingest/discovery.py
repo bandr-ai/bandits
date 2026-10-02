@@ -175,6 +175,14 @@ def restricted(summary: RequestSummary, identities: set[tuple[str, str]]) -> Req
     )
 
 
+def identity_coverage(summary: RequestSummary, identities: set[tuple[str, str]]) -> tuple[int, int]:
+    """``(traces where the identities alone pick exactly one candidate, traces
+    with candidates)``: whether a mapping's invocation list can choose by itself."""
+    with_candidates = [t for t in summary.traces if t.candidates]
+    single = sum(sum(c.identity in identities for c in t.candidates) == 1 for t in with_candidates)
+    return single, len(with_candidates)
+
+
 def pick_path(record: dict[str, Any], root: str, keys: tuple[str, ...]) -> str | None:
     """The one path on *record* a field search would read: the whole value when
     it is text, else the first key in priority order, shallowest first."""
