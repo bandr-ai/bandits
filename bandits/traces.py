@@ -271,6 +271,7 @@ NOTICE_ISSUE_KINDS = frozenset(
         "excluded_evaluator_trace",
         "duplicate_model_instrumentation",
         "task_unresolved",  # reported as no_task, with the fix
+        "parent_not_exported",
     }
 )
 """Issue kinds that describe how ingest handled the data, not a problem with it."""
