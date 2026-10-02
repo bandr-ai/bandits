@@ -367,6 +367,8 @@ def ingest(
             _say(f"shapes:   {len(report.shapes)} trace shape(s)")
             for line in report.shape_lines():
                 _say(f"  {line}")
+        if report.evidence_links:
+            _say(f"evidence: {report.evidence_line()}")
         if report.traces_with_absent_parents:
             _say(
                 f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "
