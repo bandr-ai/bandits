@@ -1285,10 +1285,39 @@ def _counted(key: str, value: object, unparsed: Counter[str]) -> object:
     return parsed
 
 
+def _same(a: object, b: object) -> bool:
+    return type(a) is type(b) and a == b
+
+
+def _pruned_context(
+    decoded: _Decoded, final_attributes: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The span's source context, keeping only declarations the attributes don't.
+
+    A span attribute is already in the flattened attributes unless (a) it
+    shadowed a different resource value of the same key, or (b) the final
+    attributes no longer hold it as declared (normalized messages replace
+    ``gen_ai.input.messages`` and its kin). Only those are kept here, so the
+    declared bytes survive without storing every attribute twice. Comparison
+    is type-aware: ``0``, ``False`` and ``""`` differ. Builds a new dict; the
+    decoded context is shared with the episode attributes and stays whole.
+    """
+    context = decoded.source_context
+    resource = context["resource"]
+    kept = {
+        key: value
+        for key, value in context["span_attributes"].items()
+        if (key in resource and not _same(resource[key], value))
+        or (final_attributes is not None and not _same(final_attributes.get(key), value))
+    }
+    return {**context, "span_attributes": kept}
+
+
 def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Span:
     attributes = dict(decoded.attributes)
     # Keep namespaces distinct. The flattened attributes above remain for
-    # existing convention translators; these are the recorded source facts.
+    # existing convention translators; these are the recorded source facts,
+    # pruned once the final attributes are known (``_pruned_context``).
     attributes["bandits.otlp.source_context"] = decoded.source_context
     if decoded.events:
         attributes["otel.events"] = decoded.events
@@ -1321,6 +1350,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
             # this placeholder become a training target or a judge answer.
             attributes["bandits.output_unusable_reason"] = "transport_response_object_repr"
             output = None
+        attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
         return Span(
             span_id=decoded.span_id,
             parent_span_id=decoded.parent_id,
@@ -1357,6 +1387,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
     )
     if as_step:
         attributes[PIPELINE_STEP] = True
+    attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
     return Span(
         span_id=decoded.span_id,
         parent_span_id=decoded.parent_id,
@@ -1870,7 +1901,9 @@ def load_otlp_standard(
                         for key, value in span.attributes.items()
                         if key not in _INPUT_VALUE_KEYS and key not in _OUTPUT_VALUE_KEYS
                     }
-                    | {"bandits.otlp.source_context": span.source_context},
+                    # Rule (a) only: the node's input/output values are its
+                    # parsed fields, not attributes.
+                    | {"bandits.otlp.source_context": _pruned_context(span)},
                 )
                 for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
                 if span.role in (_STEP, _NONE)
