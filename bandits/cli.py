@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import typer
@@ -98,6 +99,7 @@ from bandits.ingest import (
     IngestReport,
     UnknownSourceError,
     detect_source,
+    iter_corpus,
     load_corpus,
 )
 from bandits.ingest.discovery import (
@@ -107,6 +109,7 @@ from bandits.ingest.discovery import (
     identity_coverage,
     restricted,
 )
+from bandits.ingest.health import Health, collect, finish
 from bandits.ingest.health import check as check_health
 from bandits.ingest.mapping import (
     Identity,
@@ -120,8 +123,8 @@ from bandits.ingest.mapping import (
 )
 from bandits.ingest.mapping import confirm as confirm_mapping
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
-from bandits.store import ArtifactStore, DerivedStore
-from bandits.traces import WorkflowDeclaration
+from bandits.store import ArtifactStore, DerivedStore, StreamingWrite
+from bandits.traces import TraceCorpus, WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
@@ -359,63 +362,95 @@ def ingest(
                 (found.delivered_field,) if found.delivered_field else (),
                 found.answer_options,
             )
-    corpus = load(workflow)
-    if control_marker:
-        corpus = corpus.replace(control_markers=tuple(control_marker))
-
-    health = check_health(corpus, source, hints=found.hints() or None)
-    # Only the OTLP family fills the report; other readers print no accounting.
-    reported = source in _WORKFLOW_SOURCES
-    _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
-    if reported:
-        _say(f"records:  {report.summary()}")
-        if report.shapes:
-            _say(f"shapes:   {len(report.shapes)} trace shape(s)")
-            for line in report.shape_lines():
-                _say(f"  {line}")
-        if report.evidence_links:
-            _say(f"evidence: {report.evidence_line()}")
-        if report.traces_with_absent_parents:
-            _say(
-                f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "
-                f"whose parent was not exported (max {report.max_top_steps} per trace)"
-            )
-        # Every span must land somewhere; when it does not, the corpus cannot
-        # be trusted to be complete, whatever else looks fine.
-        health.fatal.extend(
-            f"record accounting does not add up: {error}" for error in report.accounting_errors
-        )
-    hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
-    _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
-    if health.fatal:
-        for problem in health.fatal:
-            _say(f"[red]error:[/red] {problem}")
-        for warning in health.warnings:
-            _say(f"  - {warning}")
-        _say("nothing was saved")
-        raise typer.Exit(code=1)
-    if health.warnings:
-        _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
-        for warning in health.warnings:
-            _say(f"  - {warning}")
-    else:
-        _say("problems: none")
-    if workflow is not None and mapping is None:
-        _say(f"to save these choices: bandits mapping propose {path} --source {source} --name NAME")
-    if dry_run:
-        _say("dry run:  nothing saved")
-        return
-
     store = ArtifactStore(project / ".bandits")
-    envelope = store.write(
-        corpus,
-        source_path=str(path),
-        problem_count=len(health.warnings) + len(health.fatal),
-        report=report.as_dict() if reported else None,
-    )
-    _say(f"artifact_id: {envelope.artifact_id}")
-    if health.warnings:
-        _say(f"details:  bandits show {envelope.artifact_id} --issues")
+    with StreamingWrite(store, source) if source in _WORKFLOW_SOURCES else nullcontext() as staged:
+        if source in _WORKFLOW_SOURCES:
+            health = Health()
+            try:
+                for item in iter_corpus(
+                    path,
+                    source,
+                    ruleset_by_name(redaction),
+                    pipeline_steps=pipeline_steps,
+                    workflow=workflow,
+                    report=report,
+                    mapping=mapping,
+                ):
+                    if isinstance(item, TraceCorpus):
+                        corpus = item.replace(control_markers=tuple(control_marker))
+                        staged.finish(corpus)
+                    else:
+                        collect(health, item, source, workflow=workflow is not None)
+                        staged.add(item)
+                health = finish(health, corpus, hints=found.hints() or None)
+            except (ValueError, FileNotFoundError) as exc:
+                _fail(
+                    f"could not read {path} as {source}", str(exc), "check the export and options"
+                )
+        else:
+            corpus = load(workflow)
+            if control_marker:
+                corpus = corpus.replace(control_markers=tuple(control_marker))
+            health = check_health(corpus, source, hints=found.hints() or None)
+        # Only the OTLP family fills the report; other readers print no accounting.
+        reported = source in _WORKFLOW_SOURCES
+        _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
+        if reported:
+            _say(f"records:  {report.summary()}")
+            if report.shapes:
+                _say(f"shapes:   {len(report.shapes)} trace shape(s)")
+                for line in report.shape_lines():
+                    _say(f"  {line}")
+            if report.evidence_links:
+                _say(f"evidence: {report.evidence_line()}")
+            if report.traces_with_absent_parents:
+                _say(
+                    f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "
+                    f"whose parent was not exported (max {report.max_top_steps} per trace)"
+                )
+            # Every span must land somewhere; when it does not, the corpus cannot
+            # be trusted to be complete, whatever else looks fine.
+            health.fatal.extend(
+                f"record accounting does not add up: {error}" for error in report.accounting_errors
+            )
+        hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
+        _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
+        if health.fatal:
+            for problem in health.fatal:
+                _say(f"[red]error:[/red] {problem}")
+            for warning in health.warnings:
+                _say(f"  - {warning}")
+            _say("nothing was saved")
+            raise typer.Exit(code=1)
+        if health.warnings:
+            _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
+            for warning in health.warnings:
+                _say(f"  - {warning}")
+        else:
+            _say("problems: none")
+        if workflow is not None and mapping is None:
+            _say(
+                f"to save these choices: bandits mapping propose {path} --source {source} --name NAME"
+            )
+        if dry_run:
+            _say("dry run:  nothing saved")
+            return
+
+        if reported:
+            envelope = staged.commit(
+                source_path=str(path),
+                problem_count=len(health.warnings) + len(health.fatal),
+                report=report.as_dict(),
+            )
+        else:
+            envelope = store.write(
+                corpus,
+                source_path=str(path),
+                problem_count=len(health.warnings) + len(health.fatal),
+            )
+        _say(f"artifact_id: {envelope.artifact_id}")
+        if health.warnings:
+            _say(f"details:  bandits show {envelope.artifact_id} --issues")
 
 
 def _say_found(what: str, flag: str, chosen: tuple[str, ...], options: list) -> None:
@@ -827,7 +862,9 @@ def build_sft_command(
         None, "--trace", help="Trace to consider. Repeat to select several; omit for all."
     ),
     output: Path = typer.Option(..., "--output", help="Directory for the three review buckets."),
-    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Review model, as <provider>/<model>."),
+    model: str = typer.Option(
+        DEFAULT_MODEL, "--model", help="Review model, as <provider>/<model>."
+    ),
     samples: int = typer.Option(3, "--samples", min=1, help="Independent LLM reviews per trace."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:

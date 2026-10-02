@@ -9,11 +9,13 @@ of silently overwriting.
 
 from __future__ import annotations
 
+import errno
 import functools
 import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import tomllib
 from datetime import UTC, datetime
 from itertools import chain
@@ -23,7 +25,7 @@ from pydantic import BaseModel, ConfigDict
 
 import bandits
 from bandits.redact import redact_bytes, ruleset_by_name
-from bandits.traces import TraceCorpus
+from bandits.traces import Trace, TraceCorpus
 
 
 class Contract(BaseModel):
@@ -338,6 +340,111 @@ class ArtifactStore:
             if entry.is_dir()
         ]
         return sorted(envelopes, key=lambda e: e.created_at, reverse=True)
+
+
+class StreamingWrite:
+    """Stage canonical corpus bytes; publish only after the caller's health gate.
+
+    Temporary files live beside the store, on the same filesystem as artifacts.
+    No complete corpus or serialized corpus is retained in memory.
+    """
+
+    def __init__(self, store: ArtifactStore, source: str):
+        self.store = store
+        store._project_dir.parent.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(
+            prefix=".bandits-ingest-", dir=store._project_dir.parent
+        )
+        self.directory = Path(self.temp.name)
+        self.output = (self.directory / "corpus.json").open("wb")
+        self.digest = hashlib.sha256()
+        self.trace_count = self.span_count = 0
+        self.source_digest: str | None = None
+        self.mixed_source_digests = False
+        prefix = TraceCorpus(source=source, traces=()).model_dump_json().split('"traces":[]', 1)[0]
+        self._write((prefix + '"traces":[').encode())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.output.close()
+        self.temp.cleanup()
+
+    def _write(self, data: bytes) -> None:
+        self.output.write(data)
+        self.digest.update(data)
+
+    def add(self, trace: Trace) -> None:
+        if self.trace_count:
+            self._write(b",")
+        self._write(trace.model_dump_json().encode())
+        self.trace_count += 1
+        self.span_count += len(trace.spans)
+        if self.source_digest is None:
+            self.source_digest = trace.source_digest
+        elif trace.source_digest != self.source_digest:
+            self.mixed_source_digests = True
+
+    def finish(self, footer: TraceCorpus) -> None:
+        if footer.traces:
+            raise ValueError("stream footer must not contain traces")
+        suffix = footer.model_dump_json().split('"traces":[]', 1)[1]
+        self._write(("]" + suffix).encode())
+        self.output.close()
+        self.footer = footer
+        self.artifact_id = "corpus-" + self.digest.hexdigest()[:16]
+
+    def commit(
+        self, *, source_path: str, problem_count: int, report: dict | None
+    ) -> ArtifactEnvelope:
+        corpus = self.footer
+        target = self.store._dir(self.artifact_id)
+        if target.exists():
+            with (
+                (target / "corpus.json").open("rb") as existing,
+                (self.directory / "corpus.json").open("rb") as staged,
+            ):
+                while True:
+                    left, right = existing.read(1024 * 1024), staged.read(1024 * 1024)
+                    if left != right:
+                        raise ArtifactConflict(
+                            f"artifact {self.artifact_id} already exists with different content"
+                        )
+                    if not left:
+                        break
+            return self.store.read_envelope(self.artifact_id)
+        self.store._archive_source(self.directory, source_path, corpus)
+        manifest = self.directory / "source-manifest.json"
+        if self.source_digest is not None and manifest.exists() and Path(source_path).is_file():
+            if json.loads(manifest.read_text())[0]["source_sha256"] != self.source_digest:
+                raise ValueError(f"source file changed after ingest: {source_path}")
+        version, commit, dirty = code_version()
+        envelope = ArtifactEnvelope(
+            artifact_id=self.artifact_id,
+            created_at=datetime.now(UTC).isoformat(),
+            source_path=source_path,
+            source=corpus.source,
+            trace_count=self.trace_count,
+            span_count=self.span_count,
+            issue_count=len(corpus.issues),
+            derivation_version=corpus.workflow.derivation_version if corpus.workflow else None,
+            bandits_version=version,
+            git_commit=commit,
+            git_dirty=dirty,
+            problem_count=problem_count,
+            redaction_count=sum(i.kind == "redaction" for i in corpus.issues),
+        )
+        _atomic_write(self.directory / "envelope.json", envelope.model_dump_json().encode())
+        self.store._write_report(self.directory, report)
+        self.store._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(self.directory, target)
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+            return self.commit(source_path=source_path, problem_count=problem_count, report=report)
+        return envelope
 
 
 class DerivedEnvelope(Contract):

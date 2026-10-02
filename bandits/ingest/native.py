@@ -25,7 +25,7 @@ from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
-from bandits.traces import TraceCorpus, TraceIssue, WorkflowDeclaration
+from bandits.traces import Trace, TraceCorpus, TraceIssue, WorkflowDeclaration
 
 Position = dict[str, Any]
 """Where a native record sits in its file: ``{"line": n}`` (1-based, physical),
@@ -532,7 +532,7 @@ def _request(span: dict[str, Any], source_name: str) -> dict[str, Any]:
     }
 
 
-def load_native(
+def iter_native(
     path: Path,
     source_name: str,
     ruleset: RedactionRuleset = DEFAULT_RULESET,
@@ -541,8 +541,11 @@ def load_native(
     pipeline_steps: bool = True,
     report: IngestReport | None = None,
     mapping: IngestMapping | None = None,
-) -> TraceCorpus:
-    """Import one native JSON/JSONL file without an external conversion script.
+) -> Iterator[Trace | TraceCorpus]:
+    """Yield traces, then a trace-free corpus footer containing issues and metadata.
+
+    The report is complete only when the iterator is exhausted. Bundled Langfuse
+    JSONL releases decoded chunks; other native formats retain their grouping.
 
     Every observation the converters see is counted: converted, skipped as
     unconvertible or duplicate, and the converted ones through the OTLP
@@ -552,7 +555,8 @@ def load_native(
     # Always collected: the per-ingest summary issues are built from it once,
     # not once per chunk.
     decoded = IngestReport()
-    converted_traces = []
+    with path.open("rb") as original:
+        digest = hashlib.file_digest(original, "sha256").hexdigest()
     converted_issues: list[TraceIssue] = []
     seen_ids: set[str] = set()
     for chunk_path in conversion.chunks():
@@ -568,8 +572,12 @@ def load_native(
         ids = {trace.trace_id for trace in chunk.traces}
         decoded.split_trace_ids += len(ids & seen_ids)
         seen_ids |= ids
-        converted_traces.extend(chunk.traces)
+        for trace in chunk.traces:
+            yield trace.replace(source=source_name, source_digest=digest)
         converted_issues.extend(chunk.issues)
+        del chunk
+    if conversion.source_hash.hexdigest() != digest:
+        raise ValueError(f"source file changed during ingest: {path}")
     internal = conversion.finish(decoded)
     deferred = aggregate_issues(
         internal,
@@ -580,13 +588,37 @@ def load_native(
     )
     if report is not None:
         report.merge(internal)
-    return TraceCorpus(
+    yield TraceCorpus(
         source=source_name,
-        traces=tuple(
-            trace.replace(source=source_name, source_digest=conversion.source_hash.hexdigest())
-            for trace in converted_traces
-        ),
+        traces=(),
         issues=tuple(conversion.issues) + tuple(converted_issues) + tuple(deferred),
         workflow=workflow,
         redaction_ruleset=ruleset.name,
     )
+
+
+def load_native(
+    path: Path,
+    source_name: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    workflow: WorkflowDeclaration | None = None,
+    pipeline_steps: bool = True,
+    report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
+) -> TraceCorpus:
+    """Materialize the streaming native reader for library callers."""
+    traces = []
+    for item in iter_native(
+        path,
+        source_name,
+        ruleset,
+        workflow=workflow,
+        pipeline_steps=pipeline_steps,
+        report=report,
+        mapping=mapping,
+    ):
+        if isinstance(item, TraceCorpus):
+            return item.replace(traces=tuple(traces))
+        traces.append(item)
+    raise RuntimeError("native reader ended without a footer")

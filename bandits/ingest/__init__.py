@@ -12,7 +12,7 @@ from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.detect import DetectionError, detect_source
 from bandits.ingest.mapping import IngestMapping
-from bandits.ingest.native import load_native
+from bandits.ingest.native import iter_native, load_native
 from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.report import IngestReport
@@ -105,6 +105,7 @@ def load_corpus(
 
 
 __all__ = [
+    "iter_corpus",
     "CANONICAL_SOURCES",
     "DetectionError",
     "IngestReport",
@@ -112,3 +113,19 @@ __all__ = [
     "detect_source",
     "load_corpus",
 ]
+
+
+def iter_corpus(
+    path: str | Path, source: str, ruleset: RedactionRuleset = DEFAULT_RULESET, **kwargs
+):
+    """Yield normalized traces then a trace-free corpus footer.
+
+    Native bundled exports release each decoded chunk. Other formats currently
+    retain their adapter's grouping behavior, including interleaved trace IDs.
+    """
+    if source in ("langfuse", "langsmith", "phoenix"):
+        yield from iter_native(Path(path), source, ruleset, **kwargs)
+    else:
+        corpus = load_corpus(path, source, ruleset, **kwargs)
+        yield from corpus.traces
+        yield corpus.replace(traces=())

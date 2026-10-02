@@ -497,14 +497,13 @@ def test_other_sources_print_no_accounting(tmp_path) -> None:
 def test_accounting_that_does_not_add_up_saves_nothing(tmp_path, monkeypatch) -> None:
     import bandits.cli
 
-    real = bandits.cli.load_corpus
+    real = bandits.cli.iter_corpus
 
     def broken(*args, report, **kwargs):
-        corpus = real(*args, report=report, **kwargs)
+        yield from real(*args, report=report, **kwargs)
         report.accounting_errors.append("6 span(s) seen but 5 accounted for")
-        return corpus
 
-    monkeypatch.setattr(bandits.cli, "load_corpus", broken)
+    monkeypatch.setattr(bandits.cli, "iter_corpus", broken)
     result = runner.invoke(
         app, ["ingest", str(LANGFUSE_FIXTURE), "--source", "langfuse", "--project", str(tmp_path)]
     )

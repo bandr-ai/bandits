@@ -173,3 +173,20 @@ with a reason; no LLM proposes a mapping yet. A source archive preserves what
 was recorded, but it cannot restore content omitted upstream or removed by
 redaction. A format match and a successful decode are the first two checks;
 task origin, causal links, and stage quality require separate validation.
+
+
+### Memory during ingest
+
+The CLI writes OTLP-family corpora incrementally to a temporary directory beside
+the project store. It publishes the directory only after health and record
+accounting pass and the source archive is complete. Failed runs and dry runs
+remove the staging directory. Written bytes and content IDs match serialization
+of the same materialized corpus, including declared control markers.
+
+Bundled Langfuse JSONL is decoded in chunks rather than retaining all normalized
+traces. Memory still depends on the largest source record/chunk and accumulated
+issues. Whole-file JSON, direct OTLP, and native LangSmith/Phoenix grouping can
+still buffer the input; incremental writing does not make those readers bounded.
+Library `load_corpus` and reading a saved corpus still materialize the corpus.
+`iter_corpus` yields traces followed by a trace-free `TraceCorpus` footer; its
+report is complete only when iteration finishes.

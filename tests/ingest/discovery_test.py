@@ -146,9 +146,9 @@ def test_cli_builds_the_corpus_once_and_prints_the_options(tmp_path, monkeypatch
     import bandits.cli
 
     calls = []
-    real = bandits.cli.load_corpus
+    real = bandits.cli.iter_corpus
     monkeypatch.setattr(
-        bandits.cli, "load_corpus", lambda *a, **k: calls.append(1) or real(*a, **k)
+        bandits.cli, "iter_corpus", lambda *a, **k: calls.append(1) or real(*a, **k)
     )
     path = _write(tmp_path / "new.jsonl", *(_request(_new(c * 32)) for c in "56"))
     result = CliRunner().invoke(app, ["ingest", str(path), "--source", "otlp-std", "--dry-run"])
