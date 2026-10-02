@@ -327,12 +327,18 @@ def build_evidence(
     # haystack for the whole workflow.
     for target_id, started_at, value in targets():
         haystack = _haystack(value)
-        if haystack:
-            for call_id, (call, needles) in needles_by_call.items():
-                if target_id == call_id or started_at < call.ended_at:
-                    continue
-                if all(needle in haystack for needle in needles):
-                    matched[target_id][call_id] = sum(len(needle) for needle in needles)
+        if not haystack:
+            continue
+        leaves = {_norm(leaf) for leaf in _leaves(value)}
+        for call_id, (call, needles) in needles_by_call.items():
+            if target_id == call_id or started_at < call.ended_at:
+                continue
+            # Long fields can be consumed independently (one query from a list).
+            # Short labels must match a complete field, never a substring such
+            # as "tools" inside "powertools".
+            present = [n for n in needles if (n in leaves if short[call_id] else n in haystack)]
+            if present:
+                matched[target_id][call_id] = sum(len(n) for n in present)
     unsure = {c: short.get(c, False) or duplicate.get(c, False) for c in texts}
     for target_id, by_call in matched.items():
         for call_id, chars in by_call.items():
@@ -344,13 +350,36 @@ def build_evidence(
                     call_span_id=call_id,
                     kind="shared_result" if others else "text_match",
                     target_span_id=target_id,
-                    basis="this call's output appears verbatim in the target's input"
-                    + ("; so do the outputs of other calls" if others else ""),
+                    basis="text from this call's output appears verbatim in the target's input"
+                    + ("; so does output text from other calls" if others else ""),
                     match_chars=chars,
                     ambiguous=unsure[call_id],
                     shared_with=others,
                 )
             )
+
+    # Pipeline results can supply a model prompt without a model producing them.
+    # The call is the receiver; the target identifies the earlier source record.
+    sources = [(s.span_id, s.ended_at, s.output) for s in spans if s.kind is SpanKind.TOOL]
+    sources += [(n.span_id, n.ended_at, n.output) for n in nodes]
+    for call in calls:
+        haystack = _haystack(_span_input(call))
+        for source_id, ended_at, output in sources:
+            if ended_at > call.started_at:
+                continue
+            needles = {_norm(t) for t in _leaves(output) if len(_norm(t)) >= MIN_MATCH_CHARS}
+            present = [t for t in needles if t in haystack]
+            if present:
+                links.append(
+                    EvidenceLink(
+                        call_span_id=call.span_id,
+                        kind="input_context",
+                        target_span_id=source_id,
+                        basis="text from this earlier pipeline result appears verbatim in the call's input; "
+                        "containment does not prove the call used it",
+                        match_chars=sum(map(len, present)),
+                    )
+                )
 
     # Delivery: the declared delivered value contains the call's output.
     if request is not None and isinstance(request.delivered, str):

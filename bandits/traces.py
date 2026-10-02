@@ -224,7 +224,10 @@ class WorkflowNode(Contract):
 
 
 class EvidenceLink(Contract):
-    """One recorded relationship from a model call to something observed later.
+    """One recorded relationship involving a model call.
+
+    ``input_context`` points to an earlier pipeline result whose text appears
+    in the call input; other kinds describe structure or later observations.
 
     A link says what the record supports and on what basis — never that one
     thing caused another. ``ambiguous`` marks a match that could as well belong
@@ -233,10 +236,12 @@ class EvidenceLink(Contract):
 
     call_span_id: str
     kind: Literal[
-        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery"
+        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery",
+        "input_context",
     ]
     target_span_id: str | None = None
-    """The span or node the call links to; None for ``delivery`` (the request record)."""
+    """The span or node the call links to; None for ``delivery`` (the request record).
+    For ``input_context``, the target is the earlier source of recorded input text."""
 
     basis: str
     match_chars: int | None = None
