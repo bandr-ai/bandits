@@ -115,8 +115,19 @@ class ArtifactStore:
         return self._artifacts_dir / artifact_id
 
     def write(
-        self, corpus: TraceCorpus, *, source_path: str, problem_count: int | None = None
+        self,
+        corpus: TraceCorpus,
+        *,
+        source_path: str,
+        problem_count: int | None = None,
+        report: dict | None = None,
     ) -> ArtifactEnvelope:
+        """Store *corpus* under its content id.
+
+        ``report`` (what the read saw, as plain JSON data) is saved as
+        ``report.json`` beside it, outside the id: the same corpus read twice
+        is the same artifact, and an existing report is never replaced.
+        """
         artifact_id = compute_artifact_id(corpus)
         artifact_dir = self._dir(artifact_id)
         corpus_bytes = corpus.model_dump_json().encode("utf-8")
@@ -128,6 +139,7 @@ class ArtifactStore:
                     f"artifact {artifact_id} already exists with different content"
                 )
             self._archive_source(artifact_dir, source_path, corpus)
+            self._write_report(artifact_dir, report)
             return self.read_envelope(artifact_id)
 
         artifact_dir.mkdir(parents=True)
@@ -152,7 +164,18 @@ class ArtifactStore:
         _atomic_write(artifact_dir / "corpus.json", corpus_bytes)
         _atomic_write(artifact_dir / "envelope.json", envelope.model_dump_json().encode("utf-8"))
         self._archive_source(artifact_dir, source_path, corpus)
+        self._write_report(artifact_dir, report)
         return envelope
+
+    @staticmethod
+    def _write_report(artifact_dir: Path, report: dict | None) -> None:
+        path = artifact_dir / "report.json"
+        if report is not None and not path.exists():
+            _atomic_write(path, json.dumps(report, ensure_ascii=False, indent=1).encode("utf-8"))
+
+    def read_report(self, artifact_id: str) -> dict | None:
+        path = self._dir(artifact_id) / "report.json"
+        return json.loads(path.read_text()) if path.exists() else None
 
     def _archive_source(self, artifact_dir: Path, source_path: str, corpus: TraceCorpus) -> None:
         """Store redacted source bytes next to the normalized corpus.

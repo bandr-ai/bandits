@@ -39,6 +39,41 @@ including JSON serialized inside an OTLP attribute; `default-v1` remains
 available to reproduce old artifacts. It does not promise to find every kind
 of sensitive data.
 
+For OTLP and native sources, ingest prints where every record went:
+
+```
+records:  293 seen → 41 model · 73 pipeline_step · 179 node · 0 dropped (unreadable items: 0)
+parents:  5 trace(s) have top-level steps whose parent was not exported (max 3 per trace)
+```
+
+"Seen" is every span the OTLP decoder read, or every observation a native
+converter read (nested ones included). Each lands in exactly one bucket: kept
+(`model`, `tool`, `invocation`, `pipeline_step`, `node`, `container`,
+`step_with_calls`, `covered`) or dropped (`unconvertible`, `duplicate_native`,
+`malformed_span`, `duplicate`, `cyclic`, `excluded`, `empty_trace`,
+`root_step`, `unrepresented`), each dropped bucket with an issue. If the
+buckets do not add up to what was seen, that is a Bandits bug: ingest stops
+and saves nothing. Unreadable items (a line that is not JSON, a record with no
+spans list, an unsupported native record) are counted separately, since the
+spans inside them cannot be counted. Records are decoded records, so the
+`tool` count can differ from the corpus when tool calls are also recovered
+from model messages. The same report is saved as `report.json` beside the
+corpus, outside its id.
+
+Issue kinds added with this report:
+
+| kind | class | meaning |
+| --- | --- | --- |
+| `unconvertible_observation` | warning | native observations with no id, an unparseable or missing start/end time (a running observation), not an object, nested in one of those, or repeated within a record; examples name the reason |
+| `trace_split_across_chunks` | warning | one trace id appears in native records read in different batches, so the corpus holds more than one trace with that id |
+| `malformed_record` | warning | also raised now for a `resourceSpans`/`scopeSpans` entry that is not an object |
+| `parent_not_exported` | notice | workflow traces whose top-level steps point to parents the export does not contain; one issue per ingest with up to three example traces |
+
+Summary issues (`unparsed_value`, `unrepresented_span`, `source_container`,
+`excluded_evaluator`, `task_unresolved`/`task_conflict`, and the ones above)
+are issued once per ingest with the source path as location, never once per
+native batch.
+
 `envelope.json` records which code wrote the corpus (`bandits_version`, and
 `git_commit`/`git_dirty` when bandits runs from its own checkout), the workflow
 `derivation_version`, and `problem_count` (the warnings printed at ingest)

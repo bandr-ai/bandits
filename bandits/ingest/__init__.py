@@ -14,6 +14,7 @@ from bandits.ingest.detect import DetectionError, detect_source
 from bandits.ingest.native import load_native
 from bandits.ingest.otlp import load_otlp
 from bandits.ingest.otlp_standard import load_otlp_standard
+from bandits.ingest.report import IngestReport
 from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
 from bandits.traces import TraceCorpus, WorkflowDeclaration
@@ -49,11 +50,12 @@ def load_corpus(
     *,
     pipeline_steps: bool = True,
     workflow: WorkflowDeclaration | None = None,
+    report: IngestReport | None = None,
 ) -> TraceCorpus:
     """Read a raw export into a :class:`TraceCorpus` using a recognized adapter.
 
     ``pipeline_steps`` and ``workflow`` apply to OTLP and the native readers
-    routed through it.
+    routed through it; so does ``report``, which the other readers leave empty.
     """
     if source == "auto":
         source = detect_source(Path(path)).source
@@ -70,7 +72,12 @@ def load_corpus(
             )
     if source in ("langfuse", "langsmith", "phoenix"):
         return load_native(
-            Path(path), source, ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+            Path(path),
+            source,
+            ruleset,
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
+            report=report,
         )
     loader = _LOADERS.get(source)
     if loader is None:
@@ -79,7 +86,7 @@ def load_corpus(
         )
     if source == "otlp-std":
         return load_otlp_standard(
-            Path(path), ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+            Path(path), ruleset, pipeline_steps=pipeline_steps, workflow=workflow, report=report
         )
     if workflow is not None:
         raise ValueError(f"workflow mode is an otlp-std option; source {source!r} has none")
@@ -91,6 +98,7 @@ def load_corpus(
 __all__ = [
     "CANONICAL_SOURCES",
     "DetectionError",
+    "IngestReport",
     "UnknownSourceError",
     "detect_source",
     "load_corpus",

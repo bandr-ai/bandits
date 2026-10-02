@@ -466,3 +466,49 @@ def test_list_is_quiet_when_derivation_versions_agree(tmp_path) -> None:
     runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
     result = runner.invoke(app, ["list", "--project", str(tmp_path)])
     assert "different versions" not in plain(result.stdout)
+
+
+LANGFUSE_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures/upstream/langfuse/agno-2025-06-11.trace.json"
+)
+
+
+def test_ingest_prints_record_accounting_and_saves_the_report(tmp_path) -> None:
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app, ["ingest", str(LANGFUSE_FIXTURE), "--source", "langfuse", "--project", str(tmp_path)]
+    )
+    out = plain(result.stdout)
+    assert result.exit_code == 0, out
+    assert re.search(r"records:  6 seen → .* · 0 dropped \(unreadable items: 0\)", out)
+    artifact_id = re.search(r"artifact_id: (\S+)", out).group(1)
+    report = ArtifactStore(tmp_path / ".bandits").read_report(artifact_id)
+    assert report["spans_seen"] == 6 and report["dropped"] == 0
+
+
+def test_other_sources_print_no_accounting(tmp_path) -> None:
+    result = runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    assert "records:" not in plain(result.stdout)
+
+
+def test_accounting_that_does_not_add_up_saves_nothing(tmp_path, monkeypatch) -> None:
+    import bandits.cli
+
+    real = bandits.cli.load_corpus
+
+    def broken(*args, report, **kwargs):
+        corpus = real(*args, report=report, **kwargs)
+        report.accounting_errors.append("6 span(s) seen but 5 accounted for")
+        return corpus
+
+    monkeypatch.setattr(bandits.cli, "load_corpus", broken)
+    result = runner.invoke(
+        app, ["ingest", str(LANGFUSE_FIXTURE), "--source", "langfuse", "--project", str(tmp_path)]
+    )
+    assert result.exit_code == 1
+    assert "record accounting does not add up" in plain(result.stdout)
+    assert "nothing was saved" in plain(result.stdout)
+    assert not (tmp_path / ".bandits").exists()

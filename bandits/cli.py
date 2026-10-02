@@ -93,7 +93,13 @@ from bandits.export import (
     save_direct_sft,
     write_direct_sft,
 )
-from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
+from bandits.ingest import (
+    CANONICAL_SOURCES,
+    IngestReport,
+    UnknownSourceError,
+    detect_source,
+    load_corpus,
+)
 from bandits.ingest.health import check as check_health
 from bandits.ingest.health import detect_request_fields
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
@@ -254,7 +260,11 @@ def ingest(
             "drop them, or use --mode workflow (otlp-std and platform exports only)",
         )
 
+    report = IngestReport()
+
     def load(workflow: WorkflowDeclaration | None):
+        nonlocal report
+        report = IngestReport()  # one per read; the last read is the corpus kept
         try:
             return load_corpus(
                 path,
@@ -262,6 +272,7 @@ def ingest(
                 ruleset_by_name(redaction),
                 pipeline_steps=pipeline_steps,
                 workflow=workflow,
+                report=report,
             )
         except (UnknownSourceError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
             _fail(
@@ -302,7 +313,21 @@ def ingest(
         corpus = corpus.replace(control_markers=tuple(control_marker))
 
     health = check_health(corpus, source)
+    # Only the OTLP family fills the report; other readers print no accounting.
+    reported = source in _WORKFLOW_SOURCES
     _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
+    if reported:
+        _say(f"records:  {report.summary()}")
+        if report.traces_with_absent_parents:
+            _say(
+                f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "
+                f"whose parent was not exported (max {report.max_top_steps} per trace)"
+            )
+        # Every span must land somewhere; when it does not, the corpus cannot
+        # be trusted to be complete, whatever else looks fine.
+        health.fatal.extend(
+            f"record accounting does not add up: {error}" for error in report.accounting_errors
+        )
     hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
     _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
     if health.fatal:
@@ -327,6 +352,7 @@ def ingest(
         corpus,
         source_path=str(path),
         problem_count=len(health.warnings) + len(health.fatal),
+        report=report.as_dict() if reported else None,
     )
     _say(f"artifact_id: {envelope.artifact_id}")
     if health.warnings:
