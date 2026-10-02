@@ -806,7 +806,14 @@ def _normalized_messages(
                 parsed = _recorded_attribute_value(parsed, direction)
                 found = _messages(parsed, default_role=role)
                 if found is None and prompt_is_text:
-                    found = _text_message(role, parsed)
+                    # Structured model replies are assistant content too; the
+                    # raw value remains available on the span.
+                    content = (
+                        json.dumps(parsed, ensure_ascii=False)
+                        if direction == "output" and isinstance(parsed, (dict, list))
+                        else parsed
+                    )
+                    found = _text_message(role, content)
             candidates.append((declared[0], found))
         origin, messages = next(
             ((o, m) for o, m in candidates if m and any(message.get("parts") for message in m)),

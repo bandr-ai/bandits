@@ -566,7 +566,11 @@ def assemble_corpus(
             tools = root_tools if root_tools is not None else tools
             system_prompt = root_prompt if root_prompt is not None else system_prompt
             context = {**context, **root_context}
-        if system_prompt is None:
+        if (trace_extras or {}).get(trace_id, {}).get("interaction") == "workflow":
+            # Only the invocation can declare a workflow-wide policy. Stage
+            # prompts remain on their individual calls.
+            system_prompt = context_from_attributes(declared or {})[1]
+        elif system_prompt is None:
             # Most exporters record the policy as the system message opening
             # each model call rather than on the root. The first call's is what
             # the episode started under; a later call under a different one is
