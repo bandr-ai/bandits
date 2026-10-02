@@ -159,8 +159,11 @@ class WorkflowDeclaration(Contract):
     """Who started the runs. A workflow has no human follow-ups inside a run; that
     says nothing about who started it."""
 
-    derivation_version: int = 1
-    """Bumped whenever how requests, nodes or links are derived changes."""
+    derivation_version: int = 2
+    """Bumped whenever how requests, nodes or links are derived changes.
+
+    2: invocation-only workflow system prompt, ``input_context`` links, exact
+    short-label matching, archive pointers in place of copied native records."""
 
 
 class WorkflowRequest(Contract):
@@ -252,6 +255,19 @@ class EvidenceLink(Contract):
     Overlap, not contribution: a framework that passes its whole state forward
     repeats every earlier output in every later input. ``shared_result`` says the
     texts appear there together — never that these calls caused that result."""
+
+
+NOTICE_ISSUE_KINDS = frozenset(
+    {
+        "redaction",
+        "source_container",
+        "excluded_evaluator",
+        "excluded_evaluator_trace",
+        "duplicate_model_instrumentation",
+        "task_unresolved",  # reported as no_task, with the fix
+    }
+)
+"""Issue kinds that describe how ingest handled the data, not a problem with it."""
 
 
 class TraceIssue(Contract):
