@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 
 import bandits
 from bandits.traces import Contract, WorkflowDeclaration
@@ -54,6 +54,7 @@ class Identity(Contract):
     def parse(cls, text: str) -> Identity:
         label, sep, name = text.partition("|")
         if not sep or not label or not name:
+            # ValueError, so pydantic reports it as a validation error in a file.
             raise MappingError(f"{text!r} is not KIND_LABEL|NAME (e.g. 'kind=SPAN|run')")
         return cls(kind_label=label, name=name)
 
@@ -82,6 +83,15 @@ class IngestMapping(Contract):
 
     shapes: tuple[ShapeRef, ...] = ()
     """The trace shapes the user saw when confirming; others are flagged."""
+
+    @field_validator("step_kinds")
+    @classmethod
+    def _identity_keys(cls, kinds: dict[str, str]) -> dict[str, str]:
+        # A key that cannot name an identity would match nothing and silently
+        # do nothing; refuse it instead.
+        for key in kinds:
+            Identity.parse(key)
+        return kinds
 
     confirmed: bool = False
     confirmed_digest: str | None = None

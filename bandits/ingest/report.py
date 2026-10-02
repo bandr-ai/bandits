@@ -119,6 +119,7 @@ class IngestReport:
     task_status: Counter[str] = field(default_factory=Counter)
     excluded_by_mapping: Counter[str] = field(default_factory=Counter)
     override_not_applicable: Counter[str] = field(default_factory=Counter)
+    step_kind_hits: Counter[str] = field(default_factory=Counter)
 
     def add_shape(
         self, shape: str, trace_id: str, model_calls: int, task_status: str | None
@@ -169,6 +170,7 @@ class IngestReport:
             "task_status",
             "excluded_by_mapping",
             "override_not_applicable",
+            "step_kind_hits",
         ):
             getattr(self, name).update(getattr(other, name))
         self.unmapped_shapes += other.unmapped_shapes
@@ -252,7 +254,12 @@ class IngestReport:
 
 
 def aggregate_issues(
-    report: IngestReport, location: str, *, workflow: bool, mapping_name: str | None = None
+    report: IngestReport,
+    location: str,
+    *,
+    workflow: bool,
+    mapping_name: str | None = None,
+    step_kinds: Iterable[str] = (),
 ) -> list[TraceIssue]:
     """One issue per kind and label for the whole ingest, never one per chunk."""
     issues = [
@@ -334,6 +341,16 @@ def aggregate_issues(
         )
         for key, count in sorted(report.override_not_applicable.items())
     ]
+    unmatched = sorted(key for key in step_kinds if not report.step_kind_hits[key])
+    if unmatched:
+        issues.append(
+            TraceIssue(
+                kind="mapping_key_unmatched",
+                detail=f"mapping {mapping_name} step_kinds key(s) matched no span in this "
+                f"export, so they did nothing: {', '.join(unmatched)}",
+                location=location,
+            )
+        )
     if report.unmapped_shapes:
         issues.append(
             TraceIssue(
