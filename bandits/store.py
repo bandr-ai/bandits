@@ -18,7 +18,6 @@ import subprocess
 import tempfile
 import tomllib
 from datetime import UTC, datetime
-from itertools import chain
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
@@ -267,14 +266,17 @@ class ArtifactStore:
             redacted_bytes = 0
             with file.open("rb") as stream:
                 first = stream.readline()
-                jsonl = (
-                    file.suffix == ".jsonl"
-                    and first.lstrip().startswith(b"{")
-                    and first.rstrip().endswith(b"}")
+                while first and not first.strip():
+                    first = stream.readline()
+                jsonl = file.suffix == ".jsonl" and (
+                    (first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"))
+                    or (first.lstrip().startswith(b"[") and first.rstrip().endswith(b"]"))
+                    or not first.lstrip().startswith((b"{", b"["))
                 )
+                stream.seek(0)
                 if jsonl:
                     with archive_path.with_suffix(".tmp").open("wb") as output:
-                        for line in chain((first,), stream):
+                        for line in stream:
                             source_hash.update(line)
                             data = redact_bytes(line, str(file), ruleset).data
                             output.write(data)
@@ -282,7 +284,7 @@ class ArtifactStore:
                             redacted_bytes += len(data)
                     os.replace(archive_path.with_suffix(".tmp"), archive_path)
                 else:
-                    original = first + stream.read()
+                    original = stream.read()
                     source_hash.update(original)
                     redacted = redact_bytes(original, str(file), ruleset)
                     _atomic_write(archive_path, redacted.data)

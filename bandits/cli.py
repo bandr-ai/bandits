@@ -375,6 +375,7 @@ def ingest(
                     workflow=workflow,
                     report=report,
                     mapping=mapping,
+                    scratch_dir=staged.directory,
                 ):
                     if isinstance(item, TraceCorpus):
                         corpus = item.replace(control_markers=tuple(control_marker))

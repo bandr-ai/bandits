@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from bandits.ingest.mapping import IngestMapping
-from bandits.ingest.otlp_standard import load_otlp_standard
+from bandits.ingest.otlp_standard import iter_otlp_standard, load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
 from bandits.traces import Trace, TraceCorpus, TraceIssue, WorkflowDeclaration
@@ -400,10 +400,18 @@ class NativeConversion:
         path, ruleset = self.path, self.ruleset
         with path.open("rb") as stream:
             first = stream.readline()
-            # A complete first-line object signals JSONL. Keep only one trace
-            # in memory even when the export is many gigabytes long.
-            if first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"):
-                for number, line in enumerate(chain((first,), stream), start=1):
+            first_number = 1
+            while first and not first.strip():
+                self.source_hash.update(first)
+                first = stream.readline()
+                first_number += 1
+            # Complete JSON objects/arrays are independent JSONL records.
+            try:
+                jsonl = isinstance(json.loads(first), (dict, list))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                jsonl = False
+            if jsonl:
+                for number, line in enumerate(chain((first,), stream), start=first_number):
                     self.source_hash.update(line)
                     if not line.strip():
                         continue
@@ -413,8 +421,9 @@ class NativeConversion:
                         index = {"index": inner["index"]} if "index" in inner else {}
                         yield {"line": number, **index}, record
             else:
-                original = first + stream.read()
-                self.source_hash.update(original)
+                stream.seek(0)
+                original = stream.read()
+                self.source_hash = hashlib.sha256(original)
                 safe = redact_bytes(original, str(path), ruleset)
                 self.issues.extend(safe.issues)
                 yield from _records(safe.data)
@@ -541,11 +550,12 @@ def iter_native(
     pipeline_steps: bool = True,
     report: IngestReport | None = None,
     mapping: IngestMapping | None = None,
+    scratch_dir: Path | None = None,
 ) -> Iterator[Trace | TraceCorpus]:
     """Yield traces, then a trace-free corpus footer containing issues and metadata.
 
     The report is complete only when the iterator is exhausted. Bundled Langfuse
-    JSONL releases decoded chunks; other native formats retain their grouping.
+    releases decoded chunks; interleaved native spans are grouped on disk.
 
     Every observation the converters see is counted: converted, skipped as
     unconvertible or duplicate, and the converted ones through the OTLP
@@ -560,22 +570,40 @@ def iter_native(
     converted_issues: list[TraceIssue] = []
     seen_ids: set[str] = set()
     for chunk_path in conversion.chunks():
-        chunk = load_otlp_standard(
-            chunk_path,
-            ruleset,
-            pipeline_steps=pipeline_steps,
-            workflow=workflow,
-            report=decoded,
-            defer_aggregate_issues=True,
-            mapping=mapping,
-        )
-        ids = {trace.trace_id for trace in chunk.traces}
+        ids = set()
+        reader = iter_otlp_standard if source_name != "langfuse" else None
+        if reader is None:
+            chunk = load_otlp_standard(
+                chunk_path,
+                ruleset,
+                pipeline_steps=pipeline_steps,
+                workflow=workflow,
+                report=decoded,
+                defer_aggregate_issues=True,
+                mapping=mapping,
+            )
+            items = (*chunk.traces, chunk.replace(traces=()))
+        else:
+            items = reader(
+                chunk_path,
+                ruleset,
+                pipeline_steps=pipeline_steps,
+                workflow=workflow,
+                report=decoded,
+                defer_aggregate_issues=True,
+                mapping=mapping,
+                scratch_dir=scratch_dir,
+            )
+        for item in items:
+            if isinstance(item, TraceCorpus):
+                converted_issues.extend(item.issues)
+            else:
+                ids.add(item.trace_id)
+                yield item.replace(source=source_name, source_digest=digest)
         decoded.split_trace_ids += len(ids & seen_ids)
         seen_ids |= ids
-        for trace in chunk.traces:
-            yield trace.replace(source=source_name, source_digest=digest)
-        converted_issues.extend(chunk.issues)
-        del chunk
+        if reader is None:
+            del chunk, items
     if conversion.source_hash.hexdigest() != digest:
         raise ValueError(f"source file changed during ingest: {path}")
     internal = conversion.finish(decoded)

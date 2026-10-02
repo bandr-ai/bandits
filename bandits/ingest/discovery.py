@@ -30,7 +30,7 @@ from bandits.ingest.otlp_standard import (
     _invocation_candidates,
     _io_value,
     _prepare,
-    _read,
+    disk_read,
     shape_id,
 )
 from bandits.ingest.report import IngestReport
@@ -128,21 +128,21 @@ def _hashed(value: object, depth: int = 0) -> object:
 
 def _summarize(path: Path, ruleset: RedactionRuleset, summary: RequestSummary) -> None:
     issues: list[TraceIssue] = []  # the loader reports these; discovery only reads
-    read = _read(path, ruleset, issues, IngestReport())
     scratch: Counter[str] = Counter()
-    for trace_id, decoded in read.by_trace.items():
-        decoded, _ = _prepare(trace_id, decoded, issues)
-        if not decoded:
-            continue
-        candidates = []
-        for span_id in _invocation_candidates(decoded):
-            span = decoded[span_id]
-            record = {
-                "input": _hashed(_io_value(span.attributes, _INPUT_VALUE_KEYS, scratch)),
-                "output": _hashed(_io_value(span.attributes, _OUTPUT_VALUE_KEYS, scratch)),
-            }
-            candidates.append(Candidate(span_id, (span.label, span.name), record))
-        summary.traces.append(TraceRequests(trace_id, candidates, shape_id(decoded)))
+    with disk_read(path, ruleset, issues, IngestReport()) as read:
+        for trace_id, decoded in read.by_trace.items():
+            decoded, _ = _prepare(trace_id, decoded, issues)
+            if not decoded:
+                continue
+            candidates = []
+            for span_id in _invocation_candidates(decoded):
+                span = decoded[span_id]
+                record = {
+                    "input": _hashed(_io_value(span.attributes, _INPUT_VALUE_KEYS, scratch)),
+                    "output": _hashed(_io_value(span.attributes, _OUTPUT_VALUE_KEYS, scratch)),
+                }
+                candidates.append(Candidate(span_id, (span.label, span.name), record))
+            summary.traces.append(TraceRequests(trace_id, candidates, shape_id(decoded)))
 
 
 def discover_requests(

@@ -48,9 +48,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -64,11 +66,13 @@ from bandits.ingest.otlp import (
     assemble_corpus,
 )
 from bandits.ingest.report import EXAMPLES, STEPS_PER_EXAMPLE, IngestReport, aggregate_issues
-from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
+from bandits.ingest.spool import TraceSpool
+from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes, redact_source
 from bandits.traces import (
     Span,
     SpanKind,
     SpanStatus,
+    Trace,
     TraceCorpus,
     TraceIssue,
     UserTurn,
@@ -949,11 +953,13 @@ def _decode_file(
     issues: list[TraceIssue],
     counter: list[int],
     unreadable: Counter[str] | None = None,
+    *,
+    requests: Iterator[tuple[str, Any]] | None = None,
 ) -> Iterator[_Decoded]:
     """Every span in one file. ``unreadable`` counts items skipped whole, before
     any span inside them could be counted; ``counter[0]`` counts raw spans."""
     unreadable = Counter() if unreadable is None else unreadable
-    for location, request in _requests(data, str(path)):
+    for location, request in _requests(data, str(path)) if requests is None else requests:
         if isinstance(request, (json.JSONDecodeError, UnicodeDecodeError)):
             issues.append(TraceIssue(kind="malformed_json", detail=str(request), location=location))
             unreadable["malformed_json"] += 1
@@ -1500,7 +1506,9 @@ class _Read:
 
     __slots__ = ("by_trace", "source_digest", "ruleset_name")
 
-    def __init__(self, by_trace: dict[str, dict[str, _Decoded]], digest: str, ruleset: str):
+    def __init__(
+        self, by_trace: dict[str, dict[str, _Decoded]] | TraceSpool, digest: str, ruleset: str
+    ):
         self.by_trace, self.source_digest, self.ruleset_name = by_trace, digest, ruleset
 
 
@@ -1705,6 +1713,7 @@ def load_otlp_standard(
     report: IngestReport | None = None,
     defer_aggregate_issues: bool = False,
     mapping: IngestMapping | None = None,
+    _read_result: _Read | None = None,
 ) -> TraceCorpus:
     """Read a standard OTLP/JSON export (a file or a directory) into one corpus.
 
@@ -1726,7 +1735,11 @@ def load_otlp_standard(
     local = IngestReport()
     workflow_extras: dict[str, dict[str, Any]] = {}
     issues: list[TraceIssue] = []
-    read = _read(path, ruleset, issues, local)
+    if _read_result is None:
+        read = _read(path, ruleset, issues, local)
+    else:
+        read = _read_result
+        local.spans_seen = sum(len(spans) for spans in read.by_trace.values())
 
     unparsed = local.unparsed
     spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
@@ -1999,3 +2012,203 @@ def load_otlp_standard(
     if report is not None:
         report.merge(local)
     return corpus.replace(traces=tuple(traces), workflow=workflow)
+
+
+def _disk_read(
+    path: Path,
+    ruleset: RedactionRuleset,
+    issues: list[TraceIssue],
+    report: IngestReport,
+    spool: TraceSpool,
+) -> _Read:
+    """Decode JSONL one record at a time, grouping spans on disk.
+
+    Whole-file JSON retains its existing decoder. Redaction notices precede
+    decode issues for each file, exactly as in the materialized reader.
+    """
+    files = _files(path)
+    if not files:
+        raise FileNotFoundError(f"no .json or .jsonl files under {path}")
+    counter = [0]
+    decoded_count = 0
+    digests = []
+    for file in files:
+        with file.open("rb") as stream:
+            count = 0
+            first = b""
+            digest = hashlib.sha256()
+            for line in stream:
+                digest.update(line)
+                if line.strip():
+                    count += 1
+                    if not first:
+                        first = line
+        try:
+            json.loads(first.decode("utf-8"))
+            jsonl = first_valid = True
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            first_valid = False
+            jsonl = (
+                file.suffix == ".jsonl"
+                and first.strip() not in (b"{", b"[")
+                and (
+                    not first.lstrip().startswith((b"{", b"["))
+                    or first.rstrip().endswith((b"}", b"]"))
+                )
+            )
+        file_issues = []
+        if jsonl:
+            detected, escaped = [], []
+
+            parsed_digest = hashlib.sha256()
+
+            def requests(
+                file=file,
+                count=count,
+                first_valid=first_valid,
+                detected=detected,
+                escaped=escaped,
+                parsed_digest=parsed_digest,
+            ):
+                with file.open("rb") as stream:
+                    for number, line in enumerate(stream, 1):
+                        parsed_digest.update(line)
+                        if not line.strip():
+                            continue
+                        safe = redact_bytes(line, str(file), ruleset)
+                        for issue in safe.issues:
+                            if issue.detail.startswith("redacted detected"):
+                                detected.append(issue.replace(location=f"{file}:{number}"))
+                            else:
+                                escaped.append(
+                                    issue.replace(
+                                        location=str(file)
+                                        if count == 1 and first_valid
+                                        else f"{file}:{number}"
+                                    )
+                                )
+                        if count == 1 and first_valid:
+                            yield from _requests(safe.data, str(file))
+                        else:
+                            try:
+                                yield (
+                                    f"{file}:{number}",
+                                    json.loads(safe.data.rstrip(b"\n").decode("utf-8")),
+                                )
+                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                yield f"{file}:{number}", exc
+
+            spans = _decode_file(
+                file, b"", file_issues, counter, report.unreadable_items, requests=requests()
+            )
+        else:
+            safe = redact_source(file, ruleset)
+            detected, escaped = list(safe.issues), []
+            digest = None
+            spans = _decode_file(file, safe.data, file_issues, counter, report.unreadable_items)
+        for decoded in spans:
+            decoded_count += 1
+            if not spool.add(decoded):
+                file_issues.append(
+                    TraceIssue(
+                        kind="duplicate_span",
+                        detail=f"span {decoded.span_id} of trace {decoded.trace_id} was exported more than once; the first copy is kept",
+                        location=decoded.location,
+                    )
+                )
+                report.buckets["duplicate"] += 1
+        if jsonl and parsed_digest.hexdigest() != digest.hexdigest():
+            raise ValueError(f"source file changed during ingest: {file}")
+        issues.extend(detected)
+        issues.extend(escaped)
+        issues.extend(file_issues)
+        source_digest = digest.hexdigest() if digest is not None else safe.source_digest
+        digests.append(f"{file.relative_to(path) if path.is_dir() else file.name}\0{source_digest}")
+    report.spans_seen += counter[0]
+    report.buckets["malformed_span"] += counter[0] - decoded_count
+    source_digest = (
+        digests[0].split("\0", 1)[1]
+        if not path.is_dir()
+        else hashlib.sha256("\n".join(digests).encode()).hexdigest()
+    )
+    return _Read(spool, source_digest, ruleset.name)
+
+
+def iter_otlp_standard(
+    path: Path,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    workflow: WorkflowDeclaration | None = None,
+    pipeline_steps: bool = True,
+    report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
+    defer_aggregate_issues: bool = False,
+    scratch_dir: Path | None = None,
+) -> Iterator[Trace | TraceCorpus]:
+    """Read interleaved JSONL with disk grouping, yielding traces then a footer."""
+    with tempfile.TemporaryDirectory(
+        prefix=".bandits-read-", dir=scratch_dir or Path.cwd()
+    ) as directory:
+        spool = TraceSpool(Path(directory))
+        try:
+            local = IngestReport()
+            issues = []
+            read = _disk_read(path, ruleset, issues, local, spool)
+            seen = local.spans_seen
+            for trace_id, decoded in read.by_trace.items():
+                one = IngestReport()
+                corpus = load_otlp_standard(
+                    path,
+                    ruleset,
+                    workflow=workflow,
+                    pipeline_steps=pipeline_steps,
+                    report=one,
+                    mapping=mapping,
+                    defer_aggregate_issues=True,
+                    _read_result=_Read({trace_id: decoded}, read.source_digest, read.ruleset_name),
+                )
+                one.spans_seen = 0  # already counted by the decoding pass
+                local.merge(one)
+                issues.extend(corpus.issues)
+                for trace in corpus.traces:
+                    spool.save_trace(trace)
+                del corpus, decoded
+            if sum(local.buckets.values()) != seen:
+                local.accounting_errors.append(
+                    f"{path}: {seen} span(s) seen but {sum(local.buckets.values())} accounted for; this is a bandits bug"
+                )
+            if not defer_aggregate_issues:
+                issues.extend(
+                    aggregate_issues(
+                        local,
+                        str(path),
+                        workflow=workflow is not None,
+                        mapping_name=workflow.mapping_name if workflow else None,
+                        step_kinds=mapping.step_kinds if mapping else (),
+                    )
+                )
+            if report is not None:
+                report.merge(local)
+            yield from spool.sorted_traces()
+            yield TraceCorpus(
+                source=SOURCE,
+                traces=(),
+                issues=tuple(issues),
+                workflow=workflow,
+                redaction_ruleset=ruleset.name,
+            )
+        finally:
+            spool.close()
+
+
+@contextmanager
+def disk_read(
+    path: Path, ruleset: RedactionRuleset, issues: list[TraceIssue], report: IngestReport
+) -> Iterator[_Read]:
+    """A disk-grouped decoding pass for request discovery without a corpus."""
+    with tempfile.TemporaryDirectory(prefix=".bandits-discover-", dir=Path.cwd()) as directory:
+        spool = TraceSpool(Path(directory))
+        try:
+            yield _disk_read(path, ruleset, issues, report, spool)
+        finally:
+            spool.close()

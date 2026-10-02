@@ -183,10 +183,17 @@ accounting pass and the source archive is complete. Failed runs and dry runs
 remove the staging directory. Written bytes and content IDs match serialization
 of the same materialized corpus, including declared control markers.
 
-Bundled Langfuse JSONL is decoded in chunks rather than retaining all normalized
-traces. Memory still depends on the largest source record/chunk and accumulated
-issues. Whole-file JSON, direct OTLP, and native LangSmith/Phoenix grouping can
-still buffer the input; incremental writing does not make those readers bounded.
+Bundled Langfuse JSONL is decoded in chunks. Standard OTLP, LangSmith, and
+Phoenix JSONL group interleaved spans in a temporary SQLite database and assemble
+one complete trace at a time. This also applies to the discovery pre-pass;
+standard OTLP directories group spans across files. Source order breaks timestamp
+ties, the first duplicate span is retained, and the resulting traces keep their
+existing order. The spool is removed on completion or failure.
+
+Memory depends on the largest source record/trace and accumulated issues,
+reports, and discovery summaries, rather than all recorded prompts and replies.
+Grouping and canonical ordering use temporary disk space and add I/O. Whole-file
+JSON and the legacy flat `otlp` conversation adapter still buffer input.
 Library `load_corpus` and reading a saved corpus still materialize the corpus.
 `iter_corpus` yields traces followed by a trace-free `TraceCorpus` footer; its
 report is complete only when iteration finishes.

@@ -53,3 +53,34 @@ workflow judge still refuses these corpora pending stage-aware evaluation
 (M2). The 16 model-generated reference labels from the private export are not human ground
 truth. A quality claim needs reviewed labels and a held-out comparison of
 stage-aware predictions to those labels; that work is not complete.
+
+
+### JSONL memory and serialization validation
+
+Standard OTLP, native LangSmith, and Phoenix JSONL were measured using separate
+synthetic exports of approximately 101 MB each: 256 traces, 512 records, model
+inputs of approximately 384 KiB, and all children exported before all parents.
+These are stress fixtures, not independently captured platform exports.
+
+| Reader | Materialized reference peak RSS | Streaming peak RSS | Corpus SHA-256 |
+|---|---:|---:|---|
+| Standard OTLP | 630,448 KiB | 43,832 KiB | identical |
+| LangSmith | 631,536 KiB | 44,940 KiB | identical |
+| Phoenix | 631,640 KiB | 44,412 KiB | identical |
+
+The reference runs read and serialize the corpus. Streaming runs additionally
+perform request discovery and write the source archive. They therefore compare
+memory behavior, not equivalent timing: reference runs took 28–58 seconds and
+streaming runs took 72–153 seconds. All runs account for 512 records with no
+drops. Disk grouping preserves complete traces even when records interleave.
+
+Regression checks compare canonical bytes, accounting, and health against the
+materialized readers across the seven existing OTLP convention captures. Native
+JSONL checks use the previous conversion-plus-OTLP assembly as the reference.
+Additional tests cover cross-file parents, duplicates, malformed records, byte
+and decoded redactions, source mutation between passes, physical line pointers,
+and CLI discovery/archiving without reading an entire JSONL file into bytes.
+
+These measurements do not establish bounded memory for one enormous record or
+trace, whole-file JSON, legacy flat OTLP, saved-corpus read-back, or unbounded
+issue/discovery metadata. Temporary grouping also requires disk space.

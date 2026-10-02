@@ -6,6 +6,7 @@ require an explicit source rather than a guessed interpretation.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
@@ -14,11 +15,11 @@ from bandits.ingest.detect import DetectionError, detect_source
 from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.native import iter_native, load_native
 from bandits.ingest.otlp import load_otlp
-from bandits.ingest.otlp_standard import load_otlp_standard
+from bandits.ingest.otlp_standard import iter_otlp_standard, load_otlp_standard
 from bandits.ingest.report import IngestReport
 from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
-from bandits.traces import TraceCorpus, WorkflowDeclaration
+from bandits.traces import Trace, TraceCorpus, WorkflowDeclaration
 
 CANONICAL_SOURCES: tuple[str, ...] = (
     "otlp",
@@ -116,15 +117,22 @@ __all__ = [
 
 
 def iter_corpus(
-    path: str | Path, source: str, ruleset: RedactionRuleset = DEFAULT_RULESET, **kwargs
-):
+    path: str | Path,
+    source: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    scratch_dir: Path | None = None,
+    **kwargs,
+) -> Iterator[Trace | TraceCorpus]:
     """Yield normalized traces then a trace-free corpus footer.
 
-    Native bundled exports release each decoded chunk. Other formats currently
-    retain their adapter's grouping behavior, including interleaved trace IDs.
+    JSONL readers group interleaved spans on disk and normalize one trace at a
+    time. Whole-file JSON and legacy conversation adapters can still buffer input.
     """
     if source in ("langfuse", "langsmith", "phoenix"):
-        yield from iter_native(Path(path), source, ruleset, **kwargs)
+        yield from iter_native(Path(path), source, ruleset, scratch_dir=scratch_dir, **kwargs)
+    elif source == "otlp-std":
+        yield from iter_otlp_standard(Path(path), ruleset, scratch_dir=scratch_dir, **kwargs)
     else:
         corpus = load_corpus(path, source, ruleset, **kwargs)
         yield from corpus.traces
