@@ -135,7 +135,14 @@ counts, and warns when workflow corpora in one project were derived by
 different versions; envelopes written before these fields show `?`.
 
 Parsed OTLP spans also keep separate resource, scope, span, event and link records in
-`bandits.otlp.source_context`. A recorded link is preserved as a link; ingest
+`bandits.otlp.source_context`. Its `span_attributes` holds only the declarations
+the span's attributes don't already carry as declared: a value that shadowed a
+different resource value, or one the normalized view replaced (for example a
+declared `gen_ai.input.messages`). Spans from native readers carry
+`bandits.source.record`, a pointer (`line`, `index` or `document`, plus
+`observation_id`) to their record in the redacted source archive;
+`ArtifactStore.read_native_record` returns it. The native record is no longer
+copied onto each span. A recorded link is preserved as a link; ingest
 does not call it feedback or causation.
 
 The convention index in `bandits.normalized_scalars` records the source key

@@ -1,0 +1,158 @@
+"""Native records are reached through a pointer into the redacted source archive."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from bandits.ingest import load_corpus
+from bandits.ingest.otlp_standard import _Decoded, _pruned_context
+from bandits.store import ArtifactStore
+from tests.ingest.otlp_standard_test import _request, _span, _write
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "upstream"
+SECRET = "reach me at someone@mailhost.test"  # redacted by the default ruleset
+
+
+def _observation(oid: str, kind: str = "GENERATION", **fields) -> dict:
+    return {
+        "id": oid,
+        "type": kind,
+        "name": oid,
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": "2026-01-01T00:00:01Z",
+        "input": SECRET,
+        "output": "ok",
+        **fields,
+    }
+
+
+def _trace(tid: str) -> dict:
+    root = _observation(f"{tid}-root", "SPAN", children=[_observation(f"{tid}-nested")])
+    return {"id": tid, "observations": [root, _observation(f"{tid}-flat")]}
+
+
+def _run(rid: str, **fields) -> dict:
+    return {
+        "id": rid,
+        "run_type": "llm",
+        "name": rid,
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "inputs": {"text": SECRET},
+        "outputs": {"text": "ok"},
+        **fields,
+    }
+
+
+def _phoenix(sid: str) -> dict:
+    return {
+        "name": sid,
+        "context": {"trace_id": "t" * 8, "span_id": sid},
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {"openinference.span.kind": "LLM", "input.value": SECRET},
+    }
+
+
+LAYOUTS = {
+    "langfuse-jsonl": ("langfuse", "a.jsonl", "\n\n".join(json.dumps(_trace(t)) for t in "ab")),
+    "langfuse-array": ("langfuse", "a.json", json.dumps([_trace("a"), _trace("b")], indent=1)),
+    "langfuse-document": ("langfuse", "a.json", json.dumps(_trace("a"), indent=1)),
+    # One object per line in a .json file: archived by the whole-file path.
+    "langfuse-json-lines": ("langfuse", "a.json", "\n".join(json.dumps(_trace(t)) for t in "ab")),
+    "langsmith-runs": (
+        "langsmith",
+        "r.json",
+        json.dumps({"runs": [_run("r1", child_runs=[_run("r2")]), _run("r3")]}),
+    ),
+    "langsmith-jsonl": ("langsmith", "r.jsonl", "\n".join(json.dumps(_run(r)) for r in "xy")),
+    "phoenix-spans": ("phoenix", "p.json", json.dumps({"spans": [_phoenix("s1"), _phoenix("s2")]})),
+    "phoenix-line-array": ("phoenix", "p.jsonl", json.dumps([_phoenix("s1"), _phoenix("s2")])),
+}
+
+
+def _every_span_resolves(tmp_path: Path, path: Path, source: str) -> int:
+    corpus = load_corpus(path, source)
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(path)).artifact_id
+    spans = [s for t in corpus.traces for s in t.spans] + [
+        n for t in corpus.traces for n in t.workflow_nodes
+    ]
+    for span in spans:
+        pointer = json.loads(span.attributes["bandits.source.record"])
+        record = store.read_native_record(artifact, pointer)
+        context = record.get("context") or {}
+        assert pointer["observation_id"] in {
+            str(record.get("id")),
+            str(record.get("run_id")),
+            str(context.get("span_id")),
+        }
+        assert "someone@mailhost.test" not in json.dumps(record)
+    return len(spans)
+
+
+@pytest.mark.parametrize("layout", sorted(LAYOUTS))
+def test_every_span_points_at_its_archived_record(tmp_path, layout) -> None:
+    source, name, text = LAYOUTS[layout]
+    path = tmp_path / name
+    path.write_text(text)
+    assert _every_span_resolves(tmp_path, path, source) >= 2
+
+
+@pytest.mark.parametrize(
+    ("fixture", "source"),
+    [
+        ("langfuse/agno-2025-06-11.trace.json", "langfuse"),
+        ("phoenix/sdk-server-getspans.json", "phoenix"),
+    ],
+)
+def test_upstream_fixtures_resolve(tmp_path, fixture, source) -> None:
+    assert _every_span_resolves(tmp_path, FIXTURES / fixture, source) >= 1
+
+
+def test_the_copied_native_record_is_gone(tmp_path) -> None:
+    path = tmp_path / "a.jsonl"
+    path.write_text(json.dumps(_trace("a")))
+    span = load_corpus(path, "langfuse").traces[0].spans[0]
+    assert "bandits.native.record" not in span.attributes
+    assert json.loads(span.attributes["bandits.source.record"])["line"] == 1
+
+
+def _decoded(resource: dict, span_attributes: dict) -> _Decoded:
+    context = {
+        "resource": resource,
+        "span_attributes": span_attributes,
+        "scope": {},
+        "links": [],
+        "events": [],
+        "status": None,
+    }
+    return _Decoded(source_context=context)
+
+
+def test_only_shadowed_or_rewritten_declarations_are_kept() -> None:
+    declared = {"same": 1, "shadow": "span", "zero": 0, "messages": "[]", "plain": "x"}
+    decoded = _decoded({"shadow": "resource", "zero": False}, declared)
+    final = {**declared, "messages": [{"role": "user", "parts": []}]}
+    pruned = _pruned_context(decoded, final)
+    assert pruned["span_attributes"] == {"shadow": "span", "zero": 0, "messages": "[]"}
+    assert _pruned_context(decoded)["span_attributes"] == {"shadow": "span", "zero": 0}
+    # Never mutated: the episode attributes share this dict.
+    assert decoded.source_context["span_attributes"] == declared
+
+
+def test_normalized_messages_keep_their_declared_bytes(tmp_path) -> None:
+    attributes = {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.input.messages": "[]",
+        "input.value": "hello",
+        "output.value": "hi",
+    }
+    path = _write(tmp_path / "x.jsonl", _request([_span("m", "call", attributes)]))
+    span = load_corpus(path, "otlp-std").traces[0].spans[0]
+    kept = span.attributes["bandits.otlp.source_context"]["span_attributes"]
+    assert kept == {"gen_ai.input.messages": "[]"}
+    assert span.attributes["gen_ai.input.messages"][0]["parts"][0]["content"] == "hello"
