@@ -327,6 +327,10 @@ def ingest(
     _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
     if reported:
         _say(f"records:  {report.summary()}")
+        if report.shapes:
+            _say(f"shapes:   {len(report.shapes)} trace shape(s)")
+            for line in report.shape_lines():
+                _say(f"  {line}")
         if report.traces_with_absent_parents:
             _say(
                 f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "

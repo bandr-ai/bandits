@@ -31,6 +31,7 @@ from bandits.ingest.otlp_standard import (
     _io_value,
     _prepare,
     _read,
+    shape_id,
 )
 from bandits.ingest.report import IngestReport
 from bandits.ingest.workflow import resolve_task
@@ -61,6 +62,7 @@ class Candidate:
 class TraceRequests:
     trace_id: str
     candidates: list[Candidate]
+    shape_id: str = ""
 
 
 @dataclass
@@ -130,6 +132,8 @@ def _summarize(path: Path, ruleset: RedactionRuleset, summary: RequestSummary) -
     scratch: Counter[str] = Counter()
     for trace_id, decoded in read.by_trace.items():
         decoded, _ = _prepare(trace_id, decoded, issues)
+        if not decoded:
+            continue
         candidates = []
         for span_id in _invocation_candidates(decoded):
             span = decoded[span_id]
@@ -138,7 +142,7 @@ def _summarize(path: Path, ruleset: RedactionRuleset, summary: RequestSummary) -
                 "output": _hashed(_io_value(span.attributes, _OUTPUT_VALUE_KEYS, scratch)),
             }
             candidates.append(Candidate(span_id, (span.label, span.name), record))
-        summary.traces.append(TraceRequests(trace_id, candidates))
+        summary.traces.append(TraceRequests(trace_id, candidates, shape_id(decoded)))
 
 
 def discover_requests(
