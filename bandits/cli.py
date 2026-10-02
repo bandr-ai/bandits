@@ -100,8 +100,8 @@ from bandits.ingest import (
     detect_source,
     load_corpus,
 )
+from bandits.ingest.discovery import Discovery, discover, discover_requests
 from bandits.ingest.health import check as check_health
-from bandits.ingest.health import detect_request_fields
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore
 from bandits.traces import WorkflowDeclaration
@@ -195,8 +195,9 @@ def ingest(
         [],
         "--task-field",
         help="Workflow only. Path into the run's record holding the request, "
-        "e.g. input.query. Default: a common field (query, question, ...) that is "
-        "text in every run, if there is one.",
+        "e.g. input.query. Repeatable. Default: found by reading the runs (a field "
+        "named query, question, ... up to two levels deep) when exactly one set of "
+        "fields picks one run in every trace; otherwise the options are printed.",
     ),
     delivered_field: str = typer.Option(
         None,
@@ -284,35 +285,43 @@ def ingest(
             )
 
     workflow = None
+    found = Discovery()
     if mode == "workflow":
         workflow = WorkflowDeclaration(
             task_fields=tuple(task_field),
             delivered_field=delivered_field,
             request_origin=request_origin,  # type: ignore[arg-type]
         )
-    corpus = load(workflow)
     if workflow is not None and (not task_field or not delivered_field):
-        found_task, found_answer = detect_request_fields(corpus)
-        chosen_task = tuple(task_field) or ((found_task,) if found_task else ())
-        chosen_answer = delivered_field or found_answer
-        if chosen_task != workflow.task_fields or chosen_answer != workflow.delivered_field:
-            workflow = workflow.model_copy(
-                update={"task_fields": chosen_task, "delivered_field": chosen_answer}
+        # A pre-pass reads the export for the request fields, so the corpus is
+        # built once, with them.
+        try:
+            summary = discover_requests(path, source, ruleset_by_name(redaction))
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            _fail(
+                f"could not read {path} as {source}",
+                str(exc),
+                "the file is not a complete export in this format (re-export it, or try "
+                "another --source)",
             )
-            corpus = load(workflow)
+        found = discover(summary, task_fields=tuple(task_field), delivered_field=delivered_field)
+        workflow = workflow.model_copy(
+            update={"task_fields": found.task_fields, "delivered_field": found.delivered_field}
+        )
         if not task_field:
-            _say(
-                f"task:     {found_task} (found; override with --task-field)"
-                if found_task
-                else "task:     not found (no common request field in every run; "
-                "use --task-field PATH)"
+            _say_found("task", "--task-field", found.task_fields, found.task_options)
+        if not delivered_field:
+            _say_found(
+                "answer",
+                "--delivered-field",
+                (found.delivered_field,) if found.delivered_field else (),
+                found.answer_options,
             )
-        if not delivered_field and found_answer:
-            _say(f"answer:   {found_answer} (found; override with --delivered-field)")
+    corpus = load(workflow)
     if control_marker:
         corpus = corpus.replace(control_markers=tuple(control_marker))
 
-    health = check_health(corpus, source)
+    health = check_health(corpus, source, hints=found.hints() or None)
     # Only the OTLP family fills the report; other readers print no accounting.
     reported = source in _WORKFLOW_SOURCES
     _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
@@ -357,6 +366,18 @@ def ingest(
     _say(f"artifact_id: {envelope.artifact_id}")
     if health.warnings:
         _say(f"details:  bandits show {envelope.artifact_id} --issues")
+
+
+def _say_found(what: str, flag: str, chosen: tuple[str, ...], options: list) -> None:
+    label = f"{what}:".ljust(10)
+    if chosen:
+        _say(f"{label}{', '.join(chosen)} (found; override with {flag})")
+    elif not options:
+        _say(f"{label}not found (no common field in the runs; use {flag} PATH)")
+    else:
+        # Never picked between: several fields settle every run, or none does.
+        _say(f"{label}not chosen: {' · '.join(o.describe() for o in options)}")
+        _say(f"          pass {flag} PATH to say which")
 
 
 @app.command(name="list")

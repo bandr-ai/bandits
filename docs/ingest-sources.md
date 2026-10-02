@@ -74,6 +74,24 @@ Summary issues (`unparsed_value`, `unrepresented_span`, `source_container`,
 are issued once per ingest with the source path as location, never once per
 native batch.
 
+In workflow mode, when `--task-field` or `--delivered-field` is not given,
+ingest first reads the export for them (no corpus is built in that pass). A
+field qualifies by its last key (`query`, `question`, `input`, ... for the
+request; `answer`, `output`, `response`, ... for the answer) at most two levels
+below the run's `input`/`output`, or as the whole value when that is text. The
+fields found on each kind of top-level run form one option; options with the
+same fields are one option (one run recorded under two names). An option is
+chosen only when it picks exactly one run in every trace and no other option
+does; otherwise every option is printed with its coverage and the flag that
+selects it:
+
+```
+task:     not chosen: input.payload.query → app(SPAN) 5/5 · input.question → graph(CHAIN) 5/5
+```
+
+The answer field is then read on the chosen runs only, and chosen only when
+one path covers all of them. Declared flags are always used as given.
+
 `envelope.json` records which code wrote the corpus (`bandits_version`, and
 `git_commit`/`git_dirty` when bandits runs from its own checkout), the workflow
 `derivation_version`, and `problem_count` (the warnings printed at ingest)

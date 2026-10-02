@@ -18,12 +18,6 @@ from bandits.traces import NOTICE_ISSUE_KINDS, SpanKind, SpanStatus, TraceCorpus
 _ROLES = ("system", "developer", "user", "assistant", "tool")
 _EXAMPLES = 3
 
-# Field names that commonly hold a workflow's request and its answer. Used only
-# when no --task-field / --delivered-field was given, and only when the field is
-# a non-empty string in every invocation record.
-TASK_KEYS = ("query", "question", "input", "prompt", "message", "task", "request", "text")
-ANSWER_KEYS = ("answer", "output", "response", "result", "text", "content", "message")
-
 
 @dataclass
 class Health:
@@ -70,7 +64,9 @@ PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
 conversation at the trace level, so a call without its own input is normal there."""
 
 
-def check(corpus: TraceCorpus, source: str) -> Health:
+def check(corpus: TraceCorpus, source: str, hints: list[str] | None = None) -> Health:
+    """``hints``: the request fields discovery found, each as the flags that
+    select it, for the warning about traces without a task."""
     health = Health(traces=len(corpus.traces))
     models = [s for t in corpus.traces for s in t.spans if s.kind == SpanKind.MODEL]
     health.model_calls = len(models)
@@ -146,42 +142,12 @@ def check(corpus: TraceCorpus, source: str) -> Health:
     warn(
         "no_task",
         "trace(s) have no task",
-        "no request field was found in the run's input; pass --task-field PATH "
-        "(e.g. input.query) to say where it is",
+        "the request field could not be chosen; pass one of: " + " | ".join(hints)
+        if hints
+        else "no request field was found in the run's input; pass --task-field PATH "
+        "to say where it is",
     )
     for kind, count in other.most_common():
         detail = next((i.detail for i in corpus.issues if i.kind == kind), "")
         health.warnings.append(f"{count} `{kind}` issue(s)\n    e.g. {detail[:200]}")
     return health
-
-
-def _common_string_field(records: list[Any], root: str, keys: tuple[str, ...]) -> str | None:
-    """A path that is a non-empty string in every record, or None."""
-    if not records:
-        return None
-    if all(isinstance(r, str) and r.strip() for r in records):
-        return root
-    if not all(isinstance(r, dict) for r in records):
-        return None
-    for key in keys:
-        if all(isinstance(r.get(key), str) and r[key].strip() for r in records):
-            return f"{root}.{key}"
-    return None
-
-
-def detect_request_fields(corpus: TraceCorpus) -> tuple[str | None, str | None]:
-    """``(task_field, delivered_field)`` found in every invocation record, or None each."""
-    requests = [t.request for t in corpus.traces if t.request and t.request.source_span_id]
-    inputs = [
-        _messages(r.raw_input) if isinstance(r.raw_input, str) else r.raw_input for r in requests
-    ]
-    outputs = [
-        _messages(r.raw_output) if isinstance(r.raw_output, str) else r.raw_output for r in requests
-    ]
-    # A JSON string that is not JSON stays text.
-    inputs = [i if i is not None else r.raw_input for i, r in zip(inputs, requests, strict=True)]
-    outputs = [o if o is not None else r.raw_output for o, r in zip(outputs, requests, strict=True)]
-    return (
-        _common_string_field(inputs, "input", TASK_KEYS),
-        _common_string_field(outputs, "output", ANSWER_KEYS),
-    )

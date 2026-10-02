@@ -367,6 +367,165 @@ def _where(path: Path, position: Position) -> str:
     return f"{path}[{position['index']}]" if "index" in position else str(path)
 
 
+class NativeConversion:
+    """One native file converted to OTLP in chunks, counting every observation.
+
+    :meth:`chunks` yields the path of a temporary OTLP/JSONL file holding the
+    next batch; whoever consumes it (the loader, or request discovery) must
+    finish reading before asking for the next. Langfuse records are batched
+    by about 400 spans so a large export never has to fit in memory.
+    """
+
+    def __init__(self, path: Path, source_name: str, ruleset: RedactionRuleset) -> None:
+        if source_name not in _CONVERTERS:
+            raise ValueError(f"unknown native source {source_name!r}")
+        if path.is_dir():
+            raise ValueError(
+                f"{source_name} reads one export file; {path} is a directory — ingest each file"
+            )
+        self.path, self.source_name, self.ruleset = path, source_name, ruleset
+        self.issues: list[TraceIssue] = []
+        self.source_hash = hashlib.sha256()
+        # Converter-level counts; a caller adds the decoded chunks' own.
+        self.report = IngestReport()
+        self.observations = 0
+
+    def _source_records(self) -> Iterator[tuple[Position, dict[str, Any]]]:
+        path, ruleset = self.path, self.ruleset
+        with path.open("rb") as stream:
+            first = stream.readline()
+            # A complete first-line object signals JSONL. Keep only one trace
+            # in memory even when the export is many gigabytes long.
+            if first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"):
+                for number, line in enumerate(chain((first,), stream), start=1):
+                    self.source_hash.update(line)
+                    if not line.strip():
+                        continue
+                    safe = redact_bytes(line, f"{path}:record{number}", ruleset)
+                    self.issues.extend(safe.issues)
+                    for inner, record in _records(safe.data):
+                        index = {"index": inner["index"]} if "index" in inner else {}
+                        yield {"line": number, **index}, record
+            else:
+                original = first + stream.read()
+                self.source_hash.update(original)
+                safe = redact_bytes(original, str(path), ruleset)
+                self.issues.extend(safe.issues)
+                yield from _records(safe.data)
+
+    def _skip(self, skipped: Skipped, position: Position) -> None:
+        self.observations += len(skipped)
+        for reason, observation_id in skipped:
+            bucket = "duplicate_native" if reason == _DUPLICATE else "unconvertible"
+            self.report.buckets[bucket] += 1
+            if len(self.report.unconvertible_examples) < EXAMPLES:
+                self.report.unconvertible_examples.append(
+                    f"{_where(self.path, position)} observation {observation_id or '?'}: {reason}"
+                )
+
+    def chunks(self) -> Iterator[Path]:
+        source_name = self.source_name
+        with tempfile.TemporaryDirectory(prefix="bandits-native-") as temporary:
+            converted = Path(temporary) / "converted.jsonl"
+            with converted.open("w+", encoding="utf-8") as output:
+                pending = 0
+                for position, outer in self._source_records():
+                    records = (
+                        outer.get("runs")
+                        if source_name == "langsmith"
+                        else outer.get("spans") or outer.get("data")
+                        if source_name == "phoenix"
+                        else None
+                    )
+                    if not isinstance(records, list):
+                        records = [outer]
+                    skipped: Skipped = []
+                    expanded = (
+                        (
+                            run
+                            for record in records
+                            for run in (
+                                _langsmith_runs(record, skipped)
+                                if isinstance(record, dict)
+                                else [record]
+                            )
+                        )
+                        if source_name == "langsmith"
+                        else iter(records)
+                    )
+                    for record in expanded:
+                        try:
+                            if not isinstance(record, dict):
+                                raise ValueError("expected an object")
+                            spans, dropped = _CONVERTERS[source_name](record, position)
+                        except (TypeError, ValueError) as exc:
+                            self.issues.append(
+                                TraceIssue(
+                                    kind="unsupported_native_record",
+                                    detail=str(exc),
+                                    location=_where(self.path, position),
+                                )
+                            )
+                            self.report.unreadable_items["unsupported_native_record"] += 1
+                            continue
+                        self.observations += len(spans)
+                        self._skip(dropped, position)
+                        for span in spans:
+                            output.write(
+                                json.dumps(_request(span, source_name), ensure_ascii=False)
+                            )
+                            output.write("\n")
+                            pending += 1
+                    self._skip(skipped, position)
+                    if source_name == "langfuse" and pending >= 400:
+                        output.flush()
+                        yield converted
+                        output.seek(0)
+                        output.truncate(0)
+                        pending = 0
+                if pending:
+                    output.flush()
+                    yield converted
+
+    def finish(self, decoded: IngestReport) -> IngestReport:
+        """Converter counts plus the decoded chunks' (*decoded*), checked to add up."""
+        total = IngestReport()
+        total.merge(self.report)
+        total.merge(decoded)
+        lost = self.report.buckets["unconvertible"] + self.report.buckets["duplicate_native"]
+        if self.observations != lost + decoded.spans_seen:
+            total.accounting_errors.append(
+                f"{self.path}: {self.observations} observation(s) seen but {lost} skipped and "
+                f"{decoded.spans_seen} converted; this is a bandits bug"
+            )
+        total.spans_seen = self.observations
+        return total
+
+
+def _request(span: dict[str, Any], source_name: str) -> dict[str, Any]:
+    """One converted span as its own OTLP export request."""
+    native_resource = span.pop("_native_resource", {})
+    native_scope = span.pop("_native_scope", {"name": source_name})
+    if not isinstance(native_scope, dict):
+        native_scope = {"name": source_name}
+    if not isinstance(native_resource, dict):
+        native_resource = {}
+    scope = {k: v for k, v in native_scope.items() if k != "attributes"}
+    scope["attributes"] = (
+        _attrs(native_scope.get("attributes") or {})
+        if isinstance(native_scope.get("attributes"), dict)
+        else native_scope.get("attributes") or []
+    )
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": _attrs(native_resource)},
+                "scopeSpans": [{"scope": scope, "spans": [span]}],
+            }
+        ]
+    }
+
+
 def load_native(
     path: Path,
     source_name: str,
@@ -382,175 +541,38 @@ def load_native(
     unconvertible or duplicate, and the converted ones through the OTLP
     reader's own buckets. ``report`` receives the totals.
     """
-    if source_name not in _CONVERTERS:
-        raise ValueError(f"unknown native source {source_name!r}")
-    if path.is_dir():
-        raise ValueError(
-            f"{source_name} reads one export file; {path} is a directory — ingest each file"
-        )
-    issues: list[TraceIssue] = []
-    source_hash = hashlib.sha256()
+    conversion = NativeConversion(path, source_name, ruleset)
     # Always collected: the per-ingest summary issues are built from it once,
     # not once per chunk.
-    internal = IngestReport()
-    observations = 0
-
-    def source_records() -> Iterator[tuple[Position, dict[str, Any]]]:
-        with path.open("rb") as stream:
-            first = stream.readline()
-            # A complete first-line object signals JSONL. Keep only one trace
-            # in memory even when the export is many gigabytes long.
-            if first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"):
-                for number, line in enumerate(chain((first,), stream), start=1):
-                    source_hash.update(line)
-                    if not line.strip():
-                        continue
-                    safe = redact_bytes(line, f"{path}:record{number}", ruleset)
-                    issues.extend(safe.issues)
-                    for inner, record in _records(safe.data):
-                        yield (
-                            {
-                                "line": number,
-                                **({"index": inner["index"]} if "index" in inner else {}),
-                            },
-                            record,
-                        )
-            else:
-                original = first + stream.read()
-                source_hash.update(original)
-                safe = redact_bytes(original, str(path), ruleset)
-                issues.extend(safe.issues)
-                yield from _records(safe.data)
-
-    def skip(skipped: Skipped, position: Position) -> None:
-        for reason, observation_id in skipped:
-            bucket = "duplicate_native" if reason == _DUPLICATE else "unconvertible"
-            internal.buckets[bucket] += 1
-            if len(internal.unconvertible_examples) < EXAMPLES:
-                internal.unconvertible_examples.append(
-                    f"{_where(path, position)} observation {observation_id or '?'}: {reason}"
-                )
-
-    with tempfile.TemporaryDirectory(prefix="bandits-native-") as temporary:
-        converted = Path(temporary) / "converted.jsonl"
-        converted_traces = []
-        converted_issues: list[TraceIssue] = []
-        chunk_trace_ids: set[str] = set()
-        with converted.open("w+", encoding="utf-8") as output:
-            pending = 0
-
-            def flush() -> None:
-                nonlocal pending
-                if not pending:
-                    return
-                output.flush()
-                chunk_report = IngestReport()
-                chunk = load_otlp_standard(
-                    converted,
-                    ruleset,
-                    pipeline_steps=pipeline_steps,
-                    workflow=workflow,
-                    report=chunk_report,
-                    defer_aggregate_issues=True,
-                )
-                internal.merge(chunk_report)
-                ids = {trace.trace_id for trace in chunk.traces}
-                internal.split_trace_ids += len(ids & chunk_trace_ids)
-                chunk_trace_ids.update(ids)
-                converted_traces.extend(chunk.traces)
-                converted_issues.extend(chunk.issues)
-                output.seek(0)
-                output.truncate(0)
-                pending = 0
-
-            for position, outer in source_records():
-                records = (
-                    outer.get("runs")
-                    if source_name == "langsmith"
-                    else outer.get("spans") or outer.get("data")
-                    if source_name == "phoenix"
-                    else None
-                )
-                if not isinstance(records, list):
-                    records = [outer]
-                skipped: Skipped = []
-                expanded = (
-                    (
-                        run
-                        for record in records
-                        for run in (
-                            _langsmith_runs(record, skipped)
-                            if isinstance(record, dict)
-                            else [record]
-                        )
-                    )
-                    if source_name == "langsmith"
-                    else iter(records)
-                )
-                for record in expanded:
-                    try:
-                        if not isinstance(record, dict):
-                            raise ValueError("expected an object")
-                        spans, dropped = _CONVERTERS[source_name](record, position)
-                    except (TypeError, ValueError) as exc:
-                        issues.append(
-                            TraceIssue(
-                                kind="unsupported_native_record",
-                                detail=str(exc),
-                                location=_where(path, position),
-                            )
-                        )
-                        internal.unreadable_items["unsupported_native_record"] += 1
-                        continue
-                    observations += len(spans) + len(dropped)
-                    skip(dropped, position)
-                    for span in spans:
-                        native_resource = span.pop("_native_resource", {})
-                        native_scope = span.pop("_native_scope", {"name": source_name})
-                        if not isinstance(native_scope, dict):
-                            native_scope = {"name": source_name}
-                        if not isinstance(native_resource, dict):
-                            native_resource = {}
-                        scope = {k: v for k, v in native_scope.items() if k != "attributes"}
-                        scope["attributes"] = (
-                            _attrs(native_scope.get("attributes") or {})
-                            if isinstance(native_scope.get("attributes"), dict)
-                            else native_scope.get("attributes") or []
-                        )
-                        request = {
-                            "resourceSpans": [
-                                {
-                                    "resource": {"attributes": _attrs(native_resource)},
-                                    "scopeSpans": [{"scope": scope, "spans": [span]}],
-                                }
-                            ]
-                        }
-                        output.write(json.dumps(request, ensure_ascii=False) + "\n")
-                        pending += 1
-                observations += len(skipped)
-                skip(skipped, position)
-                if source_name == "langfuse" and pending >= 400:
-                    flush()
-            flush()
-
-    converted_spans = internal.spans_seen
-    lost = internal.buckets["unconvertible"] + internal.buckets["duplicate_native"]
-    if observations != lost + converted_spans:
-        internal.accounting_errors.append(
-            f"{path}: {observations} observation(s) seen but {lost} skipped and "
-            f"{converted_spans} converted; this is a bandits bug"
+    decoded = IngestReport()
+    converted_traces = []
+    converted_issues: list[TraceIssue] = []
+    seen_ids: set[str] = set()
+    for chunk_path in conversion.chunks():
+        chunk = load_otlp_standard(
+            chunk_path,
+            ruleset,
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
+            report=decoded,
+            defer_aggregate_issues=True,
         )
-    internal.spans_seen = observations
+        ids = {trace.trace_id for trace in chunk.traces}
+        decoded.split_trace_ids += len(ids & seen_ids)
+        seen_ids |= ids
+        converted_traces.extend(chunk.traces)
+        converted_issues.extend(chunk.issues)
+    internal = conversion.finish(decoded)
     deferred = aggregate_issues(internal, str(path), workflow=workflow is not None)
     if report is not None:
         report.merge(internal)
     return TraceCorpus(
         source=source_name,
         traces=tuple(
-            trace.replace(source=source_name, source_digest=source_hash.hexdigest())
+            trace.replace(source=source_name, source_digest=conversion.source_hash.hexdigest())
             for trace in converted_traces
         ),
-        issues=tuple(issues) + tuple(converted_issues) + tuple(deferred),
+        issues=tuple(conversion.issues) + tuple(converted_issues) + tuple(deferred),
         workflow=workflow,
         redaction_ruleset=ruleset.name,
     )
