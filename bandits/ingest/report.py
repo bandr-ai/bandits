@@ -37,6 +37,7 @@ BUCKETS = (
     "node",
     "step_with_calls",
     "covered",
+    "kept_on_trace",
     # Not in the corpus.
     "root_step",
     "unrepresented",
@@ -53,6 +54,7 @@ KEPT = frozenset(
         "node",
         "step_with_calls",
         "covered",
+        "kept_on_trace",
     }
 )
 """Buckets whose records the corpus represents (or, for a converter container,
@@ -90,6 +92,9 @@ class IngestReport:
     an unsupported shape. Separate from the span sum."""
 
     unconvertible_examples: list[str] = field(default_factory=list)
+    kept_on_trace_examples: list[str] = field(default_factory=list)
+    """Native records kept whole in their trace's ``source_record`` rather than
+    as spans (an unpaired FailproofAI event, say), with the reason."""
     accounting_errors: list[str] = field(default_factory=list)
 
     split_trace_ids: int = 0
@@ -199,6 +204,9 @@ class IngestReport:
         self.unconvertible_examples.extend(
             other.unconvertible_examples[: EXAMPLES - len(self.unconvertible_examples)]
         )
+        self.kept_on_trace_examples.extend(
+            other.kept_on_trace_examples[: EXAMPLES - len(self.kept_on_trace_examples)]
+        )
         self.accounting_errors.extend(other.accounting_errors)
         self.split_trace_ids += other.split_trace_ids
         self.traces_with_absent_parents += other.traces_with_absent_parents
@@ -229,6 +237,7 @@ class IngestReport:
             "dropped": self.dropped,
             "unreadable_items": dict(self.unreadable_items),
             "unconvertible_examples": self.unconvertible_examples,
+            "kept_on_trace_examples": self.kept_on_trace_examples,
             "accounting_errors": self.accounting_errors,
             "split_trace_ids": self.split_trace_ids,
             "traces_with_absent_parents": self.traces_with_absent_parents,
@@ -388,6 +397,16 @@ def aggregate_issues(
                 kind="unconvertible_observation",
                 detail=f"{lost} observation(s) could not become spans and are not in the "
                 "corpus; e.g. " + "; ".join(report.unconvertible_examples),
+                location=location,
+            )
+        )
+    if report.buckets["kept_on_trace"]:
+        issues.append(
+            TraceIssue(
+                kind="record_kept_on_trace",
+                detail=f"{report.buckets['kept_on_trace']} record(s) did not become spans and are "
+                "kept whole in their trace's source_record; e.g. "
+                + "; ".join(report.kept_on_trace_examples),
                 location=location,
             )
         )

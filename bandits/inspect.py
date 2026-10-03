@@ -280,6 +280,8 @@ def _leaves(value: Any, path: str = "") -> Iterator[tuple[str, Any]]:
 
 
 _ABSENT = object()
+_UNCHECKED = object()
+"""A raw value the record a pointer names cannot show (it came from another record)."""
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -373,11 +375,18 @@ def _canonical(value: Any) -> str:
 def _raw_declared(raw: dict[str, Any], key: str, source: str) -> Any:
     """The value a raw record declared under attribute *key*, parsed as the
     decoder reads it; ``_ABSENT`` when it declares none."""
-    from bandits.ingest.native import RAW_IO
+    from bandits.ingest.native import RAW_DECLARED, RAW_IO
     from bandits.ingest.otlp_standard import _UNPARSED, _attributes, _json_value
 
     native = RAW_IO.get(source, {}).get(key)
-    if native is not None and native in raw:
+    if source in RAW_DECLARED:
+        declared = RAW_DECLARED[source](raw, key)
+        if declared is None:
+            return _UNCHECKED
+        if not declared[0]:
+            return _ABSENT
+        found = declared[1]
+    elif native is not None and native in raw:
         found = raw[native]
     else:
         attributes = raw.get("attributes")
@@ -460,6 +469,8 @@ def check_fidelity(
         # Values stored once in the step's own field: checked exactly too.
         for key, target in (step.attributes.get("bandits.stored_as") or {}).items():
             declared = _raw_declared(raw, key, source)
+            if declared is _UNCHECKED:
+                continue
             kept = step_view(step).get(key, _ABSENT)
             stored += 1
             if declared is _ABSENT or _canonical(declared) != _canonical(kept):

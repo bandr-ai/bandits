@@ -87,6 +87,20 @@ def _shape(record: Any) -> tuple[str, str] | None:
         )
     ):
         return "otlp-std", "OTLP resourceSpans/batches"
+    events = record.get("events")
+    if (
+        isinstance(record.get("schema_version"), str)
+        and record.get("session_id")
+        and isinstance(events, list)
+        and events
+        and all(
+            isinstance(e, dict)
+            and isinstance(e.get("event_type"), str)
+            and isinstance(e.get("payload"), dict)
+            for e in events[:10]
+        )
+    ):
+        return "failproofai", "FailproofAI session transcript with typed events"
     if isinstance(record.get("observations"), list) and (
         record.get("trace_id")
         or record.get("id")

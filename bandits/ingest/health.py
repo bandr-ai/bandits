@@ -59,7 +59,7 @@ def _has_content(value: Any) -> bool:
     )
 
 
-PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
+PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix", "failproofai")
 """Readers that record each model call's own input and output. The others keep a
 conversation at the trace level, so a call without its own input is normal there."""
 
