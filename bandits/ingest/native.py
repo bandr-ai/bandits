@@ -1098,7 +1098,8 @@ class NativeConversion:
             raise ValueError(f"unknown native source {source_name!r}")
         if path.is_dir():
             raise ValueError(
-                f"{source_name} reads one export file; {path} is a directory — ingest each file"
+                f"{source_name} reads one export file; {path} is a directory — join it with "
+                "bandits.ingest.bundle.bundle_json_documents (bandits ingest does)"
             )
         self.path, self.source_name, self.ruleset = path, source_name, ruleset
         self.scratch_dir = scratch_dir
