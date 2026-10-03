@@ -12,6 +12,7 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.redact import SECRETS_ONLY_RULESET, redact_source, ruleset_by_name
 from bandits.store import ArtifactStore
+from tests.cli_test import plain
 
 runner = CliRunner()
 
@@ -122,7 +123,7 @@ def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> 
     )
 
     assert result.exit_code == 0
-    assert "redaction: secrets-only-v2" in result.stdout
+    assert "redaction: secrets-only-v2" in plain(result.stdout)
     store = ArtifactStore(project / ".bandits")
     assert store.read(store.list()[0].artifact_id).redaction_ruleset == "secrets-only-v2"
 

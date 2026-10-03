@@ -13,6 +13,7 @@ from bandits.ingest.native import _ns
 from bandits.ingest.otlp_standard import _attributes
 from bandits.store import ArtifactStore, resolve_record
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
+from tests.cli_test import plain
 
 
 def _file(tmp_path: Path, name: str, payload: object) -> Path:
@@ -110,7 +111,7 @@ def test_native_langfuse_keeps_request_and_observation(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "read:     1 traces" in result.output
+    assert "read:     1 traces" in plain(result.output)
 
 
 def test_upstream_langfuse_trace_wrapper_preserves_all_observations() -> None:

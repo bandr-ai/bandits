@@ -10,6 +10,7 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.traces import SpanKind, SpanStatus
+from tests.cli_test import plain
 
 TRACE = "5b8efff798038103d269b633813fc60c"
 T0 = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z in unix nanoseconds
@@ -571,7 +572,7 @@ def test_dispatch_and_cli(tmp_path) -> None:
         app, ["ingest", str(path), "--source", "otlp-std", "--project", str(tmp_path)]
     )
     assert result.exit_code == 0, result.stdout
-    assert "read:     1 traces" in result.stdout
+    assert "read:     1 traces" in plain(result.stdout)
 
 
 def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:

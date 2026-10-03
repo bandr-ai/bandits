@@ -16,6 +16,7 @@ from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.workflow import delivery_status, resolve_task
 from bandits.traces import SpanStatus, WorkflowDeclaration
 from bandits.verify.turns import WorkflowTurnsError, extract_turns
+from tests.cli_test import plain
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
 QUESTION = "If my order arrives after the promised date, is the delivery fee refunded?"
@@ -473,7 +474,7 @@ def test_cli_rejects_workflow_options_without_workflow_mode(tmp_path) -> None:
         ],
     )
     assert result.exit_code == 1
-    assert "only apply to workflows" in result.output
+    assert "only apply to workflows" in plain(result.output)
 
 
 def test_workflow_mode_is_otlp_std_only(tmp_path) -> None:
