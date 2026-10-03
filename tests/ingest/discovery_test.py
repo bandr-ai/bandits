@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -11,6 +12,7 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.discovery import discover, discover_requests
 from bandits.traces import WorkflowDeclaration
+from tests.cli_test import plain
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
 QUESTION = "Can I change the delivery address after checkout?"
@@ -158,3 +160,33 @@ def test_cli_builds_the_corpus_once_and_prints_the_options(tmp_path, monkeypatch
     assert "task:     not chosen: input.payload.query → handle(SPAN) 2/2" in out
     assert "--task-field input.payload.query (selects handle(SPAN); 2/2)" in out
     assert "--task-field input.question (selects graph(CHAIN); 2/2)" in out
+
+
+def test_temporary_files_go_in_the_project_not_the_working_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures/upstream/langfuse/agno-2025-06-11.trace.json"
+    )
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o555)
+    monkeypatch.chdir(readonly)
+    try:
+        for args in (
+            ["ingest", str(fixture), "--source", "langfuse"],
+            ["mapping", "propose", str(fixture), "--source", "langfuse", "--name", "m"],
+        ):
+            result = CliRunner().invoke(app, [*args, "--project", str(tmp_path / "project")])
+            assert result.exit_code == 0, (result.output, result.exception)
+        assert list(readonly.iterdir()) == []
+        assert [p.name for p in (tmp_path / "project").iterdir()] == [".bandits"]
+
+        result = CliRunner().invoke(
+            app, ["ingest", str(fixture), "--source", "langfuse", "--project", str(readonly)]
+        )
+        assert result.exit_code == 1, result.output
+        assert "cannot write to" in plain(result.output)
+    finally:
+        readonly.chmod(0o755)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import tempfile
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -150,6 +151,17 @@ def _fail(what: str, why: str, fix: str) -> None:
     _say(f"  why: {why}")
     _say(f"  fix: {fix}")
     raise typer.Exit(code=1)
+
+
+def _scratch(project: Path) -> Path:
+    """The project directory, where a read's temporary files go (beside the
+    store, as the staged write's), not the working directory."""
+    try:
+        project.mkdir(parents=True, exist_ok=True)
+        tempfile.TemporaryDirectory(prefix=".bandits-check-", dir=project).cleanup()
+    except OSError as exc:
+        _fail(f"cannot write to {project}", str(exc), "pass a writable --project")
+    return project
 
 
 @app.command(name="check-source", hidden=True)
@@ -341,8 +353,10 @@ def ingest(
         # A pre-pass reads the export for the request fields, so the corpus is
         # built once, with them.
         try:
-            summary = discover_requests(path, source, ruleset_by_name(redaction))
-        except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            summary = discover_requests(
+                path, source, ruleset_by_name(redaction), scratch_dir=_scratch(project)
+            )
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
             _fail(
                 f"could not read {path} as {source}",
                 str(exc),
@@ -362,7 +376,7 @@ def ingest(
                 (found.delivered_field,) if found.delivered_field else (),
                 found.answer_options,
             )
-    store = ArtifactStore(project / ".bandits")
+    store = ArtifactStore(_scratch(project) / ".bandits")
     with StreamingWrite(store, source) if source in _WORKFLOW_SOURCES else nullcontext() as staged:
         if source in _WORKFLOW_SOURCES:
             health = Health()
@@ -384,7 +398,7 @@ def ingest(
                         collect(health, item, source, workflow=workflow is not None)
                         staged.add(item)
                 health = finish(health, corpus, hints=found.hints() or None)
-            except (ValueError, FileNotFoundError) as exc:
+            except (ValueError, OSError) as exc:
                 _fail(
                     f"could not read {path} as {source}", str(exc), "check the export and options"
                 )
@@ -498,8 +512,10 @@ def mapping_propose(
             "pass --force to replace it (it will need confirming again)",
         )
     try:
-        summary = discover_requests(path, source, ruleset_by_name(redaction))
-    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+        summary = discover_requests(
+            path, source, ruleset_by_name(redaction), scratch_dir=_scratch(project)
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
         _fail(f"could not read {path} as {source}", str(exc), "check --source")
     keys = {(i.kind_label, i.name) for i in identities}
     found = discover(restricted(summary, keys) if keys else summary)

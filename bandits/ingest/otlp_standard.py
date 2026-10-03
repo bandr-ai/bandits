@@ -2212,10 +2212,16 @@ def iter_otlp_standard(
 
 @contextmanager
 def disk_read(
-    path: Path, ruleset: RedactionRuleset, issues: list[TraceIssue], report: IngestReport
+    path: Path,
+    ruleset: RedactionRuleset,
+    issues: list[TraceIssue],
+    report: IngestReport,
+    scratch_dir: Path | None = None,
 ) -> Iterator[_Read]:
     """A disk-grouped decoding pass for request discovery without a corpus."""
-    with tempfile.TemporaryDirectory(prefix=".bandits-discover-", dir=Path.cwd()) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix=".bandits-discover-", dir=scratch_dir or Path.cwd()
+    ) as directory:
         spool = TraceSpool(Path(directory))
         try:
             yield _disk_read(path, ruleset, issues, report, spool)

@@ -126,10 +126,12 @@ def _hashed(value: object, depth: int = 0) -> object:
     return None
 
 
-def _summarize(path: Path, ruleset: RedactionRuleset, summary: RequestSummary) -> None:
+def _summarize(
+    path: Path, ruleset: RedactionRuleset, summary: RequestSummary, scratch_dir: Path | None
+) -> None:
     issues: list[TraceIssue] = []  # the loader reports these; discovery only reads
     scratch: Counter[str] = Counter()
-    with disk_read(path, ruleset, issues, IngestReport()) as read:
+    with disk_read(path, ruleset, issues, IngestReport(), scratch_dir) as read:
         for trace_id, decoded in read.by_trace.items():
             decoded, _ = _prepare(trace_id, decoded, issues)
             if not decoded:
@@ -146,18 +148,25 @@ def _summarize(path: Path, ruleset: RedactionRuleset, summary: RequestSummary) -
 
 
 def discover_requests(
-    path: Path, source: str, ruleset: RedactionRuleset = DEFAULT_RULESET
+    path: Path,
+    source: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    scratch_dir: Path | None = None,
 ) -> RequestSummary:
-    """Every trace's invocation candidates, summarized; no corpus is built."""
+    """Every trace's invocation candidates, summarized; no corpus is built.
+
+    Temporary files go in *scratch_dir* (default: the working directory).
+    """
     from bandits.ingest.native import _CONVERTERS, NativeConversion
 
     summary = RequestSummary()
     if source in _CONVERTERS:
-        conversion = NativeConversion(path, source, ruleset)
+        conversion = NativeConversion(path, source, ruleset, scratch_dir=scratch_dir)
         for chunk in conversion.chunks():
-            _summarize(chunk, ruleset, summary)
+            _summarize(chunk, ruleset, summary, scratch_dir)
     elif source == "otlp-std":
-        _summarize(path, ruleset, summary)
+        _summarize(path, ruleset, summary, scratch_dir)
     else:
         raise ValueError(f"request discovery reads OTLP and native exports, not {source!r}")
     return summary

@@ -397,7 +397,14 @@ class NativeConversion:
     by about 400 spans so a large export never has to fit in memory.
     """
 
-    def __init__(self, path: Path, source_name: str, ruleset: RedactionRuleset) -> None:
+    def __init__(
+        self,
+        path: Path,
+        source_name: str,
+        ruleset: RedactionRuleset,
+        *,
+        scratch_dir: Path | None = None,
+    ) -> None:
         if source_name not in _CONVERTERS:
             raise ValueError(f"unknown native source {source_name!r}")
         if path.is_dir():
@@ -405,6 +412,7 @@ class NativeConversion:
                 f"{source_name} reads one export file; {path} is a directory — ingest each file"
             )
         self.path, self.source_name, self.ruleset = path, source_name, ruleset
+        self.scratch_dir = scratch_dir
         self.issues: list[TraceIssue] = []
         self.source_hash = hashlib.sha256()
         # Converter-level counts; a caller adds the decoded chunks' own.
@@ -476,7 +484,9 @@ class NativeConversion:
 
     def chunks(self) -> Iterator[Path]:
         source_name = self.source_name
-        with tempfile.TemporaryDirectory(prefix="bandits-native-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix=".bandits-native-", dir=self.scratch_dir or Path.cwd()
+        ) as temporary:
             converted = Path(temporary) / "converted.jsonl"
             with converted.open("w+", encoding="utf-8") as output:
                 pending = 0
@@ -613,7 +623,7 @@ def iter_native(
     unconvertible or duplicate, and the converted ones through the OTLP
     reader's own buckets. ``report`` receives the totals.
     """
-    conversion = NativeConversion(path, source_name, ruleset)
+    conversion = NativeConversion(path, source_name, ruleset, scratch_dir=scratch_dir)
     # Always collected: the per-ingest summary issues are built from it once,
     # not once per chunk.
     decoded = IngestReport()
