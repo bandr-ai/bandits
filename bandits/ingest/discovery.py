@@ -4,16 +4,15 @@ A pre-pass over the export: the same read, redaction, decoding and
 classification as the loader, and the same invocation candidates, but no
 spans, nodes or corpus. Each candidate keeps only the string leaves of its
 input and output (two levels deep), hashed, which is enough to run
-:func:`~bandits.ingest.workflow.resolve_task` exactly as the loader will.
+:func:`~bandits.ingest.workflow.select_invocation` exactly as the loader will.
 
-A field is proposed only when it settles every trace the way the loader will
-check it: exactly one candidate per trace resolves it. Options are grouped by
-the candidate's identity (declared kind and name). When two different
-identities each settle every trace with different fields, nothing is chosen:
-which one is the application run is a fact about the application, not about
-the record, and the user is shown both with the flag that picks each.
-Identities whose fields are the same (one run recorded under two names) are
-one option: passing those fields loads the same corpus either way.
+A field set is chosen by itself when it settles every trace. Otherwise every
+field found is declared together, and each trace is settled the loader's way:
+candidates holding the same text agree (the task is certain), candidates
+holding different text are a conflict, kept with every value and left for a
+consumer to resolve. Nothing is guessed and nothing waits on a person.
+Options are still grouped by the candidate's identity (declared kind and
+name) and shown, with the flag that selects each, for anyone who wants one.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from bandits.ingest.otlp_standard import (
     shape_id,
 )
 from bandits.ingest.report import IngestReport
-from bandits.ingest.workflow import resolve_task
+from bandits.ingest.workflow import select_invocation
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
 from bandits.traces import TraceIssue
 
@@ -113,7 +112,9 @@ def identity_label(identity: tuple[str, str]) -> str:
 
 
 def _digest(text: str) -> str:
-    return "" if not text.strip() else hashlib.sha256(text.encode()).hexdigest()[:16]
+    # Surrounding whitespace aside, as the loader compares task text.
+    text = text.strip()
+    return "" if not text else hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _hashed(value: object, depth: int = 0) -> object:
@@ -212,9 +213,17 @@ def pick_path(record: dict[str, Any], root: str, keys: tuple[str, ...]) -> str |
     return min(found)[2] if found else None
 
 
-def _selected(trace: TraceRequests, paths: tuple[str, ...]) -> list[Candidate]:
-    """Candidates where *paths* resolve, as ``build_request`` will check it."""
-    return [c for c in trace.candidates if resolve_task(c.record, paths)[1] != "unresolved"]
+def _select(trace: TraceRequests, paths: tuple[str, ...]) -> tuple[Candidate | None, bool]:
+    """The candidate the loader will choose with *paths* declared, by the same
+    rule (:func:`select_invocation`), on hashed text; and whether its task
+    resolves (a sole candidate is chosen even when it holds no task)."""
+    by_id = {c.span_id: c for c in trace.candidates}
+    chosen, _, found = select_invocation(
+        list(by_id), {span_id: c.record for span_id, c in by_id.items()}, paths
+    )
+    if chosen is None:
+        return None, False
+    return by_id[chosen], any(c.span_id == chosen for c in found)
 
 
 def _ordered(paths: set[str], keys: tuple[str, ...]) -> tuple[str, ...]:
@@ -241,7 +250,7 @@ def task_options(summary: RequestSummary) -> list[Option]:
     with_candidates = [t for t in summary.traces if t.candidates]
     options = []
     for paths, identities in by_paths.items():
-        covered = sum(len(_selected(t, paths)) == 1 for t in with_candidates)
+        covered = sum(_select(t, paths)[1] for t in with_candidates)
         options.append(Option(paths, tuple(sorted(identities)), covered, len(with_candidates)))
     return sorted(options, key=lambda o: (-o.covered, o.paths))
 
@@ -249,23 +258,46 @@ def task_options(summary: RequestSummary) -> list[Option]:
 def chosen_runs(summary: RequestSummary, task_fields: tuple[str, ...]) -> list[Candidate | None]:
     """The candidate the loader will choose in each trace: the sole candidate,
     or the only one where the task fields resolve; None when it chooses none."""
-    runs = []
+    return [_select(trace, task_fields)[0] for trace in summary.traces]
+
+
+def answer_runs(summary: RequestSummary, task_fields: tuple[str, ...]) -> list[list[Candidate]]:
+    """Per trace, the runs the loader may read the answer from: the chosen run,
+    or every run that agrees on the task (the loader takes the one whose output
+    holds the delivered field); empty when it chooses none."""
+    groups = []
     for trace in summary.traces:
-        if len(trace.candidates) == 1:
-            runs.append(trace.candidates[0])
-            continue
-        resolving = _selected(trace, task_fields) if task_fields else []
-        runs.append(resolving[0] if len(resolving) == 1 else None)
-    return runs
+        by_id = {c.span_id: c for c in trace.candidates}
+        chosen, basis, found = select_invocation(
+            list(by_id), {span_id: c.record for span_id, c in by_id.items()}, task_fields
+        )
+        if chosen is None:
+            groups.append([])
+        elif basis.startswith("agreement"):
+            groups.append([by_id[s] for s in dict.fromkeys(c.span_id for c in found)])
+        else:
+            groups.append([by_id[chosen]])
+    return groups
 
 
-def answer_options(runs: list[Candidate | None]) -> list[Option]:
-    """The answer path each chosen run would be read from, with coverage."""
-    chosen = [run for run in runs if run is not None]
-    picked = Counter(
-        path for run in chosen if (path := pick_path(run.record, "output", ANSWER_KEYS)) is not None
-    )
-    return [Option((path,), (), count, len(chosen)) for path, count in picked.most_common()]
+def answer_options(runs: list[Candidate | None] | list[list[Candidate]]) -> list[Option]:
+    """Each answer path the chosen runs hold, with how many traces hold it.
+
+    A run per trace, or a group of agreeing runs per trace: a trace holds a
+    path when any run in its group does.
+    """
+    groups = [run if isinstance(run, list) else ([] if run is None else [run]) for run in runs]
+    groups = [group for group in groups if group]
+    picked: Counter[str] = Counter()
+    for group in groups:
+        picked.update(
+            {
+                path
+                for run in group
+                if (path := pick_path(run.record, "output", ANSWER_KEYS)) is not None
+            }
+        )
+    return [Option((path,), (), count, len(groups)) for path, count in picked.most_common()]
 
 
 def discover(
@@ -274,16 +306,26 @@ def discover(
     task_fields: tuple[str, ...] = (),
     delivered_field: str | None = None,
 ) -> Discovery:
-    """Choose what is unambiguous; declared fields are kept as given."""
+    """Choose what is unambiguous; declared fields are kept as given.
+
+    One option that settles every trace is chosen. Otherwise every option's
+    fields are declared together: where they hold the same text the task is
+    certain, and where they differ the loader keeps every value unresolved,
+    so nothing is guessed and nothing waits on a person.
+    """
     found = Discovery(task_fields=task_fields, delivered_field=delivered_field)
     if not task_fields:
         found.task_options = task_options(summary)
         complete = [option for option in found.task_options if option.complete]
         if len(complete) == 1:
             found.task_fields = complete[0].paths
+        elif found.task_options:
+            found.task_fields = tuple(
+                dict.fromkeys(path for option in found.task_options for path in option.paths)
+            )
     if delivered_field is None:
-        found.answer_options = answer_options(chosen_runs(summary, found.task_fields))
+        found.answer_options = answer_options(answer_runs(summary, found.task_fields))
         complete = [option for option in found.answer_options if option.complete]
-        if len(found.answer_options) == 1 and complete:
+        if len(complete) == 1:
             found.delivered_field = complete[0].paths[0]
     return found

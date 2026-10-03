@@ -33,6 +33,7 @@ from bandits.traces import (
     EvidenceLink,
     Span,
     SpanKind,
+    TaskCandidate,
     WorkflowDeclaration,
     WorkflowNode,
     WorkflowRequest,
@@ -63,17 +64,11 @@ def resolve(record: dict[str, Any], path: str) -> Any:
     return node
 
 
-def resolve_task(
+def task_values(
     record: dict[str, Any], fields: Sequence[str]
-) -> tuple[str | None, str, str | None, str | None]:
-    """``(task, status, path, reason)`` from the declared fields, first present wins.
-
-    Declared only when a field resolves to a non-empty string and no other
-    declared field resolves to a different one. A conflict leaves the task
-    unset rather than silently picking the first.
-    """
-    if not fields:
-        return None, "unresolved", None, "no --task-field was declared"
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """``([(path, text)], [why a field was skipped])``: every declared field
+    that holds non-empty text on *record*, in declaration order."""
     found: list[tuple[str, str]] = []
     wrong_type: list[str] = []
     for path in fields:
@@ -85,16 +80,90 @@ def resolve_task(
             continue
         if value.strip():
             found.append((path, value))
+    return found, wrong_type
+
+
+def resolve_task(
+    record: dict[str, Any], fields: Sequence[str]
+) -> tuple[str | None, str, str | None, str | None]:
+    """``(task, status, path, reason)`` from the declared fields, first present wins.
+
+    Declared only when a field resolves to non-empty text and every other
+    declared field that resolves holds the same text (surrounding whitespace
+    aside). A conflict leaves the task unset rather than silently picking the first.
+    """
+    if not fields:
+        return None, "unresolved", None, "no --task-field was declared"
+    found, wrong_type = task_values(record, fields)
     if not found:
         reason = "; ".join(wrong_type) or (
             f"none of {', '.join(fields)} is present and non-empty in the invocation record"
         )
         return None, "unresolved", None, reason
-    if len({value for _, value in found}) > 1:
+    if len({value.strip() for _, value in found}) > 1:
         detail = "; ".join(f"{path}={value[:80]!r}" for path, value in found)
         return None, "conflict", None, f"declared fields disagree: {detail}"
     path, value = found[0]
     return value, "declared", path, None
+
+
+def select_invocation(
+    candidates: Sequence[str],
+    records: dict[str, dict[str, Any]],
+    task_fields: Sequence[str],
+    delivered_field: str | None = None,
+) -> tuple[str | None, str, list[TaskCandidate]]:
+    """``(chosen span, basis, task candidates)`` among outermost candidates.
+
+    One candidate is the invocation. Several are narrowed to those where a
+    declared task field resolves: exactly one is chosen. When several resolve
+    and all hold the same text (surrounding whitespace aside) they agree: the
+    task is certain, and the invocation is the one whose output holds the
+    delivered field, else the first. When their texts differ, nothing is
+    chosen; every value is returned for a consumer to choose from. Shared by
+    the loader and request discovery, so both decide alike.
+    """
+    found = [
+        (span_id, path, value)
+        for span_id in candidates
+        for path, value in task_values(records[span_id], task_fields)[0]
+    ]
+    task_candidates = [TaskCandidate(span_id=s, path=p, value=v) for s, p, v in found]
+    if len(candidates) == 1:
+        return candidates[0], "sole outermost non-container span", task_candidates
+    if not candidates:
+        return None, "no outermost span that is not a container, model call or tool call", []
+    resolving = list(dict.fromkeys(span_id for span_id, _, _ in found))
+    if len(resolving) == 1:
+        return resolving[0], "only candidate where a declared task field resolves", task_candidates
+    if not resolving:
+        return (
+            None,
+            f"ambiguous: {len(candidates)} outermost candidates and none resolves a declared task field",
+            [],
+        )
+    if len({value.strip() for _, _, value in found}) > 1:
+        return (
+            None,
+            f"conflict: {len(resolving)} of {len(candidates)} outermost candidates hold "
+            "different task text; none chosen, every value kept",
+            task_candidates,
+        )
+    delivering = [
+        span_id
+        for span_id in resolving
+        if delivered_field and resolve(records[span_id], delivered_field) not in (_MISSING, None)
+    ]
+    if len(delivering) == 1:
+        chosen, why = delivering[0], "the one whose output holds the delivered field"
+    else:
+        chosen, why = resolving[0], "the first"
+    return (
+        chosen,
+        f"agreement: {len(resolving)} outermost candidates hold the same task text; "
+        f"invocation is {why}",
+        task_candidates,
+    )
 
 
 def build_request(
@@ -106,48 +175,41 @@ def build_request(
 ) -> WorkflowRequest:
     """Choose the invocation among outermost candidates and read its request.
 
-    One candidate is the invocation. Several are narrowed to those where a
-    declared task field resolves; if that leaves exactly one, it is chosen and
-    the basis says so. Otherwise nothing is chosen — an ambiguous invocation is
-    recorded, not guessed.
-
-    ``allowed`` is the candidates a confirmed mapping names as invocations:
-    exactly one is chosen on that basis; none or several choose nothing.
+    See :func:`select_invocation`. ``allowed`` is the candidates a confirmed
+    mapping names as invocations: exactly one is chosen on that basis; none or
+    several choose nothing.
     """
     candidates = tuple(candidates)
-    chosen: str | None = None
     if allowed is not None:
         name = declaration.mapping_name
+        found = [
+            TaskCandidate(span_id=c, path=p, value=v)
+            for c in candidates
+            for p, v in task_values(records[c], declaration.task_fields)[0]
+        ]
         if len(allowed) == 1:
             chosen, basis = allowed[0], f"mapping {name}: invocation identity"
         else:
-            basis = (
-                f"ambiguous: mapping {name} matches {len(allowed)} of {len(candidates)} "
-                f"outermost candidates ({', '.join(allowed) or 'none'})"
+            chosen, basis = (
+                None,
+                (
+                    f"ambiguous: mapping {name} matches {len(allowed)} of {len(candidates)} "
+                    f"outermost candidates ({', '.join(allowed) or 'none'})"
+                ),
             )
-    elif len(candidates) == 1:
-        chosen, basis = candidates[0], "sole outermost non-container span"
-    elif not candidates:
-        basis = "no outermost span that is not a container, model call or tool call"
     else:
-        resolving = [
-            span_id
-            for span_id in candidates
-            if resolve_task(records[span_id], declaration.task_fields)[1] != "unresolved"
-        ]
-        if len(resolving) == 1:
-            chosen, basis = resolving[0], "only candidate where a declared task field resolves"
-        else:
-            basis = (
-                f"ambiguous: {len(candidates)} outermost candidates and "
-                f"{len(resolving)} resolve a declared task field"
-            )
+        chosen, basis, found = select_invocation(
+            candidates, records, declaration.task_fields, declaration.delivered_field
+        )
     if chosen is None:
+        conflict = basis.startswith("conflict")
         return WorkflowRequest(
             source_span_id=None,
             invocation_basis=basis,
             candidate_span_ids=candidates,
-            task_reason="no invocation was selected",
+            task_status="conflict" if conflict else "unresolved",
+            task_reason=basis if conflict else "no invocation was selected",
+            task_candidates=tuple(found),
             origin=declaration.request_origin,
         )
     record = records[chosen]
@@ -166,6 +228,7 @@ def build_request(
         task_status=status,  # type: ignore[arg-type]
         task_path=path,
         task_reason=reason,
+        task_candidates=tuple(found),
         origin=declaration.request_origin,
         delivered=None if delivered is _MISSING else delivered,
     )

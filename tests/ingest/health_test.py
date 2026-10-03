@@ -40,7 +40,10 @@ def test_request_field_must_be_text_in_every_run() -> None:
         [("run", {"query": "b", "email": "y"}, None)],
     ]
     assert discover(_summary(*runs)).task_fields == ("input.query",)
-    assert discover(_summary(*runs, [("run", {"email": "z"}, None)])).task_fields == ()
+    # A field most runs hold is declared; the run without it stays unresolved.
+    assert discover(_summary(*runs, [("run", {"email": "z"}, None)])).task_fields == (
+        "input.query",
+    )
     assert pick_path({"input": _hashed({"query": ""})}, "input", ("query",)) is None
     assert pick_path({"input": _hashed({"query": 3})}, "input", ("query",)) is None
 
@@ -66,10 +69,11 @@ def test_nested_fields_qualify_by_their_last_key_two_levels_deep() -> None:
     assert pick_path(record, "input", TASK_KEYS) == "input.payload.query"
 
 
-def test_two_identities_that_each_settle_every_run_are_never_chosen_between() -> None:
+def test_two_identities_holding_the_same_text_agree() -> None:
     trace = [("app", {"payload": {"query": "q"}}, None), ("graph", {"question": "q"}, None)]
     found = discover(_summary(trace, trace))
-    assert found.task_fields == ()
+    assert found.task_fields == ("input.payload.query", "input.question")
+    assert all(run is not None for run in chosen_runs(_summary(trace, trace), found.task_fields))
     assert [(o.paths, o.identities[0][1], o.covered, o.total) for o in found.task_options] == [
         (("input.payload.query",), "app", 2, 2),
         (("input.question",), "graph", 2, 2),
@@ -154,10 +158,13 @@ def test_one_run_recorded_under_two_names_is_one_option() -> None:
     assert found.delivered_field == "output.answer"
 
 
-def test_a_merged_option_resolving_two_runs_in_one_trace_stays_ambiguous() -> None:
+def test_runs_holding_different_text_are_a_conflict_in_that_trace_only() -> None:
     clean = [("answer", {"query": "q"}, None)]
     both = [("answer", {"query": "q"}, None), ("answer_stream", {"query": "q2"}, None)]
-    found = discover(_summary(clean, both))
+    summary = _summary(clean, both)
+    found = discover(summary)
     (option,) = found.task_options
     assert (option.covered, option.total) == (1, 2)
-    assert found.task_fields == ()
+    assert found.task_fields == ("input.query",)
+    clean_run, conflict = chosen_runs(summary, found.task_fields)
+    assert clean_run is not None and conflict is None

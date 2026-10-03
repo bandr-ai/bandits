@@ -77,7 +77,8 @@ def collect(health: Health, trace: Trace, source: str, *, workflow: bool) -> Non
     health.traces += 1
     health.model_calls += sum(s.kind == SpanKind.MODEL for s in trace.spans)
     if workflow and trace.task is None:
-        health.note("no_task", f"trace {trace.trace_id}")
+        conflict = trace.request is not None and trace.request.task_status == "conflict"
+        health.note("task_conflict" if conflict else "no_task", f"trace {trace.trace_id}")
     for span in trace.spans:
         if span.kind != SpanKind.MODEL or source not in PER_CALL_SOURCES:
             continue
@@ -147,6 +148,12 @@ def finish(health: Health, corpus: TraceCorpus, hints: list[str] | None = None) 
         "bad_messages",
         "model call(s) have malformed message lists",
         "a message has no valid role or no parts list",
+    )
+    warn(
+        "task_conflict",
+        "trace(s) hold different question texts in their candidate runs",
+        "none was chosen; every value is kept on the trace (request.task_candidates) "
+        "for whatever uses the corpus to choose",
     )
     warn(
         "no_task",

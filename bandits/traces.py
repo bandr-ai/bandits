@@ -172,6 +172,14 @@ class WorkflowDeclaration(Contract):
     short-label matching, archive pointers in place of copied native records."""
 
 
+class TaskCandidate(Contract):
+    """One place the task was recorded: a declared field on a candidate span."""
+
+    span_id: str
+    path: str
+    value: str
+
+
 class WorkflowRequest(Contract):
     """The application invocation of a workflow episode: what came in, what went out.
 
@@ -197,6 +205,11 @@ class WorkflowRequest(Contract):
     task_path: str | None = None
     task_reason: str | None = None
     """Why the task is unresolved or in conflict; None when declared."""
+
+    task_candidates: tuple[TaskCandidate, ...] = ()
+    """Every non-empty value a declared task field holds on the invocation
+    candidates. Declared tasks list where the agreeing text came from; a
+    conflict keeps every differing value, for a consumer to choose from."""
 
     origin: Literal["human", "machine", "unknown"] = "unknown"
 

@@ -92,7 +92,9 @@ def test_propose_a_single_shape_export(tmp_path) -> None:
     assert "confirmed, unmodified" in _out(shown)
 
 
-def test_ambiguous_export_needs_an_invocation_then_resolves_every_task(tmp_path) -> None:
+def test_agreeing_candidates_need_no_invocation_and_an_explicit_one_still_works(
+    tmp_path,
+) -> None:
     path = _file(tmp_path, _new("1" * 32), _new("2" * 32))
     project = str(tmp_path)
     result = _cli(
@@ -100,14 +102,16 @@ def test_ambiguous_export_needs_an_invocation_then_resolves_every_task(tmp_path)
     )
     out = _out(result)
     assert result.exit_code == 0, out
-    assert f'--invocation "{SPAN}|handle"' in out and f'--invocation "{CHAIN}|graph"' in out
-    assert load_mapping(tmp_path, "m").task_fields == ()
-
-    refused = _cli("mapping", "confirm", "m", "--project", project)
-    assert refused.exit_code == 1
-    text = " ".join(_out(refused).split())
-    assert "discovery was ambiguous; rerun propose with --invocation" in text
-    assert f'"{SPAN}|handle"' in text and f'"{CHAIN}|graph"' in text
+    # Both runs hold the same question: the fields are declared together.
+    assert load_mapping(tmp_path, "m").task_fields == ("input.payload.query", "input.question")
+    assert _cli("mapping", "confirm", "m", "--project", project).exit_code == 0
+    ingested = _cli(
+        "ingest", str(path), "--source", "otlp-std", "--mapping", "m", "--project", project
+    )
+    assert ingested.exit_code == 0, _out(ingested)
+    artifact = re.search(r"artifact_id: (\S+)", _out(ingested)).group(1)
+    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact)
+    assert [t.request.task_status for t in corpus.traces] == ["declared", "declared"]
 
     again = _cli(
         "mapping",

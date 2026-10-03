@@ -105,16 +105,49 @@ def test_mixed_shapes_resolve_every_task_and_answer(tmp_path) -> None:
     assert {t.request.delivered for t in corpus.traces} == {"Yes, until it ships."}
 
 
-def test_two_identities_with_different_fields_leave_the_task_unresolved(tmp_path) -> None:
+def test_two_identities_holding_the_same_question_agree(tmp_path) -> None:
     path = _write(tmp_path / "new.jsonl", *(_request(_new(c * 32)) for c in "56"))
     found = discover(discover_requests(path, "otlp-std"))
-    assert found.task_fields == () and found.delivered_field is None
+    assert found.task_fields == ("input.payload.query", "input.question")
+    assert found.delivered_field == "output.answer"
     assert [o.describe() for o in found.task_options] == [
         "input.payload.query → handle(SPAN) 2/2",
         "input.question → graph(CHAIN) 2/2",
     ]
     corpus = _load(path, found)
-    assert {t.request.task_status for t in corpus.traces} == {"unresolved"}
+    for trace in corpus.traces:
+        request = trace.request
+        assert (request.task_status, request.task) == ("declared", QUESTION)
+        assert request.invocation_basis.startswith("agreement: 2 outermost candidates")
+        assert {c.path for c in request.task_candidates} == {
+            "input.payload.query",
+            "input.question",
+        }
+        assert request.delivered == "Yes, until it ships."
+
+
+def test_different_questions_are_kept_unresolved_with_every_value(tmp_path) -> None:
+    other = "What is the return window?"
+    traces = []
+    for c in "78":
+        spans = _new(c * 32)
+        for span in spans:
+            for item in span["attributes"]:
+                if item["key"] == "input.value" and "question" in item["value"]["stringValue"]:
+                    item["value"]["stringValue"] = json.dumps({"question": other})
+        traces.append(spans)
+    path = _write(tmp_path / "conflict.jsonl", *(_request(t) for t in traces))
+    found = discover(discover_requests(path, "otlp-std"))
+    corpus = _load(path, found)
+    for trace in corpus.traces:
+        request = trace.request
+        assert (request.task_status, request.task, request.source_span_id) == (
+            "conflict",
+            None,
+            None,
+        )
+        assert {c.value for c in request.task_candidates} == {QUESTION, other}
+        assert request.invocation_basis.startswith("conflict:")
 
 
 def test_native_discovery_reads_the_same_candidates(tmp_path) -> None:
@@ -157,9 +190,8 @@ def test_cli_builds_the_corpus_once_and_prints_the_options(tmp_path, monkeypatch
     out = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
     assert result.exit_code == 0, out
     assert len(calls) == 1
-    assert "task:     not chosen: input.payload.query → handle(SPAN) 2/2" in out
-    assert "--task-field input.payload.query (selects handle(SPAN); 2/2)" in out
-    assert "--task-field input.question (selects graph(CHAIN); 2/2)" in out
+    assert "task:     input.payload.query, input.question (found" in out
+    assert "problems: none" in out
 
 
 def test_temporary_files_go_in_the_project_not_the_working_directory(
