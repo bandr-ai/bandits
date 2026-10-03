@@ -252,6 +252,9 @@ def _trace_view(trace: Trace) -> dict[str, Any]:
         ],
         "delivered": _clip(request.delivered) if request else None,
         "system_prompt": _clip(trace.system_prompt) if trace.system_prompt else None,
+        # Shown nowhere else: the source's own trace-level record, and the
+        # records kept on it rather than as steps.
+        "record": _clip(trace.source_record, 30_000) if trace.source_record else None,
         "evidence": len(trace.evidence),
         "steps": _steps(trace),
     }
@@ -759,6 +762,7 @@ ${t.task_candidates.length > 1 ? `<details><summary class="label">${t.task_statu
 <table>${t.task_candidates.map(c => `<tr><td><code>${esc(c.path)}</code><div class="muted"><code>${esc(c.span_id)}</code></div></td><td>${esc(c.value)}</td></tr>`).join("")}</table></details>` : ""}</td></tr>
 <tr><th>answer</th><td>${pre(t.delivered)}</td></tr>
 ${t.system_prompt ? `<tr><th>system prompt</th><td>${pre(t.system_prompt)}</td></tr>` : ""}
+${t.record ? `<tr><th>trace record</th><td><details><summary class="label">kept, not interpreted${typeof t.record === "object" ? ` (${Object.keys(t.record).length} fields)` : ""}</summary>${pre(t.record)}</details></td></tr>` : ""}
 <tr><th>steps</th><td>${t.steps.length} (${["model","tool","step","invocation"].map(k => `${t.steps.filter(s=>s.type===k).length} ${k}`).join(", ")}) · ${t.evidence} evidence links</td></tr></table>
 <div class="label">step tree (click a step to see its input, output and fields)</div>${tree(t)}</div>`;
 }

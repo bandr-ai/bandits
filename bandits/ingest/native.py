@@ -548,8 +548,29 @@ def _phoenix(record: dict[str, Any], position: Position) -> tuple[list[dict[str,
 
 
 FAILPROOFAI_VERSIONS = ("1", "2")
-"""FailproofAI session transcript versions read: v1 (the dashboard's evaluator
-JSON export, integer event ids) and v2 (string ids, ``event_count``)."""
+"""FailproofAI session transcript versions read, each to its own contract.
+
+v1 is the body of the retired ``agenteye-evaluator`` ``EvalRequest`` and what
+``GET /sessions/{id}/export`` still returns: ``session_id``, ``agent_id``,
+``environment`` and ``started_at`` required; ``ended_at`` the ``agent_end``
+time or null; ``events`` may be empty; each event an integer ``id``, ``ts``,
+``event_type`` and an object ``payload`` (absent reads as ``{}``). v2 is
+``SessionTranscript.from_wire`` in failproofai_sdk.evaluator.protocol: string
+ids, and ``assignment_id``, ``session_revision_id``, ``ended_at`` and an
+``event_count`` equal to the events' number all required."""
+
+_FAILPROOFAI_REQUIRED = {
+    "1": ("session_id", "agent_id", "environment", "started_at"),
+    "2": (
+        "assignment_id",
+        "session_id",
+        "session_revision_id",
+        "agent_id",
+        "environment",
+        "started_at",
+        "ended_at",
+    ),
+}
 
 _FAILPROOFAI_PAIRS = (
     # (opener, closer, the documented id both carry, span kind)
@@ -732,51 +753,111 @@ def _failproofai_pairs(
     return pairs, {i: r for i, r in unpaired.items() if r}
 
 
-def _failproofai(record: dict[str, Any], position: Position) -> tuple[list[dict[str, Any]], Skipped]:
+def _failproofai_envelope(record: dict[str, Any]) -> tuple[str, list[Any]]:
+    """The transcript's version and events, or ValueError naming the first
+    field its version's contract requires and the record lacks."""
+    version = record.get("schema_version")
+    if version not in FAILPROOFAI_VERSIONS:
+        raise ValueError(f"FailproofAI transcript schema_version {version!r} is not one of 1, 2")
+    for name in _FAILPROOFAI_REQUIRED[version]:
+        if not isinstance(record.get(name), str):
+            raise ValueError(f"FailproofAI v{version} transcript requires {name} as a string")
+    if _ns(record["started_at"]) is None:
+        raise ValueError(
+            f"FailproofAI transcript started_at {record['started_at']!r} is not a time"
+        )
+    ended = record.get("ended_at")
+    if version == "1" and ended is not None and _ns(ended) is None:
+        raise ValueError(f"FailproofAI v1 ended_at {ended!r} is neither a time nor null")
+    events = record.get("events", [] if version == "1" else None)
+    if not isinstance(events, list):
+        raise ValueError(f"FailproofAI v{version} transcript requires events[]")
+    if version == "2":
+        count = record.get("event_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("FailproofAI v2 transcript requires event_count as an integer")
+        if count != len(events):
+            raise ValueError(
+                f"event_count is {count!r} but the transcript has {len(events)} events"
+            )
+    return version, events
+
+
+def _failproofai_event(event: object, version: str) -> tuple[dict[str, Any] | None, str]:
+    """*event* as its version's contract reads it, or None and why not.
+
+    A v1 event's id is an integer (pydantic also takes its digits as a
+    string) and an absent payload reads as ``{}``; a v2 event's id is a
+    string and its payload is required. A null payload is invalid in both.
+    """
+    if not isinstance(event, dict):
+        return None, "not an event object"
+    event_id = event.get("id")
+    if version == "1":
+        valid_id = (isinstance(event_id, int) and not isinstance(event_id, bool)) or (
+            isinstance(event_id, str) and event_id.strip().lstrip("+-").isdigit()
+        )
+    else:
+        valid_id = isinstance(event_id, str)
+    problems = [] if valid_id else [f"id must be {'an integer' if version == '1' else 'a string'}"]
+    if not isinstance(event.get("ts"), str) or _ns(event["ts"]) is None:
+        problems.append("ts must be a time")
+    if not isinstance(event.get("event_type"), str):
+        problems.append("event_type must be a string")
+    payload = event.get("payload", {} if version == "1" else None)
+    if not isinstance(payload, dict):
+        problems.append("payload must be an object" + (" (it is null)" if payload is None else ""))
+    if problems:
+        return None, f"invalid v{version} event: " + "; ".join(problems)
+    return (event if "payload" in event else {**event, "payload": payload}), ""
+
+
+def _failproofai(
+    record: dict[str, Any], position: Position
+) -> tuple[list[dict[str, Any]], Skipped]:
+    spans, skipped, _ = _failproofai_session(record, position)
+    return spans, skipped
+
+
+def _failproofai_session(
+    record: dict[str, Any], position: Position
+) -> tuple[list[dict[str, Any]], Skipped, dict[str, Any] | None]:
     """One FailproofAI session transcript: a session span, and a span per
     proven opener/closer pair beneath it (beneath its agent's span when that
     agent's start and end were paired).
 
     Every event that does not become a span is kept whole in the trace
     record under ``unpaired_events``, with the reason, and counted as
-    ``kept_on_trace``: unpaired or ambiguous halves, the standalone
+    ``kept_on_trace``: invalid events (the version's contract names the
+    problem), unpaired or ambiguous halves, the standalone
     ``error``/``human_pause``/``human_interrupt`` (FailproofAI names no span
     they belong to), unknown types, and paired pauses and human waits, which
     have no span kind of their own (``human_input`` is kept as recorded; its
     authorship is FailproofAI's to state, not inferred here).
+
+    A session with no model or tool call, and no step under a session span,
+    is still a session: no spans are made, and the third value is the trace
+    (its id and record) for the caller to keep without any. A null
+    ``ended_at`` stays null: there is then no session span, never an
+    invented end.
     """
-    version = record.get("schema_version")
-    if version not in FAILPROOFAI_VERSIONS:
-        raise ValueError(f"FailproofAI transcript schema_version {version!r} is not one of 1, 2")
-    events = record.get("events")
-    session_id = record.get("session_id")
-    if not isinstance(events, list) or not session_id:
-        raise ValueError("FailproofAI transcript requires session_id and events[]")
-    if "event_count" in record and record["event_count"] != len(events):
-        raise ValueError(
-            f"event_count is {record['event_count']!r} but the transcript has {len(events)} events"
-        )
+    version, events = _failproofai_envelope(record)
+    session_id = record["session_id"]
     skipped: Skipped = []
     readable: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []  # events preserved on the trace, not as spans
     seen: set[str] = set()
     for event in events:
-        if not (
-            isinstance(event, dict)
-            and isinstance(event.get("payload"), dict)
-            and isinstance(event.get("event_type"), str)
-            and _failproofai_key(event.get("id")) is not None
-        ):
-            kept.append(
-                {"reason": "not an event with id, event_type and a payload object", "event": event}
-            )
+        read, problem = _failproofai_event(event, version)
+        if read is None:
+            kept.append({"reason": problem, "event": event})
             continue
-        native_id = str(event["id"])
+        native_id = str(read["id"])
         if native_id in seen:
             kept.append({"reason": "duplicate event id; the first is used", "event": event})
             continue
         seen.add(native_id)
-        readable.append(event)
+        readable.append(read)
     pairs, reasons = _failproofai_pairs(readable)
     paired = {id(e) for opener, closer, _ in pairs for e in (opener, closer)}
     for index, event in enumerate(readable):
@@ -790,16 +871,16 @@ def _failproofai(record: dict[str, Any], position: Position) -> tuple[list[dict[
         )
         kept.append({"reason": reason, "event": event})
 
-    session_span: str | None = f"session:{session_id}"
-    if _ns(record.get("started_at")) is None or _ns(record.get("ended_at")) is None:
-        skipped.append(("session has no parseable started_at/ended_at", str(session_id)))
-        session_span = None
+    session_span: str | None = (
+        f"session:{session_id}" if _ns(record.get("ended_at")) is not None else None
+    )
     agents = {
         opener["payload"].get("agent_id"): opener
         for opener, _, _ in pairs
         if opener["event_type"] == "agent_start"
     }
     spans: list[dict[str, Any]] = []
+    made: list[tuple[dict[str, Any], dict[str, Any], str]] = []  # the pairs that became spans
     for opener, closer, basis in pairs:
         kind = next(k for o, _, _, k in _FAILPROOFAI_PAIRS if o == opener["event_type"])
         if kind == "UNKNOWN":
@@ -844,8 +925,19 @@ def _failproofai(record: dict[str, Any], position: Position) -> tuple[list[dict[
             else None
         )
         agent_id = opener["payload"].get("agent_id")
-        owner = agents.get(
-            opener["payload"].get("parent_id") if opener["event_type"] == "agent_start" else agent_id
+        # A pair may open under one agent and close under another (documented);
+        # both ids stay on the span, and neither is taken as its owner.
+        crossed = opener["event_type"] != "agent_start" and agent_id != closer["payload"].get(
+            "agent_id"
+        )
+        owner = (
+            None
+            if crossed
+            else agents.get(
+                opener["payload"].get("parent_id")
+                if opener["event_type"] == "agent_start"
+                else agent_id
+            )
         )
         parent = (
             f"agent_start:{owner['id']}" if owner is not None and owner is not opener else session_span
@@ -871,12 +963,34 @@ def _failproofai(record: dict[str, Any], position: Position) -> tuple[list[dict[
                     extra=extra,
                 )
             )
+            made.append((opener, closer, basis))
         except _Unconvertible as exc:
             kept.extend({"reason": str(exc), "event": event} for event in (opener, closer))
+    calls = any(
+        a["key"] == "openinference.span.kind" and a["value"].get("stringValue") in ("LLM", "TOOL")
+        for span in spans
+        for a in span["attributes"]
+    )
+    session: dict[str, Any] | None = None
+    if not calls and not (session_span is not None and spans):
+        # Nothing the trace reader keeps as a step: the session is kept as a
+        # trace without spans, and the events these spans held stay on it.
+        for opener, closer, basis in made:
+            for event, other in ((opener, closer), (closer, opener)):
+                kept.append(
+                    {
+                        "reason": f"paired by {basis} with event {other['id']}; the session has "
+                        "no model or tool call, and no session span to hold it as a step",
+                        "event": event,
+                    }
+                )
+        spans, session_span = [], None
     trace_record = {k: v for k, v in record.items() if k != "events"}
     if kept:
         trace_record["unpaired_events"] = kept
-    if session_span is not None:
+    if not spans:
+        session = {"trace_id": _hex_id(session_id, 32, "failproofai:trace"), "record": trace_record}
+    elif session_span is not None:
         spans.insert(
             0,
             _span(
@@ -900,15 +1014,11 @@ def _failproofai(record: dict[str, Any], position: Position) -> tuple[list[dict[
         for span in spans:
             if "parentSpanId" not in span:
                 span["attributes"].append({"key": TRACE_RECORD, "value": _av(trace_record)})
-    # With no span at all there is no trace to keep them on.
-    prefix = _ON_TRACE if spans else ""
     for entry in kept:
         event = entry["event"]
         native_id = event.get("id") if isinstance(event, dict) else None
-        skipped.append(
-            (prefix + entry["reason"], None if native_id is None else str(native_id))
-        )
-    return spans, skipped
+        skipped.append((_ON_TRACE + entry["reason"], None if native_id is None else str(native_id)))
+    return spans, skipped, session
 
 
 _CONVERTERS = {
@@ -1002,6 +1112,8 @@ class NativeConversion:
         # Records kept whole on each trace's source_record, by OTLP trace id;
         # see :meth:`drop_kept`.
         self.kept_by_trace: dict[str, int] = {}
+        # Sessions kept as traces without spans (FailproofAI): id and record.
+        self.sessions: list[dict[str, Any]] = []
 
     def _source_records(self) -> Iterator[tuple[Position, dict[str, Any]]]:
         path, ruleset = self.path, self.ruleset
@@ -1111,7 +1223,12 @@ class NativeConversion:
                         try:
                             if not isinstance(record, dict):
                                 raise ValueError("expected an object")
-                            spans, dropped = _CONVERTERS[source_name](record, position)
+                            if source_name == "failproofai":
+                                spans, dropped, session = _failproofai_session(record, position)
+                                if session is not None:
+                                    self.sessions.append(session)
+                            else:
+                                spans, dropped = _CONVERTERS[source_name](record, position)
                         except (TypeError, ValueError) as exc:
                             self.issues.append(
                                 TraceIssue(
@@ -1282,6 +1399,18 @@ def iter_native(
             del chunk, items
     if conversion.source_hash.hexdigest() != digest:
         raise ValueError(f"source file changed during ingest: {path}")
+    for session in conversion.sessions:
+        if session["trace_id"] in seen_ids:
+            decoded.split_trace_ids += 1
+        seen_ids.add(session["trace_id"])
+        yield Trace(
+            trace_id=session["trace_id"],
+            source=source_name,
+            source_digest=digest,
+            interaction="workflow" if workflow is not None else "conversation",
+            source_record=session["record"],
+            spans=(),
+        )
     conversion.drop_kept(seen_ids)
     internal = conversion.finish(decoded)
     deferred = aggregate_issues(

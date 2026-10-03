@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from bandits.ingest import detect_source, load_corpus
+from bandits.ingest.health import check
 from bandits.ingest.report import IngestReport
 from bandits.inspect import check_fidelity
 from bandits.store import ArtifactStore
@@ -157,18 +158,104 @@ def test_incompatible_halves_stay_unpaired(tmp_path: Path, events: list, reason:
     assert all(reason in r for r in kept.values())
 
 
-def test_events_kept_on_a_dropped_trace_are_counted_as_lost(tmp_path: Path) -> None:
+def _session(path: Path, report: IngestReport | None = None):
+    """The one trace of a session that recorded no model or tool call."""
+    corpus, trace = _load(path, report)
+    assert trace.spans == ()
+    return corpus, trace
+
+
+def test_a_session_without_calls_is_kept_with_its_events(tmp_path: Path) -> None:
     report = IngestReport()
-    corpus = load_corpus(
-        _write(tmp_path, [_event(1, "error", 1, error_type="E", message="m")]),
-        "failproofai",
-        report=report,
-    )
-    assert not corpus.traces
+    path = _write(tmp_path, [_event(1, "error", 1, error_type="E", message="m")])
+    _, trace = _session(path, report)
     assert report.accounting_errors == []
-    assert report.buckets["kept_on_trace"] == 0
-    assert report.buckets["unconvertible"] == 1
-    assert not any(i.kind == "record_kept_on_trace" for i in corpus.issues)
+    assert report.dropped == 0
+    assert report.buckets["kept_on_trace"] == 1
+    assert "standalone" in _kept(trace)[1]
+    assert trace.source_record["session_id"] == "s1"
+
+
+def test_v1_contract_example_with_null_end_is_kept(tmp_path: Path) -> None:
+    # The agenteye-evaluator wire-format example: one agent_start, ended_at null.
+    events = [_event(1, "agent_start", 0, goal="help the user")]
+    path = _write(tmp_path, events, ended_at=None)
+    assert detect_source(path).source == "failproofai"
+    _, trace = _session(path)
+    assert trace.source_record["ended_at"] is None  # never an invented end
+    assert "1 agent_start and 0 agent_end" in _kept(trace)[1]
+    from bandits.inspect import _trace_view
+
+    assert _trace_view(trace)["record"] == trace.source_record  # what inspect shows
+
+
+def test_v1_ended_at_may_be_absent(tmp_path: Path) -> None:
+    path = _write(tmp_path, [])
+    document = json.loads(path.read_text())
+    del document["ended_at"]
+    path.write_text(json.dumps(document))
+    _, trace = _session(path)
+    assert "ended_at" not in trace.source_record
+
+
+def test_empty_session_is_detected_and_kept(tmp_path: Path) -> None:
+    path = _write(tmp_path, [])
+    assert detect_source(path).source == "failproofai"
+    _, trace = _session(path)
+    assert "unpaired_events" not in trace.source_record
+
+
+def test_lifecycle_pair_is_kept_on_the_trace_without_a_session_span(tmp_path: Path) -> None:
+    events = [_event(1, "agent_start", 1, goal="g"), _event(2, "agent_end", 2, outcome="done")]
+    _, trace = _session(_write(tmp_path, events, ended_at=None))
+    kept = _kept(trace)
+    assert "paired by agent_id with event 2" in kept[1]
+    assert "paired by agent_id with event 1" in kept[2]
+
+
+def test_lifecycle_pair_with_an_end_is_a_step(tmp_path: Path) -> None:
+    events = [_event(1, "agent_start", 1, goal="g"), _event(2, "agent_end", 2, outcome="done")]
+    corpus = load_corpus(_write(tmp_path, events), "failproofai", workflow=WorkflowDeclaration())
+    (step,) = corpus.traces[0].spans
+    assert (step.name, step.attributes["failproofai.pairing"]) == ("a", "agent_id")
+
+
+def test_null_payload_is_kept_with_its_reason(tmp_path: Path) -> None:
+    events = [*ANCHOR, {"id": 1, "ts": _ts(1), "event_type": "agent_end", "payload": None}]
+    path = _write(tmp_path, events)
+    assert detect_source(path).source == "failproofai"
+    _, trace = _load(path)
+    assert _kept(trace)[1] == "invalid v1 event: payload must be an object (it is null)"
+
+
+def test_null_end_keeps_calls_without_a_session_span(tmp_path: Path) -> None:
+    report = IngestReport()
+    _, trace = _load(_write(tmp_path, ANCHOR, ended_at=None), report)
+    assert [s.kind for s in trace.spans] == [SpanKind.MODEL]
+    assert trace.source_record["ended_at"] is None
+    assert report.accounting_errors == []
+    assert report.dropped == 0
+
+
+@pytest.mark.parametrize(
+    ("top", "detail"),
+    [
+        ({"agent_id": None}, "v1 transcript requires agent_id"),
+        ({"started_at": "soon"}, "started_at 'soon' is not a time"),
+        ({"ended_at": "later"}, "ended_at 'later' is neither a time nor null"),
+        ({"events": None}, "requires events[]"),
+    ],
+)
+def test_v1_envelope_contract(tmp_path: Path, top: dict, detail: str) -> None:
+    corpus = load_corpus(_write(tmp_path, top.pop("events", ANCHOR), **top), "failproofai")
+    assert not corpus.traces
+    assert any(detail in i.detail for i in corpus.issues)
+
+
+def test_v1_event_ids_are_integers(tmp_path: Path) -> None:
+    events = [*ANCHOR, _event("e1", "error", 1, error_type="E", message="m")]
+    _, trace = _load(_write(tmp_path, events))
+    assert _kept(trace)["e1"] == "invalid v1 event: id must be an integer"
 
 
 def test_failed_outcome_marks_the_agent_span(tmp_path: Path) -> None:
@@ -188,16 +275,44 @@ def test_failed_outcome_marks_the_agent_span(tmp_path: Path) -> None:
     assert agent.status == SpanStatus.ERROR
 
 
+V2 = {
+    "schema_version": "2",
+    "assignment_id": "as1",
+    "session_revision_id": "rev1",
+}
+
+
 def test_v2_string_ids_and_event_count(tmp_path: Path) -> None:
     events = [
         _event("e1", "model_request", 1, request_id="r", messages=[]),
         _event("e2", "model_response", 2, request_id="r", content="c"),
     ]
-    _, trace = _load(_write(tmp_path, events, schema_version="2", event_count=2))
+    _, trace = _load(_write(tmp_path, events, **V2, event_count=2))
     assert [s.kind for s in trace.spans if s.kind == SpanKind.MODEL] == [SpanKind.MODEL]
-    bad = load_corpus(_write(tmp_path, events, schema_version="2", event_count=3), "failproofai")
+    bad = load_corpus(_write(tmp_path, events, **V2, event_count=3), "failproofai")
     assert not bad.traces
     assert any("event_count is 3" in i.detail for i in bad.issues)
+
+
+@pytest.mark.parametrize(
+    ("top", "detail"),
+    [
+        ({"assignment_id": None}, "v2 transcript requires assignment_id"),
+        ({"ended_at": None}, "v2 transcript requires ended_at"),
+        ({"event_count": None}, "requires event_count as an integer"),
+    ],
+)
+def test_v2_envelope_contract(tmp_path: Path, top: dict, detail: str) -> None:
+    events = [_event("e1", "error", 1, error_type="E", message="m")]
+    corpus = load_corpus(_write(tmp_path, events, **{**V2, "event_count": 1, **top}), "failproofai")
+    assert not corpus.traces
+    assert any(detail in i.detail for i in corpus.issues)
+
+
+def test_v2_event_ids_are_strings(tmp_path: Path) -> None:
+    events = [_event(7, "error", 1, error_type="E", message="m")]
+    _, trace = _session(_write(tmp_path, events, **V2, event_count=1))
+    assert _kept(trace)[7] == "invalid v2 event: id must be a string"
 
 
 def test_unknown_schema_version_is_refused(tmp_path: Path) -> None:
@@ -217,3 +332,45 @@ def test_pointers_resolve_and_fields_are_kept_exactly(tmp_path: Path) -> None:
     model = next(s for s in corpus.traces[0].spans if s.name == "model-a")
     closer = json.loads(model.attributes["failproofai.closer_unmapped"])
     assert closer["payload"]["fw_cost"] == 0.01
+
+
+def test_a_session_without_model_calls_is_saved_with_a_warning(tmp_path: Path) -> None:
+    corpus = load_corpus(_write(tmp_path, []), "failproofai")
+    health = check(corpus, "failproofai")
+    assert health.fatal == []
+    assert any("record no model call" in w for w in health.warnings)
+
+
+def test_other_sources_without_model_calls_still_refuse(tmp_path: Path) -> None:
+    # A tool call alone: kept as a trace, but its source may hold model calls
+    # in a convention not recognized, so the file is refused, not saved empty.
+    span = {
+        "traceId": "0" * 31 + "1",
+        "spanId": "0" * 15 + "1",
+        "name": "search",
+        "startTimeUnixNano": "1700000000000000000",
+        "endTimeUnixNano": "1700000001000000000",
+        "attributes": [{"key": "openinference.span.kind", "value": {"stringValue": "TOOL"}}],
+    }
+    path = tmp_path / "otlp.json"
+    path.write_text(json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [span]}]}]}))
+    corpus = load_corpus(path, "otlp-std")
+    assert len(corpus.traces) == 1
+    assert any("no model calls were found" in f for f in check(corpus, "otlp-std").fatal)
+
+
+def test_a_pair_across_agents_has_no_owner(tmp_path: Path) -> None:
+    events = [
+        _event(1, "agent_start", 1, goal="g"),
+        _event(2, "model_request", 2, request_id="r", messages=[]),
+        {**_event(3, "model_response", 3, request_id="r", content="c")},
+        _event(4, "agent_end", 4, outcome="done"),
+    ]
+    events[2]["payload"]["agent_id"] = "b"
+    _, trace = _load(_write(tmp_path, events))
+    model = next(s for s in trace.spans if s.kind == SpanKind.MODEL)
+    agent = next(s for s in trace.spans if s.attributes.get("failproofai.pairing") == "agent_id")
+    assert model.parent_span_id != agent.span_id  # under the session, not agent a
+    opener = json.loads(model.attributes["bandits.unmapped"])["payload"]["agent_id"]
+    closer = json.loads(model.attributes["failproofai.closer_unmapped"])["payload"]["agent_id"]
+    assert (opener, closer) == ("a", "b")
