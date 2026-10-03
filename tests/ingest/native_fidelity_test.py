@@ -801,3 +801,38 @@ def test_langfuse_embedding_generation_is_not_a_model_call(tmp_path: Path) -> No
     )
     spans = load_corpus(path, "langfuse").traces[0].spans
     assert [s.name for s in spans if s.kind == SpanKind.MODEL] == ["chat"]
+
+
+def _repeated_records(tmp_path: Path, source: str) -> Path:
+    """One native record written twice, so its spans repeat across lines."""
+    if source == "langfuse":
+        upstream = Path(__file__).resolve().parents[1] / "fixtures/upstream/langfuse"
+        record = json.loads((upstream / "agno-2025-06-11.trace.json").read_text())
+    else:
+        record = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "trace_id": "11111111-1111-1111-1111-111111111111",
+            "run_type": "llm",
+            "name": "chat",
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": "2026-01-01T00:00:01Z",
+            "inputs": {"messages": [{"role": "user", "content": "hello"}]},
+            "outputs": {"messages": [{"role": "assistant", "content": "hi"}]},
+        }
+    path = tmp_path / f"{source}.jsonl"
+    path.write_text("\n".join([json.dumps(record)] * 2) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("source", ["langfuse", "langsmith"])
+def test_native_issue_locations_name_the_source_file_not_the_conversion(
+    tmp_path: Path, source: str
+) -> None:
+    # The conversion's temporary path in a stored issue made the corpus id
+    # differ on every ingest of the same file.
+    path = _repeated_records(tmp_path, source)
+    first, second = load_corpus(path, source), load_corpus(path, source)
+    located = [issue.location for issue in first.issues if issue.kind == "duplicate_span"]
+    assert located
+    assert all(location.startswith(f"{path}:2 observation ") for location in located)
+    assert first.model_dump_json() == second.model_dump_json()

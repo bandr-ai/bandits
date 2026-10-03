@@ -373,6 +373,16 @@ def _where(path: Path, position: Position) -> str:
     return f"{path}[{position['index']}]" if "index" in position else str(path)
 
 
+def _origin(path: Path, span: dict[str, Any]) -> str:
+    """Where a converted span came from in the native file, for issue locations."""
+    for attribute in span.get("attributes") or []:
+        if attribute.get("key") == "bandits.source.record":
+            pointer = json.loads(attribute["value"]["stringValue"])
+            position = {k: v for k, v in pointer.items() if k != "observation_id"}
+            return f"{_where(path, position)} observation {pointer['observation_id']}"
+    return str(path)
+
+
 class NativeConversion:
     """One native file converted to OTLP in chunks, counting every observation.
 
@@ -395,6 +405,8 @@ class NativeConversion:
         # Converter-level counts; a caller adds the decoded chunks' own.
         self.report = IngestReport()
         self.observations = 0
+        # Native origin of each line in the current converted chunk.
+        self.origins: list[str] = []
 
     def _source_records(self) -> Iterator[tuple[Position, dict[str, Any]]]:
         path, ruleset = self.path, self.ruleset
@@ -486,6 +498,7 @@ class NativeConversion:
                         self.observations += len(spans)
                         self._skip(dropped, position)
                         for span in spans:
+                            self.origins.append(_origin(self.path, span))
                             output.write(
                                 json.dumps(_request(span, source_name), ensure_ascii=False)
                             )
@@ -497,10 +510,25 @@ class NativeConversion:
                         yield converted
                         output.seek(0)
                         output.truncate(0)
+                        self.origins = []
                         pending = 0
                 if pending:
                     output.flush()
                     yield converted
+
+    def relocate(self, issue: TraceIssue, chunk: Path) -> TraceIssue:
+        """*issue* located in the native file instead of the converted *chunk*.
+
+        The chunk lives in a random temporary directory, so its path in a
+        stored issue would make the corpus id differ on every ingest.
+        """
+        location = issue.location or ""
+        if not location.startswith(str(chunk)):
+            return issue
+        line = location[len(str(chunk)) :].removeprefix(":").split("#", 1)[0]
+        if line.isdigit() and 0 < int(line) <= len(self.origins):
+            return issue.replace(location=self.origins[int(line) - 1])
+        return issue.replace(location=str(self.path))
 
     def finish(self, decoded: IngestReport) -> IngestReport:
         """Converter counts plus the decoded chunks' (*decoded*), checked to add up."""
@@ -596,7 +624,7 @@ def iter_native(
             )
         for item in items:
             if isinstance(item, TraceCorpus):
-                converted_issues.extend(item.issues)
+                converted_issues.extend(conversion.relocate(i, chunk_path) for i in item.issues)
             else:
                 ids.add(item.trace_id)
                 yield item.replace(source=source_name, source_digest=digest)
