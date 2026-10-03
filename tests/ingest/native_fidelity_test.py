@@ -837,3 +837,132 @@ def test_native_issue_locations_name_the_source_file_not_the_conversion(
     assert located
     assert all(location.startswith(f"{path}:2 observation ") for location in located)
     assert first.model_dump_json() == second.model_dump_json()
+
+
+def _unmapped(span) -> dict:
+    value = span.attributes.get("bandits.unmapped") or {}
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _every_step(corpus):
+    return [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+
+
+def test_fields_no_converter_knows_are_kept_not_dropped(tmp_path: Path) -> None:
+    # A field nobody listed yet (a vendor adds one tomorrow) must come through
+    # every native converter, in the same place.
+    future = {"brand_new_field": {"nested": [1, 2]}}
+    langfuse = {
+        "id": "t1",
+        "user_id": "u-9",
+        "observations": [
+            {
+                "id": "o1",
+                "type": "GENERATION",
+                "name": "chat",
+                "parentObservationId": "never-exported",
+                "startTime": "2026-01-01T00:00:00Z",
+                "endTime": "2026-01-01T00:00:01Z",
+                "input": [{"role": "user", "content": "hi"}],
+                "output": "hello",
+                "usageDetails": {"input": 313, "output": 64, "total": 377},
+                "modelParameters": {"temperature": 0, "top_p": 0.7},
+                "costDetails": {"total": 4.1e-06},
+                **future,
+            }
+        ],
+    }
+    langsmith = {
+        "id": "r1",
+        "run_type": "llm",
+        "name": "chat",
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "inputs": {"messages": [{"role": "user", "content": "hi"}]},
+        "outputs": {"messages": [{"role": "assistant", "content": "hello"}]},
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "extra": {"invocation_params": {"temperature": 0.2}},
+        "tags": ["prod"],
+        **future,
+    }
+    phoenix = {
+        "name": "chat",
+        "context": {"trace_id": "t" * 8, "span_id": "s1"},
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {"openinference.span.kind": "LLM", "input.value": "hi"},
+        **future,
+    }
+    for source, record in (("langfuse", langfuse), ("langsmith", langsmith), ("phoenix", phoenix)):
+        corpus = load_corpus(_file(tmp_path, f"{source}.json", record), source)
+        (step,) = [s for s in _every_step(corpus) if _unmapped(s)]
+        assert _unmapped(step)["brand_new_field"] == {"nested": [1, 2]}, source
+
+    corpus = load_corpus(_file(tmp_path, "usage.json", langfuse), "langfuse")
+    (step,) = _every_step(corpus)
+    assert _unmapped(step)["costDetails"] == {"total": 4.1e-06}
+    assert step.attributes["gen_ai.usage.input_tokens"] == 313
+    assert step.attributes["gen_ai.usage.output_tokens"] == 64
+    assert step.attributes["gen_ai.request.temperature"] == 0
+    # Its parent was never exported: it is a top step and carries the trace's fields.
+    trace_record = step.attributes["bandits.native.trace_record"]
+    trace_record = json.loads(trace_record) if isinstance(trace_record, str) else trace_record
+    assert trace_record["user_id"] == "u-9"
+
+    corpus = load_corpus(_file(tmp_path, "ls.json", langsmith), "langsmith")
+    (step,) = [s for s in _every_step(corpus) if _unmapped(s)]
+    assert step.attributes["gen_ai.usage.input_tokens"] == 5
+    assert step.attributes["gen_ai.request.temperature"] == 0.2
+    assert _unmapped(step)["tags"] == ["prod"]
+
+
+def test_unmapped_keeps_nulls_empties_nested_leftovers_and_odd_shapes(tmp_path: Path) -> None:
+    from bandits.ingest.native import USED_FIELDS, unmapped_fields
+
+    observation = {
+        "id": "o1",
+        "type": "GENERATION",
+        "name": "step",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": "2026-01-01T00:00:01Z",
+        "input": "q",
+        "output": "a",
+        "custom_null": None,
+        "custom_empty": {},
+        "custom_zero": 0,
+        "custom_false": False,
+        "metadata": "not json",  # an odd shape: kept whole, not read
+        "input.value": "a field named like an attribute",  # a name collision
+    }
+    corpus = load_corpus(
+        _file(tmp_path, "lf.json", {"id": "t", "observations": [observation]}), "langfuse"
+    )
+    (step,) = [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+    kept = _unmapped(step)
+    assert kept == {
+        "custom_null": None,
+        "custom_empty": {},
+        "custom_zero": 0,
+        "custom_false": False,
+        "metadata": "not json",
+        "input.value": "a field named like an attribute",
+    }
+    assert kept == unmapped_fields(observation, USED_FIELDS["langfuse"](observation))
+
+    span = {
+        "name": "chat",
+        "context": {"trace_id": "t" * 8, "span_id": "s1", "trace_state": "vendor=1"},
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {"openinference.span.kind": "LLM", "input.value": "hi"},
+        "status": {"status_code": "OK", "detail": {"retries": 2}},
+        "resource": "flat-string",
+    }
+    corpus = load_corpus(_file(tmp_path, "px.json", {"spans": [span]}), "phoenix")
+    (step,) = [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+    assert _unmapped(step) == {
+        "context": {"trace_state": "vendor=1"},  # the unread key inside a read object
+        "status": {"detail": {"retries": 2}},
+        "resource": "flat-string",  # not the object the converter reads: kept whole
+    }
