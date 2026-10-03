@@ -10,6 +10,7 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.traces import SpanKind, SpanStatus
+from tests.cli_test import plain
 
 TRACE = "5b8efff798038103d269b633813fc60c"
 T0 = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z in unix nanoseconds
@@ -571,7 +572,7 @@ def test_dispatch_and_cli(tmp_path) -> None:
         app, ["ingest", str(path), "--source", "otlp-std", "--project", str(tmp_path)]
     )
     assert result.exit_code == 0, result.stdout
-    assert "read:     1 traces" in result.stdout
+    assert "read:     1 traces" in plain(result.stdout)
 
 
 def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
@@ -593,9 +594,7 @@ def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
             ),
             "gen_ai.tool.definitions": json.dumps(tools),
             "gen_ai.request.model": "gpt-5",
-            "gen_ai.input.messages": json.dumps(
-                [{"role": "user", "content": "Refund order 7741"}]
-            ),
+            "gen_ai.input.messages": json.dumps([{"role": "user", "content": "Refund order 7741"}]),
         },
     )
     chat = _span(
@@ -1246,3 +1245,80 @@ def test_completion_request_prompts_are_user_input_only() -> None:
     assert _messages({"prompt": "x"}, default_role="assistant") != [
         {"role": "user", "parts": [{"type": "text", "content": "x"}]}
     ]
+
+
+def test_older_role_content_messages_and_output_text_are_read(tmp_path: Path) -> None:
+    # Before the parts convention, GenAI instrumentations recorded
+    # {role, content} messages; some put the reply in gen_ai.output.text.
+    from bandits.ingest import health
+
+    declared = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    path = _write(
+        tmp_path / "older.jsonl",
+        _request(
+            [
+                _span(
+                    "call",
+                    "chat",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": "some-model",
+                        "gen_ai.input.messages": json.dumps(declared),
+                        "gen_ai.output.text": "hello",
+                    },
+                )
+            ]
+        ),
+    )
+    corpus = load_corpus(path, "otlp-std")
+    (span,) = _only_trace(corpus).spans
+    assert span.attributes["gen_ai.input.messages"] == [
+        {"role": "system", "parts": [{"type": "text", "content": "be brief"}]},
+        {"role": "user", "parts": [{"type": "text", "content": "hi"}]},
+    ]
+    assert span.attributes["gen_ai.output.messages"] == [
+        {"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}
+    ]
+    counts = health.check(corpus, "otlp-std").counts
+    assert not counts["bad_messages"] and not counts["output_missing"]
+
+
+def test_parts_messages_are_kept_as_declared(tmp_path: Path) -> None:
+    declared = [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}]
+    path = _write(
+        tmp_path / "current.jsonl",
+        _request(
+            [
+                _span(
+                    "call",
+                    "chat",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.input.messages": json.dumps(declared),
+                        "gen_ai.output.messages": json.dumps(
+                            [{"role": "assistant", "parts": [{"type": "text", "content": "ok"}]}]
+                        ),
+                    },
+                )
+            ]
+        ),
+    )
+    (span,) = _only_trace(load_corpus(path, "otlp-std")).spans
+    assert "bandits.input_messages_from" not in span.attributes
+
+
+def test_otlp_steps_point_at_their_raw_span_and_keep_its_kind(tmp_path: Path) -> None:
+    from bandits.store import ArtifactStore
+
+    span = _span("call", "chat", {"gen_ai.operation.name": "chat", "input.value": "hi"})
+    span["kind"] = 3
+    path = _write(tmp_path / "one.jsonl", _request([]), _request([span]))
+    corpus = load_corpus(path, "otlp-std")
+    (step,) = _only_trace(corpus).spans
+    pointer = step.attributes["bandits.source.record"]
+    pointer = json.loads(pointer) if isinstance(pointer, str) else pointer
+    assert pointer == {"line": 2, "observation_id": "call"}
+    assert step.attributes["otel.span.kind"] == 3
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(path)).artifact_id
+    assert store.read_native_record(artifact, pointer)["spanId"] == "call"

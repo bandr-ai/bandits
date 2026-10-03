@@ -94,3 +94,30 @@ def input_units(attributes: dict[str, Any]) -> list[tuple[str, str] | None]:
             text = message["content"]
         units.append((role, text) if text and text.strip() else None)
     return units
+
+
+def plain_messages(messages: object) -> list[dict[str, str]] | None:
+    """*messages* as ``[{role, content}]`` text messages, when that says all of it.
+
+    None when any message holds more than one text part or anything besides
+    its role and parts: then the plain form would lose something.
+    """
+    messages = _parsed(messages)
+    if not isinstance(messages, list):
+        return None
+    plain = []
+    for message in messages:
+        if not isinstance(message, dict) or set(message) != {"role", "parts"}:
+            return None
+        parts = message["parts"]
+        if not (
+            isinstance(parts, list)
+            and len(parts) == 1
+            and isinstance(parts[0], dict)
+            and set(parts[0]) == {"type", "content"}
+            and parts[0]["type"] == "text"
+            and isinstance(parts[0]["content"], str)
+        ):
+            return None
+        plain.append({"role": message["role"], "content": parts[0]["content"]})
+    return plain

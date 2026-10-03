@@ -6,17 +6,20 @@ require an explicit source rather than a guessed interpretation.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
 from bandits.ingest.claude_code import load_claude_code
 from bandits.ingest.detect import DetectionError, detect_source
-from bandits.ingest.native import load_native
+from bandits.ingest.mapping import IngestMapping
+from bandits.ingest.native import iter_native, load_native
 from bandits.ingest.otlp import load_otlp
-from bandits.ingest.otlp_standard import load_otlp_standard
+from bandits.ingest.otlp_standard import iter_otlp_standard, load_otlp_standard
+from bandits.ingest.report import IngestReport
 from bandits.ingest.trail import load_trail
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset
-from bandits.traces import TraceCorpus, WorkflowDeclaration
+from bandits.traces import Trace, TraceCorpus, WorkflowDeclaration
 
 CANONICAL_SOURCES: tuple[str, ...] = (
     "otlp",
@@ -49,11 +52,14 @@ def load_corpus(
     *,
     pipeline_steps: bool = True,
     workflow: WorkflowDeclaration | None = None,
+    report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
 ) -> TraceCorpus:
     """Read a raw export into a :class:`TraceCorpus` using a recognized adapter.
 
     ``pipeline_steps`` and ``workflow`` apply to OTLP and the native readers
-    routed through it.
+    routed through it; so do ``report``, which the other readers leave empty,
+    and a confirmed ``mapping``.
     """
     if source == "auto":
         source = detect_source(Path(path)).source
@@ -70,7 +76,13 @@ def load_corpus(
             )
     if source in ("langfuse", "langsmith", "phoenix"):
         return load_native(
-            Path(path), source, ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+            Path(path),
+            source,
+            ruleset,
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
+            report=report,
+            mapping=mapping,
         )
     loader = _LOADERS.get(source)
     if loader is None:
@@ -79,9 +91,14 @@ def load_corpus(
         )
     if source == "otlp-std":
         return load_otlp_standard(
-            Path(path), ruleset, pipeline_steps=pipeline_steps, workflow=workflow
+            Path(path),
+            ruleset,
+            pipeline_steps=pipeline_steps,
+            workflow=workflow,
+            report=report,
+            mapping=mapping,
         )
-    if workflow is not None:
+    if workflow is not None or mapping is not None:
         raise ValueError(f"workflow mode is an otlp-std option; source {source!r} has none")
     if not pipeline_steps:
         raise ValueError(f"pipeline steps are an otlp-std option; source {source!r} has none")
@@ -89,9 +106,34 @@ def load_corpus(
 
 
 __all__ = [
+    "iter_corpus",
     "CANONICAL_SOURCES",
     "DetectionError",
+    "IngestReport",
     "UnknownSourceError",
     "detect_source",
     "load_corpus",
 ]
+
+
+def iter_corpus(
+    path: str | Path,
+    source: str,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    scratch_dir: Path | None = None,
+    **kwargs,
+) -> Iterator[Trace | TraceCorpus]:
+    """Yield normalized traces then a trace-free corpus footer.
+
+    JSONL readers group interleaved spans on disk and normalize one trace at a
+    time. Whole-file JSON and legacy conversation adapters can still buffer input.
+    """
+    if source in ("langfuse", "langsmith", "phoenix"):
+        yield from iter_native(Path(path), source, ruleset, scratch_dir=scratch_dir, **kwargs)
+    elif source == "otlp-std":
+        yield from iter_otlp_standard(Path(path), ruleset, scratch_dir=scratch_dir, **kwargs)
+    else:
+        corpus = load_corpus(path, source, ruleset, **kwargs)
+        yield from corpus.traces
+        yield corpus.replace(traces=())

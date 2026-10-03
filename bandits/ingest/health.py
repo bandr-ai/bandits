@@ -13,27 +13,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from bandits.traces import SpanKind, SpanStatus, TraceCorpus
+from bandits.traces import NOTICE_ISSUE_KINDS, SpanKind, SpanStatus, Trace, TraceCorpus
 
-# Notices about handling, not problems with the data.
-_NOTICE_KINDS = frozenset(
-    {
-        "redaction",
-        "source_container",
-        "excluded_evaluator",
-        "excluded_evaluator_trace",
-        "duplicate_model_instrumentation",
-        "task_unresolved",  # reported as no_task, with the fix
-    }
-)
 _ROLES = ("system", "developer", "user", "assistant", "tool")
 _EXAMPLES = 3
-
-# Field names that commonly hold a workflow's request and its answer. Used only
-# when no --task-field / --delivered-field was given, and only when the field is
-# a non-empty string in every invocation record.
-TASK_KEYS = ("query", "question", "input", "prompt", "message", "task", "request", "text")
-ANSWER_KEYS = ("answer", "output", "response", "result", "text", "content", "message")
 
 
 @dataclass
@@ -81,42 +64,53 @@ PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
 conversation at the trace level, so a call without its own input is normal there."""
 
 
-def check(corpus: TraceCorpus, source: str) -> Health:
-    health = Health(traces=len(corpus.traces))
-    models = [s for t in corpus.traces for s in t.spans if s.kind == SpanKind.MODEL]
-    health.model_calls = len(models)
-    c = health.counts
+def check(corpus: TraceCorpus, source: str, hints: list[str] | None = None) -> Health:
+    """``hints``: the request fields discovery found, each as the flags that
+    select it, for the warning about traces without a task."""
+    health = Health()
     for trace in corpus.traces:
-        if corpus.workflow is not None and trace.task is None:
-            health.note("no_task", f"trace {trace.trace_id}")
-        for span in trace.spans:
-            if span.kind != SpanKind.MODEL or source not in PER_CALL_SOURCES:
-                continue
-            a = span.attributes
-            where = f"trace {trace.trace_id} span {span.span_id} ({span.name})"
-            in_msgs, out_msgs = a.get("gen_ai.input.messages"), a.get("gen_ai.output.messages")
-            failed = span.status == SpanStatus.ERROR
-            if not _has_content(in_msgs):
-                kind = "input_unread" if a.get("input.value") is not None else "input_missing"
-                health.note(kind, where)
-            if a.get("bandits.output_unusable_reason") and not failed:
-                health.note("output_unusable", where)
-            elif not _has_content(out_msgs) and span.output is None:
-                health.note("failed_no_output" if failed else "output_missing", where)
-            if any(not _valid(v) for v in (in_msgs, out_msgs) if v is not None and v != []):
-                health.note("bad_messages", where)
-    other = Counter(i.kind for i in corpus.issues if i.kind not in _NOTICE_KINDS)
+        collect(health, trace, source, workflow=corpus.workflow is not None)
+    return finish(health, corpus, hints)
 
-    if not corpus.traces:
+
+def collect(health: Health, trace: Trace, source: str, *, workflow: bool) -> None:
+    health.traces += 1
+    health.model_calls += sum(s.kind == SpanKind.MODEL for s in trace.spans)
+    if workflow and trace.task is None:
+        conflict = trace.request is not None and trace.request.task_status == "conflict"
+        health.note("task_conflict" if conflict else "no_task", f"trace {trace.trace_id}")
+    for span in trace.spans:
+        if span.kind != SpanKind.MODEL or source not in PER_CALL_SOURCES:
+            continue
+        a = span.attributes
+        where = f"trace {trace.trace_id} span {span.span_id} ({span.name})"
+        in_msgs, out_msgs = a.get("gen_ai.input.messages"), a.get("gen_ai.output.messages")
+        failed = span.status == SpanStatus.ERROR
+        if not _has_content(in_msgs):
+            kind = "input_unread" if a.get("input.value") is not None else "input_missing"
+            health.note(kind, where)
+        if a.get("bandits.output_unusable_reason") and not failed:
+            health.note("output_unusable", where)
+        elif not _has_content(out_msgs) and span.output is None:
+            health.note("failed_no_output" if failed else "output_missing", where)
+        if any(not _valid(v) for v in (in_msgs, out_msgs) if v is not None and v != []):
+            health.note("bad_messages", where)
+
+
+def finish(health: Health, corpus: TraceCorpus, hints: list[str] | None = None) -> Health:
+    c = health.counts
+    other = Counter(i.kind for i in corpus.issues if i.kind not in NOTICE_ISSUE_KINDS)
+
+    if not health.traces:
         health.fatal.append("no traces could be read from this file")
-    elif not models:
+    elif not health.model_calls:
         health.fatal.append(
             "no model calls were found; the file may use span kinds Bandits does not "
             "recognize (see `unrepresented_span` issues with --dry-run)"
         )
-    elif c["input_missing"] + c["input_unread"] == len(models):
+    elif c["input_missing"] + c["input_unread"] == health.model_calls:
         health.fatal.append(
-            f"none of the {len(models)} model calls has a readable input; the export "
+            f"none of the {health.model_calls} model calls has a readable input; the export "
             "may have been captured with content recording turned off"
         )
 
@@ -140,8 +134,9 @@ def check(corpus: TraceCorpus, source: str) -> Health:
     )
     warn(
         "output_missing",
-        "successful model call(s) have no recorded output",
-        "the exporter did not record the reply; these calls cannot become training rows",
+        "successful model call(s) have no output in a field Bandits reads",
+        "the exporter did not record the reply, or recorded it in a field Bandits does not "
+        "know; these calls cannot become training rows",
     )
     warn(
         "output_unusable",
@@ -155,44 +150,20 @@ def check(corpus: TraceCorpus, source: str) -> Health:
         "a message has no valid role or no parts list",
     )
     warn(
+        "task_conflict",
+        "trace(s) hold different question texts in their candidate runs",
+        "none was chosen; every value is kept on the trace (request.task_candidates) "
+        "for whatever uses the corpus to choose",
+    )
+    warn(
         "no_task",
         "trace(s) have no task",
-        "no request field was found in the run's input; pass --task-field PATH "
-        "(e.g. input.query) to say where it is",
+        "the request field could not be chosen; pass one of: " + " | ".join(hints)
+        if hints
+        else "no request field was found in the run's input; pass --task-field PATH "
+        "to say where it is",
     )
     for kind, count in other.most_common():
         detail = next((i.detail for i in corpus.issues if i.kind == kind), "")
         health.warnings.append(f"{count} `{kind}` issue(s)\n    e.g. {detail[:200]}")
     return health
-
-
-def _common_string_field(records: list[Any], root: str, keys: tuple[str, ...]) -> str | None:
-    """A path that is a non-empty string in every record, or None."""
-    if not records:
-        return None
-    if all(isinstance(r, str) and r.strip() for r in records):
-        return root
-    if not all(isinstance(r, dict) for r in records):
-        return None
-    for key in keys:
-        if all(isinstance(r.get(key), str) and r[key].strip() for r in records):
-            return f"{root}.{key}"
-    return None
-
-
-def detect_request_fields(corpus: TraceCorpus) -> tuple[str | None, str | None]:
-    """``(task_field, delivered_field)`` found in every invocation record, or None each."""
-    requests = [t.request for t in corpus.traces if t.request and t.request.source_span_id]
-    inputs = [
-        _messages(r.raw_input) if isinstance(r.raw_input, str) else r.raw_input for r in requests
-    ]
-    outputs = [
-        _messages(r.raw_output) if isinstance(r.raw_output, str) else r.raw_output for r in requests
-    ]
-    # A JSON string that is not JSON stays text.
-    inputs = [i if i is not None else r.raw_input for i, r in zip(inputs, requests, strict=True)]
-    outputs = [o if o is not None else r.raw_output for o, r in zip(outputs, requests, strict=True)]
-    return (
-        _common_string_field(inputs, "input", TASK_KEYS),
-        _common_string_field(outputs, "output", ANSWER_KEYS),
-    )

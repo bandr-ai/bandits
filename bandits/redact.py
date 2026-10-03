@@ -257,8 +257,14 @@ def redact_bytes(
     original: bytes,
     location: str,
     ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    first_line: int = 1,
 ) -> RedactedSource:
-    """Redact one source record; suitable for streaming independent JSONL lines."""
+    """Redact one source record; suitable for streaming independent JSONL lines.
+
+    *first_line* is the file line *original* starts on, so issue locations
+    count lines in the file, not in the record.
+    """
     spans = _matches(original, ruleset)
 
     chunks: list[bytes] = []
@@ -266,7 +272,7 @@ def redact_bytes(
     cursor = 0
     # Matches arrive in order, so each line number is counted on from the last
     # one; counting from the top every time is quadratic on a large export.
-    line, counted_to = 1, 0
+    line, counted_to = first_line, 0
     for start, end, kind in spans:
         chunks.append(original[cursor:start])
         chunks.append(_REPLACEMENT % kind.encode())
@@ -300,7 +306,7 @@ def redact_bytes(
     except (UnicodeDecodeError, json.JSONDecodeError):
         records = byte_redacted.splitlines(keepends=True)
         fixed: list[bytes] = []
-        for number, record in enumerate(records, start=1):
+        for number, record in enumerate(records, start=first_line):
             rewritten, found = _redact_decoded_json(record, f"{location}:{number}", ruleset)
             fixed.append(rewritten)
             issues.extend(found)

@@ -25,6 +25,7 @@ from typing import Any
 
 from bandits.ingest import load_corpus
 from bandits.redact import RedactionRuleset
+from bandits.store import resolve_record
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
 
 NO_REDACTION = RedactionRuleset("none-audit", ())
@@ -62,13 +63,21 @@ def shape(value: Any, depth: int = 0) -> str:
     return type(value).__name__
 
 
-def _present(source: str, attributes: dict[str, Any], direction: int) -> tuple[bool, Any]:
+def _native(attributes: dict[str, Any], data: bytes) -> dict[str, Any]:
+    # Read without redaction, so the file's own bytes are what the pointer indexes.
+    pointer = attributes.get("bandits.source.record")
+    return resolve_record(data, pointer) if pointer is not None else {}
+
+
+def _present(
+    source: str, attributes: dict[str, Any], direction: int, data: bytes
+) -> tuple[bool, Any]:
     if source in NATIVE_FIELDS:
-        record = _parsed(attributes.get("bandits.native.record"))
-        value = record.get(NATIVE_FIELDS[source][direction]) if isinstance(record, dict) else None
+        record = _native(attributes, data)
+        value = record.get(NATIVE_FIELDS[source][direction])
         return _parsed(value) not in EMPTY, value
     if source == "phoenix":
-        record = _parsed(attributes.get("bandits.native.record")) or {}
+        record = _native(attributes, data)
         value = (record.get("attributes") or {}).get(("input.value", "output.value")[direction])
         return _parsed(value) not in EMPTY, value
     keys = (OTLP_INPUT_KEYS, OTLP_OUTPUT_KEYS)[direction]
@@ -119,13 +128,14 @@ def _only_json_text(value: Any) -> bool:
 
 def audit(source: str, path: Path, workflow: WorkflowDeclaration | None) -> dict[str, Any]:
     corpus = load_corpus(path, source, NO_REDACTION, workflow=workflow)
+    data = path.read_bytes() if path.is_file() else b""
     models = [s for t in corpus.traces for s in t.spans if s.kind == SpanKind.MODEL]
     counts: Counter[str] = Counter()
     undetermined: dict[str, Counter[str]] = {"input": Counter(), "output": Counter()}
     for span in models:
         a = span.attributes
         for direction, name in enumerate(("input", "output")):
-            present, raw = _present(source, a, direction)
+            present, raw = _present(source, a, direction, data)
             if not present:
                 if name == "output" and span.status == SpanStatus.ERROR:
                     counts["output.absent_failed_call"] += 1
@@ -136,7 +146,7 @@ def audit(source: str, path: Path, workflow: WorkflowDeclaration | None) -> dict
             retained = (
                 a.get(f"{name}.value") is not None
                 or a.get(f"gen_ai.{name}.messages") is not None
-                or "bandits.native.record" in a
+                or "bandits.source.record" in a
                 or any(k.startswith(("gen_ai.prompt.", "gen_ai.completion.", "llm.")) for k in a)
             )
             counts[f"{name}.retained"] += retained

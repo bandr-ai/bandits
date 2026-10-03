@@ -48,24 +48,31 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
+import time
 from collections import Counter
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from bandits.genai import PIPELINE_STEP
+from bandits.genai import PIPELINE_STEP, plain_messages
+from bandits.ingest.mapping import LABEL_PREFIX, IngestMapping
 from bandits.ingest.otlp import (
     _LINEAGE_KEYS,
     _declared_completion,
     _declared_task,
     assemble_corpus,
 )
-from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
+from bandits.ingest.report import EXAMPLES, STEPS_PER_EXAMPLE, IngestReport, aggregate_issues
+from bandits.ingest.spool import TraceSpool
+from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes, redact_source
 from bandits.traces import (
     Span,
     SpanKind,
     SpanStatus,
+    Trace,
     TraceCorpus,
     TraceIssue,
     UserTurn,
@@ -189,6 +196,7 @@ _OUTPUT_VALUE_KEYS = (
     "ai.response.toolCalls",
     "ai.toolCall.result",
     "braintrust.output_json",
+    "gen_ai.output.text",
 )
 _TOOL_NAME_KEYS = ("gen_ai.tool.name", "tool.name", "traceloop.entity.name", "ai.toolCall.name")
 
@@ -775,6 +783,14 @@ def _normalized_messages(
             # Keep the declared bytes in source_context, but let substantive
             # recorded content fill the normalized view.
             if declared and any(message.get("parts") for message in declared):
+                # The older convention's {role, content} messages are read the
+                # same way but stored normalized, so readers see one shape.
+                raw = _json_value(attributes[key])
+                if isinstance(raw, list) and any(
+                    isinstance(m, dict) and not isinstance(m.get("parts"), list) for m in raw
+                ):
+                    added[key] = declared
+                    added[f"bandits.{direction}_messages_from"] = key
                 continue
         candidates: list[tuple[str, Any]] = [
             (f"event:{key}", _messages(details.get(key))),
@@ -806,7 +822,14 @@ def _normalized_messages(
                 parsed = _recorded_attribute_value(parsed, direction)
                 found = _messages(parsed, default_role=role)
                 if found is None and prompt_is_text:
-                    found = _text_message(role, parsed)
+                    # Structured model replies are assistant content too; the
+                    # raw value remains available on the span.
+                    content = (
+                        json.dumps(parsed, ensure_ascii=False)
+                        if direction == "output" and isinstance(parsed, (dict, list))
+                        else parsed
+                    )
+                    found = _text_message(role, content)
             candidates.append((declared[0], found))
         origin, messages = next(
             ((o, m) for o, m in candidates if m and any(message.get("parts") for message in m)),
@@ -933,12 +956,35 @@ def _requests(data: bytes, location: str) -> Iterator[tuple[str, object]]:
             yield f"{location}:{number}", exc
 
 
+def _position(location: str) -> dict[str, Any]:
+    """A request's place in its file, from the location :func:`_requests` gave:
+    ``{"line": n}``, ``{"index": i}`` (whole-file array) or ``{"document": True}``."""
+    if location.endswith("]"):
+        head, _, index = location[:-1].rpartition("[")
+        if index.isdigit():
+            return {"index": int(index)}
+    head, _, line = location.rpartition(":")
+    if head and line.isdigit():
+        return {"line": int(line)}
+    return {"document": True}
+
+
 def _decode_file(
-    path: Path, data: bytes, issues: list[TraceIssue], counter: list[int]
+    path: Path,
+    data: bytes,
+    issues: list[TraceIssue],
+    counter: list[int],
+    unreadable: Counter[str] | None = None,
+    *,
+    requests: Iterator[tuple[str, Any]] | None = None,
 ) -> Iterator[_Decoded]:
-    for location, request in _requests(data, str(path)):
+    """Every span in one file. ``unreadable`` counts items skipped whole, before
+    any span inside them could be counted; ``counter[0]`` counts raw spans."""
+    unreadable = Counter() if unreadable is None else unreadable
+    for location, request in _requests(data, str(path)) if requests is None else requests:
         if isinstance(request, (json.JSONDecodeError, UnicodeDecodeError)):
             issues.append(TraceIssue(kind="malformed_json", detail=str(request), location=location))
+            unreadable["malformed_json"] += 1
             continue
         resource_spans = (
             (request.get("resourceSpans") or request.get("batches"))
@@ -953,9 +999,18 @@ def _decode_file(
                     location=location,
                 )
             )
+            unreadable["malformed_record"] += 1
             continue
         for r, resource_span in enumerate(resource_spans):
             if not isinstance(resource_span, dict):
+                issues.append(
+                    TraceIssue(
+                        kind="malformed_record",
+                        detail="a resourceSpans entry is not an object; its spans are unknown",
+                        location=f"{location}#resourceSpans[{r}]",
+                    )
+                )
+                unreadable["malformed_record"] += 1
                 continue
             resource = _attributes((resource_span.get("resource") or {}).get("attributes"))
             scopes = (
@@ -965,6 +1020,14 @@ def _decode_file(
             )
             for s, scope_span in enumerate(scopes):
                 if not isinstance(scope_span, dict):
+                    issues.append(
+                        TraceIssue(
+                            kind="malformed_record",
+                            detail="a scopeSpans entry is not an object; its spans are unknown",
+                            location=f"{location}#resourceSpans[{r}].scopeSpans[{s}]",
+                        )
+                    )
+                    unreadable["malformed_record"] += 1
                     continue
                 scope = scope_span.get("scope") or scope_span.get("instrumentationLibrary") or {}
                 for k, raw in enumerate(scope_span.get("spans") or []):
@@ -972,6 +1035,13 @@ def _decode_file(
                     counter[0] += 1
                     decoded = _decode_span(raw, resource, scope, where, counter[0], issues)
                     if decoded is not None:
+                        if "bandits.source.record" not in decoded.attributes:
+                            # Where this span sits in the archived file, as native
+                            # records point (a native record already does).
+                            decoded.attributes["bandits.source.record"] = {
+                                **_position(location),
+                                "observation_id": str(raw.get("spanId")),
+                            }
                         yield decoded
 
 
@@ -1020,6 +1090,9 @@ def _decode_span(
     # but a span's own declaration is the more specific claim.
     span_attributes = _attributes(raw.get("attributes"))
     attributes = {**resource, **span_attributes}
+    if raw.get("kind") is not None:
+        # The span's own kind (client, server, internal, ...), as recorded.
+        attributes.setdefault("otel.span.kind", raw["kind"])
     if isinstance(scope, dict) and isinstance(scope.get("name"), str):
         attributes.setdefault("otel.scope.name", scope["name"])
     events = [
@@ -1080,8 +1153,14 @@ def _cyclic(spans: dict[str, _Decoded]) -> set[str]:
     return looped
 
 
-def _pipeline_steps(spans: dict[str, _Decoded]) -> set[str]:
-    """Declared steps with no model or tool call beneath them, outermost only."""
+def _pipeline_steps(
+    spans: dict[str, _Decoded], structure: frozenset[str] = frozenset()
+) -> tuple[set[str], dict[str, bool]]:
+    """Declared steps with no model or tool call beneath them, outermost only,
+    and whether each span has a model or tool call at or beneath it.
+
+    ``structure`` are spans a mapping declared structure: never pipeline steps.
+    """
     children: dict[str, list[str]] = {}
     for span in spans.values():
         if span.parent_id is not None:
@@ -1105,7 +1184,12 @@ def _pipeline_steps(spans: dict[str, _Decoded]) -> set[str]:
     def eligible(span_id: str) -> bool:
         span = spans[span_id]
         # The root is the episode itself, not a step inside it.
-        return span.role == _STEP and span.parent_id is not None and not has_action[span_id]
+        return (
+            span.role == _STEP
+            and span.parent_id is not None
+            and not has_action[span_id]
+            and span_id not in structure
+        )
 
     selected = set()
     for span_id in spans:
@@ -1117,7 +1201,7 @@ def _pipeline_steps(spans: dict[str, _Decoded]) -> set[str]:
             parent = spans[parent].parent_id
         if parent not in spans or parent in seen:
             selected.add(span_id)
-    return selected
+    return selected, has_action
 
 
 def _collapse_model_wrappers(spans: dict[str, _Decoded]) -> list[tuple[_Decoded, _Decoded]]:
@@ -1240,10 +1324,104 @@ def _counted(key: str, value: object, unparsed: Counter[str]) -> object:
     return parsed
 
 
+def _same(a: object, b: object) -> bool:
+    return type(a) is type(b) and a == b
+
+
+TRACE_RECORD = "bandits.native.trace_record"
+"""Where a native converter puts the source's trace-level record (on top steps)."""
+
+STORED_AS = "bandits.stored_as"
+"""``{source key: step field}``: declared values dropped from a step's
+attributes because the step holds the same value in that field."""
+
+
+def _node_attributes(span: _Decoded) -> dict[str, Any]:
+    """A node's attributes, less the declared values read into its ``input`` and
+    ``output`` fields (recorded in :data:`STORED_AS`)."""
+    attributes = dict(span.attributes)
+    stored: dict[str, str] = {}
+    for keys, field in ((_INPUT_VALUE_KEYS, "input"), (_OUTPUT_VALUE_KEYS, "output")):
+        found = _first_value(attributes, keys)
+        if found is not None:
+            del attributes[found[0]]
+            stored[found[0]] = field
+    if stored:
+        attributes[STORED_AS] = stored
+    attributes["bandits.otlp.source_context"] = _pruned_context(span)
+    return attributes
+
+
+def _store_once(
+    attributes: dict[str, Any], fields: tuple[tuple[tuple[str, ...], str, object], ...]
+) -> None:
+    """Drop each declared I/O value the step already holds, parsed, in a field.
+
+    Only an equal value is dropped, and :data:`STORED_AS` records where it is;
+    the exact bytes stay in the source archive.
+    """
+    stored: dict[str, str] = {}
+    for keys, field, value in fields:
+        found = _first_value(attributes, keys)
+        if found is None or value is None:
+            continue
+        parsed = _json_value(found[1])
+        parsed = found[1] if parsed is _UNPARSED else parsed
+        if _same(parsed, value):
+            stored[found[0]] = field
+        elif isinstance(value, dict) and set(value) == {"input"} and _same(parsed, value["input"]):
+            stored[found[0]] = f"{field}.input"
+    for key in stored:
+        del attributes[key]
+    if stored:
+        attributes[STORED_AS] = {**attributes.get(STORED_AS, {}), **stored}
+
+
+def _pruned_context(
+    decoded: _Decoded, final_attributes: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The span's source context, keeping only declarations the attributes don't.
+
+    Resource values the flattened attributes hold unchanged are dropped too,
+    with the resource's key names kept. A span attribute is already in the
+    flattened attributes unless (a) it
+    shadowed a different resource value of the same key, or (b) the final
+    attributes no longer hold it as declared (normalized messages replace
+    ``gen_ai.input.messages`` and its kin). Only those are kept here, so the
+    declared bytes survive without storing every attribute twice. Comparison
+    is type-aware: ``0``, ``False`` and ``""`` differ. Builds a new dict; the
+    decoded context is shared with the episode attributes and stays whole.
+    """
+    context = decoded.source_context
+    resource = context["resource"]
+    kept = {
+        key: value
+        for key, value in context["span_attributes"].items()
+        if (key in resource and not _same(resource[key], value))
+        or (final_attributes is not None and not _same(final_attributes.get(key), value))
+    }
+    if final_attributes is None:
+        return {**context, "span_attributes": kept}
+    # Resource values already in the flattened attributes are not stored again;
+    # ``resource_keys`` keeps which keys the resource declared, and a value a
+    # span attribute shadowed stays here.
+    return {
+        **context,
+        "span_attributes": kept,
+        "resource": {
+            key: value
+            for key, value in resource.items()
+            if not _same(final_attributes.get(key), value)
+        },
+        "resource_keys": sorted(resource),
+    }
+
+
 def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Span:
     attributes = dict(decoded.attributes)
     # Keep namespaces distinct. The flattened attributes above remain for
-    # existing convention translators; these are the recorded source facts.
+    # existing convention translators; these are the recorded source facts,
+    # pruned once the final attributes are known (``_pruned_context``).
     attributes["bandits.otlp.source_context"] = decoded.source_context
     if decoded.events:
         attributes["otel.events"] = decoded.events
@@ -1276,6 +1454,19 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
             # this placeholder become a training target or a judge answer.
             attributes["bandits.output_unusable_reason"] = "transport_response_object_repr"
             output = None
+        attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
+        _store_once(
+            attributes,
+            (
+                # A plain [{role, content}] prompt is the messages, reshaped.
+                (
+                    _INPUT_VALUE_KEYS,
+                    "gen_ai.input.messages",
+                    plain_messages(attributes.get("gen_ai.input.messages")),
+                ),
+                (_OUTPUT_VALUE_KEYS, "output", output),
+            ),
+        )
         return Span(
             span_id=decoded.span_id,
             parent_span_id=decoded.parent_id,
@@ -1312,6 +1503,16 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
     )
     if as_step:
         attributes[PIPELINE_STEP] = True
+    attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
+    arguments = (
+        arguments
+        if isinstance(arguments, dict)
+        else ({} if arguments is None else {"input": arguments})
+    )
+    _store_once(
+        attributes,
+        ((_INPUT_VALUE_KEYS, "arguments", arguments), (_OUTPUT_VALUE_KEYS, "output", output)),
+    )
     return Span(
         span_id=decoded.span_id,
         parent_span_id=decoded.parent_id,
@@ -1320,9 +1521,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
         started_at=decoded.started_at,
         ended_at=decoded.ended_at,
         status=status,
-        arguments=arguments
-        if isinstance(arguments, dict)
-        else ({} if arguments is None else {"input": arguments}),
+        arguments=arguments,
         output=output,
         # A step ran because the pipeline is written that way, not because a
         # model asked for it: nothing recorded a decision to call it.
@@ -1418,32 +1617,28 @@ def _files(path: Path) -> list[Path]:
     return sorted(p for p in path.rglob("*") if p.is_file() and p.suffix in (".json", ".jsonl"))
 
 
-def load_otlp_standard(
-    path: Path,
-    ruleset: RedactionRuleset = DEFAULT_RULESET,
-    *,
-    pipeline_steps: bool = True,
-    workflow: WorkflowDeclaration | None = None,
-) -> TraceCorpus:
-    """Read a standard OTLP/JSON export (a file or a directory) into one corpus.
+class _Read:
+    """Every decoded span of an export, grouped by trace, and what it came from."""
 
-    ``workflow`` declares the export a program-driven workflow. Then no model
-    input becomes a user turn, the task comes only from the declared fields of
-    the invocation record, steps containing model calls are kept as structure,
-    and each model call gets evidence links (``bandits.ingest.workflow``).
-    """
-    from bandits.ingest.workflow import build_request
+    __slots__ = ("by_trace", "source_digest", "ruleset_name")
 
-    workflow_extras: dict[str, dict[str, Any]] = {}
-    workflow_counts: Counter[str] = Counter()
+    def __init__(
+        self, by_trace: dict[str, dict[str, _Decoded]] | TraceSpool, digest: str, ruleset: str
+    ):
+        self.by_trace, self.source_digest, self.ruleset_name = by_trace, digest, ruleset
+
+
+def _read(
+    path: Path, ruleset: RedactionRuleset, issues: list[TraceIssue], report: IngestReport
+) -> _Read:
+    """Redact, decode and classify every file, counting what was seen."""
     files = _files(path)
     if not files:
         raise FileNotFoundError(f"no .json or .jsonl files under {path}")
-
-    issues: list[TraceIssue] = []
     digests: list[str] = []
     by_trace: dict[str, dict[str, _Decoded]] = {}
     counter = [0]
+    decoded_count = 0
     ruleset_name = ruleset.name
     for file in files:
         source = redact_source(file, ruleset)
@@ -1452,7 +1647,8 @@ def load_otlp_standard(
         digests.append(
             f"{file.relative_to(path) if path.is_dir() else file.name}\0{source.source_digest}"
         )
-        for decoded in _decode_file(file, source.data, issues, counter):
+        for decoded in _decode_file(file, source.data, issues, counter, report.unreadable_items):
+            decoded_count += 1
             spans = by_trace.setdefault(decoded.trace_id, {})
             if decoded.span_id in spans:
                 issues.append(
@@ -1463,8 +1659,11 @@ def load_otlp_standard(
                         location=decoded.location,
                     )
                 )
+                report.buckets["duplicate"] += 1
                 continue
             spans[decoded.span_id] = decoded
+    report.spans_seen += counter[0]
+    report.buckets["malformed_span"] += counter[0] - decoded_count
 
     # One file is its own digest. A directory is one export split into parts,
     # so its digest covers every part's exact bytes and its relative path.
@@ -1473,64 +1672,315 @@ def load_otlp_standard(
         if not path.is_dir()
         else hashlib.sha256("\n".join(digests).encode()).hexdigest()
     )
+    return _Read(by_trace, source_digest, ruleset_name)
 
-    unrepresented: Counter[str] = Counter()
-    containers: Counter[str] = Counter()
-    excluded: Counter[str] = Counter()
-    unparsed: Counter[str] = Counter()
+
+def _prepare(
+    trace_id: str, decoded: dict[str, _Decoded], issues: list[TraceIssue]
+) -> tuple[dict[str, _Decoded], int]:
+    """One trace's spans with loops removed and exclusions and duplicate model
+    instrumentation resolved: the roles every later decision reads.
+
+    Returns the remaining spans and how many were removed as cyclic.
+    """
+    looped = _cyclic(decoded)
+    for span_id in sorted(looped):
+        issues.append(
+            TraceIssue(
+                kind="malformed_span",
+                detail=f"span {span_id} of trace {trace_id} is its own ancestor through "
+                "parentSpanId; a trace is a tree, so it cannot be placed",
+                location=decoded[span_id].location,
+            )
+        )
+    decoded = {k: v for k, v in decoded.items() if k not in looped}
+    if not decoded:
+        return decoded, len(looped)
+    _exclude_subtrees(decoded)
+    for wrapper, call in _collapse_model_wrappers(decoded):
+        issues.append(
+            TraceIssue(
+                kind="duplicate_model_instrumentation",
+                detail=f"trace {trace_id}: enclosing model span {wrapper.span_id} and "
+                f"provider span {call.span_id} appear to record one call; "
+                "the enclosing record is retained as structure",
+                location=wrapper.location,
+            )
+        )
+    return decoded, len(looped)
+
+
+def _top_steps(spans: dict[str, _Decoded]) -> list[tuple[_Decoded, str]]:
+    """Spans whose parent is absent from the trace, with that parent's id.
+
+    Converter containers are looked through, as for invocation candidates: a
+    span under a container whose own parent was never exported is a top step.
+    """
+    out = []
+    for span in sorted(spans.values(), key=lambda s: (s.started_at, s.index)):
+        if _is_container(span) or span.role == _EXCLUDED:
+            continue
+        parent, seen = span.parent_id, {span.span_id}
+        while parent in spans and parent not in seen and _is_container(spans[parent]):
+            seen.add(parent)
+            parent = spans[parent].parent_id
+        if parent is not None and parent not in spans:
+            out.append((span, parent))
+    return out
+
+
+def _shape_digests(
+    spans: dict[str, _Decoded],
+) -> tuple[dict[str | None, list[str]], dict[str, str]]:
+    """Each span's subtree signature digest, and the children under each parent
+    (``None``: spans whose parent is not in the trace)."""
+    children: dict[str | None, list[str]] = {}
+    for span in spans.values():
+        parent = span.parent_id if span.parent_id in spans else None
+        children.setdefault(parent, []).append(span.span_id)
+    digest: dict[str, str] = {}
+    stack: list[tuple[str, bool]] = [(root, False) for root in children.get(None, ())]
+    while stack:  # iterative post-order; exported trees can be deep
+        node, expanded = stack.pop()
+        if node in digest:
+            continue
+        if not expanded:
+            stack.append((node, True))
+            stack.extend((c, False) for c in children.get(node, ()) if c not in digest)
+            continue
+        span = spans[node]
+        below = ",".join(sorted({digest[c] for c in children.get(node, ())}))
+        signature = f"{span.role}|{span.label}|{span.name}({below})"
+        digest[node] = hashlib.sha256(signature.encode()).hexdigest()
+    return children, digest
+
+
+def shape_id(spans: dict[str, _Decoded]) -> str:
+    """A short id for how one trace is structured, independent of order and repeats.
+
+    Each span is ``role|declared kind|name`` over the set of its children's
+    signatures, so the same step repeated, or siblings recorded in another
+    order, give the same shape; different nesting gives a different one. Every
+    span whose parent is not in the trace hangs off one virtual root, so a
+    trace with several top-level steps is one shape; the absent parent ids
+    themselves never enter it. Children are combined by digest, sorted, which
+    keeps a deep trace's signature bounded.
+    """
+    children, digest = _shape_digests(spans)
+    top = ",".join(sorted({digest[root] for root in children.get(None, ())}))
+    return hashlib.sha256(f"({top})".encode()).hexdigest()[:12]
+
+
+OUTLINE_LINES = 200
+"""Lines kept in one shape's outline; a longer one ends with a count of the rest."""
+
+
+def shape_outline(spans: dict[str, _Decoded]) -> list[str]:
+    """One shape as indented lines, ``role · name`` with ``×N`` for a step
+    repeated with the same subtree: what :func:`shape_id` hashes, readable.
+
+    Siblings that :func:`shape_id` treats as one (same subtree) are one line;
+    lines are ordered by first start, so the outline reads like the trace.
+    """
+    children, digest = _shape_digests(spans)
+
+    def grouped(ids: list[str]) -> list[tuple[str, int]]:
+        first: dict[str, str] = {}
+        count: Counter[str] = Counter()
+        for span_id in sorted(ids, key=lambda i: (spans[i].started_at, spans[i].index)):
+            first.setdefault(digest[span_id], span_id)
+            count[digest[span_id]] += 1
+        return [(span_id, count[d]) for d, span_id in first.items()]
+
+    lines: list[str] = []
+    stack = [(span_id, n, 0) for span_id, n in reversed(grouped(children.get(None, [])))]
+    while stack:
+        span_id, repeats, depth = stack.pop()
+        if len(lines) >= OUTLINE_LINES:
+            lines.append(f"… {len(stack) + 1} more step group(s)")
+            break
+        span = spans[span_id]
+        lines.append(
+            "  " * depth + f"{span.role} · {span.name}" + (f" ×{repeats}" if repeats > 1 else "")
+        )
+        stack.extend(
+            (child, n, depth + 1) for child, n in reversed(grouped(children.get(span_id, [])))
+        )
+    return lines
+
+
+def _apply_step_kinds(
+    spans: dict[str, _Decoded],
+    kinds: dict[str, str],
+    not_applicable: Counter[str],
+    hits: Counter[str],
+) -> tuple[set[str], frozenset[str]]:
+    """A mapping's role overrides, applied over the classified roles.
+
+    ``step`` makes a model or tool call structure; ``exclude`` removes the span
+    and everything beneath it, as an evaluator is; ``tool`` makes a span a
+    pipeline step the agent did not call, but only where no model or tool call
+    sits beneath it (a step with calls beneath is represented by them), else
+    the override is left unapplied and counted. Returns the spans forced to be
+    pipeline steps and those declared structure.
+    """
+    tools: dict[str, str] = {}
+    structure: set[str] = set()
+    for span in spans.values():
+        kind = kinds.get(f"{span.label}|{span.name}")
+        if kind is None:
+            continue
+        hits[f"{span.label}|{span.name}"] += 1
+        if span.role == _EXCLUDED:
+            continue
+        if kind == "exclude":
+            span.role, span.label = _EXCLUDED, f"{LABEL_PREFIX}{span.label}|{span.name}"
+        elif kind == "step":
+            span.role = _STEP
+            structure.add(span.span_id)
+        elif kind == "tool":
+            tools[span.span_id] = span.role
+            span.role = _STEP
+    _exclude_subtrees(spans)
+    if not tools:
+        return set(), frozenset(structure)
+    _, has_action = _pipeline_steps(spans)
+    forced = set()
+    for span_id, original in tools.items():
+        span = spans[span_id]
+        if span.role == _EXCLUDED:  # beneath an excluded span; exclusion wins
+            continue
+        if has_action[span_id]:
+            span.role = original
+            not_applicable[f"{span.label}|{span.name}"] += 1
+        else:
+            forced.add(span_id)
+    return forced, frozenset(structure)
+
+
+def _absent_parent_example(trace_id: str, top: list[tuple[_Decoded, str]]) -> str:
+    steps = ", ".join(
+        f"{span.name}({span.label.rsplit('=', 1)[-1]})→{parent}"
+        for span, parent in top[:STEPS_PER_EXAMPLE]
+    )
+    more = f", +{len(top) - STEPS_PER_EXAMPLE} more" if len(top) > STEPS_PER_EXAMPLE else ""
+    return f"trace {trace_id}: {steps}{more}"
+
+
+def load_otlp_standard(
+    path: Path,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    pipeline_steps: bool = True,
+    workflow: WorkflowDeclaration | None = None,
+    report: IngestReport | None = None,
+    defer_aggregate_issues: bool = False,
+    mapping: IngestMapping | None = None,
+    _read_result: _Read | None = None,
+) -> TraceCorpus:
+    """Read a standard OTLP/JSON export (a file or a directory) into one corpus.
+
+    ``workflow`` declares the export a program-driven workflow. Then no model
+    input becomes a user turn, the task comes only from the declared fields of
+    the invocation record, steps containing model calls are kept as structure,
+    and each model call gets evidence links (``bandits.ingest.workflow``).
+
+    ``report`` receives what was seen and where each span went (summed into it).
+    ``defer_aggregate_issues`` leaves the per-ingest summary issues to a caller
+    that reads one export in several calls, so they are issued once.
+
+    ``mapping`` is a confirmed mapping (``bandits.ingest.mapping``): its role
+    overrides, its invocation identities and its confirmed shapes are applied.
+    Its fields arrive through ``workflow``; nothing is discovered here.
+    """
+    from bandits.ingest.workflow import build_request
+
+    local = IngestReport()
+    workflow_extras: dict[str, dict[str, Any]] = {}
+    source_records: dict[str, dict[str, Any]] = {}
+    issues: list[TraceIssue] = []
+    if _read_result is None:
+        read = _read(path, ruleset, issues, local)
+    else:
+        read = _read_result
+        local.spans_seen = sum(len(spans) for spans in read.by_trace.values())
+
+    unparsed = local.unparsed
     spans_by_trace: dict[str, list[tuple[int, Span]]] = {}
     task_by_trace: dict[str, str] = {}
     lineage_by_trace: dict[str, str] = {}
     episode_attributes: dict[str, dict[str, Any]] = {}
-    for trace_id, decoded in by_trace.items():
-        looped = _cyclic(decoded)
-        for span_id in sorted(looped):
-            issues.append(
-                TraceIssue(
-                    kind="malformed_span",
-                    detail=f"span {span_id} of trace {trace_id} is its own ancestor through "
-                    "parentSpanId; a trace is a tree, so it cannot be placed",
-                    location=decoded[span_id].location,
-                )
-            )
-        decoded = {k: v for k, v in decoded.items() if k not in looped}
+    for trace_id, decoded in read.by_trace.items():
+        decoded, looped = _prepare(trace_id, decoded, issues)
+        local.buckets["cyclic"] += looped
         if not decoded:
             continue
-        _exclude_subtrees(decoded)
-        for wrapper, call in _collapse_model_wrappers(decoded):
-            issues.append(
-                TraceIssue(
-                    kind="duplicate_model_instrumentation",
-                    detail=f"trace {trace_id}: enclosing model span {wrapper.span_id} and "
-                    f"provider span {call.span_id} appear to record one call; "
-                    "the enclosing record is retained as structure",
-                    location=wrapper.location,
+        # The export's own structure: drift compares it before any override.
+        shape = shape_id(decoded)
+        outline = shape_outline(decoded) if shape not in local.shapes else None
+        # A native export's trace-level record rides on its top steps; it
+        # belongs to the trace.
+        for span in decoded.values():
+            record = _json_value(span.attributes.pop(TRACE_RECORD, None))
+            if isinstance(record, dict):
+                source_records.setdefault(trace_id, record)
+        forced: set[str] = set()
+        structure: frozenset[str] = frozenset()
+        if mapping is not None:
+            if shape not in mapping.shape_ids:
+                local.unmapped_shapes += 1
+            if mapping.step_kinds:
+                forced, structure = _apply_step_kinds(
+                    decoded, mapping.step_kinds, local.override_not_applicable, local.step_kind_hits
                 )
-            )
-        steps = _pipeline_steps(decoded)
+        models = sum(span.role == _MODEL for span in decoded.values())
+        steps, has_action = _pipeline_steps(decoded, structure)
+        if forced:
+            steps |= forced
+            steps -= _covered(decoded, steps)  # outermost only
         covered = _covered(decoded, steps)
+        bucket: dict[str, str] = {}
         collected: list[tuple[int, Span]] = []
         for span in sorted(decoded.values(), key=lambda s: s.index):
             if span.role in (_MODEL, _TOOL):
                 collected.append((span.index, _to_span(span, as_step=False, unparsed=unparsed)))
+                bucket[span.span_id] = span.role
             elif span.span_id in steps:
                 if pipeline_steps:
                     collected.append((span.index, _to_span(span, as_step=True, unparsed=unparsed)))
+                    bucket[span.span_id] = "pipeline_step"
+                elif workflow is None:
+                    local.unrepresented[span.label] += 1
+                    bucket[span.span_id] = "unrepresented"
                 else:
-                    unrepresented[span.label] += 1
-            elif _is_container(span):
-                containers[span.label] += 1
+                    bucket[span.span_id] = "node"  # kept as structure (below)
             elif span.role == _EXCLUDED:
-                excluded[span.label] += 1
-            elif (
-                span.role == _NONE
-                and span.span_id not in covered
-                # A workflow keeps these as structure (below).
-                and workflow is None
-            ):
-                unrepresented[span.label] += 1
-            # Otherwise a step with calls beneath it (represented by them) or a
-            # span inside a selected step (represented by the step).
+                if span.label.startswith(LABEL_PREFIX):
+                    local.excluded_by_mapping[span.label.removeprefix(LABEL_PREFIX)] += 1
+                else:
+                    local.excluded[span.label] += 1
+                bucket[span.span_id] = "excluded"
+            elif _is_container(span):
+                local.containers[span.label] += 1
+                bucket[span.span_id] = "container"
+            elif workflow is not None:
+                bucket[span.span_id] = "node"  # every other recorded step is structure
+            elif span.role == _NONE and span.span_id not in covered:
+                local.unrepresented[span.label] += 1
+                bucket[span.span_id] = "unrepresented"
+            elif span.role == _STEP and has_action[span.span_id]:
+                bucket[span.span_id] = "step_with_calls"  # represented by its calls
+            elif span.span_id in covered:
+                bucket[span.span_id] = "covered"  # represented by the enclosing step
+            else:
+                # A root step with nothing beneath it, or any span no rule
+                # above represents: never silently absent.
+                local.unrepresented[span.label] += 1
+                bucket[span.span_id] = (
+                    "root_step"
+                    if span.role == _STEP and span.parent_id is None
+                    else "unrepresented"
+                )
             lineage = next(
                 (
                     span.attributes[k]
@@ -1557,11 +2007,21 @@ def load_otlp_standard(
                         "or pipeline step",
                     )
                 )
+            local.buckets.update(
+                "excluded" if name == "excluded" else "empty_trace" for name in bucket.values()
+            )
+            local.add_shape(shape, trace_id, models, None, outline=outline)
             lineage_by_trace.pop(trace_id, None)
             continue
         spans_by_trace[trace_id] = collected
         root = _episode_root(decoded)
         if workflow is not None:
+            top = _top_steps(decoded)
+            if top:
+                local.traces_with_absent_parents += 1
+                local.max_top_steps = max(local.max_top_steps, len(top))
+                if len(local.absent_parent_examples) < EXAMPLES:
+                    local.absent_parent_examples.append(_absent_parent_example(trace_id, top))
             candidates = _invocation_candidates(decoded)
             # Cut-off values are counted per candidate, and only the chosen
             # invocation's reach the report: it is left out of the workflow nodes,
@@ -1579,7 +2039,18 @@ def load_otlp_standard(
                 }
                 for span_id in candidates
             }
-            request = build_request(candidates=candidates, records=records, declaration=workflow)
+            allowed = None
+            if mapping is not None and mapping.invocation:
+                identities = mapping.invocation_keys
+                allowed = [
+                    c for c in candidates if (decoded[c].label, decoded[c].name) in identities
+                ]
+            request = build_request(
+                candidates=candidates,
+                records=records,
+                declaration=workflow,
+                allowed=allowed,
+            )
             if request.source_span_id is not None:
                 unparsed.update(scratch.get(request.source_span_id, Counter()))
             if request.source_span_id is None:
@@ -1593,12 +2064,21 @@ def load_otlp_standard(
             else:
                 # The invocation, not the converter's container, is the episode's context.
                 root = decoded[request.source_span_id]
+                bucket[request.source_span_id] = "invocation"
                 # It is the episode record, never one of its actions: a code-only
                 # invocation would otherwise also be kept as a pipeline step.
                 spans_by_trace[trace_id] = [
                     pair for pair in collected if pair[1].span_id != request.source_span_id
                 ]
-            workflow_counts[request.task_status] += 1
+            local.task_status[request.task_status] += 1
+            local.add_shape(
+                shape,
+                trace_id,
+                models,
+                request.task_status,
+                task_path=request.task_path,
+                outline=outline,
+            )
             # Every recorded step not already kept as a span is structure: steps
             # containing calls, and the code-only records inside a kept pipeline
             # step, whose output is often its own (a scoring, a search backend).
@@ -1614,12 +2094,7 @@ def load_otlp_standard(
                     output=_io_value(span.attributes, _OUTPUT_VALUE_KEYS, unparsed),
                     status=SpanStatus.ERROR if span.error else SpanStatus.OK,
                     framework=_framework(span.attributes),
-                    attributes={
-                        key: value
-                        for key, value in span.attributes.items()
-                        if key not in _INPUT_VALUE_KEYS and key not in _OUTPUT_VALUE_KEYS
-                    }
-                    | {"bandits.otlp.source_context": span.source_context},
+                    attributes=_node_attributes(span),
                 )
                 for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
                 if span.role in (_STEP, _NONE)
@@ -1627,6 +2102,7 @@ def load_otlp_standard(
                 and span.span_id != request.source_span_id
                 and not _is_container(span)
             )
+            local.buckets.update(bucket.values())
             turns: tuple[UserTurn, ...] = ()
             if request.origin == "human" and request.task is not None:
                 turns = (UserTurn(text=request.task, after_span_id=None, origin="declared"),)
@@ -1650,6 +2126,8 @@ def load_otlp_standard(
                     "bandits.otlp.source_context": root.source_context,
                 }
             continue
+        local.buckets.update(bucket.values())
+        local.add_shape(shape, trace_id, models, None, outline=outline)
         if root is not None:
             episode_attributes[trace_id] = {
                 **root.attributes,
@@ -1661,71 +2139,263 @@ def load_otlp_standard(
         if task is not None:
             task_by_trace[trace_id] = task
 
-    for key, count in sorted(unparsed.items()):
-        issues.append(
-            TraceIssue(
-                kind="unparsed_value",
-                detail=f"{count} value(s) under {key} open as JSON but do not parse, as an "
-                "exporter that cuts long values off leaves them; none was read as message text",
-                location=str(path),
+    accounted = sum(local.buckets.values())
+    if accounted != local.spans_seen:
+        local.accounting_errors.append(
+            f"{path}: {local.spans_seen} span(s) seen but {accounted} accounted for "
+            f"({dict(local.buckets)}); this is a bandits bug"
+        )
+    if not defer_aggregate_issues:
+        issues.extend(
+            aggregate_issues(
+                local,
+                str(path),
+                workflow=workflow is not None,
+                mapping_name=workflow.mapping_name if workflow is not None else None,
+                step_kinds=mapping.step_kinds if mapping is not None else (),
             )
         )
-    for label, count in sorted(unrepresented.items()):
-        issues.append(
-            TraceIssue(
-                kind="unrepresented_span",
-                detail=f"{count} span(s) with {label} carry no model or tool call and are not "
-                "in the corpus",
-                location=str(path),
-            )
-        )
-    for label, count in sorted(containers.items()):
-        issues.append(
-            TraceIssue(
-                kind="source_container",
-                detail=f"{count} converter container span(s) with {label} are kept in the "
-                "source archive, not as application actions",
-                location=str(path),
-            )
-        )
-    for label, count in sorted(excluded.items()):
-        issues.append(
-            TraceIssue(
-                kind="excluded_evaluator",
-                detail=f"{count} evaluator span(s) with {label} excluded from the action corpus",
-                location=str(path),
-            )
-        )
-
-    if workflow is not None:
-        for status in ("unresolved", "conflict"):
-            if workflow_counts[status]:
-                issues.append(
-                    TraceIssue(
-                        kind=f"task_{status}",
-                        detail=f"{workflow_counts[status]} workflow trace(s) have their task "
-                        f"{status}; see each trace's request.task_reason",
-                        location=str(path),
-                    )
-                )
 
     corpus = assemble_corpus(
         spans_by_trace,
         task_by_trace=task_by_trace,
         lineage_by_trace=lineage_by_trace,
         source=SOURCE,
-        source_digest=source_digest,
+        source_digest=read.source_digest,
         issues=issues,
-        redaction_ruleset=ruleset_name,
+        redaction_ruleset=read.ruleset_name,
         episode_attributes=episode_attributes,
-        trace_extras=workflow_extras,
+        trace_extras={
+            trace_id: {
+                **workflow_extras.get(trace_id, {}),
+                **(
+                    {"source_record": source_records[trace_id]}
+                    if trace_id in source_records
+                    else {}
+                ),
+            }
+            for trace_id in workflow_extras.keys() | source_records.keys()
+        },
     )
     if workflow is None:
+        if report is not None:
+            report.merge(local)
         return corpus
     from bandits.ingest.workflow import build_evidence
 
-    traces = tuple(
-        trace.replace(evidence=build_evidence(trace.spans, trace.workflow_nodes, trace.request))
-        for trace in corpus.traces
+    traces = []
+    started = time.perf_counter()
+    for trace in corpus.traces:
+        links = build_evidence(trace.spans, trace.workflow_nodes, trace.request)
+        local.add_evidence(links)
+        traces.append(trace.replace(evidence=links))
+    local.evidence_seconds += time.perf_counter() - started
+    if report is not None:
+        report.merge(local)
+    return corpus.replace(traces=tuple(traces), workflow=workflow)
+
+
+def _disk_read(
+    path: Path,
+    ruleset: RedactionRuleset,
+    issues: list[TraceIssue],
+    report: IngestReport,
+    spool: TraceSpool,
+) -> _Read:
+    """Decode JSONL one record at a time, grouping spans on disk.
+
+    Whole-file JSON retains its existing decoder. Redaction notices precede
+    decode issues for each file, exactly as in the materialized reader.
+    """
+    files = _files(path)
+    if not files:
+        raise FileNotFoundError(f"no .json or .jsonl files under {path}")
+    counter = [0]
+    decoded_count = 0
+    digests = []
+    for file in files:
+        with file.open("rb") as stream:
+            count = 0
+            first = b""
+            digest = hashlib.sha256()
+            for line in stream:
+                digest.update(line)
+                if line.strip():
+                    count += 1
+                    if not first:
+                        first = line
+        try:
+            json.loads(first.decode("utf-8"))
+            jsonl = first_valid = True
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            first_valid = False
+            jsonl = (
+                file.suffix == ".jsonl"
+                and first.strip() not in (b"{", b"[")
+                and (
+                    not first.lstrip().startswith((b"{", b"["))
+                    or first.rstrip().endswith((b"}", b"]"))
+                )
+            )
+        file_issues = []
+        if jsonl:
+            detected, escaped = [], []
+
+            parsed_digest = hashlib.sha256()
+
+            def requests(
+                file=file,
+                count=count,
+                first_valid=first_valid,
+                detected=detected,
+                escaped=escaped,
+                parsed_digest=parsed_digest,
+            ):
+                with file.open("rb") as stream:
+                    for number, line in enumerate(stream, 1):
+                        parsed_digest.update(line)
+                        if not line.strip():
+                            continue
+                        safe = redact_bytes(line, str(file), ruleset)
+                        for issue in safe.issues:
+                            if issue.detail.startswith("redacted detected"):
+                                detected.append(issue.replace(location=f"{file}:{number}"))
+                            else:
+                                escaped.append(
+                                    issue.replace(
+                                        location=str(file)
+                                        if count == 1 and first_valid
+                                        else f"{file}:{number}"
+                                    )
+                                )
+                        if count == 1 and first_valid:
+                            yield from _requests(safe.data, str(file))
+                        else:
+                            try:
+                                yield (
+                                    f"{file}:{number}",
+                                    json.loads(safe.data.rstrip(b"\n").decode("utf-8")),
+                                )
+                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                yield f"{file}:{number}", exc
+
+            spans = _decode_file(
+                file, b"", file_issues, counter, report.unreadable_items, requests=requests()
+            )
+        else:
+            safe = redact_source(file, ruleset)
+            detected, escaped = list(safe.issues), []
+            digest = None
+            spans = _decode_file(file, safe.data, file_issues, counter, report.unreadable_items)
+        for decoded in spans:
+            decoded_count += 1
+            if not spool.add(decoded):
+                file_issues.append(
+                    TraceIssue(
+                        kind="duplicate_span",
+                        detail=f"span {decoded.span_id} of trace {decoded.trace_id} was exported more than once; the first copy is kept",
+                        location=decoded.location,
+                    )
+                )
+                report.buckets["duplicate"] += 1
+        if jsonl and parsed_digest.hexdigest() != digest.hexdigest():
+            raise ValueError(f"source file changed during ingest: {file}")
+        issues.extend(detected)
+        issues.extend(escaped)
+        issues.extend(file_issues)
+        source_digest = digest.hexdigest() if digest is not None else safe.source_digest
+        digests.append(f"{file.relative_to(path) if path.is_dir() else file.name}\0{source_digest}")
+    report.spans_seen += counter[0]
+    report.buckets["malformed_span"] += counter[0] - decoded_count
+    source_digest = (
+        digests[0].split("\0", 1)[1]
+        if not path.is_dir()
+        else hashlib.sha256("\n".join(digests).encode()).hexdigest()
     )
-    return corpus.replace(traces=traces, workflow=workflow)
+    return _Read(spool, source_digest, ruleset.name)
+
+
+def iter_otlp_standard(
+    path: Path,
+    ruleset: RedactionRuleset = DEFAULT_RULESET,
+    *,
+    workflow: WorkflowDeclaration | None = None,
+    pipeline_steps: bool = True,
+    report: IngestReport | None = None,
+    mapping: IngestMapping | None = None,
+    defer_aggregate_issues: bool = False,
+    scratch_dir: Path | None = None,
+) -> Iterator[Trace | TraceCorpus]:
+    """Read interleaved JSONL with disk grouping, yielding traces then a footer."""
+    with tempfile.TemporaryDirectory(
+        prefix=".bandits-read-", dir=scratch_dir or Path.cwd()
+    ) as directory:
+        spool = TraceSpool(Path(directory))
+        try:
+            local = IngestReport()
+            issues = []
+            read = _disk_read(path, ruleset, issues, local, spool)
+            seen = local.spans_seen
+            for trace_id, decoded in read.by_trace.items():
+                one = IngestReport()
+                corpus = load_otlp_standard(
+                    path,
+                    ruleset,
+                    workflow=workflow,
+                    pipeline_steps=pipeline_steps,
+                    report=one,
+                    mapping=mapping,
+                    defer_aggregate_issues=True,
+                    _read_result=_Read({trace_id: decoded}, read.source_digest, read.ruleset_name),
+                )
+                one.spans_seen = 0  # already counted by the decoding pass
+                local.merge(one)
+                issues.extend(corpus.issues)
+                for trace in corpus.traces:
+                    spool.save_trace(trace)
+                del corpus, decoded
+            if sum(local.buckets.values()) != seen:
+                local.accounting_errors.append(
+                    f"{path}: {seen} span(s) seen but {sum(local.buckets.values())} accounted for; this is a bandits bug"
+                )
+            if not defer_aggregate_issues:
+                issues.extend(
+                    aggregate_issues(
+                        local,
+                        str(path),
+                        workflow=workflow is not None,
+                        mapping_name=workflow.mapping_name if workflow else None,
+                        step_kinds=mapping.step_kinds if mapping else (),
+                    )
+                )
+            if report is not None:
+                report.merge(local)
+            yield from spool.sorted_traces()
+            yield TraceCorpus(
+                source=SOURCE,
+                traces=(),
+                issues=tuple(issues),
+                workflow=workflow,
+                redaction_ruleset=ruleset.name,
+            )
+        finally:
+            spool.close()
+
+
+@contextmanager
+def disk_read(
+    path: Path,
+    ruleset: RedactionRuleset,
+    issues: list[TraceIssue],
+    report: IngestReport,
+    scratch_dir: Path | None = None,
+) -> Iterator[_Read]:
+    """A disk-grouped decoding pass for request discovery without a corpus."""
+    with tempfile.TemporaryDirectory(
+        prefix=".bandits-discover-", dir=scratch_dir or Path.cwd()
+    ) as directory:
+        spool = TraceSpool(Path(directory))
+        try:
+            yield _disk_read(path, ruleset, issues, report, spool)
+        finally:
+            spool.close()

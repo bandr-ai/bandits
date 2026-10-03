@@ -624,9 +624,11 @@ def assemble_corpus(
             system_prompt = root_prompt if root_prompt is not None else system_prompt
             context = {**context, **root_context}
         extras = (trace_extras or {}).get(trace_id, {})
-        # Each workflow stage runs under its own system message; none of them is
-        # the episode's policy, and each stays on its own span.
-        if system_prompt is None and extras.get("interaction") != "workflow":
+        if extras.get("interaction") == "workflow":
+            # Only the invocation can declare a workflow-wide policy. Each stage
+            # runs under its own system message, which stays on its own span.
+            system_prompt = context_from_attributes(declared or {})[1]
+        elif system_prompt is None:
             # Most exporters record the policy as the system message opening
             # each model call rather than on the root. The first call's is what
             # the episode started under; a later call under a different one is

@@ -159,8 +159,28 @@ class WorkflowDeclaration(Contract):
     """Who started the runs. A workflow has no human follow-ups inside a run; that
     says nothing about who started it."""
 
-    derivation_version: int = 1
-    """Bumped whenever how requests, nodes or links are derived changes."""
+    mapping_name: str | None = None
+    mapping_digest: str | None = None
+    """The confirmed ingest mapping these choices came from, and its digest; None
+    when they were passed as flags or found. A different mapping is a different
+    artifact even when it happens to choose the same fields."""
+
+    derivation_version: int = 3
+    """Bumped whenever how requests, nodes or links are derived changes.
+
+    3: the source's trace record on the trace, not its top steps; declared I/O
+    values a step holds in its own fields stored once (``bandits.stored_as``).
+
+    2: invocation-only workflow system prompt, ``input_context`` links, exact
+    short-label matching, archive pointers in place of copied native records."""
+
+
+class TaskCandidate(Contract):
+    """One place the task was recorded: a declared field on a candidate span."""
+
+    span_id: str
+    path: str
+    value: str
 
 
 class WorkflowRequest(Contract):
@@ -188,6 +208,11 @@ class WorkflowRequest(Contract):
     task_path: str | None = None
     task_reason: str | None = None
     """Why the task is unresolved or in conflict; None when declared."""
+
+    task_candidates: tuple[TaskCandidate, ...] = ()
+    """Every non-empty value a declared task field holds on the invocation
+    candidates. Declared tasks list where the agreeing text came from; a
+    conflict keeps every differing value, for a consumer to choose from."""
 
     origin: Literal["human", "machine", "unknown"] = "unknown"
 
@@ -224,7 +249,10 @@ class WorkflowNode(Contract):
 
 
 class EvidenceLink(Contract):
-    """One recorded relationship from a model call to something observed later.
+    """One recorded relationship involving a model call.
+
+    ``input_context`` points to an earlier pipeline result whose text appears
+    in the call input; other kinds describe structure or later observations.
 
     A link says what the record supports and on what basis — never that one
     thing caused another. ``ambiguous`` marks a match that could as well belong
@@ -233,10 +261,12 @@ class EvidenceLink(Contract):
 
     call_span_id: str
     kind: Literal[
-        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery"
+        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery",
+        "input_context",
     ]
     target_span_id: str | None = None
-    """The span or node the call links to; None for ``delivery`` (the request record)."""
+    """The span or node the call links to; None for ``delivery`` (the request record).
+    For ``input_context``, the target is the earlier source of recorded input text."""
 
     basis: str
     match_chars: int | None = None
@@ -247,6 +277,21 @@ class EvidenceLink(Contract):
     Overlap, not contribution: a framework that passes its whole state forward
     repeats every earlier output in every later input. ``shared_result`` says the
     texts appear there together — never that these calls caused that result."""
+
+
+NOTICE_ISSUE_KINDS = frozenset(
+    {
+        "redaction",
+        "source_container",
+        "excluded_evaluator",
+        "excluded_evaluator_trace",
+        "duplicate_model_instrumentation",
+        "task_unresolved",  # reported as no_task, with the fix
+        "parent_not_exported",
+        "excluded_by_mapping",
+    }
+)
+"""Issue kinds that describe how ingest handled the data, not a problem with it."""
 
 
 class TraceIssue(Contract):
@@ -316,6 +361,10 @@ class Trace(Contract):
 
     system_prompt: str | None = None
     """The system or developer instruction the episode ran under, when recorded."""
+
+    source_record: dict[str, Any] | None = None
+    """The source's own trace-level record (its fields other than the steps),
+    for exports that have one; None when the source has no such record."""
 
     runtime_context: dict[str, Any] = Field(default_factory=dict)
     """Configuration the episode ran under: model, sampling settings, working
