@@ -266,6 +266,8 @@ def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str
         }
         parent = observation.get("parentObservationId") or enclosing_id
         if parent is None or str(parent) not in present:
+            # On every top step: the first may become the trace's request,
+            # which is not stored as a step.
             attributes["bandits.native.trace_record"] = {
                 k: v for k, v in trace_record.items() if k != "observations"
             }
@@ -279,6 +281,12 @@ def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str
             metadata = decoded if isinstance(decoded, dict) else metadata
         if isinstance(metadata, dict):
             for key, value in metadata.items():
+                if key in _PROMOTED_METADATA and isinstance(value, dict):
+                    # The span's resource or scope (below), not stored twice;
+                    # the marker lets readers find it under its own name.
+                    moved = attributes.setdefault("bandits.native.metadata_moved", {})
+                    moved[key] = _PROMOTED_METADATA[key]
+                    continue
                 attributes[f"metadata.{key}"] = value
         # Metadata that is not an object is not consumed: it is carried as-is.
         _carry(
@@ -341,6 +349,12 @@ _LANGFUSE_USED: Used = {
 }
 """Langfuse observation fields the converter turns into span fields or the
 attributes above; every other field is kept in ``bandits.unmapped``."""
+
+
+_PROMOTED_METADATA = {"resourceAttributes": "resource", "scope": "scope"}
+"""Langfuse metadata keys holding the span's OTel resource and scope: they
+become the span's resource and scope, read back as ``metadata.*`` by
+``bandits.fields``."""
 
 
 def langfuse_used(observation: dict[str, Any]) -> Used:

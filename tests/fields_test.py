@@ -92,3 +92,25 @@ def test_cli_prints_json_for_agents(tmp_path: Path) -> None:
     assert line["value"] == "because" and line["present"]
     missing = runner.invoke(app, ["fields", "corpus-nope", "--project", str(tmp_path)])
     assert missing.exit_code == 1
+
+
+def test_metadata_stored_as_the_resource_still_reads_under_its_own_name(tmp_path: Path) -> None:
+    observation = {
+        "id": "o1",
+        "type": "GENERATION",
+        "name": "chat",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": "2026-01-01T00:00:01Z",
+        "input": "hi",
+        "output": "hello",
+        "metadata": {"resourceAttributes": {"service.name": "svc"}, "kept": 1},
+    }
+    path = tmp_path / "lf.json"
+    path.write_text(json.dumps({"id": "t1", "observations": [observation]}))
+    corpus = load_corpus(path, "langfuse")
+    (step,) = corpus.traces[0].spans
+    assert "metadata.resourceAttributes" not in step.attributes  # stored once, as the resource
+    (row,) = values(corpus, "metadata.resourceAttributes.service.name", present_only=True)
+    assert row["value"] == "svc"
+    (row,) = values(corpus, "resource.service.name", present_only=True)
+    assert row["value"] == "svc"

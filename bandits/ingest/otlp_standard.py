@@ -1310,7 +1310,9 @@ def _pruned_context(
 ) -> dict[str, Any]:
     """The span's source context, keeping only declarations the attributes don't.
 
-    A span attribute is already in the flattened attributes unless (a) it
+    Resource values the flattened attributes hold unchanged are dropped too,
+    with the resource's key names kept. A span attribute is already in the
+    flattened attributes unless (a) it
     shadowed a different resource value of the same key, or (b) the final
     attributes no longer hold it as declared (normalized messages replace
     ``gen_ai.input.messages`` and its kin). Only those are kept here, so the
@@ -1326,7 +1328,21 @@ def _pruned_context(
         if (key in resource and not _same(resource[key], value))
         or (final_attributes is not None and not _same(final_attributes.get(key), value))
     }
-    return {**context, "span_attributes": kept}
+    if final_attributes is None:
+        return {**context, "span_attributes": kept}
+    # Resource values already in the flattened attributes are not stored again;
+    # ``resource_keys`` keeps which keys the resource declared, and a value a
+    # span attribute shadowed stays here.
+    return {
+        **context,
+        "span_attributes": kept,
+        "resource": {
+            key: value
+            for key, value in resource.items()
+            if not _same(final_attributes.get(key), value)
+        },
+        "resource_keys": sorted(resource),
+    }
 
 
 def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Span:

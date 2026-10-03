@@ -382,7 +382,13 @@ def test_native_phoenix_preserves_openinference_and_links(tmp_path: Path) -> Non
     assert span.kind == SpanKind.MODEL
     assert resolve_record(path.read_bytes(), span.attributes["bandits.source.record"]) == raw
     assert span.attributes["bandits.otlp.source_context"]["links"] == raw["links"]
-    assert span.attributes["bandits.otlp.source_context"]["resource"] == {"service.name": "demo"}
+    # Stored once: the value lives in the attributes, the context keeps its key.
+    context = span.attributes["bandits.otlp.source_context"]
+    assert context["resource"] == {} and context["resource_keys"] == ["service.name"]
+    assert span.attributes["service.name"] == "demo"
+    from bandits.fields import resolve, step_view
+
+    assert resolve(step_view(span), "resource") == {"service.name": "demo"}
     assert span.status == SpanStatus.ERROR
     _assert_archived(tmp_path, path, corpus)
 

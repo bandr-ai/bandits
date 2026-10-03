@@ -62,6 +62,17 @@ def step_view(step: Span | WorkflowNode) -> dict[str, Any]:
     else:
         view["input"] = step.input
         view["output"] = step.output
+    context = _json_text(step.attributes.get("bandits.otlp.source_context"))
+    if isinstance(context, dict):
+        # The resource as declared: keys stored once in the attributes, plus
+        # any value a span attribute shadowed (kept in the context).
+        resource = context.get("resource") or {}
+        keys = context.get("resource_keys", list(resource))
+        view["resource"] = {
+            key: resource[key] if key in resource else step.attributes.get(key) for key in keys
+        }
+        if context.get("scope"):
+            view["scope"] = context["scope"]
     for key, value in step.attributes.items():
         if key in _HIDDEN:
             continue
@@ -72,6 +83,12 @@ def step_view(step: Span | WorkflowNode) -> dict[str, Any]:
             view[key] = _json_text(value)
         else:
             view[key] = value
+    moved = _json_text(step.attributes.get("bandits.native.metadata_moved"))
+    if isinstance(moved, dict):
+        # Source metadata stored as the step's resource or scope, under its own name.
+        for key, target in moved.items():
+            if target in view:
+                view[f"metadata.{key}"] = view[target]
     return view
 
 
@@ -91,6 +108,12 @@ def trace_view(trace: Trace) -> dict[str, Any]:
         )
     if trace.system_prompt is not None:
         view["system_prompt"] = trace.system_prompt
+    # The source's own trace-level record, kept on the trace's top steps.
+    for step in _steps(trace):
+        record = step.attributes.get("bandits.native.trace_record")
+        if record is not None:
+            view["record"] = _json_text(record)
+            break
     return view
 
 
@@ -180,6 +203,8 @@ def _group(path: str) -> str:
     if path.startswith("bandits."):
         return "bandits"
     if path.split(".", 1)[0] in (
+        "resource",
+        "scope",
         "name",
         "kind",
         "status",
