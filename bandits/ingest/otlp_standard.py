@@ -956,6 +956,19 @@ def _requests(data: bytes, location: str) -> Iterator[tuple[str, object]]:
             yield f"{location}:{number}", exc
 
 
+def _position(location: str) -> dict[str, Any]:
+    """A request's place in its file, from the location :func:`_requests` gave:
+    ``{"line": n}``, ``{"index": i}`` (whole-file array) or ``{"document": True}``."""
+    if location.endswith("]"):
+        head, _, index = location[:-1].rpartition("[")
+        if index.isdigit():
+            return {"index": int(index)}
+    head, _, line = location.rpartition(":")
+    if head and line.isdigit():
+        return {"line": int(line)}
+    return {"document": True}
+
+
 def _decode_file(
     path: Path,
     data: bytes,
@@ -1022,6 +1035,13 @@ def _decode_file(
                     counter[0] += 1
                     decoded = _decode_span(raw, resource, scope, where, counter[0], issues)
                     if decoded is not None:
+                        if "bandits.source.record" not in decoded.attributes:
+                            # Where this span sits in the archived file, as native
+                            # records point (a native record already does).
+                            decoded.attributes["bandits.source.record"] = {
+                                **_position(location),
+                                "observation_id": str(raw.get("spanId")),
+                            }
                         yield decoded
 
 
@@ -1070,6 +1090,9 @@ def _decode_span(
     # but a span's own declaration is the more specific claim.
     span_attributes = _attributes(raw.get("attributes"))
     attributes = {**resource, **span_attributes}
+    if raw.get("kind") is not None:
+        # The span's own kind (client, server, internal, ...), as recorded.
+        attributes.setdefault("otel.span.kind", raw["kind"])
     if isinstance(scope, dict) and isinstance(scope.get("name"), str):
         attributes.setdefault("otel.scope.name", scope["name"])
     events = [

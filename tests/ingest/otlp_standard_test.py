@@ -594,9 +594,7 @@ def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
             ),
             "gen_ai.tool.definitions": json.dumps(tools),
             "gen_ai.request.model": "gpt-5",
-            "gen_ai.input.messages": json.dumps(
-                [{"role": "user", "content": "Refund order 7741"}]
-            ),
+            "gen_ai.input.messages": json.dumps([{"role": "user", "content": "Refund order 7741"}]),
         },
     )
     chat = _span(
@@ -1307,3 +1305,20 @@ def test_parts_messages_are_kept_as_declared(tmp_path: Path) -> None:
     )
     (span,) = _only_trace(load_corpus(path, "otlp-std")).spans
     assert "bandits.input_messages_from" not in span.attributes
+
+
+def test_otlp_steps_point_at_their_raw_span_and_keep_its_kind(tmp_path: Path) -> None:
+    from bandits.store import ArtifactStore
+
+    span = _span("call", "chat", {"gen_ai.operation.name": "chat", "input.value": "hi"})
+    span["kind"] = 3
+    path = _write(tmp_path / "one.jsonl", _request([]), _request([span]))
+    corpus = load_corpus(path, "otlp-std")
+    (step,) = _only_trace(corpus).spans
+    pointer = step.attributes["bandits.source.record"]
+    pointer = json.loads(pointer) if isinstance(pointer, str) else pointer
+    assert pointer == {"line": 2, "observation_id": "call"}
+    assert step.attributes["otel.span.kind"] == 3
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(path)).artifact_id
+    assert store.read_native_record(artifact, pointer)["spanId"] == "call"

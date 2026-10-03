@@ -95,8 +95,17 @@ def code_version() -> tuple[str, str | None, bool | None]:
 
 
 _WRAPPERS = ("observations", "spans", "data", "runs")
-_NESTED = (*_WRAPPERS, "children", "child_runs")
-_ID_KEYS = ("id", "run_id", "span_id")
+_NESTED = (
+    *_WRAPPERS,
+    "children",
+    "child_runs",
+    # OTLP: request → resourceSpans → scopeSpans → spans
+    "resourceSpans",
+    "batches",
+    "scopeSpans",
+    "instrumentationLibrarySpans",
+)
+_ID_KEYS = ("id", "run_id", "span_id", "spanId")
 
 
 _LINE_LIMIT = 64 << 20

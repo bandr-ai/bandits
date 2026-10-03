@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -278,12 +278,14 @@ def _leaves(value: Any, path: str = "") -> Iterator[tuple[str, Any]]:
 
 _ABSENT = object()
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
 
 
-def _instant(text: str) -> float | None:
-    """*text* as a point in time, when it is an ISO timestamp, so that
-    ``…32.598Z`` and ``…32.598000+00:00`` compare equal."""
+def _instant(text: str) -> int | None:
+    """*text* as a point in time in whole microseconds (what Bandits stores),
+    when it is an ISO timestamp, so ``…32.598Z`` and ``…32.598000+00:00`` match."""
     if len(text) > 40 or not _TIMESTAMP.match(text):
         return None
     try:
@@ -292,13 +294,15 @@ def _instant(text: str) -> float | None:
         return None
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
-    return moment.timestamp()
+    return (moment - _EPOCH) // timedelta(microseconds=1)
 
 
 def _parsed_values(value: Any, texts: list[str], numbers: set[float], flags: set[bool]) -> None:
     """Every value in a parsed step, reading JSON held in strings as well;
     timestamps also count as instants (in *numbers*, negated to stay apart)."""
     if isinstance(value, dict):
+        # Keys are data too: an OTLP attribute's name is a value in its raw record.
+        texts.extend(str(key) for key in value)
         for child in value.values():
             _parsed_values(child, texts, numbers, flags)
     elif isinstance(value, (list, tuple)):
@@ -341,8 +345,19 @@ def missing_values(raw: dict[str, Any], parsed: dict[str, Any]) -> list[str]:
         elif isinstance(leaf, (int, float)):
             kept = float(leaf) in numbers or json.dumps(leaf) in exact
         else:
-            moment = _instant(str(leaf))
-            kept = str(leaf) in exact or (moment is not None and -moment - 1 in numbers)
+            text = str(leaf)
+            moment = _instant(text)
+            kept = (
+                text in exact
+                or (moment is not None and -moment - 1 in numbers)
+                # OTLP writes 64-bit integers, and nanosecond times, as strings.
+                or (text.lstrip("-").isdigit() and float(text) in numbers)
+                or (
+                    len(text) in range(16, 20)
+                    and text.isdigit()
+                    and -(int(text) // 1000) - 1 in numbers
+                )
+            )
         if not kept:
             missing.append(path)
     return missing
@@ -419,7 +434,7 @@ def check_fidelity(
                         "kept": _clip(actual.get(key, "(absent)"), 300),
                     }
                 )
-        missing = missing_values(raw, step.model_dump(mode="json"))
+        missing = missing_values(raw, {**step.model_dump(mode="json"), "trace_id": trace_id})
         per_step[step.span_id] = {"raw": _clip(raw, 20_000), "missing": missing, "wrong": wrong}
         if missing and len(examples) < 50:
             examples.append({"trace_id": trace_id, "step": step.name, "paths": missing[:20]})

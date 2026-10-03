@@ -128,9 +128,12 @@ After a CLI ingest the sampled steps are compared with the raw records they
 came from (in the redacted source archive): every field the converter does not
 read must be in `bandits.unmapped` with the same name, type and value (exact),
 and the share of raw values found anywhere in the parsed step is reported as an
-informational signal (a value can match by coincidence). The run's own record
-is kept as the trace's request and is not compared; OTLP sources have no raw
-record pointer yet and are reported as not checked.
+informational signal (a value can match by coincidence). OTLP spans point to
+their raw span too (line or array position, and `spanId`) and get the
+informational comparison; OTLP's integer and nanosecond-time strings compare
+by value. A field the parser renames (a workflow step's `input.value` becomes
+its `input`) shows as a key not found. The run's own record is kept as the
+trace's request and is not compared.
 
 ## Saved mappings
 
