@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import tempfile
 import time
 from contextlib import nullcontext
@@ -658,6 +659,9 @@ def show(
     artifact_id: str,
     trace: str = typer.Option(None, "--trace"),
     issues: bool = typer.Option(False, "--issues"),
+    all_redactions: bool = typer.Option(
+        False, "--all-redactions", help="With --issues, list every redacted value, not a count."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Inspect one stored artifact."""
@@ -666,8 +670,8 @@ def show(
 
     if issues:
         table = Table("kind", "location", "detail")
-        for issue in corpus.issues:
-            table.add_row(issue.kind, issue.location or "", issue.detail)
+        for row in _issue_rows(corpus.issues, all_redactions=all_redactions):
+            table.add_row(*row)
         console.print(table)
         return
 
@@ -695,6 +699,35 @@ def show(
         task = (traced.task or "")[:60]
         table.add_row(traced.trace_id, task, str(len(traced.spans)))
     console.print(table)
+
+
+_LOCATION_FILE = re.compile(r"^(.*?)(?::record\d+)?(?::\d+)?$")
+
+
+def _issue_rows(issues: tuple, *, all_redactions: bool) -> list[tuple[str, str, str]]:
+    """Issue rows with redactions counted per kind of value, not one row each.
+
+    A redaction is routine (one per hidden value, often hundreds per file);
+    listed one by one they bury the issues that need reading.
+    """
+    rows: list[tuple[str, str, str]] = []
+    redactions: dict[str, list[str]] = {}
+    for issue in issues:
+        if issue.kind == "redaction" and not all_redactions:
+            redactions.setdefault(issue.detail, []).append(issue.location or "")
+            continue
+        rows.append((issue.kind, issue.location or "", issue.detail))
+    grouped = []
+    for detail, locations in redactions.items():
+        files = sorted({Path(_LOCATION_FILE.match(loc).group(1)).name for loc in locations if loc})
+        grouped.append(
+            (
+                "redaction",
+                f"{len(set(locations))} location(s) in {', '.join(files) or 'the source'}",
+                f"{detail} ({len(locations)} value(s); --all-redactions lists each)",
+            )
+        )
+    return grouped + rows
 
 
 @app.command()

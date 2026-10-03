@@ -203,3 +203,22 @@ def test_streamed_array_redaction_counts_file_lines_and_archives_the_rest_verbat
     assert archived.splitlines()[0] == "["
     assert len(archived.splitlines()) == len(text.splitlines())
     assert "someone@mailhost.test" not in archived
+
+
+def test_show_issues_counts_redactions_instead_of_listing_each(tmp_path) -> None:
+    from bandits.cli import _issue_rows
+
+    path = tmp_path / "a.jsonl"
+    path.write_text("\n".join(json.dumps(_trace(t)) for t in "abc"))
+    corpus = load_corpus(path, "langfuse")
+    hidden = [issue for issue in corpus.issues if issue.kind == "redaction"]
+    others = [issue for issue in corpus.issues if issue.kind != "redaction"]
+    assert len(hidden) > 3
+    rows = _issue_rows(corpus.issues, all_redactions=False)
+    assert rows[0] == (
+        "redaction",
+        "3 location(s) in a.jsonl",
+        f"{hidden[0].detail} ({len(hidden)} value(s); --all-redactions lists each)",
+    )
+    assert rows[1:] == [(i.kind, i.location or "", i.detail) for i in others]
+    assert len(_issue_rows(corpus.issues, all_redactions=True)) == len(corpus.issues)
