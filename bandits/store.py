@@ -23,6 +23,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 import bandits
+from bandits.jsonarray import iter_array
 from bandits.redact import redact_bytes, ruleset_by_name
 from bandits.traces import Trace, TraceCorpus
 
@@ -95,6 +96,11 @@ def code_version() -> tuple[str, str | None, bool | None]:
 _WRAPPERS = ("observations", "spans", "data", "runs")
 _NESTED = (*_WRAPPERS, "children", "child_runs")
 _ID_KEYS = ("id", "run_id", "span_id")
+
+
+_LINE_LIMIT = 64 << 20
+"""Matches ``bandits.ingest.native``: a longer first line starting with ``[``
+is a single-line array, archived as a stream."""
 
 
 def resolve_record(data: bytes, pointer: dict | str) -> dict:
@@ -265,13 +271,30 @@ class ArtifactStore:
             redacted_hash = hashlib.sha256()
             redacted_bytes = 0
             with file.open("rb") as stream:
-                first = stream.readline()
+                first = stream.readline(_LINE_LIMIT)
                 while first and not first.strip():
-                    first = stream.readline()
-                jsonl = file.suffix == ".jsonl" and (
-                    (first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"))
-                    or (first.lstrip().startswith(b"[") and first.rstrip().endswith(b"]"))
-                    or not first.lstrip().startswith((b"{", b"["))
+                    first = stream.readline(_LINE_LIMIT)
+                # A first line cut at the limit is a single-line array: stream it.
+                cut = len(first) == _LINE_LIMIT and not first.endswith(b"\n")
+                array = first.lstrip().startswith(b"[")
+                if cut and not array:
+                    first += stream.readline()
+                    cut = False
+                if array and not cut:
+                    # A complete first line is JSONL (or a one-line array) to
+                    # the native reader too; only a multi-line array streams.
+                    try:
+                        array = not isinstance(json.loads(first), list)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pass
+                jsonl = (
+                    not cut
+                    and file.suffix == ".jsonl"
+                    and (
+                        (first.lstrip().startswith(b"{") and first.rstrip().endswith(b"}"))
+                        or (first.lstrip().startswith(b"[") and first.rstrip().endswith(b"]"))
+                        or not first.lstrip().startswith((b"{", b"["))
+                    )
                 )
                 stream.seek(0)
                 if jsonl:
@@ -279,6 +302,20 @@ class ArtifactStore:
                         for line in stream:
                             source_hash.update(line)
                             data = redact_bytes(line, str(file), ruleset).data
+                            output.write(data)
+                            redacted_hash.update(data)
+                            redacted_bytes += len(data)
+                    os.replace(archive_path.with_suffix(".tmp"), archive_path)
+                elif array:
+                    # Elements redacted one at a time, everything between them
+                    # copied verbatim, so the array's index pointers still resolve.
+                    with archive_path.with_suffix(".tmp").open("wb") as output:
+                        for gap, element, line in iter_array(stream, source_hash):
+                            data = gap
+                            if element is not None:
+                                data += redact_bytes(
+                                    element, str(file), ruleset, first_line=line
+                                ).data
                             output.write(data)
                             redacted_hash.update(data)
                             redacted_bytes += len(data)

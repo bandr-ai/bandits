@@ -192,8 +192,12 @@ existing order. The spool is removed on completion or failure.
 
 Memory depends on the largest source record/trace and accumulated issues,
 reports, and discovery summaries, rather than all recorded prompts and replies.
-Grouping and canonical ordering use temporary disk space and add I/O. Whole-file
-JSON and the legacy flat `otlp` conversation adapter still buffer input.
+Grouping and canonical ordering use temporary disk space and add I/O. A native
+export that is one top-level JSON array (pretty-printed, or a single line) is read
+one element at a time, for ingest and for the source archive. A single JSON
+document (one object, such as LangSmith's `{"runs": [...]}`) and the legacy flat
+`otlp` conversation adapter still buffer input; convert such a file to JSONL
+first (`jq -c '.runs[]' in.json > in.jsonl`) when it is large.
 Library `load_corpus` and reading a saved corpus still materialize the corpus.
 `iter_corpus` yields traces followed by a trace-free `TraceCorpus` footer; its
 report is complete only when iteration finishes.

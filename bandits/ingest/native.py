@@ -24,6 +24,7 @@ from typing import Any
 from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.otlp_standard import iter_otlp_standard, load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
+from bandits.jsonarray import iter_array
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
 from bandits.traces import Trace, TraceCorpus, TraceIssue, WorkflowDeclaration
 
@@ -36,6 +37,10 @@ Skipped = list[tuple[str, str | None]]
 """``(reason, observation id)`` for each observation a converter could not
 turn into a span. Reasons starting ``duplicate`` are duplicates; the rest are
 unconvertible."""
+
+_LINE_LIMIT = 64 << 20
+"""Bytes read looking for the end of the first line; past this, a file
+starting with ``[`` is read as one streamed array."""
 
 _DUPLICATE = "duplicate id in this record; the first copy is kept"
 _INSIDE_SKIPPED = "inside an observation that could not be converted"
@@ -411,15 +416,21 @@ class NativeConversion:
     def _source_records(self) -> Iterator[tuple[Position, dict[str, Any]]]:
         path, ruleset = self.path, self.ruleset
         with path.open("rb") as stream:
-            first = stream.readline()
+            first = stream.readline(_LINE_LIMIT)
             first_number = 1
             while first and not first.strip():
                 self.source_hash.update(first)
-                first = stream.readline()
+                first = stream.readline(_LINE_LIMIT)
                 first_number += 1
+            # A first line cut at the limit is a single-line array export
+            # (streamed below); any other long first line is read whole.
+            cut = len(first) == _LINE_LIMIT and not first.endswith(b"\n")
+            if cut and not first.lstrip().startswith(b"["):
+                first += stream.readline()
+                cut = False
             # Complete JSON objects/arrays are independent JSONL records.
             try:
-                jsonl = isinstance(json.loads(first), (dict, list))
+                jsonl = not cut and isinstance(json.loads(first), (dict, list))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 jsonl = False
             if jsonl:
@@ -432,6 +443,19 @@ class NativeConversion:
                     for inner, record in _records(safe.data):
                         index = {"index": inner["index"]} if "index" in inner else {}
                         yield {"line": number, **index}, record
+            elif first.lstrip().startswith(b"["):
+                # One array element in memory at a time, not the whole file.
+                stream.seek(0)
+                self.source_hash = hashlib.sha256()
+                for index, (_, element, line) in enumerate(iter_array(stream, self.source_hash)):
+                    if element is None:
+                        break
+                    safe = redact_bytes(element, str(path), ruleset, first_line=line)
+                    self.issues.extend(safe.issues)
+                    record = json.loads(safe.data)
+                    if not isinstance(record, dict):
+                        raise ValueError("expected objects in JSON array")
+                    yield {"index": index}, record
             else:
                 stream.seek(0)
                 original = stream.read()

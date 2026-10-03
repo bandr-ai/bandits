@@ -156,3 +156,39 @@ def test_normalized_messages_keep_their_declared_bytes(tmp_path) -> None:
     kept = span.attributes["bandits.otlp.source_context"]["span_attributes"]
     assert kept == {"gen_ai.input.messages": "[]"}
     assert span.attributes["gen_ai.input.messages"][0]["parts"][0]["content"] == "hello"
+
+
+def test_a_one_line_array_past_the_line_limit_streams(tmp_path, monkeypatch) -> None:
+    # A compact multi-GB array is one line; reading it as a line would hold
+    # the whole file. A small limit stands in for the real one.
+    import bandits.ingest.native as native
+    import bandits.store as store
+
+    monkeypatch.setattr(native, "_LINE_LIMIT", 64)
+    monkeypatch.setattr(store, "_LINE_LIMIT", 64)
+    path = tmp_path / "a.json"
+    path.write_text(json.dumps([_trace("a"), _trace("b")]))
+    assert _every_span_resolves(tmp_path, path, "langfuse") >= 2
+
+
+def test_streamed_array_redaction_counts_file_lines_and_archives_the_rest_verbatim(
+    tmp_path,
+) -> None:
+    path = tmp_path / "a.json"
+    text = json.dumps([_trace("a"), _trace("b")], indent=1)
+    path.write_text(text)
+    corpus = load_corpus(path, "langfuse")
+    expected = {
+        f"{path}:{number}"
+        for number, line in enumerate(text.splitlines(), start=1)
+        if "someone@mailhost.test" in line
+    }
+    found = {i.location for i in corpus.issues if i.kind == "redaction"}
+    assert found == expected
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(path)).artifact_id
+    archived = (store._dir(artifact) / "source" / "000000.json").read_text()
+    # Only the redacted values differ: same layout, same line count.
+    assert archived.splitlines()[0] == "["
+    assert len(archived.splitlines()) == len(text.splitlines())
+    assert "someone@mailhost.test" not in archived
