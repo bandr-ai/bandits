@@ -60,8 +60,9 @@ the source archive keeps). Everything else is dropped and counted."""
 
 EXAMPLES = 3
 STEPS_PER_EXAMPLE = 5
-SHAPES_KEPT = 50
-"""Shapes saved in ``report.json``; the total count is always kept."""
+OUTLINES_KEPT = 500
+"""Shapes, most common first, whose outline is saved in ``report.json``;
+every shape's counts are saved."""
 
 
 @dataclass
@@ -70,6 +71,10 @@ class ShapeStats:
     example_trace_id: str = ""
     model_calls: int = 0
     task_status: Counter[str] = field(default_factory=Counter)
+    task_paths: Counter[str] = field(default_factory=Counter)
+    """Where the question was read in this shape's traces: versions of an app
+    often differ exactly here."""
+    outline: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -122,13 +127,24 @@ class IngestReport:
     step_kind_hits: Counter[str] = field(default_factory=Counter)
 
     def add_shape(
-        self, shape: str, trace_id: str, model_calls: int, task_status: str | None
+        self,
+        shape: str,
+        trace_id: str,
+        model_calls: int,
+        task_status: str | None,
+        *,
+        task_path: str | None = None,
+        outline: list[str] | None = None,
     ) -> None:
         stats = self.shapes.setdefault(shape, ShapeStats(example_trace_id=trace_id))
         stats.traces += 1
         stats.model_calls += model_calls
         if task_status is not None:
             stats.task_status[task_status] += 1
+        if task_path is not None:
+            stats.task_paths[task_path] += 1
+        if outline and not stats.outline:
+            stats.outline = outline
 
     def add_evidence(self, links: Iterable[Any]) -> None:
         kinds = Counter(link.kind for link in links)
@@ -159,6 +175,8 @@ class IngestReport:
             mine.traces += theirs.traces
             mine.model_calls += theirs.model_calls
             mine.task_status.update(theirs.task_status)
+            mine.task_paths.update(theirs.task_paths)
+            mine.outline = mine.outline or theirs.outline
         self.spans_seen += other.spans_seen
         for name in (
             "buckets",
@@ -228,8 +246,10 @@ class IngestReport:
                     "example_trace_id": stats.example_trace_id,
                     "model_calls": stats.model_calls,
                     "task_status": dict(stats.task_status),
+                    "task_paths": dict(stats.task_paths),
+                    **({"outline": stats.outline} if rank < OUTLINES_KEPT else {}),
                 }
-                for shape, stats in self.ranked_shapes()[:SHAPES_KEPT]
+                for rank, (shape, stats) in enumerate(self.ranked_shapes())
             ],
         }
 
