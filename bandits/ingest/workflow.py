@@ -375,12 +375,19 @@ def build_evidence(
     # The call is the receiver; the target identifies the earlier source record.
     sources = [(s.span_id, s.ended_at, s.output) for s in spans if s.kind is SpanKind.TOOL]
     sources += [(n.span_id, n.ended_at, n.output) for n in nodes]
+    # A source's text is the same for every call it precedes: normalize it once,
+    # on first use, instead of once per call.
+    needles_of: dict[int, set[str]] = {}
     for call in calls:
         haystack = _haystack(_span_input(call))
-        for source_id, ended_at, output in sources:
+        for index, (source_id, ended_at, output) in enumerate(sources):
             if ended_at > call.started_at:
                 continue
-            needles = {_norm(t) for t in _leaves(output) if len(_norm(t)) >= MIN_MATCH_CHARS}
+            needles = needles_of.get(index)
+            if needles is None:
+                needles = needles_of[index] = {
+                    text for text in map(_norm, _leaves(output)) if len(text) >= MIN_MATCH_CHARS
+                }
             present = [t for t in needles if t in haystack]
             if present:
                 links.append(
