@@ -139,3 +139,22 @@ def test_the_exact_check_catches_a_carried_field_that_changed(tmp_path: Path) ->
     fidelity = check_fidelity(store, artifact, [tampered], "langfuse")
     assert fidelity["carried_wrong"] == 1
     assert fidelity["mismatches"][0]["field"] == key
+
+
+def test_raw_records_are_only_in_the_debug_page(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    runner = CliRunner()
+    runner.invoke(app, ["ingest", str(FIXTURE), "--project", str(project)])
+    (envelope,) = ArtifactStore(project / ".bandits").list()
+    folder = project / ".bandits" / "artifacts" / envelope.artifact_id
+    normal = _data(folder / "inspect.html")
+    assert normal["fidelity"]["steps"] and not normal["debug"]
+    assert all("raw" not in e for e in normal["fidelity"]["per_step"].values())
+    step = next(s for t in normal["traces"] for s in t["steps"] if s["type"] == "model")
+    assert "input.value" not in step["attributes"] and "bandits.unmapped" not in step["attributes"]
+    result = runner.invoke(
+        app, ["inspect", envelope.artifact_id, "--debug", "--project", str(project)]
+    )
+    assert result.exit_code == 0, result.output
+    debug = _data(folder / "inspect-debug.html")
+    assert all("raw" in e for e in debug["fidelity"]["per_step"].values())

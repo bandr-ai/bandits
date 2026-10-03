@@ -719,6 +719,9 @@ def show(
 @app.command(name="inspect")
 def inspect_command(
     artifact_id: str,
+    debug: bool = typer.Option(
+        False, "--debug", help="Write inspect-debug.html, with each step's raw record."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Write (or rewrite) the artifact's inspect.html: counts, shapes, step trees, notes."""
@@ -740,7 +743,13 @@ def inspect_command(
     fidelity = check_fidelity(store, artifact_id, sample.kept.values(), envelope.source)
     _say(f"raw vs parsed: {fidelity_line(fidelity)}")
     page = write_page(
-        store._dir(artifact_id), envelope.model_dump(mode="json"), report, corpus, sample, fidelity
+        store._dir(artifact_id),
+        envelope.model_dump(mode="json"),
+        report,
+        corpus,
+        sample,
+        fidelity,
+        debug=debug,
     )
     _say(f"inspect:  {page}")
 

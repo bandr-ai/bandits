@@ -140,6 +140,37 @@ def _misc(attributes: dict[str, Any]) -> dict[str, Any]:
     return _clip(misc, 30_000) if misc else {}
 
 
+_SHOWN_ELSEWHERE = (
+    "input.value",
+    "output.value",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "bandits.unmapped",
+    "bandits.otlp.source_context",
+)
+"""Fields the page already shows as input, output or Misc, or that only
+restate where a field came from; left out of a step's other fields."""
+
+_DETAIL_PREFIXES = ("gen_ai.usage.", "gen_ai.request.", "gen_ai.response.")
+
+
+def _other_fields(attributes: dict[str, Any]) -> dict[str, Any]:
+    return _clip_fields(
+        {
+            key: value
+            for key, value in attributes.items()
+            if key not in _SHOWN_ELSEWHERE
+            and not key.startswith("metadata.")
+            and not key.startswith(_DETAIL_PREFIXES)
+        }
+    )
+
+
+def _details(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Model, token usage and request parameters, under their GenAI names."""
+    return {k: v for k, v in attributes.items() if k.startswith(_DETAIL_PREFIXES)}
+
+
 def _steps(trace: Trace) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     request = trace.request
@@ -160,7 +191,8 @@ def _steps(trace: Trace) -> list[dict[str, Any]]:
                 "output_messages": _messages_text(attributes.get("gen_ai.output.messages")),
                 "input": _clip(span.arguments) if span.arguments else None,
                 "output": _clip(span.output),
-                "attributes": _clip_fields(attributes),
+                "details": _details(attributes),
+                "attributes": _other_fields(attributes),
                 "misc": _misc(attributes),
             }
         )
@@ -179,7 +211,7 @@ def _steps(trace: Trace) -> list[dict[str, Any]]:
                 "ms": round((node.ended_at - node.started_at).total_seconds() * 1000),
                 "input": _clip(node.input),
                 "output": _clip(node.output),
-                "attributes": _clip_fields(node.attributes),
+                "attributes": _other_fields(node.attributes),
                 "misc": _misc(node.attributes),
             }
         )
@@ -443,8 +475,19 @@ def page_data(
     footer: TraceCorpus,
     sample: TraceSample,
     fidelity: dict[str, Any] | None = None,
+    *,
+    debug: bool = False,
 ) -> dict[str, Any]:
-    """Everything the page shows, as plain JSON data."""
+    """Everything the page shows, as plain JSON data. Raw records are
+    embedded only in the debug page; the check's results always are."""
+    if fidelity and not debug:
+        fidelity = {
+            **fidelity,
+            "per_step": {
+                step: {k: v for k, v in entry.items() if k != "raw"}
+                for step, entry in (fidelity.get("per_step") or {}).items()
+            },
+        }
     issues = footer.issues
     redactions: dict[str, int] = {}
     for issue in issues:
@@ -474,6 +517,7 @@ def page_data(
         "traces_seen": sample.seen,
         "traces": [_trace_view(trace) for trace in sample.kept.values()],
         "misc_fields": _misc_counts(sample.kept.values()),
+        "debug": debug,
         "fidelity": fidelity or {"steps": 0},
         "fidelity_line": fidelity_line(fidelity or {"steps": 0}),
     }
@@ -492,12 +536,16 @@ def write_page(
     footer: TraceCorpus,
     sample: TraceSample,
     fidelity: dict[str, Any] | None = None,
+    *,
+    debug: bool = False,
 ) -> Path:
-    """Write ``inspect.html`` into an artifact *directory*; returns its path."""
-    path = directory / "inspect.html"
+    """Write ``inspect.html`` (or, with *debug*, ``inspect-debug.html`` with
+    each step's raw record) into an artifact *directory*; returns its path."""
+    path = directory / ("inspect-debug.html" if debug else "inspect.html")
     temporary = path.with_suffix(".tmp")
     temporary.write_text(
-        render(page_data(envelope, report, footer, sample, fidelity)), encoding="utf-8"
+        render(page_data(envelope, report, footer, sample, fidelity, debug=debug)),
+        encoding="utf-8",
     )
     temporary.replace(path)
     return path
@@ -607,17 +655,19 @@ ${R.evidence_links ? `<div class="box"><h3>Evidence links between steps</h3><div
 function stepBody(s) {
   let h = '<div class="body">';
   if (s.model) h += `<div class="label">model</div><code>${esc(s.model)}</code>`;
+  if (s.details && Object.keys(s.details).length) h += `<div class="label">details</div><table>${Object.entries(s.details).map(([k,v]) => `<tr><td><code>${esc(k)}</code></td><td>${esc(fmt(v))}</td></tr>`).join("")}</table>`;
   if (s.input_messages) h += `<div class="label">input messages</div>` + s.input_messages.map(m => `<div class="msg"><span class="role">${esc(m.role)}</span>${pre(m.text)}</div>`).join("");
   else if (s.input !== undefined && s.input !== null) h += `<div class="label">input</div>${pre(s.input)}`;
   if (s.output_messages) h += `<div class="label">output messages</div>` + s.output_messages.map(m => `<div class="msg"><span class="role">${esc(m.role)}</span>${pre(m.text)}</div>`).join("");
   else h += `<div class="label">output</div>${pre(s.output)}`;
-  h += `<details><summary class="label">all parsed fields (${Object.keys(s.attributes||{}).length})</summary>${pre(s.attributes)}</details>`;
+  if (Object.keys(s.attributes||{}).length) h += `<details><summary class="label">other parsed fields (${Object.keys(s.attributes).length})</summary>${pre(s.attributes)}</details>`;
   const misc = s.misc || {};
   if (Object.keys(misc).length) h += `<details><summary class="label">misc: kept, not interpreted (${Object.keys(misc).length})</summary>${pre(misc)}</details>`;
   const f = (D.fidelity.per_step || {})[s.id];
   if (f) h += (f.wrong.length ? `<div class="label err">unmapped fields not kept exactly (${f.wrong.length})</div><pre class="err">${esc(f.wrong.join("\n"))}</pre>` : "")
     + (f.missing.length ? `<div class="label">raw values not found anywhere in the parsed step (informational, ${f.missing.length})</div><pre>${esc(f.missing.join("\n"))}</pre>` : "")
-    + `<details><summary class="label">raw record (as exported, redacted)</summary>${pre(f.raw)}</details>`;
+    + (f.raw !== undefined ? `<details><summary class="label">raw record (as exported, after redaction)</summary>${pre(f.raw)}</details>`
+      : `<div class="muted">raw record: <code>bandits inspect ${esc(E.artifact_id)} --debug</code> writes a page with it</div>`);
   h += `</div>`;
   return h;
 }
