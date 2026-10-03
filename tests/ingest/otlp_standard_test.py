@@ -1246,3 +1246,63 @@ def test_completion_request_prompts_are_user_input_only() -> None:
     assert _messages({"prompt": "x"}, default_role="assistant") != [
         {"role": "user", "parts": [{"type": "text", "content": "x"}]}
     ]
+
+
+def test_older_role_content_messages_and_output_text_are_read(tmp_path: Path) -> None:
+    # Before the parts convention, GenAI instrumentations recorded
+    # {role, content} messages; some put the reply in gen_ai.output.text.
+    from bandits.ingest import health
+
+    declared = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    path = _write(
+        tmp_path / "older.jsonl",
+        _request(
+            [
+                _span(
+                    "call",
+                    "chat",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": "some-model",
+                        "gen_ai.input.messages": json.dumps(declared),
+                        "gen_ai.output.text": "hello",
+                    },
+                )
+            ]
+        ),
+    )
+    corpus = load_corpus(path, "otlp-std")
+    (span,) = _only_trace(corpus).spans
+    assert span.attributes["gen_ai.input.messages"] == [
+        {"role": "system", "parts": [{"type": "text", "content": "be brief"}]},
+        {"role": "user", "parts": [{"type": "text", "content": "hi"}]},
+    ]
+    assert span.attributes["gen_ai.output.messages"] == [
+        {"role": "assistant", "parts": [{"type": "text", "content": "hello"}]}
+    ]
+    counts = health.check(corpus, "otlp-std").counts
+    assert not counts["bad_messages"] and not counts["output_missing"]
+
+
+def test_parts_messages_are_kept_as_declared(tmp_path: Path) -> None:
+    declared = [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}]
+    path = _write(
+        tmp_path / "current.jsonl",
+        _request(
+            [
+                _span(
+                    "call",
+                    "chat",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.input.messages": json.dumps(declared),
+                        "gen_ai.output.messages": json.dumps(
+                            [{"role": "assistant", "parts": [{"type": "text", "content": "ok"}]}]
+                        ),
+                    },
+                )
+            ]
+        ),
+    )
+    (span,) = _only_trace(load_corpus(path, "otlp-std")).spans
+    assert "bandits.input_messages_from" not in span.attributes

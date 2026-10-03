@@ -179,7 +179,7 @@ The input format is always explicit. Bandits does not guess, because a guess ris
 
 <br>
 
-`otlp-std` reads what an OTel exporter or collector file exporter writes. Model and tool spans are recognized from whichever convention the instrumentation declared: the OTel GenAI semantic conventions (current and legacy `gen_ai.prompt.N.*` / span events), OpenInference, OpenLLMetry/Traceloop, or Langfuse. Messages in OpenAI, Anthropic, Gemini or LangChain shape are normalized into `gen_ai.input.messages`, and the span's own attributes are kept as-is.
+`otlp-std` reads what an OTel exporter or collector file exporter writes. Model and tool spans are recognized from whichever convention the instrumentation declared: the OTel GenAI semantic conventions (current, older `{role, content}` message lists, and legacy `gen_ai.prompt.N.*` / span events), OpenInference, OpenLLMetry/Traceloop, or Langfuse. Messages in OpenAI, Anthropic, Gemini or LangChain shape are normalized into `gen_ai.input.messages`, and the span's own attributes are kept as-is.
 
 A declared workflow step with no model or tool call beneath it (a retrieval, a rerank, a filter node) becomes a tool span marked `call_recorded=False`. The judge can see its result, but it is never exported as a call the model chose. Those steps are left out of SFT transcripts with a warning, and `--no-pipeline-steps` leaves them out of the corpus.
 

@@ -196,6 +196,7 @@ _OUTPUT_VALUE_KEYS = (
     "ai.response.toolCalls",
     "ai.toolCall.result",
     "braintrust.output_json",
+    "gen_ai.output.text",
 )
 _TOOL_NAME_KEYS = ("gen_ai.tool.name", "tool.name", "traceloop.entity.name", "ai.toolCall.name")
 
@@ -782,6 +783,14 @@ def _normalized_messages(
             # Keep the declared bytes in source_context, but let substantive
             # recorded content fill the normalized view.
             if declared and any(message.get("parts") for message in declared):
+                # The older convention's {role, content} messages are read the
+                # same way but stored normalized, so readers see one shape.
+                raw = _json_value(attributes[key])
+                if isinstance(raw, list) and any(
+                    isinstance(m, dict) and not isinstance(m.get("parts"), list) for m in raw
+                ):
+                    added[key] = declared
+                    added[f"bandits.{direction}_messages_from"] = key
                 continue
         candidates: list[tuple[str, Any]] = [
             (f"event:{key}", _messages(details.get(key))),

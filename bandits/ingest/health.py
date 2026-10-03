@@ -133,8 +133,9 @@ def finish(health: Health, corpus: TraceCorpus, hints: list[str] | None = None) 
     )
     warn(
         "output_missing",
-        "successful model call(s) have no recorded output",
-        "the exporter did not record the reply; these calls cannot become training rows",
+        "successful model call(s) have no output in a field Bandits reads",
+        "the exporter did not record the reply, or recorded it in a field Bandits does not "
+        "know; these calls cannot become training rows",
     )
     warn(
         "output_unusable",

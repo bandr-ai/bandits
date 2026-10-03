@@ -190,4 +190,4 @@ def test_check_does_not_call_an_errored_model_response_lost(tmp_path: Path) -> N
     source.write_text(json.dumps(record))
     result = CliRunner().invoke(app, ["ingest", str(source), "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "no recorded output" not in result.output
+    assert "no output in a field Bandits reads" not in result.output
