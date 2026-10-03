@@ -57,7 +57,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from bandits.genai import PIPELINE_STEP
+from bandits.genai import PIPELINE_STEP, plain_messages
 from bandits.ingest.mapping import LABEL_PREFIX, IngestMapping
 from bandits.ingest.otlp import (
     _LINEAGE_KEYS,
@@ -1328,6 +1328,55 @@ def _same(a: object, b: object) -> bool:
     return type(a) is type(b) and a == b
 
 
+TRACE_RECORD = "bandits.native.trace_record"
+"""Where a native converter puts the source's trace-level record (on top steps)."""
+
+STORED_AS = "bandits.stored_as"
+"""``{source key: step field}``: declared values dropped from a step's
+attributes because the step holds the same value in that field."""
+
+
+def _node_attributes(span: _Decoded) -> dict[str, Any]:
+    """A node's attributes, less the declared values read into its ``input`` and
+    ``output`` fields (recorded in :data:`STORED_AS`)."""
+    attributes = dict(span.attributes)
+    stored: dict[str, str] = {}
+    for keys, field in ((_INPUT_VALUE_KEYS, "input"), (_OUTPUT_VALUE_KEYS, "output")):
+        found = _first_value(attributes, keys)
+        if found is not None:
+            del attributes[found[0]]
+            stored[found[0]] = field
+    if stored:
+        attributes[STORED_AS] = stored
+    attributes["bandits.otlp.source_context"] = _pruned_context(span)
+    return attributes
+
+
+def _store_once(
+    attributes: dict[str, Any], fields: tuple[tuple[tuple[str, ...], str, object], ...]
+) -> None:
+    """Drop each declared I/O value the step already holds, parsed, in a field.
+
+    Only an equal value is dropped, and :data:`STORED_AS` records where it is;
+    the exact bytes stay in the source archive.
+    """
+    stored: dict[str, str] = {}
+    for keys, field, value in fields:
+        found = _first_value(attributes, keys)
+        if found is None or value is None:
+            continue
+        parsed = _json_value(found[1])
+        parsed = found[1] if parsed is _UNPARSED else parsed
+        if _same(parsed, value):
+            stored[found[0]] = field
+        elif isinstance(value, dict) and set(value) == {"input"} and _same(parsed, value["input"]):
+            stored[found[0]] = f"{field}.input"
+    for key in stored:
+        del attributes[key]
+    if stored:
+        attributes[STORED_AS] = {**attributes.get(STORED_AS, {}), **stored}
+
+
 def _pruned_context(
     decoded: _Decoded, final_attributes: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1406,6 +1455,18 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
             attributes["bandits.output_unusable_reason"] = "transport_response_object_repr"
             output = None
         attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
+        _store_once(
+            attributes,
+            (
+                # A plain [{role, content}] prompt is the messages, reshaped.
+                (
+                    _INPUT_VALUE_KEYS,
+                    "gen_ai.input.messages",
+                    plain_messages(attributes.get("gen_ai.input.messages")),
+                ),
+                (_OUTPUT_VALUE_KEYS, "output", output),
+            ),
+        )
         return Span(
             span_id=decoded.span_id,
             parent_span_id=decoded.parent_id,
@@ -1443,6 +1504,15 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
     if as_step:
         attributes[PIPELINE_STEP] = True
     attributes["bandits.otlp.source_context"] = _pruned_context(decoded, attributes)
+    arguments = (
+        arguments
+        if isinstance(arguments, dict)
+        else ({} if arguments is None else {"input": arguments})
+    )
+    _store_once(
+        attributes,
+        ((_INPUT_VALUE_KEYS, "arguments", arguments), (_OUTPUT_VALUE_KEYS, "output", output)),
+    )
     return Span(
         span_id=decoded.span_id,
         parent_span_id=decoded.parent_id,
@@ -1451,9 +1521,7 @@ def _to_span(decoded: _Decoded, *, as_step: bool, unparsed: Counter[str]) -> Spa
         started_at=decoded.started_at,
         ended_at=decoded.ended_at,
         status=status,
-        arguments=arguments
-        if isinstance(arguments, dict)
-        else ({} if arguments is None else {"input": arguments}),
+        arguments=arguments,
         output=output,
         # A step ran because the pipeline is written that way, not because a
         # model asked for it: nothing recorded a decision to call it.
@@ -1829,6 +1897,7 @@ def load_otlp_standard(
 
     local = IngestReport()
     workflow_extras: dict[str, dict[str, Any]] = {}
+    source_records: dict[str, dict[str, Any]] = {}
     issues: list[TraceIssue] = []
     if _read_result is None:
         read = _read(path, ruleset, issues, local)
@@ -1849,6 +1918,12 @@ def load_otlp_standard(
         # The export's own structure: drift compares it before any override.
         shape = shape_id(decoded)
         outline = shape_outline(decoded) if shape not in local.shapes else None
+        # A native export's trace-level record rides on its top steps; it
+        # belongs to the trace.
+        for span in decoded.values():
+            record = _json_value(span.attributes.pop(TRACE_RECORD, None))
+            if isinstance(record, dict):
+                source_records.setdefault(trace_id, record)
         forced: set[str] = set()
         structure: frozenset[str] = frozenset()
         if mapping is not None:
@@ -2019,14 +2094,7 @@ def load_otlp_standard(
                     output=_io_value(span.attributes, _OUTPUT_VALUE_KEYS, unparsed),
                     status=SpanStatus.ERROR if span.error else SpanStatus.OK,
                     framework=_framework(span.attributes),
-                    attributes={
-                        key: value
-                        for key, value in span.attributes.items()
-                        if key not in _INPUT_VALUE_KEYS and key not in _OUTPUT_VALUE_KEYS
-                    }
-                    # Rule (a) only: the node's input/output values are its
-                    # parsed fields, not attributes.
-                    | {"bandits.otlp.source_context": _pruned_context(span)},
+                    attributes=_node_attributes(span),
                 )
                 for span in sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
                 if span.role in (_STEP, _NONE)
@@ -2097,7 +2165,17 @@ def load_otlp_standard(
         issues=issues,
         redaction_ruleset=read.ruleset_name,
         episode_attributes=episode_attributes,
-        trace_extras=workflow_extras,
+        trace_extras={
+            trace_id: {
+                **workflow_extras.get(trace_id, {}),
+                **(
+                    {"source_record": source_records[trace_id]}
+                    if trace_id in source_records
+                    else {}
+                ),
+            }
+            for trace_id in workflow_extras.keys() | source_records.keys()
+        },
     )
     if workflow is None:
         if report is not None:

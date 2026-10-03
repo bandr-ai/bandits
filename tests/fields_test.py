@@ -114,3 +114,92 @@ def test_metadata_stored_as_the_resource_still_reads_under_its_own_name(tmp_path
     assert row["value"] == "svc"
     (row,) = values(corpus, "resource.service.name", present_only=True)
     assert row["value"] == "svc"
+
+
+def test_values_stored_once_still_read_under_their_own_names(tmp_path: Path) -> None:
+    base = {"startTime": "2026-01-01T00:00:00Z", "endTime": "2026-01-01T00:00:01Z"}
+    observations = [
+        {
+            **base,
+            "id": "o1",
+            "type": "GENERATION",
+            "name": "chat",
+            "output": "hello",
+            "input": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}],
+        },
+        {
+            **base,
+            "id": "o2",
+            "type": "TOOL",
+            "name": "lookup",
+            "input": {"order_id": "A-1"},
+            "output": {"status": "shipped"},
+        },
+    ]
+    path = tmp_path / "lf.json"
+    path.write_text(json.dumps({"id": "t1", "userId": "u-1", "observations": observations}))
+    corpus = load_corpus(path, "langfuse")
+    spans = {span.name: span for span in corpus.traces[0].spans}
+    tool, model = spans["lookup"], spans["chat"]
+    # Held once, in the step's own fields; the copies are gone.
+    assert "input.value" not in tool.attributes and "output.value" not in tool.attributes
+    assert tool.attributes["bandits.stored_as"] == {
+        "input.value": "arguments",
+        "output.value": "output",
+    }
+    assert "input.value" not in model.attributes
+    (row,) = (
+        values(corpus, "input.value", present_only=True, trace_ids=[])
+        if False
+        else [r for r in values(corpus, "input.value", present_only=True) if r["step"] == "lookup"]
+    )
+    assert row["value"] == {"order_id": "A-1"}
+    (row,) = [r for r in values(corpus, "input.value", present_only=True) if r["step"] == "chat"]
+    assert row["value"] == observations[0]["input"]
+    # The trace's own record is on the trace, not copied onto steps.
+    assert corpus.traces[0].source_record["userId"] == "u-1"
+    (row,) = values(corpus, "trace.record.userId")
+    assert row["value"] == "u-1"
+
+
+def test_a_prompt_the_messages_cannot_rebuild_is_kept(tmp_path: Path) -> None:
+    observation = {
+        "id": "o1",
+        "type": "GENERATION",
+        "name": "chat",
+        "output": "hello",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": "2026-01-01T00:00:01Z",
+        "input": [{"role": "user", "content": "hi", "name": "alex"}],
+    }
+    path = tmp_path / "lf.json"
+    path.write_text(json.dumps({"id": "t1", "observations": [observation]}))
+    (step,) = load_corpus(path, "langfuse").traces[0].spans
+    assert "input.value" in step.attributes
+
+
+def test_fields_filters_by_kind_and_pages(tmp_path: Path) -> None:
+    corpus = _corpus(tmp_path)
+    rows = fields(corpus, kind="tool")
+    assert rows == []  # the only step is a model call
+    assert all(not r["path"].startswith("trace.") for r in fields(corpus, kind="model"))
+    artifact = ArtifactStore(tmp_path / ".bandits").write(corpus, source_path="x").artifact_id
+    runner = CliRunner()
+    out = runner.invoke(
+        app,
+        [
+            "fields",
+            artifact,
+            "--json",
+            "--prefix",
+            "misc.",
+            "--limit",
+            "2",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert out.exit_code == 0, out.output
+    rows = json.loads(out.stdout)
+    assert len(rows) == 2 and all(r["path"].startswith("misc.") for r in rows)
+    assert "--offset 2 for more" in out.stderr

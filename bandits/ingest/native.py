@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from bandits.ingest.mapping import IngestMapping
-from bandits.ingest.otlp_standard import iter_otlp_standard, load_otlp_standard
+from bandits.ingest.otlp_standard import TRACE_RECORD, iter_otlp_standard, load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
 from bandits.jsonarray import iter_array
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
@@ -266,9 +266,9 @@ def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str
         }
         parent = observation.get("parentObservationId") or enclosing_id
         if parent is None or str(parent) not in present:
-            # On every top step: the first may become the trace's request,
-            # which is not stored as a step.
-            attributes["bandits.native.trace_record"] = {
+            # Carried on every top step (any may become the request, which is
+            # not stored as a step); the decoder moves it onto the trace.
+            attributes[TRACE_RECORD] = {
                 k: v for k, v in trace_record.items() if k != "observations"
             }
         metadata = observation.get("metadata")
@@ -370,6 +370,12 @@ def langfuse_used(observation: dict[str, Any]) -> Used:
         return _LANGFUSE_USED
     return {k: v for k, v in _LANGFUSE_USED.items() if k != "metadata"}
 
+
+RAW_IO: dict[str, dict[str, str]] = {
+    "langfuse": {"input.value": "input", "output.value": "output"},
+    "langsmith": {"input.value": "inputs", "output.value": "outputs"},
+}
+"""Per source: the raw field each converter writes to an I/O value key."""
 
 USED_FIELDS = {
     "langfuse": langfuse_used,

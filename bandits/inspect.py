@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bandits.fields import ABSENT, resolve, step_view
 from bandits.traces import Trace, TraceCorpus, TraceIssue
 
 TRACES_SHOWN = 50
@@ -189,7 +190,9 @@ def _steps(trace: Trace) -> list[dict[str, Any]]:
                 "model": attributes.get("gen_ai.request.model"),
                 "input_messages": _messages_text(attributes.get("gen_ai.input.messages")),
                 "output_messages": _messages_text(attributes.get("gen_ai.output.messages")),
-                "input": _clip(span.arguments) if span.arguments else None,
+                "input": _clip(span.arguments)
+                if span.arguments
+                else _clip(attributes.get("input.value")),
                 "output": _clip(span.output),
                 "details": _details(attributes),
                 "attributes": _other_fields(attributes),
@@ -367,6 +370,26 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
 
+def _raw_declared(raw: dict[str, Any], key: str, source: str) -> Any:
+    """The value a raw record declared under attribute *key*, parsed as the
+    decoder reads it; ``_ABSENT`` when it declares none."""
+    from bandits.ingest.native import RAW_IO
+    from bandits.ingest.otlp_standard import _UNPARSED, _attributes, _json_value
+
+    native = RAW_IO.get(source, {}).get(key)
+    if native is not None and native in raw:
+        found = raw[native]
+    else:
+        attributes = raw.get("attributes")
+        if isinstance(attributes, list):  # OTLP key/value list
+            attributes = _attributes(attributes)
+        found = resolve(attributes, key) if isinstance(attributes, dict) else _ABSENT
+        if found is ABSENT:
+            return _ABSENT
+    parsed = _json_value(found)
+    return found if parsed is _UNPARSED else parsed
+
+
 def check_fidelity(
     store: Any, artifact_id: str, traces: Iterable[Trace], source: str = ""
 ) -> dict[str, Any]:
@@ -399,7 +422,7 @@ def check_fidelity(
         raws = store.read_native_records(artifact_id, [p for _, _, p in steps])
     except (ValueError, FileNotFoundError, LookupError) as exc:
         return {"steps": 0, "error": str(exc)}
-    checked = values = carried = 0
+    checked = values = carried = stored = 0
     per_step: dict[str, dict[str, Any]] = {}
     examples: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -434,6 +457,23 @@ def check_fidelity(
                         "kept": _clip(actual.get(key, "(absent)"), 300),
                     }
                 )
+        # Values stored once in the step's own field: checked exactly too.
+        for key, target in (step.attributes.get("bandits.stored_as") or {}).items():
+            declared = _raw_declared(raw, key, source)
+            kept = step_view(step).get(key, _ABSENT)
+            stored += 1
+            if declared is _ABSENT or _canonical(declared) != _canonical(kept):
+                wrong.append(key)
+                if len(mismatches) < 50:
+                    mismatches.append(
+                        {
+                            "trace_id": trace_id,
+                            "step": step.name,
+                            "field": f"{key} (stored as {target})",
+                            "raw": _clip("(absent)" if declared is _ABSENT else declared, 300),
+                            "kept": _clip("(absent)" if kept is _ABSENT else kept, 300),
+                        }
+                    )
         missing = missing_values(raw, {**step.model_dump(mode="json"), "trace_id": trace_id})
         per_step[step.span_id] = {"raw": _clip(raw, 20_000), "missing": missing, "wrong": wrong}
         if missing and len(examples) < 50:
@@ -443,6 +483,7 @@ def check_fidelity(
         "values": values,
         "carried": carried,
         "carried_wrong": sum(len(v["wrong"]) for v in per_step.values()),
+        "stored": stored,
         "mismatches": mismatches,
         "exact": used_for is not None,
         "missing": sum(len(v["missing"]) for v in per_step.values()),
@@ -457,12 +498,14 @@ def fidelity_line(fidelity: dict[str, Any]) -> str:
     if not fidelity.get("steps"):
         return "not checked (no step points to a raw record)"
     parts = [f"{fidelity['steps']} stored steps compared with their raw records"]
+    wrong = fidelity["carried_wrong"]
     if fidelity.get("exact"):
-        wrong = fidelity["carried_wrong"]
+        parts.append(f"{fidelity['carried']} unmapped fields")
+    if fidelity.get("stored"):
+        parts.append(f"{fidelity['stored']} values stored once in a step field")
+    if len(parts) > 1:
         parts.append(
-            f"{fidelity['carried']} unmapped fields kept exactly"
-            if not wrong
-            else f"{wrong} unmapped field(s) NOT kept exactly (see inspect.html)"
+            "all kept exactly" if not wrong else f"{wrong} NOT kept exactly (see inspect.html)"
         )
     found = fidelity["values"] - fidelity["missing"]
     parts.append(

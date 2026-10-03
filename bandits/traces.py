@@ -165,8 +165,11 @@ class WorkflowDeclaration(Contract):
     when they were passed as flags or found. A different mapping is a different
     artifact even when it happens to choose the same fields."""
 
-    derivation_version: int = 2
+    derivation_version: int = 3
     """Bumped whenever how requests, nodes or links are derived changes.
+
+    3: the source's trace record on the trace, not its top steps; declared I/O
+    values a step holds in its own fields stored once (``bandits.stored_as``).
 
     2: invocation-only workflow system prompt, ``input_context`` links, exact
     short-label matching, archive pointers in place of copied native records."""
@@ -358,6 +361,10 @@ class Trace(Contract):
 
     system_prompt: str | None = None
     """The system or developer instruction the episode ran under, when recorded."""
+
+    source_record: dict[str, Any] | None = None
+    """The source's own trace-level record (its fields other than the steps),
+    for exports that have one; None when the source has no such record."""
 
     runtime_context: dict[str, Any] = Field(default_factory=dict)
     """Configuration the episode ran under: model, sampling settings, working

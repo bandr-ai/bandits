@@ -131,6 +131,7 @@ from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
 console = Console()
+err_console = Console(stderr=True)
 
 _MAX_INLINE_ISSUES = 3
 _DEFAULT_PROJECT = Path(".")
@@ -723,13 +724,29 @@ def fields_command(
     group: str = typer.Option(
         None, "--group", help="Only one group: trace, step, normalized, metadata, misc, bandits."
     ),
+    prefix: str = typer.Option(None, "--prefix", help="Only paths starting with this."),
+    kind: str = typer.Option(None, "--kind", help="Only steps of one kind: model, tool, step."),
+    limit: int = typer.Option(200, "--limit", help="At most this many paths; 0 for all."),
+    offset: int = typer.Option(0, "--offset", help="Skip this many paths first."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """List every field in a corpus: path, types, how many steps hold it, examples."""
     from bandits.fields import fields
 
     corpus = _read_corpus(project, artifact_id)
-    rows = [r for r in fields(corpus) if group is None or r["group"] == group]
+    rows = [
+        r
+        for r in fields(corpus, kind=kind)
+        if (group is None or r["group"] == group)
+        and (prefix is None or r["path"].startswith(prefix))
+    ]
+    total = len(rows)
+    rows = rows[offset : offset + limit if limit else None]
+    if offset + len(rows) < total:
+        err_console.print(
+            f"showing {offset + 1}-{offset + len(rows)} of {total} paths;"
+            f" --offset {offset + len(rows)} for more, or narrow with --prefix/--group/--kind"
+        )
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, default=str))
         return

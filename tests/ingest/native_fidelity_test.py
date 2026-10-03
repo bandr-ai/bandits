@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from bandits.cli import app
+from bandits.fields import step_view
 from bandits.ingest import detect_source, load_corpus
 from bandits.ingest.native import _ns
 from bandits.ingest.otlp_standard import _attributes
@@ -738,7 +739,13 @@ def test_captured_otel_keeps_every_attribute_of_retained_spans(dialect: str) -> 
         declared = original[span.span_id]
         context = span.attributes["bandits.otlp.source_context"]["span_attributes"]
         assert set(context) <= set(declared)
+        stored = span.attributes.get("bandits.stored_as", {})
+        view = step_view(span)
         for key, value in declared.items():
+            if key in stored:
+                # Stored once, in the step's own field, with the same value.
+                assert view[key] == json.loads(value), key
+                continue
             assert span.attributes.get(key) == value or context.get(key) == value, key
 
     workflow = load_corpus(source, "otlp-std", workflow=WorkflowDeclaration(task_fields=()))
@@ -911,10 +918,9 @@ def test_fields_no_converter_knows_are_kept_not_dropped(tmp_path: Path) -> None:
     assert step.attributes["gen_ai.usage.input_tokens"] == 313
     assert step.attributes["gen_ai.usage.output_tokens"] == 64
     assert step.attributes["gen_ai.request.temperature"] == 0
-    # Its parent was never exported: it is a top step and carries the trace's fields.
-    trace_record = step.attributes["bandits.native.trace_record"]
-    trace_record = json.loads(trace_record) if isinstance(trace_record, str) else trace_record
-    assert trace_record["user_id"] == "u-9"
+    # The trace's own fields are on the trace, not its steps.
+    assert "bandits.native.trace_record" not in step.attributes
+    assert corpus.traces[0].source_record["user_id"] == "u-9"
 
     corpus = load_corpus(_file(tmp_path, "ls.json", langsmith), "langsmith")
     (step,) = [s for s in _every_step(corpus) if _unmapped(s)]

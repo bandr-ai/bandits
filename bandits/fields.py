@@ -19,6 +19,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from typing import Any
 
+from bandits.genai import plain_messages
 from bandits.traces import Span, Trace, TraceCorpus, WorkflowNode
 
 EXAMPLES = 3
@@ -83,6 +84,14 @@ def step_view(step: Span | WorkflowNode) -> dict[str, Any]:
             view[key] = _json_text(value)
         else:
             view[key] = value
+    stored = _json_text(step.attributes.get("bandits.stored_as"))
+    if isinstance(stored, dict):
+        # Declared values the step holds in its own fields, under their own names.
+        own = {**view, "arguments": step.arguments} if isinstance(step, Span) else view
+        for key, target in stored.items():
+            found = resolve(own, target)
+            if found is not ABSENT:
+                view[key] = plain_messages(found) if target.endswith(".messages") else found
     moved = _json_text(step.attributes.get("bandits.native.metadata_moved"))
     if isinstance(moved, dict):
         # Source metadata stored as the step's resource or scope, under its own name.
@@ -108,12 +117,8 @@ def trace_view(trace: Trace) -> dict[str, Any]:
         )
     if trace.system_prompt is not None:
         view["system_prompt"] = trace.system_prompt
-    # The source's own trace-level record, kept on the trace's top steps.
-    for step in _steps(trace):
-        record = step.attributes.get("bandits.native.trace_record")
-        if record is not None:
-            view["record"] = _json_text(record)
-            break
+    if trace.source_record is not None:
+        view["record"] = trace.source_record
     return view
 
 
@@ -219,12 +224,16 @@ def _group(path: str) -> str:
     return "normalized"
 
 
-def fields(corpus: TraceCorpus | Iterable[Trace]) -> list[dict[str, Any]]:
+def fields(
+    corpus: TraceCorpus | Iterable[Trace], *, kind: str | None = None
+) -> list[dict[str, Any]]:
     """Every path in the corpus: ``{path, group, types, count, of, examples}``.
 
     ``count`` is how many steps (for ``trace.*``, traces) hold the path, out of
     ``of``; a path held as an explicit null counts as held. Composite values
     are listed and walked into; scalars inside lists share one ``[]`` path.
+    With *kind* (``model``, ``tool``, ``step``), only steps of that kind are
+    read, and no ``trace.*`` paths are listed.
     """
     traces = corpus.traces if isinstance(corpus, TraceCorpus) else list(corpus)
     types: dict[str, Counter[str]] = {}
@@ -250,10 +259,13 @@ def fields(corpus: TraceCorpus | Iterable[Trace]) -> list[dict[str, Any]]:
                     kept.append(text)
 
     for trace in traces:
-        add(trace_view(trace), "trace.")
+        if kind is None:
+            add(trace_view(trace), "trace.")
         for step in _steps(trace):
-            steps += 1
-            add(step_view(step), "")
+            view = step_view(step)
+            if kind is None or view["kind"] == kind:
+                steps += 1
+                add(view, "")
     rows = [
         {
             "path": path,
