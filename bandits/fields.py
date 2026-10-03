@@ -130,37 +130,51 @@ def _steps(trace: Trace) -> Iterator[Span | WorkflowNode]:
             yield step
 
 
-def resolve(node: Any, path: str) -> Any:
-    """The value at *path* inside *node*, or :data:`ABSENT`.
+def matches(node: Any, path: str, at: str = "") -> Iterator[tuple[str, Any]]:
+    """``(concrete path, value)`` for everything *path* reaches inside *node*.
 
     At an object, the longest key that is the path or a dotted prefix of it is
     taken, so ``gen_ai.usage.input_tokens`` and ``misc.usageDetails.input``
-    both resolve. ``[n]`` indexes a list. JSON text is read when stepped into.
+    both resolve. ``[n]`` indexes a list; ``[]`` (as :func:`fields` lists a
+    list's items) reaches every item, in order, and the concrete path names
+    each by its index. JSON text is read when stepped into. *at* prefixes the
+    concrete paths.
     """
-    while path:
-        if path.startswith("["):
-            end = path.find("]")
-            node = _json_text(node)
-            if end < 0 or not isinstance(node, list):
-                return ABSENT
-            try:
-                index = int(path[1:end])
-            except ValueError:
-                return ABSENT
-            if not -len(node) <= index < len(node):
-                return ABSENT
-            node, path = node[index], path[end + 1 :].removeprefix(".")
-            continue
+    if not path:
+        yield at, node
+        return
+    if path.startswith("["):
+        end = path.find("]")
         node = _json_text(node)
-        if not isinstance(node, dict):
-            return ABSENT
-        head = path.split("[", 1)[0]
-        matches = [key for key in node if head == key or head.startswith(key + ".")]
-        if not matches:
-            return ABSENT
-        key = max(matches, key=len)
-        node, path = node[key], path[len(key) :].removeprefix(".")
-    return node
+        if end < 0 or not isinstance(node, list):
+            return
+        rest = path[end + 1 :].removeprefix(".")
+        if end == 1:
+            for index, item in enumerate(node):
+                yield from matches(item, rest, f"{at}[{index}]")
+            return
+        try:
+            index = int(path[1:end])
+        except ValueError:
+            return
+        if -len(node) <= index < len(node):
+            yield from matches(node[index], rest, f"{at}[{index % len(node)}]")
+        return
+    node = _json_text(node)
+    if not isinstance(node, dict):
+        return
+    head = path.split("[", 1)[0]
+    keys = [key for key in node if head == key or head.startswith(key + ".")]
+    if keys:
+        key = max(keys, key=len)
+        rest = path[len(key) :].removeprefix(".")
+        yield from matches(node[key], rest, f"{at}.{key}" if at else key)
+
+
+def resolve(node: Any, path: str) -> Any:
+    """The value at *path* inside *node*, or :data:`ABSENT` (see :func:`matches`).
+    A path through ``[]`` reaches every item; this returns the first."""
+    return next(matches(node, path), (None, ABSENT))[1]
 
 
 def _type(value: Any) -> str:
@@ -292,21 +306,27 @@ def values(
     Each row has ``trace_id``, ``step_id`` and ``step`` (None for a trace
     field), ``present``, and ``value`` when present: an absent field is
     ``present: false``, a recorded null is ``present: true, value: null``.
+
+    A path through ``[]`` is present where any item holds it, as
+    :func:`fields` counts it; ``value`` is then the list of every item's
+    value, in order, and ``paths`` the concrete path of each (``a[2].b``),
+    which reads that one value alone.
     """
     traces = corpus.traces if isinstance(corpus, TraceCorpus) else list(corpus)
     wanted = set(trace_ids)
+    wildcard = "[]" in path
     for trace in traces:
         if wanted and trace.trace_id not in wanted:
             continue
         if path.startswith("trace."):
-            found = resolve(trace_view(trace), path.removeprefix("trace."))
-            rows = [(None, None, found)]
+            views = [(None, None, trace_view(trace), "trace")]
+            inner = path.removeprefix("trace.")
         else:
-            rows = [
-                (step.span_id, step.name, resolve(step_view(step), path)) for step in _steps(trace)
-            ]
-        for step_id, name, found in rows:
-            if found is ABSENT:
+            views = [(step.span_id, step.name, step_view(step), "") for step in _steps(trace)]
+            inner = path
+        for step_id, name, view, at in views:
+            found = list(matches(view, inner, at))
+            if not found:
                 if not present_only:
                     yield {
                         "trace_id": trace.trace_id,
@@ -315,10 +335,11 @@ def values(
                         "present": False,
                     }
                 continue
-            yield {
-                "trace_id": trace.trace_id,
-                "step_id": step_id,
-                "step": name,
-                "present": True,
-                "value": found,
-            }
+            row = {"trace_id": trace.trace_id, "step_id": step_id, "step": name, "present": True}
+            if wildcard:
+                # Every item's value, in order, and the path that reads each alone.
+                row["value"] = [value for _, value in found]
+                row["paths"] = [concrete for concrete, _ in found]
+            else:
+                row["value"] = found[0][1]
+            yield row
