@@ -11,6 +11,7 @@ from bandits.ingest.report import IngestReport
 from bandits.redact import DEFAULT_RULESET
 from bandits.store import ArtifactStore, StreamingWrite, compute_artifact_id
 from bandits.traces import TraceCorpus, WorkflowDeclaration
+from tests.cli_test import plain
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "upstream"
 
@@ -106,6 +107,43 @@ def test_stream_deduplicates_materialized_artifact(tmp_path):
         writer.finish(corpus.replace(traces=()))
         assert writer.commit(source_path=str(source), problem_count=0, report=None) == existing
     assert len(store.list()) == 1
+
+
+def _stream(store, corpus, source_path, report):
+    with StreamingWrite(store, corpus.source) as writer:
+        for trace in corpus.traces:
+            writer.add(trace)
+        writer.finish(corpus.replace(traces=()))
+        return writer.commit(source_path=source_path, problem_count=0, report=report)
+
+
+def test_stream_fills_in_a_missing_archive_and_report(tmp_path):
+    source = FIXTURES / "phoenix/sdk-server-getspans.json"
+    corpus = load_corpus(source, "phoenix", workflow=WorkflowDeclaration())
+    store = ArtifactStore(tmp_path / ".bandits")
+    # A library save under a logical name leaves neither archive nor report.
+    first = store.write(corpus, source_path="logical-name")
+    artifact = store._dir(first.artifact_id)
+    assert not (artifact / "source-manifest.json").exists()
+    assert _stream(store, corpus, str(source), {"spans_seen": 2}) == first
+    assert store.read_report(first.artifact_id) == {"spans_seen": 2}
+    for span in (s for t in corpus.traces for s in t.spans):
+        pointer = json.loads(span.attributes["bandits.source.record"])
+        assert store.read_native_record(first.artifact_id, pointer)
+    assert not list(tmp_path.glob(".bandits-ingest-*"))
+
+
+def test_stream_never_archives_a_changed_source_into_an_existing_artifact(tmp_path):
+    source = tmp_path / "export.json"
+    source.write_bytes((FIXTURES / "phoenix/sdk-server-getspans.json").read_bytes())
+    corpus = load_corpus(source, "phoenix", workflow=WorkflowDeclaration())
+    store = ArtifactStore(tmp_path / ".bandits")
+    first = store.write(corpus, source_path="logical-name")
+    source.write_text("{}")
+    with pytest.raises(ValueError, match="source file changed"):
+        _stream(store, corpus, str(source), None)
+    assert not (store._dir(first.artifact_id) / "source-manifest.json").exists()
+    assert not (store._dir(first.artifact_id) / "source").exists()
 
 
 def _otlp_record(trace_id, span_id, parent=None, *, model=False, text="hello"):
@@ -297,7 +335,7 @@ def test_cli_discovery_and_archive_never_read_entire_jsonl(tmp_path, monkeypatch
         app, ["ingest", str(path), "--source", source, "--project", str(tmp_path / "project")]
     )
     assert result.exit_code == 0, (result.stdout, result.exception)
-    assert "problems: none" in result.stdout
+    assert "problems: none" in plain(result.stdout)
     store = ArtifactStore(tmp_path / "project" / ".bandits")
     (envelope,) = store.list()
     corpus = store.read(envelope.artifact_id)

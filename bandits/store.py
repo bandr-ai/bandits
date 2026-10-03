@@ -14,6 +14,7 @@ import functools
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -82,7 +83,7 @@ def code_version() -> tuple[str, str | None, bool | None]:
 
     top = git("rev-parse", "--show-toplevel")
     try:
-        declared = tomllib.loads((Path(top) / "pyproject.toml").read_text())  # type: ignore[arg-type]
+        declared = tomllib.loads((Path(top) / "pyproject.toml").read_text(encoding="utf-8"))  # type: ignore[arg-type]
     except (TypeError, OSError, tomllib.TOMLDecodeError):
         declared = {}
     if top is None or declared.get("project", {}).get("name") != "bandits":
@@ -113,14 +114,13 @@ def resolve_record(data: bytes, pointer: dict | str) -> dict:
     list), so it is searched for the object whose ``id``, ``run_id``,
     ``span_id`` or ``context.span_id`` is the pointer's ``observation_id``.
 
-    Lines are split with ``bytes.splitlines``, as the archive's whole-file
-    redaction path does, so a file using a bare ``\r`` as a line break would
-    shift line numbers; such exports have not been seen.
+    Lines are split on LF only, as the readers count them; a bare ``\r``
+    inside a record is JSON whitespace, not a line break.
     """
     if isinstance(pointer, str):
         pointer = json.loads(pointer)
     if "line" in pointer:
-        record = json.loads(data.splitlines()[pointer["line"] - 1])
+        record = json.loads(data.split(b"\n")[pointer["line"] - 1])
         if "index" in pointer:
             record = record[pointer["index"]]
     else:
@@ -234,7 +234,7 @@ class ArtifactStore:
 
     def read_report(self, artifact_id: str) -> dict | None:
         path = self._dir(artifact_id) / "report.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def _archive_source(self, artifact_dir: Path, source_path: str, corpus: TraceCorpus) -> None:
         """Store redacted source bytes next to the normalized corpus.
@@ -345,7 +345,7 @@ class ArtifactStore:
         _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
 
     def source_manifest(self, artifact_id: str) -> list[dict[str, str | int]]:
-        return json.loads((self._dir(artifact_id) / "source-manifest.json").read_text())
+        return json.loads((self._dir(artifact_id) / "source-manifest.json").read_text(encoding="utf-8"))
 
     def read_source(self, artifact_id: str, archive_name: str) -> bytes:
         names = {str(item["archive"]) for item in self.source_manifest(artifact_id)}
@@ -434,6 +434,17 @@ class StreamingWrite:
         self.footer = footer
         self.artifact_id = "corpus-" + self.digest.hexdigest()[:16]
 
+    def _check_archived(self, directory: Path, source_path: str) -> None:
+        """The archived file is the one the traces were read from.
+
+        The footer has no traces, so ``_archive_source`` cannot check this itself.
+        """
+        manifest = directory / "source-manifest.json"
+        if self.source_digest is not None and manifest.exists() and Path(source_path).is_file():
+            archived = json.loads(manifest.read_text(encoding="utf-8"))[0]["source_sha256"]
+            if archived != self.source_digest:
+                raise ValueError(f"source file changed after ingest: {source_path}")
+
     def commit(
         self, *, source_path: str, problem_count: int, report: dict | None
     ) -> ArtifactEnvelope:
@@ -452,12 +463,23 @@ class StreamingWrite:
                         )
                     if not left:
                         break
+            # As ArtifactStore.write: a re-ingest fills in an archive or report
+            # the first write did not leave (a corpus saved without its file).
+            # Built and checked in staging, so a changed source never lands in
+            # the published artifact; the manifest moves last, marking it complete.
+            if not (target / "source-manifest.json").exists():
+                self.store._archive_source(self.directory, source_path, corpus)
+                self._check_archived(self.directory, source_path)
+                if (self.directory / "source-manifest.json").exists():
+                    shutil.rmtree(target / "source", ignore_errors=True)
+                    os.replace(self.directory / "source", target / "source")
+                    os.replace(
+                        self.directory / "source-manifest.json", target / "source-manifest.json"
+                    )
+            self.store._write_report(target, report)
             return self.store.read_envelope(self.artifact_id)
         self.store._archive_source(self.directory, source_path, corpus)
-        manifest = self.directory / "source-manifest.json"
-        if self.source_digest is not None and manifest.exists() and Path(source_path).is_file():
-            if json.loads(manifest.read_text())[0]["source_sha256"] != self.source_digest:
-                raise ValueError(f"source file changed after ingest: {source_path}")
+        self._check_archived(self.directory, source_path)
         version, commit, dirty = code_version()
         envelope = ArtifactEnvelope(
             artifact_id=self.artifact_id,

@@ -71,6 +71,17 @@ LAYOUTS = {
     "langsmith-jsonl": ("langsmith", "r.jsonl", "\n".join(json.dumps(_run(r)) for r in "xy")),
     "phoenix-spans": ("phoenix", "p.json", json.dumps({"spans": [_phoenix("s1"), _phoenix("s2")]})),
     "phoenix-line-array": ("phoenix", "p.jsonl", json.dumps([_phoenix("s1"), _phoenix("s2")])),
+    # A bare CR is JSON whitespace inside a record, not a line break.
+    "langsmith-jsonl-cr": (
+        "langsmith",
+        "r.jsonl",
+        "\n".join(json.dumps(_run(r)).replace(", ", ",\r ", 1) for r in "xy"),
+    ),
+    "langfuse-jsonl-crlf": (
+        "langfuse",
+        "a.jsonl",
+        "\r\n".join(json.dumps(_trace(t)) for t in "ab"),
+    ),
 }
 
 
@@ -98,7 +109,7 @@ def _every_span_resolves(tmp_path: Path, path: Path, source: str) -> int:
 def test_every_span_points_at_its_archived_record(tmp_path, layout) -> None:
     source, name, text = LAYOUTS[layout]
     path = tmp_path / name
-    path.write_text(text)
+    path.write_bytes(text.encode())
     assert _every_span_resolves(tmp_path, path, source) >= 2
 
 

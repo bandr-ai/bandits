@@ -142,7 +142,7 @@ def save_mapping(project: Path, name: str, mapping: IngestMapping, *, overwrite:
     if path.exists() and not overwrite:
         raise MappingError(f"mapping {name!r} already exists; pass --force to replace it")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mapping.model_dump_json(indent=2) + "\n")
+    path.write_text(mapping.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return path
 
 
