@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import functools
 import json
-import re
 import tempfile
 import time
 from contextlib import nullcontext
@@ -124,6 +123,7 @@ from bandits.ingest.mapping import (
     save_mapping,
 )
 from bandits.ingest.mapping import confirm as confirm_mapping
+from bandits.inspect import TraceSample, issue_rows, write_page
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore, StreamingWrite
 from bandits.traces import TraceCorpus, WorkflowDeclaration
@@ -378,6 +378,7 @@ def ingest(
                 found.answer_options,
             )
     store = ArtifactStore(_scratch(project) / ".bandits")
+    sample = TraceSample()
     with StreamingWrite(store, source) if source in _WORKFLOW_SOURCES else nullcontext() as staged:
         if source in _WORKFLOW_SOURCES:
             health = Health()
@@ -398,6 +399,7 @@ def ingest(
                     else:
                         collect(health, item, source, workflow=workflow is not None)
                         staged.add(item)
+                        sample.add(item)
                 health = finish(health, corpus, hints=found.hints() or None)
             except (ValueError, OSError) as exc:
                 _fail(
@@ -408,6 +410,8 @@ def ingest(
             if control_marker:
                 corpus = corpus.replace(control_markers=tuple(control_marker))
             health = check_health(corpus, source, hints=found.hints() or None)
+            for traced in corpus.traces:
+                sample.add(traced)
         # Only the OTLP family fills the report; other readers print no accounting.
         reported = source in _WORKFLOW_SOURCES
         _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
@@ -465,6 +469,14 @@ def ingest(
                 problem_count=len(health.warnings) + len(health.fatal),
             )
         _say(f"artifact_id: {envelope.artifact_id}")
+        page = write_page(
+            store._dir(envelope.artifact_id),
+            envelope.model_dump(mode="json"),
+            store.read_report(envelope.artifact_id),
+            corpus,
+            sample,
+        )
+        _say(f"inspect:  {page}")
         if health.warnings:
             _say(f"details:  bandits show {envelope.artifact_id} --issues")
 
@@ -670,7 +682,7 @@ def show(
 
     if issues:
         table = Table("kind", "location", "detail")
-        for row in _issue_rows(corpus.issues, all_redactions=all_redactions):
+        for row in issue_rows(corpus.issues, all_redactions=all_redactions):
             table.add_row(*row)
         console.print(table)
         return
@@ -701,33 +713,27 @@ def show(
     console.print(table)
 
 
-_LOCATION_FILE = re.compile(r"^(.*?)(?::record\d+)?(?::\d+)?$")
-
-
-def _issue_rows(issues: tuple, *, all_redactions: bool) -> list[tuple[str, str, str]]:
-    """Issue rows with redactions counted per kind of value, not one row each.
-
-    A redaction is routine (one per hidden value, often hundreds per file);
-    listed one by one they bury the issues that need reading.
-    """
-    rows: list[tuple[str, str, str]] = []
-    redactions: dict[str, list[str]] = {}
-    for issue in issues:
-        if issue.kind == "redaction" and not all_redactions:
-            redactions.setdefault(issue.detail, []).append(issue.location or "")
-            continue
-        rows.append((issue.kind, issue.location or "", issue.detail))
-    grouped = []
-    for detail, locations in redactions.items():
-        files = sorted({Path(_LOCATION_FILE.match(loc).group(1)).name for loc in locations if loc})
-        grouped.append(
-            (
-                "redaction",
-                f"{len(set(locations))} location(s) in {', '.join(files) or 'the source'}",
-                f"{detail} ({len(locations)} value(s); --all-redactions lists each)",
-            )
-        )
-    return grouped + rows
+@app.command(name="inspect")
+def inspect_command(
+    artifact_id: str,
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Write (or rewrite) the artifact's inspect.html: counts, shapes, step trees, notes."""
+    store = ArtifactStore(project / ".bandits")
+    try:
+        envelope = store.read_envelope(artifact_id)
+    except FileNotFoundError:
+        _fail(f"no artifact {artifact_id!r}", f"nothing under {project / '.bandits'}", "check --project")
+    report = store.read_report(artifact_id)
+    corpus = store.read(artifact_id)
+    wanted = [s.get("example_trace_id") for s in (report or {}).get("shapes") or []]
+    sample = TraceSample(wanted=[w for w in wanted if w])
+    for traced in corpus.traces:
+        sample.add(traced)
+    page = write_page(
+        store._dir(artifact_id), envelope.model_dump(mode="json"), report, corpus, sample
+    )
+    _say(f"inspect:  {page}")
 
 
 @app.command()

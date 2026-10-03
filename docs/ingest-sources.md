@@ -30,7 +30,12 @@ so the whole export need not fit in memory. LangSmith and Phoenix run/span
 records that share a trace are grouped across the input file.
 
 On CLI ingest, the artifact contains `corpus.json`, `source-manifest.json`, and
-`source/000000.json` (more files when the input is a directory). The source
+`source/000000.json` (more files when the input is a directory), plus
+`inspect.html`: a self-contained page (no network requests) with the record
+accounting, the trace shapes, each sampled trace as a tree of steps with their
+inputs, outputs and fields, and the notes, redactions counted per kind. It holds
+the corpus's redacted data, so it stays with the corpus; `bandits inspect ID`
+rewrites it. The source
 archive holds **redacted** source bytes; its manifest records original and
 redacted SHA-256 digests. It retains source fields that have no normalized
 meaning. `null`, empty values, and zero stay visible in that archive.

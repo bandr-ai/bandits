@@ -206,7 +206,7 @@ def test_streamed_array_redaction_counts_file_lines_and_archives_the_rest_verbat
 
 
 def test_show_issues_counts_redactions_instead_of_listing_each(tmp_path) -> None:
-    from bandits.cli import _issue_rows
+    from bandits.inspect import issue_rows as _issue_rows
 
     path = tmp_path / "a.jsonl"
     path.write_text("\n".join(json.dumps(_trace(t)) for t in "abc"))
