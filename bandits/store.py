@@ -189,8 +189,14 @@ class ArtifactStore:
         source_path: str,
         problem_count: int | None = None,
         report: dict | None = None,
+        archive_from: str | None = None,
+        bundled_from: list[dict] | None = None,
     ) -> ArtifactEnvelope:
         """Store *corpus* under its content id.
+
+        ``archive_from`` is the file the corpus was read from when that is not
+        ``source_path`` itself (a folder joined into one JSONL); ``bundled_from``
+        lists which file under ``source_path`` each of its lines came from.
 
         ``report`` (what the read saw, as plain JSON data) is saved as
         ``report.json`` beside it, outside the id: the same corpus read twice
@@ -208,7 +214,7 @@ class ArtifactStore:
                 raise ArtifactConflict(
                     f"artifact {artifact_id} already exists with different content"
                 )
-            self._archive_source(artifact_dir, source_path, corpus)
+            self._archive_source(artifact_dir, archive_from or source_path, corpus, bundled_from)
             self._write_report(artifact_dir, report)
             return self.read_envelope(artifact_id)
 
@@ -233,7 +239,7 @@ class ArtifactStore:
         )
         _atomic_write(artifact_dir / "corpus.json", corpus_bytes)
         _atomic_write(artifact_dir / "envelope.json", envelope.model_dump_json().encode("utf-8"))
-        self._archive_source(artifact_dir, source_path, corpus)
+        self._archive_source(artifact_dir, archive_from or source_path, corpus, bundled_from)
         self._write_report(artifact_dir, report)
         return envelope
 
@@ -247,7 +253,13 @@ class ArtifactStore:
         path = self._dir(artifact_id) / "report.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
-    def _archive_source(self, artifact_dir: Path, source_path: str, corpus: TraceCorpus) -> None:
+    def _archive_source(
+        self,
+        artifact_dir: Path,
+        source_path: str,
+        corpus: TraceCorpus,
+        bundled_from: list[dict] | None = None,
+    ) -> None:
         """Store redacted source bytes next to the normalized corpus.
 
         A digest alone cannot recover fields a reader did not map. The archive
@@ -353,6 +365,8 @@ class ArtifactStore:
                     "redacted_bytes": redacted_bytes,
                 }
             )
+        if bundled_from is not None and len(manifest) == 1:
+            manifest[0]["bundled_from"] = bundled_from
         _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
 
     def source_manifest(self, artifact_id: str) -> list[dict[str, str | int]]:
@@ -502,8 +516,16 @@ class StreamingWrite:
                 raise ValueError(f"source file changed after ingest: {source_path}")
 
     def commit(
-        self, *, source_path: str, problem_count: int, report: dict | None
+        self,
+        *,
+        source_path: str,
+        problem_count: int,
+        report: dict | None,
+        archive_from: str | None = None,
+        bundled_from: list[dict] | None = None,
     ) -> ArtifactEnvelope:
+        """As :meth:`ArtifactStore.write`, for a staged corpus."""
+        archived = archive_from or source_path
         corpus = self.footer
         target = self.store._dir(self.artifact_id)
         if target.exists():
@@ -524,8 +546,8 @@ class StreamingWrite:
             # Built and checked in staging, so a changed source never lands in
             # the published artifact; the manifest moves last, marking it complete.
             if not (target / "source-manifest.json").exists():
-                self.store._archive_source(self.directory, source_path, corpus)
-                self._check_archived(self.directory, source_path)
+                self.store._archive_source(self.directory, archived, corpus, bundled_from)
+                self._check_archived(self.directory, archived)
                 if (self.directory / "source-manifest.json").exists():
                     shutil.rmtree(target / "source", ignore_errors=True)
                     os.replace(self.directory / "source", target / "source")
@@ -534,8 +556,8 @@ class StreamingWrite:
                     )
             self.store._write_report(target, report)
             return self.store.read_envelope(self.artifact_id)
-        self.store._archive_source(self.directory, source_path, corpus)
-        self._check_archived(self.directory, source_path)
+        self.store._archive_source(self.directory, archived, corpus, bundled_from)
+        self._check_archived(self.directory, archived)
         version, commit, dirty = code_version()
         envelope = ArtifactEnvelope(
             artifact_id=self.artifact_id,
@@ -560,7 +582,13 @@ class StreamingWrite:
         except OSError as exc:
             if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                 raise
-            return self.commit(source_path=source_path, problem_count=problem_count, report=report)
+            return self.commit(
+                source_path=source_path,
+                problem_count=problem_count,
+                report=report,
+                archive_from=archive_from,
+                bundled_from=bundled_from,
+            )
         return envelope
 
 
