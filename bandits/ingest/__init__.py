@@ -30,7 +30,11 @@ CANONICAL_SOURCES: tuple[str, ...] = (
     "langfuse",
     "langsmith",
     "phoenix",
+    "failproofai",
 )
+
+NATIVE_SOURCES = ("langfuse", "langsmith", "phoenix", "failproofai")
+"""Native exports converted to OTLP internally (:mod:`bandits.ingest.native`)."""
 
 _LOADERS = {
     "otlp": load_otlp,
@@ -69,12 +73,13 @@ def load_corpus(
             "langfuse",
             "langsmith",
             "phoenix",
+            "failproofai",
         ):
             raise ValueError(
                 f"auto-detected {source!r}, but interaction mode is not in the file format; "
                 "declare the source and whether this is a conversation or workflow"
             )
-    if source in ("langfuse", "langsmith", "phoenix"):
+    if source in NATIVE_SOURCES:
         return load_native(
             Path(path),
             source,
@@ -129,7 +134,7 @@ def iter_corpus(
     JSONL readers group interleaved spans on disk and normalize one trace at a
     time. Whole-file JSON and legacy conversation adapters can still buffer input.
     """
-    if source in ("langfuse", "langsmith", "phoenix"):
+    if source in NATIVE_SOURCES:
         yield from iter_native(Path(path), source, ruleset, scratch_dir=scratch_dir, **kwargs)
     elif source == "otlp-std":
         yield from iter_otlp_standard(Path(path), ruleset, scratch_dir=scratch_dir, **kwargs)

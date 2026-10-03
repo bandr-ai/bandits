@@ -171,6 +171,7 @@ Everything is written as immutable artifacts under `.bandits/` in the project di
 | OpenTelemetry (flat) | `--source otlp` | One flat span object per line, `gen_ai.operation.name` of `chat` or `execute_tool` |
 | Chat transcripts | `--source chat-json` | One JSON conversation or an array of conversations |
 | Claude Code | `--source claude-code` | One session JSONL file or a directory of sessions |
+| FailproofAI | `--source failproofai` | One session transcript (the dashboard's evaluator JSON export), schema v1 or v2 |
 
 The input format is always explicit. Bandits does not guess, because a guess risks accepting a plausible-looking misparse.
 
