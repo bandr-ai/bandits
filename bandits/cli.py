@@ -716,6 +716,77 @@ def show(
     console.print(table)
 
 
+@app.command(name="fields")
+def fields_command(
+    artifact_id: str,
+    as_json: bool = typer.Option(False, "--json", help="Print JSON, for scripts and agents."),
+    group: str = typer.Option(
+        None, "--group", help="Only one group: trace, step, normalized, metadata, misc, bandits."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """List every field in a corpus: path, types, how many steps hold it, examples."""
+    from bandits.fields import fields
+
+    corpus = _read_corpus(project, artifact_id)
+    rows = [r for r in fields(corpus) if group is None or r["group"] == group]
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, default=str))
+        return
+    table = Table("path", "group", "types", "held", "examples")
+    for row in rows:
+        table.add_row(
+            row["path"],
+            row["group"],
+            ", ".join(f"{t}×{n}" for t, n in row["types"].items()),
+            f"{row['count']}/{row['of']}",
+            " | ".join(row["examples"]),
+        )
+    console.print(table)
+
+
+@app.command(name="get")
+def get_command(
+    artifact_id: str,
+    field_path: str = typer.Option(..., "--field", help="A path from `bandits fields`."),
+    trace: list[str] = typer.Option([], "--trace", help="Only these traces. Repeatable."),
+    present_only: bool = typer.Option(
+        False, "--present", help="Leave out steps that do not hold the field."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON lines, one per step."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Read one field across traces and steps; absent is told apart from null."""
+    from bandits.fields import values
+
+    corpus = _read_corpus(project, artifact_id)
+    rows = values(corpus, field_path, trace_ids=trace, present_only=present_only)
+    if as_json:
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False, default=str))
+        return
+    table = Table("trace_id", "step", "value")
+    for row in rows:
+        value = row["value"] if row["present"] else "(absent)"
+        text = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        table.add_row(row["trace_id"], row["step"] or "(trace)", text[:200])
+    console.print(table)
+
+
+def _read_corpus(project: Path, artifact_id: str) -> TraceCorpus:
+    try:
+        return ArtifactStore(project / ".bandits").read(artifact_id)
+    except FileNotFoundError:
+        _fail(
+            f"no artifact {artifact_id!r}",
+            f"nothing under {project / '.bandits'}",
+            "check --project",
+        )
+        raise
+
+
 @app.command(name="inspect")
 def inspect_command(
     artifact_id: str,

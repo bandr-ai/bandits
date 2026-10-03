@@ -338,6 +338,7 @@ Every SFT row, from either exporter, uses chat-completions-shaped `messages`. As
 | `ingest` | Normalize, redact, and store a trace export |
 | `list` / `show` | Browse corpora, traces, spans, and ingest issues |
 | `inspect` | Rebuild a corpus's `inspect.html`: counts, trace shapes, step trees, notes |
+| `fields` / `get` | List every field in a corpus (path, types, how many steps hold it, examples), and read one field across traces and steps; `--json` for agents |
 | `analyze` | Extract task candidates and outcome evidence |
 | `mine-rlm` | Discover task families by reading raw user requests, with no embedding geometry |
 | `audit-rlm` | Advisory: challenge each discovered family in a fresh adversarial context. Changes nothing |
