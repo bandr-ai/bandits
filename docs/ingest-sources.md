@@ -96,17 +96,41 @@ field qualifies by its last key (`query`, `question`, `input`, ... for the
 request; `answer`, `output`, `response`, ... for the answer) at most two levels
 below the run's `input`/`output`, or as the whole value when that is text. The
 fields found on each kind of top-level run form one option; options with the
-same fields are one option (one run recorded under two names). An option is
-chosen only when it picks exactly one run in every trace and no other option
-does; otherwise every option is printed with its coverage and the flag that
-selects it:
+same fields are one option (one run recorded under two names). One option that
+settles every trace is chosen; otherwise every option's fields are declared
+together. Nothing needs a flag and nothing is guessed:
 
-```
-task:     not chosen: input.payload.query → app(SPAN) 5/5 · input.question → graph(CHAIN) 5/5
-```
+- **Agreement.** When several top-level runs hold the question and their texts
+  are equal (surrounding whitespace aside), the question is that text. The
+  invocation is the agreeing run whose output holds the answer field, else the
+  first; `request.task_candidates` lists every field and run it was read from.
+- **Conflict.** When their texts differ, no run is chosen: the trace is saved
+  with `task_status: conflict` and every value in `request.task_candidates`
+  (path, value, run), for whatever uses the corpus to choose from. Ingest
+  reports it as a warning (`task_conflict`) and still saves.
 
-The answer field is then read on the chosen runs only, and chosen only when
-one path covers all of them. Declared flags are always used as given.
+The answer field is then read on the chosen runs (or any agreeing run), and
+chosen when one path is present in every trace. Declared flags are always used
+as given, and the options with their coverage stay visible in the output.
+
+## Fields Bandits does not interpret
+
+Each native converter names only the fields it reads. Every other field of the
+record, including nulls, empty values, unknown keys inside an object it reads
+only partly, and values of an unexpected shape, is kept on the step under its
+original name in `bandits.unmapped`; the app's own `metadata` keys are kept as
+`metadata.*`. Token counts and request parameters the source records under its
+own names are also given their GenAI names (`gen_ai.usage.*`,
+`gen_ai.request.*`). A field nobody has listed yet is therefore kept, not
+dropped, and the inspect page shows these under **Misc**.
+
+After a CLI ingest the sampled steps are compared with the raw records they
+came from (in the redacted source archive): every field the converter does not
+read must be in `bandits.unmapped` with the same name, type and value (exact),
+and the share of raw values found anywhere in the parsed step is reported as an
+informational signal (a value can match by coincidence). The run's own record
+is kept as the trace's request and is not compared; OTLP sources have no raw
+record pointer yet and are reported as not checked.
 
 ## Saved mappings
 

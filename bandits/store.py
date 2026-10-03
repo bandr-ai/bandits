@@ -345,7 +345,9 @@ class ArtifactStore:
         _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
 
     def source_manifest(self, artifact_id: str) -> list[dict[str, str | int]]:
-        return json.loads((self._dir(artifact_id) / "source-manifest.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (self._dir(artifact_id) / "source-manifest.json").read_text(encoding="utf-8")
+        )
 
     def read_source(self, artifact_id: str, archive_name: str) -> bytes:
         names = {str(item["archive"]) for item in self.source_manifest(artifact_id)}
@@ -359,6 +361,49 @@ class ArtifactStore:
         if len(manifest) != 1:
             raise ValueError("a native record pointer needs a single-file source archive")
         return resolve_record(self.read_source(artifact_id, str(manifest[0]["archive"])), pointer)
+
+    def read_native_records(self, artifact_id: str, pointers: list[dict]) -> dict[str, dict]:
+        """The archived native records for many pointers, reading the archive once.
+
+        Keyed by the pointer's canonical JSON. Only the records asked for are
+        held: JSONL lines and array elements are streamed past, so a large
+        archive is never loaded whole (a single JSON document still is).
+        """
+        manifest = self.source_manifest(artifact_id)
+        if len(manifest) != 1:
+            raise ValueError("a native record pointer needs a single-file source archive")
+        path = self._dir(artifact_id) / "source" / str(manifest[0]["archive"])
+        key = functools.partial(json.dumps, sort_keys=True)
+        by_line: dict[int, list[dict]] = {}
+        by_index: dict[int, list[dict]] = {}
+        whole: list[dict] = []
+        for pointer in pointers:
+            if "line" in pointer:
+                by_line.setdefault(pointer["line"], []).append(pointer)
+            elif "index" in pointer:
+                by_index.setdefault(pointer["index"], []).append(pointer)
+            else:
+                whole.append(pointer)
+        found: dict[str, dict] = {}
+        with path.open("rb") as stream:
+            if by_line:
+                for number, line in enumerate(stream, start=1):
+                    for pointer in by_line.get(number, ()):
+                        found[key(pointer)] = resolve_record(line, {**pointer, "line": 1})
+                stream.seek(0)
+            if by_index:
+                for index, (_, element, _) in enumerate(iter_array(stream)):
+                    if element is None:
+                        break
+                    for pointer in by_index.get(index, ()):
+                        rest = {k: v for k, v in pointer.items() if k != "index"}
+                        found[key(pointer)] = resolve_record(element, rest)
+                stream.seek(0)
+            if whole:
+                data = stream.read()
+                for pointer in whole:
+                    found[key(pointer)] = resolve_record(data, pointer)
+        return found
 
     def read(self, artifact_id: str) -> TraceCorpus:
         return TraceCorpus.model_validate_json(

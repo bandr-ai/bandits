@@ -123,7 +123,7 @@ from bandits.ingest.mapping import (
     save_mapping,
 )
 from bandits.ingest.mapping import confirm as confirm_mapping
-from bandits.inspect import TraceSample, issue_rows, write_page
+from bandits.inspect import TraceSample, check_fidelity, fidelity_line, issue_rows, write_page
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
 from bandits.store import ArtifactStore, DerivedStore, StreamingWrite
 from bandits.traces import TraceCorpus, WorkflowDeclaration
@@ -469,12 +469,15 @@ def ingest(
                 problem_count=len(health.warnings) + len(health.fatal),
             )
         _say(f"artifact_id: {envelope.artifact_id}")
+        fidelity = check_fidelity(store, envelope.artifact_id, sample.kept.values(), source)
+        _say(f"raw vs parsed: {fidelity_line(fidelity)}")
         page = write_page(
             store._dir(envelope.artifact_id),
             envelope.model_dump(mode="json"),
             store.read_report(envelope.artifact_id),
             corpus,
             sample,
+            fidelity,
         )
         _say(f"inspect:  {page}")
         if health.warnings:
@@ -723,15 +726,21 @@ def inspect_command(
     try:
         envelope = store.read_envelope(artifact_id)
     except FileNotFoundError:
-        _fail(f"no artifact {artifact_id!r}", f"nothing under {project / '.bandits'}", "check --project")
+        _fail(
+            f"no artifact {artifact_id!r}",
+            f"nothing under {project / '.bandits'}",
+            "check --project",
+        )
     report = store.read_report(artifact_id)
     corpus = store.read(artifact_id)
     wanted = [s.get("example_trace_id") for s in (report or {}).get("shapes") or []]
     sample = TraceSample(wanted=[w for w in wanted if w])
     for traced in corpus.traces:
         sample.add(traced)
+    fidelity = check_fidelity(store, artifact_id, sample.kept.values(), envelope.source)
+    _say(f"raw vs parsed: {fidelity_line(fidelity)}")
     page = write_page(
-        store._dir(artifact_id), envelope.model_dump(mode="json"), report, corpus, sample
+        store._dir(artifact_id), envelope.model_dump(mode="json"), report, corpus, sample, fidelity
     )
     _say(f"inspect:  {page}")
 

@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,30 @@ def _messages_text(messages: Any) -> list[dict[str, str]] | None:
     return shown
 
 
+def _misc(attributes: dict[str, Any]) -> dict[str, Any]:
+    """The fields Bandits keeps without interpreting: the converter's
+    ``bandits.unmapped`` and the app's own ``metadata.*``, as readable objects."""
+    misc: dict[str, Any] = {}
+    unmapped = attributes.get("bandits.unmapped")
+    if isinstance(unmapped, str):
+        try:
+            unmapped = json.loads(unmapped)
+        except ValueError:
+            pass
+    if isinstance(unmapped, dict):
+        misc.update(unmapped)
+    elif unmapped is not None:
+        misc["(unmapped)"] = unmapped
+    metadata = {
+        key.removeprefix("metadata."): value
+        for key, value in attributes.items()
+        if key.startswith("metadata.")
+    }
+    if metadata:
+        misc["metadata"] = metadata
+    return _clip(misc, 30_000) if misc else {}
+
+
 def _steps(trace: Trace) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     request = trace.request
@@ -136,6 +161,7 @@ def _steps(trace: Trace) -> list[dict[str, Any]]:
                 "input": _clip(span.arguments) if span.arguments else None,
                 "output": _clip(span.output),
                 "attributes": _clip_fields(attributes),
+                "misc": _misc(attributes),
             }
         )
         seen.add(span.span_id)
@@ -154,6 +180,7 @@ def _steps(trace: Trace) -> list[dict[str, Any]]:
                 "input": _clip(node.input),
                 "output": _clip(node.output),
                 "attributes": _clip_fields(node.attributes),
+                "misc": _misc(node.attributes),
             }
         )
         seen.add(node.span_id)
@@ -183,6 +210,11 @@ def _trace_view(trace: Trace) -> dict[str, Any]:
         "task_status": request.task_status if request else None,
         "task_path": request.task_path if request else None,
         "task_reason": request.task_reason if request else None,
+        "invocation_basis": request.invocation_basis if request else None,
+        "task_candidates": [
+            {"span_id": c.span_id, "path": c.path, "value": _clip(c.value, 500)}
+            for c in (request.task_candidates if request else ())
+        ],
         "delivered": _clip(request.delivered) if request else None,
         "system_prompt": _clip(trace.system_prompt) if trace.system_prompt else None,
         "evidence": len(trace.evidence),
@@ -190,11 +222,227 @@ def _trace_view(trace: Trace) -> dict[str, Any]:
     }
 
 
+def _leaves(value: Any, path: str = "") -> Iterator[tuple[str, Any]]:
+    """Every scalar in a raw record with its path; nested observations are
+    their own steps and are checked there."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key != "children":
+                yield from _leaves(child, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _leaves(child, f"{path}[{index}]")
+    elif isinstance(value, str) and value[:1] in "{[":
+        # JSON held in text is checked by its values, as the parsed side reads it.
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            yield path, value
+        else:
+            yield from _leaves(decoded, path)
+    else:
+        yield path, value
+
+
+_ABSENT = object()
+
+_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _instant(text: str) -> float | None:
+    """*text* as a point in time, when it is an ISO timestamp, so that
+    ``…32.598Z`` and ``…32.598000+00:00`` compare equal."""
+    if len(text) > 40 or not _TIMESTAMP.match(text):
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.timestamp()
+
+
+def _parsed_values(value: Any, texts: list[str], numbers: set[float], flags: set[bool]) -> None:
+    """Every value in a parsed step, reading JSON held in strings as well;
+    timestamps also count as instants (in *numbers*, negated to stay apart)."""
+    if isinstance(value, dict):
+        for child in value.values():
+            _parsed_values(child, texts, numbers, flags)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _parsed_values(child, texts, numbers, flags)
+    elif isinstance(value, bool):
+        flags.add(value)
+    elif isinstance(value, (int, float)):
+        numbers.add(float(value))
+    elif isinstance(value, str):
+        texts.append(value)
+        if (moment := _instant(value)) is not None:
+            numbers.add(-moment - 1)
+        if value[:1] in "{[":
+            try:
+                _parsed_values(json.loads(value), texts, numbers, flags)
+            except ValueError:
+                pass
+
+
+def missing_values(raw: dict[str, Any], parsed: dict[str, Any]) -> list[str]:
+    """Paths of values in a *raw* record that the *parsed* step holds nowhere.
+
+    Informational, not proof: a value counts as found if the parsed step
+    holds an equal value anywhere (as a field, in a message, in JSON text), so
+    it cannot tell a moved value from a coincidence. Carried fields are
+    checked exactly by :func:`check_fidelity`. Empty values are not checked.
+    """
+    texts: list[str] = []
+    numbers: set[float] = set()
+    flags: set[bool] = set()
+    _parsed_values(parsed, texts, numbers, flags)
+    exact = set(texts)
+    missing = []
+    for path, leaf in _leaves(raw):
+        if leaf is None or leaf == "":
+            continue
+        if isinstance(leaf, bool):
+            kept = leaf in flags or json.dumps(leaf) in exact
+        elif isinstance(leaf, (int, float)):
+            kept = float(leaf) in numbers or json.dumps(leaf) in exact
+        else:
+            moment = _instant(str(leaf))
+            kept = str(leaf) in exact or (moment is not None and -moment - 1 in numbers)
+        if not kept:
+            missing.append(path)
+    return missing
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def check_fidelity(
+    store: Any, artifact_id: str, traces: Iterable[Trace], source: str = ""
+) -> dict[str, Any]:
+    """Each sampled step against the raw record it was parsed from.
+
+    Exact: the fields the converter does not consume must sit in
+    ``bandits.unmapped`` under their original names, with the same type and
+    value. Informational: whether the consumed fields' values appear anywhere
+    in the parsed step. The raw record comes from the (redacted) source
+    archive through the step's ``bandits.source.record`` pointer, so
+    redaction is not a mismatch.
+    """
+    from bandits.ingest.native import USED_FIELDS, unmapped_fields
+
+    used_for = USED_FIELDS.get(source)
+    steps = []
+    for trace in traces:
+        for step in (*trace.spans, *trace.workflow_nodes):
+            pointer = step.attributes.get("bandits.source.record")
+            if isinstance(pointer, str):
+                try:
+                    pointer = json.loads(pointer)
+                except ValueError:
+                    continue
+            if isinstance(pointer, dict):
+                steps.append((trace.trace_id, step, pointer))
+    if not steps:
+        return {"steps": 0}
+    try:
+        raws = store.read_native_records(artifact_id, [p for _, _, p in steps])
+    except (ValueError, FileNotFoundError, LookupError) as exc:
+        return {"steps": 0, "error": str(exc)}
+    checked = values = carried = 0
+    per_step: dict[str, dict[str, Any]] = {}
+    examples: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    for trace_id, step, pointer in steps:
+        raw = raws.get(json.dumps(pointer, sort_keys=True))
+        if raw is None:
+            continue
+        checked += 1
+        values += sum(1 for _, leaf in _leaves(raw) if leaf is not None and leaf != "")
+        wrong: list[str] = []
+        if used_for is not None:
+            expected = unmapped_fields(raw, used_for(raw))
+            actual = step.attributes.get("bandits.unmapped") or {}
+            if isinstance(actual, str):
+                try:
+                    actual = json.loads(actual)
+                except ValueError:
+                    actual = {"(unreadable)": actual}
+            carried += len(expected)
+            wrong = sorted(
+                key
+                for key in set(expected) | set(actual)
+                if _canonical(expected.get(key, _ABSENT)) != _canonical(actual.get(key, _ABSENT))
+            )
+            for key in wrong[: max(0, 50 - len(mismatches))]:
+                mismatches.append(
+                    {
+                        "trace_id": trace_id,
+                        "step": step.name,
+                        "field": key,
+                        "raw": _clip(expected.get(key, "(absent)"), 300),
+                        "kept": _clip(actual.get(key, "(absent)"), 300),
+                    }
+                )
+        missing = missing_values(raw, step.model_dump(mode="json"))
+        per_step[step.span_id] = {"raw": _clip(raw, 20_000), "missing": missing, "wrong": wrong}
+        if missing and len(examples) < 50:
+            examples.append({"trace_id": trace_id, "step": step.name, "paths": missing[:20]})
+    return {
+        "steps": checked,
+        "values": values,
+        "carried": carried,
+        "carried_wrong": sum(len(v["wrong"]) for v in per_step.values()),
+        "mismatches": mismatches,
+        "exact": used_for is not None,
+        "missing": sum(len(v["missing"]) for v in per_step.values()),
+        "examples": examples,
+        "per_step": per_step,
+    }
+
+
+def fidelity_line(fidelity: dict[str, Any]) -> str:
+    if fidelity.get("error"):
+        return f"not checked ({fidelity['error']})"
+    if not fidelity.get("steps"):
+        return "not checked (no step points to a raw record)"
+    parts = [f"{fidelity['steps']} stored steps compared with their raw records"]
+    if fidelity.get("exact"):
+        wrong = fidelity["carried_wrong"]
+        parts.append(
+            f"{fidelity['carried']} unmapped fields kept exactly"
+            if not wrong
+            else f"{wrong} unmapped field(s) NOT kept exactly (see inspect.html)"
+        )
+    found = fidelity["values"] - fidelity["missing"]
+    parts.append(
+        f"{found}/{fidelity['values']} raw values found in the parsed steps (informational)"
+    )
+    return "; ".join(parts)
+
+
+def _misc_counts(traces: Iterable[Trace]) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for trace in traces:
+        for step in (*trace.spans, *trace.workflow_nodes):
+            misc = _misc(step.attributes)
+            for key in misc.get("metadata", {}) if isinstance(misc.get("metadata"), dict) else ():
+                counts[f"metadata.{key}"] = counts.get(f"metadata.{key}", 0) + 1
+            for key in misc:
+                if key != "metadata":
+                    counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
 def page_data(
     envelope: dict[str, Any],
     report: dict[str, Any] | None,
     footer: TraceCorpus,
     sample: TraceSample,
+    fidelity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Everything the page shows, as plain JSON data."""
     issues = footer.issues
@@ -225,6 +473,9 @@ def page_data(
         "shape_count": (report or {}).get("shape_count", len(shapes)),
         "traces_seen": sample.seen,
         "traces": [_trace_view(trace) for trace in sample.kept.values()],
+        "misc_fields": _misc_counts(sample.kept.values()),
+        "fidelity": fidelity or {"steps": 0},
+        "fidelity_line": fidelity_line(fidelity or {"steps": 0}),
     }
 
 
@@ -240,11 +491,14 @@ def write_page(
     report: dict[str, Any] | None,
     footer: TraceCorpus,
     sample: TraceSample,
+    fidelity: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``inspect.html`` into an artifact *directory*; returns its path."""
     path = directory / "inspect.html"
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(render(page_data(envelope, report, footer, sample)), encoding="utf-8")
+    temporary.write_text(
+        render(page_data(envelope, report, footer, sample, fidelity)), encoding="utf-8"
+    )
     temporary.replace(path)
     return path
 
@@ -320,9 +574,18 @@ const redactions = Object.entries(D.redactions).map(([d,n]) => `${n} × ${esc(d.
 const wf = D.workflow;
 el("overview").innerHTML = `
 <div class="cards">${card(E.trace_count,"traces")}${card(E.span_count,"steps kept as spans")}
-${card(B.model ?? "–","model calls")}${card(D.problems,"problems (block saving)")}
+${card(B.model ?? "–","model calls")}${card(D.problems,"problems (saved anyway)")}
 ${card(D.notes,"notes (informational)")}${card(D.shape_count ?? "–","trace shapes")}</div>
-<div class="box"><h3>Problems vs notes</h3><div class="muted">A <b>problem</b> means data was lost, misread or does not add up; the ingest refuses to save on one.
+<div class="box"><h3>Raw vs parsed</h3><div class="${D.fidelity.carried_wrong ? "err" : ""}">${esc(D.fidelity_line)}</div>
+${(D.fidelity.mismatches||[]).slice(0,10).map(m => `<div class="err"><code>${esc(m.trace_id.slice(0,12))}</code> ${esc(m.step)} · <code>${esc(m.field)}</code>: raw ${esc(JSON.stringify(m.raw))} → kept ${esc(JSON.stringify(m.kept))}</div>`).join("")}
+<div class="muted">Each stored step in the traces on this page is compared with the raw record it was parsed from (in the redacted source copy).
+<b>Exact:</b> every field the converter does not interpret must be kept under Misc with its original name, type and value.
+<b>Informational:</b> how many raw values appear anywhere in the parsed step; a value can be found by coincidence, so this is a signal, not proof.
+The run's own record (the invocation) is kept as the trace's request, not as a step, and is not compared here. Open a step to see its raw record.</div>
+${(D.fidelity.examples||[]).slice(0,5).map(e => `<div class="muted"><code>${esc(e.trace_id.slice(0,12))}</code> ${esc(e.step)}: not found anywhere: ${e.paths.map(esc).join(", ")}</div>`).join("")}</div>
+${D.misc_fields && D.misc_fields.length ? `<div class="box"><h3>Misc fields (kept, not interpreted)</h3><div class="muted">Fields Bandits keeps under their original names without giving them a meaning, in the steps on this page. Open a step to read them.</div>
+<table><tr><th>field</th><th>steps</th></tr>${D.misc_fields.map(([k,n]) => `<tr><td><code>${esc(k)}</code></td><td>${n}</td></tr>`).join("")}</table></div>` : ""}
+<div class="box"><h3>Problems vs notes</h3><div class="muted">A <b>problem</b> is something that may make part of the data wrong or incomplete: a run whose question could not be read, a model call with no recorded reply. The corpus is still saved; ingest refuses to save only when nothing usable was read or the records do not add up.
 A <b>note</b> is recorded for information: a hidden value, a parent the export did not include. ${D.problems ? "" : "This corpus has no problems."}</div></div>
 ${R.spans_seen !== undefined ? `<div class="box"><h3>Every record accounted for</h3>
 <div>${R.spans_seen} records seen → ${Object.entries(B).filter(([,n])=>n).map(([k,n])=>`${n} ${esc(k.replace("_"," "))}`).join(" · ")} · <b>${R.dropped} dropped</b></div>
@@ -348,7 +611,14 @@ function stepBody(s) {
   else if (s.input !== undefined && s.input !== null) h += `<div class="label">input</div>${pre(s.input)}`;
   if (s.output_messages) h += `<div class="label">output messages</div>` + s.output_messages.map(m => `<div class="msg"><span class="role">${esc(m.role)}</span>${pre(m.text)}</div>`).join("");
   else h += `<div class="label">output</div>${pre(s.output)}`;
-  h += `<details><summary class="label">all fields (${Object.keys(s.attributes||{}).length})</summary>${pre(s.attributes)}</details></div>`;
+  h += `<details><summary class="label">all parsed fields (${Object.keys(s.attributes||{}).length})</summary>${pre(s.attributes)}</details>`;
+  const misc = s.misc || {};
+  if (Object.keys(misc).length) h += `<details><summary class="label">misc: kept, not interpreted (${Object.keys(misc).length})</summary>${pre(misc)}</details>`;
+  const f = (D.fidelity.per_step || {})[s.id];
+  if (f) h += (f.wrong.length ? `<div class="label err">unmapped fields not kept exactly (${f.wrong.length})</div><pre class="err">${esc(f.wrong.join("\n"))}</pre>` : "")
+    + (f.missing.length ? `<div class="label">raw values not found anywhere in the parsed step (informational, ${f.missing.length})</div><pre>${esc(f.missing.join("\n"))}</pre>` : "")
+    + `<details><summary class="label">raw record (as exported, redacted)</summary>${pre(f.raw)}</details>`;
+  h += `</div>`;
   return h;
 }
 function tree(t) {
@@ -364,7 +634,10 @@ ${stepBody(s)}</details>${kids[s.id] ? `<div class="kids">${kids[s.id].map(node)
 function traceDetail(t) {
   return `<div class="box"><h3>Trace <code>${esc(t.trace_id)}</code></h3><table>
 <tr><th>question</th><td>${t.task ? esc(t.task) : '<span class="muted">not found</span>'}${t.task_path ? ` <span class="muted">from <code>${esc(t.task_path)}</code></span>` : ""}
-${t.task_reason ? `<div class="muted">${esc(t.task_reason)}</div>` : ""}</td></tr>
+${t.task_reason ? `<div class="muted">${esc(t.task_reason)}</div>` : ""}
+${t.invocation_basis ? `<div class="muted">run: ${esc(t.invocation_basis)}</div>` : ""}
+${t.task_candidates.length > 1 ? `<details><summary class="label">${t.task_status === "conflict" ? "different questions recorded (none chosen)" : "recorded in " + t.task_candidates.length + " fields (same text)"}</summary>
+<table>${t.task_candidates.map(c => `<tr><td><code>${esc(c.path)}</code><div class="muted"><code>${esc(c.span_id)}</code></div></td><td>${esc(c.value)}</td></tr>`).join("")}</table></details>` : ""}</td></tr>
 <tr><th>answer</th><td>${pre(t.delivered)}</td></tr>
 ${t.system_prompt ? `<tr><th>system prompt</th><td>${pre(t.system_prompt)}</td></tr>` : ""}
 <tr><th>steps</th><td>${t.steps.length} (${["model","tool","step","invocation"].map(k => `${t.steps.filter(s=>s.type===k).length} ${k}`).join(", ")}) · ${t.evidence} evidence links</td></tr></table>
@@ -373,18 +646,23 @@ ${t.system_prompt ? `<tr><th>system prompt</th><td>${pre(t.system_prompt)}</td><
 const byId = Object.fromEntries(D.traces.map(t => [t.trace_id, t]));
 
 // Shapes
-el("shapes").innerHTML = `<div class="box muted">A shape is the layout of steps in a trace. Traces with the same shape were produced by the same pipeline path.
-${D.shape_count > D.shapes.length ? `Showing the ${D.shapes.length} most common of ${D.shape_count}.` : ""}</div>
-<div class="layout"><div class="box list"><table><tr><th>shape</th><th>traces</th><th>model calls</th><th>question found</th></tr>
-${D.shapes.map(s => `<tr class="click" data-shape="${esc(s.example_trace_id)}"><td><code>${esc(s.shape_id)}</code><div class="bar"><i style="width:${s.share}%"></i></div></td>
-<td>${s.traces} (${s.share}%)</td><td>${s.model_calls}</td><td>${esc(Object.entries(s.task_status||{}).map(([k,n])=>`${n} ${k}`).join(", "))}</td></tr>`).join("")}</table></div>
-<div id="shapeview"><div class="box muted">Pick a shape to see an example trace.</div></div></div>`;
-document.querySelectorAll("[data-shape]").forEach(r => r.onclick = () => {
-  const t = byId[r.dataset.shape];
-  el("shapeview").innerHTML = t ? traceDetail(t) : `<div class="box muted">The example trace ${esc(r.dataset.shape)} is not among the traces in this page; run <code>bandits inspect ${esc(E.artifact_id)}</code> to rebuild it with every shape's example.</div>`;
-});
-const firstShape = document.querySelector("[data-shape]");
-if (firstShape) firstShape.click();
+el("shapes").innerHTML = `<div class="box muted">A shape is one layout of steps. Traces with the same shape took the same path through the app,
+so different versions of an app (or different routes through it) show up as different shapes. Every shape found is listed (${D.shape_count}),
+with where its question was read and its step outline (a repeated step shows as ×N).</div>
+<div class="layout"><div class="box list"><table><tr><th>shape</th><th>traces</th><th>question read from</th></tr>
+${D.shapes.map((s, i) => `<tr class="click" data-shape-index="${i}"><td><code>${esc(s.shape_id)}</code><div class="bar"><i style="width:${s.share}%"></i></div>
+<div class="muted">${s.model_calls} model calls</div></td><td>${s.traces} (${s.share}%)</td>
+<td>${Object.keys(s.task_paths||{}).length ? Object.entries(s.task_paths).map(([p,n])=>`<code>${esc(p)}</code> ${n}`).join("<br>") : `<span class="muted">${esc(Object.entries(s.task_status||{}).map(([k,n])=>`${n} ${k}`).join(", ") || "none")}</span>`}</td></tr>`).join("")}</table></div>
+<div id="shapeview"></div></div>`;
+function showShape(i) {
+  const s = D.shapes[i], t = byId[s.example_trace_id];
+  el("shapeview").innerHTML = `<div class="box"><h3>Shape <code>${esc(s.shape_id)}</code> · ${s.traces} trace(s)</h3>
+<div class="label">outline</div>${s.outline ? pre(s.outline.join("\n")) : '<span class="muted">not saved for this shape</span>'}
+<div class="muted">example trace <code>${esc(s.example_trace_id)}</code>${t ? "" : " (not among the traces in this page; <code>bandits inspect</code> adds every shape's example)"}</div></div>`
+  + (t ? traceDetail(t) : "");
+}
+document.querySelectorAll("[data-shape-index]").forEach(r => r.onclick = () => showShape(+r.dataset.shapeIndex));
+if (D.shapes.length) showShape(0);
 
 // Traces
 el("traces").innerHTML = `<div class="box muted">${D.traces.length} of ${E.trace_count} traces are in this page.</div>

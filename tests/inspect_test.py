@@ -79,3 +79,63 @@ def test_sample_keeps_the_first_traces_and_one_per_new_layout() -> None:
     wanted.add(trace)
     wanted.add(trace.replace(trace_id="wanted"))
     assert "wanted" in wanted.kept
+
+
+def test_raw_vs_parsed_finds_every_value_and_flags_a_dropped_one(tmp_path: Path) -> None:
+    from bandits.ingest import load_corpus
+    from bandits.inspect import check_fidelity, missing_values
+
+    corpus = load_corpus(FIXTURE, "langfuse")
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(FIXTURE)).artifact_id
+    fidelity = check_fidelity(store, artifact, corpus.traces, "langfuse")
+    stored = sum(len(t.spans) + len(t.workflow_nodes) for t in corpus.traces)
+    assert fidelity["steps"] == stored and fidelity["values"] > 50
+    assert fidelity["exact"] and fidelity["carried"] > 0
+    assert fidelity["carried_wrong"] == 0, fidelity["mismatches"]
+
+    raw = {"id": "o1", "usage": {"input": 313}, "name": "chat", "children": [{"x": "skip"}]}
+    parsed = {"name": "chat", "attributes": {"id": "o1", "kept": '{"nested": "x"}'}}
+    assert missing_values(raw, parsed) == ["usage.input"]
+    parsed["attributes"]["bandits.unmapped"] = json.dumps({"usage": {"input": 313}})
+    assert missing_values(raw, parsed) == []
+
+
+def test_every_shape_is_kept_with_its_outline_and_question_field(tmp_path: Path) -> None:
+    from bandits.ingest import load_corpus
+    from bandits.ingest.report import IngestReport
+    from bandits.traces import WorkflowDeclaration
+
+    report = IngestReport()
+    load_corpus(
+        FIXTURE,
+        "langfuse",
+        workflow=WorkflowDeclaration(task_fields=("input.message",)),
+        report=report,
+    )
+    (shape,) = report.as_dict()["shapes"]
+    assert shape["task_paths"] == {"input.message": 1}
+    assert shape["outline"][0].startswith("invocation · ") or " · " in shape["outline"][0]
+    assert any("model · " in line for line in shape["outline"])
+
+
+def test_the_exact_check_catches_a_carried_field_that_changed(tmp_path: Path) -> None:
+    from bandits.ingest import load_corpus
+    from bandits.inspect import check_fidelity
+
+    corpus = load_corpus(FIXTURE, "langfuse")
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(FIXTURE)).artifact_id
+    (trace,) = corpus.traces
+    step = next(s for s in trace.spans if s.attributes.get("bandits.unmapped"))
+    unmapped = step.attributes["bandits.unmapped"]
+    unmapped = json.loads(unmapped) if isinstance(unmapped, str) else dict(unmapped)
+    key = next(iter(unmapped))
+    unmapped[key] = "changed"
+    changed = step.replace(attributes={**step.attributes, "bandits.unmapped": unmapped})
+    tampered = trace.replace(
+        spans=tuple(changed if s.span_id == step.span_id else s for s in trace.spans)
+    )
+    fidelity = check_fidelity(store, artifact, [tampered], "langfuse")
+    assert fidelity["carried_wrong"] == 1
+    assert fidelity["mismatches"][0]["field"] == key
