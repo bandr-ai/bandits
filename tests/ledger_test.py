@@ -339,6 +339,7 @@ def test_concurrent_writers_never_interleave_a_row(ledger_path):
 
 
 def test_fsync_policy_is_honoured(ledger_path, monkeypatch):
+    ledger.record({"event_type": "created"})  # creating the file syncs its directory
     synced = []
     real = __import__("os").fsync
     monkeypatch.setattr("os.fsync", lambda fd: synced.append(fd) or real(fd))
@@ -349,8 +350,9 @@ def test_fsync_policy_is_honoured(ledger_path, monkeypatch):
     assert len(synced) == 1
     monkeypatch.delenv("BANDITS_LEDGER_FSYNC")
     ledger.record({"event_type": "c", "text": "q" * 10_000})
-    # The blob file and its directory entry, before the referencing row.
-    assert len(synced) == 3, "a blob is always made durable before its reference"
+    # Row "b" (fsync on), then, with fsync off, still synced before row "c":
+    # the new blob directory's entry, the blob file, and the blob's entry.
+    assert len(synced) == 1 + 3, "a blob is always made durable before its reference"
 
 
 def test_recorded_commands_fsync_by_default_and_restore_the_setting(tmp_path, monkeypatch):
@@ -373,3 +375,109 @@ def test_blobs_can_be_disabled(ledger_path, monkeypatch):
     ledger.record({"event_type": "a", "text": "x" * 20_000})
     assert _rows(ledger_path)[0]["text"] == "x" * 20_000
     assert not ledger.blob_dir(ledger_path).exists()
+
+
+def test_a_value_that_cannot_be_serialized_is_a_latched_recording_failure(ledger_path, monkeypatch):
+    """Not only disk errors: any row that cannot be written stops a strict run."""
+    monkeypatch.setenv("BANDITS_LEDGER_STRICT", "1")
+    ledger.clear_failure()
+    loop: dict = {}
+    loop["self"] = loop
+    try:
+        with pytest.raises(ledger.LedgerWriteError, match="ValueError"):
+            ledger.record({"event_type": "x", "value": loop})
+        with pytest.raises(ledger.LedgerWriteError):
+            ledger.raise_if_failed()
+    finally:
+        ledger.clear_failure()
+
+
+def test_lone_surrogates_are_kept_byte_exact_inline_and_in_blobs(ledger_path):
+    short = "bad \ud800 text"
+    long = "\udfff" + "a" * 9000
+    ledger.record({"event_type": "x", "short": short, "long": long})
+    row = ledger.read_events(ledger_path)[0]
+    assert row["short"] == short and row["long"] == long
+
+
+def test_seq_follows_file_order_under_contention(ledger_path):
+    def write() -> None:
+        for _ in range(100):
+            ledger.record({"event_type": "w"})
+
+    threads = [threading.Thread(target=write) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    seqs = [row["seq"] for row in _rows(ledger_path)]
+    assert seqs == sorted(seqs) and len(set(seqs)) == 800
+
+
+def test_new_ledger_files_and_directories_are_made_durable(tmp_path, monkeypatch):
+    path = tmp_path / "a" / "b" / "run.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    synced: list[str] = []
+    real = ledger._fsync_dir
+    monkeypatch.setattr(ledger, "_fsync_dir", lambda d: synced.append(str(d)) or real(d))
+    ledger.record({"event_type": "first", "text": "x" * 10_000})
+    assert str(tmp_path) in synced, "the new directory's parent entry"
+    assert str(tmp_path / "a" / "b") in synced, "the new ledger file's entry"
+    assert str(ledger.blob_dir(path)) in synced, "the new blob's entry"
+    synced.clear()
+    ledger.record({"event_type": "second"})
+    assert synced == [], "appending to an existing ledger creates nothing"
+
+
+def _call(call_id, kind="model_call", **fields):
+    return {"event_type": kind, "call_id": call_id, **fields}
+
+
+@pytest.mark.parametrize(
+    "rows, expected",
+    [
+        ([_call("a")], "ended with no start row"),
+        (
+            [_call("a", "model_call_start"), _call("a", "model_call_start"), _call("a")],
+            "more than one start",
+        ),
+        ([_call("a", "model_call_start"), _call("a"), _call("a")], "more than one end"),
+        ([_call("a", "model_call_start")], "started and never ended"),
+        ([{"event_type": "model_call", "provider": "dspy"}], "carry no call id"),
+        ([{"event_type": "invocation_end", "invocation_id": "i"}], "invocation(s) ended"),
+        ([{"event_type": "invocation_start", "invocation_id": "i"}], "invocation(s) started"),
+        ([{"event_type": "repl_end", "repl_id": "r"}], "REPL step(s) ended"),
+        (
+            [{"event_type": "repl_start", "repl_id": "r"}] * 2
+            + [{"event_type": "repl_end", "repl_id": "r"}],
+            "more than one start",
+        ),
+        ([{"event_type": "run_finished"}], "run(s) ended"),
+        ([{"event_type": "run_started"}], "run(s) started"),
+        ([{"event_type": "truncated_row"}], "cut short"),
+    ],
+)
+def test_the_checker_refuses_every_unpaired_duplicated_or_uncorrelated_row(rows, expected):
+    from bandits.analyze.rlm_ledger import reconcile
+
+    report = reconcile(rows)
+    assert not report.consistent
+    assert any(expected in problem for problem in report.problems()), report.problems()
+
+
+def test_the_checker_accepts_a_well_formed_resumed_session():
+    from bandits.analyze.rlm_ledger import reconcile
+
+    rows = [
+        {"event_type": "run_started"},
+        {"event_type": "invocation_start", "invocation_id": "i1"},
+        _call("a", "model_call_start", invocation_id="i1"),
+        _call("a", invocation_id="i1", cost_usd=0.01, usage={"prompt_tokens": 5}),
+        {"event_type": "invocation_end", "invocation_id": "i1", "llm_calls": 1},
+        {"event_type": "run_finished"},
+        {"event_type": "run_started"},
+        {"event_type": "run_finished"},
+    ]
+    report = reconcile(rows)
+    assert report.consistent, report.problems()
+    assert report.cost_reported == pytest.approx(0.01) and report.prompt_tokens == 5

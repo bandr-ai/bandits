@@ -23,6 +23,37 @@ _CALL_TERMINALS = ("model_call", "model_call_error")
 
 
 @dataclass
+class _Brackets:
+    """Start and end rows of one kind, keyed by id, with every way they can disagree."""
+
+    name: str
+    starts: Counter = field(default_factory=Counter)
+    ends: Counter = field(default_factory=Counter)
+
+    def problems(self) -> list[str]:
+        found = []
+        unended = sorted(k for k in self.starts if k not in self.ends)
+        unstarted = sorted(k for k in self.ends if k not in self.starts)
+        repeated_starts = sorted(k for k, n in self.starts.items() if n > 1)
+        repeated_ends = sorted(k for k, n in self.ends.items() if n > 1)
+        if unended:
+            found.append(
+                f"{len(unended)} {self.name}(s) started and never ended (process stopped "
+                f"mid-way): {', '.join(unended[:5])}"
+            )
+        if unstarted:
+            found.append(
+                f"{len(unstarted)} {self.name}(s) ended with no start row: "
+                f"{', '.join(unstarted[:5])}"
+            )
+        if repeated_starts:
+            found.append(f"{self.name}(s) with more than one start: {repeated_starts[:5]}")
+        if repeated_ends:
+            found.append(f"{self.name}(s) with more than one end: {repeated_ends[:5]}")
+        return found
+
+
+@dataclass
 class LedgerReport:
     """What one session's rows say, and where they fail to agree."""
 
@@ -30,8 +61,6 @@ class LedgerReport:
     calls_started: int = 0
     calls_completed: int = 0
     calls_failed: int = 0
-    unterminated_calls: list[str] = field(default_factory=list)
-    duplicate_terminals: list[str] = field(default_factory=list)
     calls_by_role: Counter = field(default_factory=Counter)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -41,45 +70,31 @@ class LedgerReport:
     cache_hits: int = 0
     finish_reasons: Counter = field(default_factory=Counter)
     invocations: dict[str, dict[str, Any]] = field(default_factory=dict)
-    unended_invocations: list[str] = field(default_factory=list)
-    invocation_mismatches: list[str] = field(default_factory=list)
     repl_steps: int = 0
-    unended_repl: list[str] = field(default_factory=list)
     events: Counter = field(default_factory=Counter)
     run_started: bool = False
     run_finished: dict[str, Any] | None = None
     truncated_rows: int = 0
-    session_mismatches: list[str] = field(default_factory=list)
+    uncorrelated_calls: int = 0
+    """Call rows with no call id: written outside the forward boundary, so they
+    cannot be paired with a start or an invocation."""
+
+    brackets: list[_Brackets] = field(default_factory=list)
+    mismatches: list[str] = field(default_factory=list)
 
     @property
     def consistent(self) -> bool:
-        return not (
-            self.unterminated_calls
-            or self.duplicate_terminals
-            or self.unended_invocations
-            or self.invocation_mismatches
-            or self.unended_repl
-            or self.truncated_rows
-            or self.session_mismatches
-        )
+        return not self.problems()
 
     def problems(self) -> list[str]:
-        found = []
-        if self.unterminated_calls:
+        found = [problem for bracket in self.brackets for problem in bracket.problems()]
+        if self.uncorrelated_calls:
             found.append(
-                f"{len(self.unterminated_calls)} call(s) started and never ended (process "
-                f"stopped mid-call): {', '.join(self.unterminated_calls[:5])}"
+                f"{self.uncorrelated_calls} call row(s) carry no call id and cannot be paired"
             )
-        if self.duplicate_terminals:
-            found.append(f"call(s) with more than one terminal row: {self.duplicate_terminals}")
-        if self.unended_invocations:
-            found.append(f"invocation(s) without an end: {self.unended_invocations}")
-        found.extend(self.invocation_mismatches)
-        if self.unended_repl:
-            found.append(f"REPL step(s) without an end: {self.unended_repl}")
         if self.truncated_rows:
             found.append("the last row was cut short (a write interrupted by a crash)")
-        found.extend(self.session_mismatches)
+        found.extend(self.mismatches)
         return found
 
 
@@ -106,90 +121,104 @@ def session_rows(rows: Iterable[dict[str, Any]], session_id: str | None) -> list
 
 
 def reconcile(rows: Sequence[dict[str, Any]], *, session: Any = None) -> LedgerReport:
-    """Pair, sum and cross-check one session's rows; compare with its session state."""
+    """Pair, sum and cross-check one session's rows; compare with its session state.
+
+    Calls, invocations, REPL steps and runs are each checked as brackets: every
+    start has exactly one end and every end exactly one start. A row that cannot
+    be paired at all, a cut-short last row, an invocation whose reported call
+    count differs from the calls recorded under it, or session totals the rows
+    do not reproduce all make the report inconsistent.
+    """
     report = LedgerReport(rows=len(rows))
-    starts: dict[str, dict[str, Any]] = {}
-    terminals: dict[str, list[dict[str, Any]]] = {}
+    calls = _Brackets("call")
+    invocations = _Brackets("invocation")
+    repl = _Brackets("REPL step")
+    runs = _Brackets("run")
+    report.brackets = [calls, invocations, repl, runs]
+    terminals: dict[str, dict[str, Any]] = {}
     calls_by_invocation: Counter = Counter()
-    repl_open: dict[str, bool] = {}
+    run_key = 0
     for row in rows:
         kind = row.get("event_type")
         report.events[kind] += 1
         if kind == "truncated_row":
             report.truncated_rows += 1
-        elif kind == "model_call_start" and row.get("call_id"):
-            starts[row["call_id"]] = row
-        elif kind in _CALL_TERMINALS and row.get("call_id"):
-            terminals.setdefault(row["call_id"], []).append(row)
+        elif kind == "model_call_start":
+            if row.get("call_id"):
+                calls.starts[row["call_id"]] += 1
+            else:
+                report.uncorrelated_calls += 1
+        elif kind in _CALL_TERMINALS:
+            if not row.get("call_id"):
+                report.uncorrelated_calls += 1
+                continue
+            calls.ends[row["call_id"]] += 1
+            terminals[row["call_id"]] = row
             if row.get("invocation_id"):
                 calls_by_invocation[row["invocation_id"]] += 1
         elif kind == "invocation_start":
-            report.invocations[row["invocation_id"]] = {"start": row}
+            invocations.starts[row["invocation_id"]] += 1
+            report.invocations.setdefault(row["invocation_id"], {})["start"] = row
         elif kind == "invocation_end":
+            invocations.ends[row["invocation_id"]] += 1
             report.invocations.setdefault(row["invocation_id"], {})["end"] = row
         elif kind == "repl_start":
-            repl_open[row.get("repl_id", "?")] = True
+            repl.starts[row.get("repl_id", "?")] += 1
             report.repl_steps += 1
         elif kind in ("repl_end", "repl_error"):
-            repl_open[row.get("repl_id", "?")] = False
+            repl.ends[row.get("repl_id", "?")] += 1
         elif kind == "run_started":
+            # A resumed session runs again under the same id: runs pair in order.
+            run_key += 1
+            runs.starts[f"run {run_key}"] += 1
             report.run_started = True
         elif kind == "run_finished":
+            runs.ends[f"run {run_key}"] += 1
             report.run_finished = row
 
-    for call_id in starts:
-        ends = terminals.get(call_id, [])
-        if not ends:
-            report.unterminated_calls.append(call_id)
-        elif len(ends) > 1:
-            report.duplicate_terminals.append(call_id)
-    for call_id, ends in terminals.items():
-        report.calls_started += call_id in starts
-        end = ends[-1]
-        report.calls_by_role[_role(end)] += 1
-        if end["event_type"] == "model_call_error":
+    report.calls_started = sum(calls.starts.values())
+    for row in terminals.values():
+        report.calls_by_role[_role(row)] += 1
+        if row["event_type"] == "model_call_error":
             report.calls_failed += 1
             report.cost_unknown += 1
             continue
         report.calls_completed += 1
-        report.finish_reasons[(end.get("response") or {}).get("finish_reason")] += 1
-        usage = end.get("usage") or {}
+        report.finish_reasons[(row.get("response") or {}).get("finish_reason")] += 1
+        usage = row.get("usage") or {}
         if isinstance(usage.get("prompt_tokens"), int):
             report.prompt_tokens += usage["prompt_tokens"]
             report.completion_tokens += usage.get("completion_tokens") or 0
         else:
             report.usage_missing += 1
-        if end.get("cache_hit"):
+        if row.get("cache_hit"):
             report.cache_hits += 1
-        elif isinstance(end.get("cost_usd"), (int, float)):
-            report.cost_reported += float(end["cost_usd"])
+        elif isinstance(row.get("cost_usd"), (int, float)):
+            report.cost_reported += float(row["cost_usd"])
         else:
             report.cost_unknown += 1
-    report.calls_started = len(starts)
 
     for invocation_id, pair in report.invocations.items():
         end = pair.get("end")
         if end is None:
-            report.unended_invocations.append(invocation_id)
-            continue
+            continue  # reported as an unended invocation
         reported = end.get("llm_calls")
         seen = calls_by_invocation.get(invocation_id, 0)
         if isinstance(reported, int) and reported != seen:
-            report.invocation_mismatches.append(
+            report.mismatches.append(
                 f"invocation {invocation_id} reports {reported} call(s); the ledger "
                 f"holds {seen} terminal row(s) under it"
             )
-    report.unended_repl = [repl_id for repl_id, open_ in repl_open.items() if open_]
 
     if session is not None:
-        recorded = sum(len(ends) for ends in terminals.values())
+        recorded = sum(calls.ends.values())
         if session.llm_calls != recorded:
-            report.session_mismatches.append(
+            report.mismatches.append(
                 f"the session counts {session.llm_calls} call(s); the ledger holds "
                 f"{recorded} terminal call row(s)"
             )
-        if session.cost_usd and abs(session.cost_usd - report.cost_reported) > 1e-9:
-            report.session_mismatches.append(
+        if abs(session.cost_usd - report.cost_reported) > 1e-9:
+            report.mismatches.append(
                 f"the session reports ${session.cost_usd:.6f}; ledger rows report "
                 f"${report.cost_reported:.6f}"
             )

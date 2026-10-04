@@ -228,14 +228,35 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+def _ensure_dir(directory: Path) -> None:
+    """Create ``directory`` and any missing parents, each durably.
+
+    A new directory exists after power loss only once its own parent's entry
+    has been synced, so every directory created here has its parent fsynced.
+    """
+    missing = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for created in reversed(missing):
+        created.mkdir(exist_ok=True)
+        _fsync_dir(created.parent)
+
+
+_BLOB_ENCODING = ("utf-8", "surrogatepass")
+"""Lone surrogates (malformed text a source or model can produce) are stored
+byte-exact rather than failing the write; reading reverses the same encoding."""
+
+
 def _store_blob(directory: Path, text: str) -> str:
     """Write ``text`` once under its sha256, durably, and return the digest."""
-    data = text.encode("utf-8")
+    data = text.encode(*_BLOB_ENCODING)
     digest = hashlib.sha256(data).hexdigest()
     target = directory / digest
     if target.exists():
         return digest
-    directory.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(directory)
     tmp = directory / f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
     with tmp.open("wb") as handle:
         handle.write(data)
@@ -274,28 +295,27 @@ def record(event: dict[str, Any]) -> None:
     would trade the thing being recorded for the record of it. Under
     ``BANDITS_LEDGER_STRICT`` the trade goes the other way and the failure is
     raised, because a formal experiment missing records is not a partial
-    result — it is one that cannot be checked.
+    result — it is one that cannot be checked. Every failure counts: a value
+    that cannot be serialized fails the same way as a full disk.
 
     Large strings are stored once as blobs (see ``BANDITS_LEDGER_BLOB_MIN``) and
-    restored by :func:`read_events`; nothing is truncated. Rows are appended
-    under a process and file lock, so concurrent writers never interleave a
-    line, and ``pid``/``seq`` order a process's rows exactly.
+    restored by :func:`read_events`; nothing is truncated. ``seq`` is assigned
+    under the write lock, so within one process it follows file order exactly;
+    rows from several processes are kept whole by ``flock`` and told apart by
+    ``pid``.
     """
     path = _path()
     if not path:
         return
-    # Serialized first, so a value that cannot become JSON fails here as a
-    # recording failure, not as a half-written row.
-    plain = json.loads(json.dumps(event, default=str))
     try:
+        plain = json.loads(json.dumps(event, default=str))
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_dir(target.parent)
         payload = _externalize(plain, blob_dir(target), _blob_min())
         row = {
             "recorded_at": _now(),
             "schema": LEDGER_SCHEMA,
             "pid": os.getpid(),
-            "seq": _next_seq(),
             **_context(),
             **payload,
             # Last, so the row's identity is the ledger's to assign. A caller
@@ -303,20 +323,27 @@ def record(event: dict[str, Any]) -> None:
             # which is the failure this field exists to make impossible.
             "event_id": uuid.uuid4().hex,
         }
-        line = json.dumps(row, default=str) + "\n"
-        with _write_lock, target.open("a", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.write(line)
-                handle.flush()
-                if os.environ.get(_ENV_FSYNC):
-                    os.fsync(handle.fileno())
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError as exc:
+        with _write_lock:
+            created = not target.exists()
+            row["seq"] = _next_seq()
+            line = json.dumps(row, default=str) + "\n"
+            with target.open("a", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.write(line)
+                    handle.flush()
+                    if os.environ.get(_ENV_FSYNC):
+                        os.fsync(handle.fileno())
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if created:
+                # The new file's directory entry, so the ledger itself survives.
+                _fsync_dir(target.parent)
+    except Exception as exc:  # noqa: BLE001 - any lost row is a recording failure
         if strict():
             error = LedgerWriteError(
-                f"the ledger could not be written to {path!r}: {exc}. "
+                f"the ledger could not be written to {path!r}: "
+                f"{type(exc).__name__}: {exc}. "
                 "The run is recording incompletely and BANDITS_LEDGER_STRICT is set."
             )
             with _failure_lock:
@@ -343,7 +370,7 @@ def _restore(value: Any, directory: Path) -> Any:
                 raise LedgerCorrupt(f"blob {digest} is missing: {exc}") from exc
             if hashlib.sha256(data).hexdigest() != digest:
                 raise LedgerCorrupt(f"blob {digest} does not match its digest")
-            text = data.decode("utf-8")
+            text = data.decode(*_BLOB_ENCODING)
             if len(text) != value["length"]:
                 raise LedgerCorrupt(f"blob {digest} has the wrong length")
             return text
