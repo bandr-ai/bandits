@@ -177,6 +177,18 @@ _request_body: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Conte
 call that set the slot. A context variable, so concurrent calls never cross."""
 
 
+@dataclass
+class _Call:
+    """One request in flight through ``RecordedLM.forward``."""
+
+    call_id: str
+    ticket: Any
+    slot: dict[str, Any]
+    token: Any
+    started: float
+    settings: dict[str, Any]
+
+
 def _install_body_capture(litellm: Any) -> None:
     """Register (once) a LiteLLM hook that hands each request body to its call.
 
@@ -277,53 +289,51 @@ def dspy_lm(
                 }
             )
             slot: dict[str, Any] = {}
-            return call_id, ticket, slot, _request_body.set(slot), time.monotonic(), settings
+            return _Call(call_id, ticket, slot, _request_body.set(slot), time.monotonic(), settings)
 
-        def _fail(self, state, prompt, messages, exc):
-            call_id, ticket, slot, token, started, settings = state
-            _request_body.reset(token)
-            if call_guard is not None and ticket is not None:
-                call_guard.settle(ticket, None)
+        def _fail(self, call: _Call, prompt, messages, exc):
+            _request_body.reset(call.token)
+            if call.ticket is not None:
+                call_guard.settle(call.ticket, None)
             self.call_log.append(
-                {"call_id": call_id, "usage": None, "cost": None, "error": str(exc)}
+                {"call_id": call.call_id, "usage": None, "cost": None, "error": str(exc)}
             )
             ledger.record(
                 {
                     "event_type": "model_call_error",
-                    "call_id": call_id,
+                    "call_id": call.call_id,
                     "model": model,
-                    "request": {"prompt": prompt, "messages": messages, "settings": settings},
-                    "effective_request": slot.get("body"),
+                    "request": {"prompt": prompt, "messages": messages, "settings": call.settings},
+                    "effective_request": call.slot.get("body"),
                     "error": str(exc),
                     "error_type": type(exc).__name__,
-                    "duration_seconds": round(time.monotonic() - started, 4),
+                    "duration_seconds": round(time.monotonic() - call.started, 4),
                 }
             )
 
-        def _finish(self, state, prompt, messages, response):
+        def _finish(self, call: _Call, prompt, messages, response):
             from bandits.analyze.rlm_history import response_record
 
-            call_id, ticket, slot, token, started, settings = state
-            _request_body.reset(token)
-            if call_guard is not None and ticket is not None:
-                call_guard.settle(ticket, response)
+            _request_body.reset(call.token)
+            if call.ticket is not None:
+                call_guard.settle(call.ticket, response)
             ledger.record(
                 {
                     "event_type": "model_call",
                     "provider": "dspy",
-                    "call_id": call_id,
+                    "call_id": call.call_id,
                     "model": model,
-                    "request": {"prompt": prompt, "messages": messages, "settings": settings},
-                    "effective_request": slot.get("body"),
+                    "request": {"prompt": prompt, "messages": messages, "settings": call.settings},
+                    "effective_request": call.slot.get("body"),
                     **response_record(response),
-                    "duration_seconds": round(time.monotonic() - started, 4),
+                    "duration_seconds": round(time.monotonic() - call.started, 4),
                     "status": "success",
                 }
             )
             usage = getattr(response, "usage", None)
             self.call_log.append(
                 {
-                    "call_id": call_id,
+                    "call_id": call.call_id,
                     "usage": dict(usage) if usage is not None else None,
                     "cost": (getattr(response, "_hidden_params", None) or {}).get("response_cost"),
                     "response": response,
@@ -336,22 +346,22 @@ def dspy_lm(
             return response
 
         def forward(self, prompt=None, messages=None, **call_kwargs):
-            state = self._begin(prompt, messages, call_kwargs)
+            call = self._begin(prompt, messages, call_kwargs)
             try:
                 response = super().forward(prompt=prompt, messages=messages, **call_kwargs)
             except BaseException as exc:
-                self._fail(state, prompt, messages, exc)
+                self._fail(call, prompt, messages, exc)
                 raise
-            return self._finish(state, prompt, messages, response)
+            return self._finish(call, prompt, messages, response)
 
         async def aforward(self, prompt=None, messages=None, **call_kwargs):
-            state = self._begin(prompt, messages, call_kwargs)
+            call = self._begin(prompt, messages, call_kwargs)
             try:
                 response = await super().aforward(prompt=prompt, messages=messages, **call_kwargs)
             except BaseException as exc:
-                self._fail(state, prompt, messages, exc)
+                self._fail(call, prompt, messages, exc)
                 raise
-            return self._finish(state, prompt, messages, response)
+            return self._finish(call, prompt, messages, response)
 
     ref = resolve(model)
     return RecordedLM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)
