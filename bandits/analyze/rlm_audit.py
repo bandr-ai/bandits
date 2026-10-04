@@ -136,7 +136,7 @@ def build_predictor(
             "the taxonomy audit needs the 'audit' extra: uv sync --extra audit"
         ) from exc
 
-    from bandits.analyze.rlm_history import scoped_to_history
+    from bandits.analyze.rlm_history import record_repl, scoped_to_history
     from bandits.analyze.rlm_mine import with_cost
 
     language_model = providers.dspy_lm(
@@ -162,8 +162,10 @@ def build_predictor(
         rationale: str = dspy.OutputField()
 
     _Audit.__doc__ = instruction_for(view)
-    rlm = dspy.RLM(
-        _Audit, max_iters=max_iterations, max_llm_calls=max_llm_calls, sub_lm=language_model
+    rlm = record_repl(
+        dspy.RLM(
+            _Audit, max_iters=max_iterations, max_llm_calls=max_llm_calls, sub_lm=language_model
+        )
     )
 
     def predict(
@@ -501,6 +503,8 @@ def audit_clustering(
                     ),
                     predict=predict,
                 )
+        except ledger.LedgerWriteError:
+            raise
         except Exception as exc:  # noqa: BLE001 - one failure must not lose the session
             if should_stop is not None and should_stop():
                 # A SIGINT during this exact call propagates to the RLM

@@ -1045,6 +1045,7 @@ def families(
 
 
 @app.command(name="build-sft")
+@ledger.project_recording
 def build_sft_command(
     corpus_id: str,
     trace_ids: list[str] = typer.Option(
@@ -1122,6 +1123,7 @@ def _corpus_traces(corpus_id: str, project: Path, trace_ids: tuple[str, ...] | N
 
 
 @app.command(name="judge-turns")
+@ledger.project_recording
 def judge_turns_command(
     corpus_id: str,
     archetype: str = typer.Option(
@@ -1204,6 +1206,7 @@ def judge_turns_command(
 
 
 @app.command(name="propose-verifier")
+@ledger.project_recording
 def propose_verifier_command(
     judge_run_id: str,
     family_id: str = typer.Option(
@@ -1450,6 +1453,7 @@ def review_checks_command(
 
 
 @app.command(name="score-traces")
+@ledger.project_recording
 def score_traces_command(
     verifier_id: str,
     include_judge: bool = typer.Option(
@@ -1611,6 +1615,7 @@ def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
 
 
 @app.command(name="mine-rlm")
+@ledger.project_recording
 def mine_rlm_command(
     analysis_id: str,
     view: str = typer.Option(
@@ -1796,6 +1801,7 @@ def mine_rlm_command(
 
 
 @app.command(name="audit-rlm")
+@ledger.project_recording
 def audit_rlm_command(
     run_id: str,
     model: str = typer.Option(RLM_AUDIT_MODEL, "--model"),
