@@ -244,13 +244,16 @@ def _redact_decoded_json(
     changed, kinds = _rewrite_json_value(parsed, ruleset)
     if not kinds:
         return data, []
-    trailing_newline = b"\n" if data.endswith(b"\n") else b""
+    # The whitespace around the document is kept byte for byte: a line pointer
+    # counts the blank lines before it.
+    leading = data[: len(data) - len(data.lstrip())]
+    trailing = data[len(data.rstrip()) :]
     output = json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     issues = [
         TraceIssue(kind="redaction", detail=f"redacted decoded {kind}", location=location)
         for kind in kinds
     ]
-    return output + trailing_newline, issues
+    return leading + output + trailing, issues
 
 
 def redact_bytes(

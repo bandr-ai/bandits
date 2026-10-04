@@ -412,3 +412,24 @@ def test_an_unresolved_task_keeps_tentative_clues_not_a_task(tmp_path: Path) -> 
         ("step_input", "analyze_failure"),
         ("first_model_prompt", "Fix step 4"),
     ]
+
+
+def test_a_pointer_survives_an_escaped_secret_after_a_blank_line(tmp_path: Path) -> None:
+    key = "sk-ant-api03-" + "A" * 48
+    events = [
+        _event(1, "model_request", 1, request_id="r", messages=[{"role": "user", "content": key}])
+    ]
+    events.append(_event(2, "model_response", 2, request_id="r", content="ok"))
+    path = _write(tmp_path, events)
+    # One line after a blank one, the secret hidden behind a JSON escape.
+    path.write_text("\n" + path.read_text().replace("sk-ant", "sk\\u002dant") + "\n")
+    corpus = load_corpus(path, "failproofai")
+    store = ArtifactStore(tmp_path / ".bandits")
+    artifact = store.write(corpus, source_path=str(path))
+    pointers = [
+        s.attributes["bandits.source.record"]
+        for s in corpus.traces[0].spans
+        if s.kind is SpanKind.MODEL
+    ]
+    record = store.read_native_record(artifact.artifact_id, pointers[0])
+    assert record["id"] == 1 and key not in json.dumps(record)
