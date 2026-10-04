@@ -216,6 +216,7 @@ def test_cli_refuses_an_edited_mapping_and_flags_still_override(tmp_path) -> Non
         project,
     )
     assert flagged.exit_code == 0 and "task:     input.missing" in _out(flagged)
+    assert "overridden by flags" in " ".join(_out(flagged).split())
     assert "1 trace(s) have no task" in _out(flagged)
 
     file = mapping_path(tmp_path, "m")

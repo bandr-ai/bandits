@@ -365,11 +365,20 @@ def ingest(
             delivered_field=delivered_field or (mapping.delivered_field if mapping else None),
             request_origin=request_origin,  # type: ignore[arg-type]
             mapping_name=mapping_name if mapping else None,
-            mapping_digest=mapping.confirmed_digest if mapping else None,
+            # A flag overriding the mapping's fields means the confirmed choices
+            # are not what was applied: no digest vouches for them.
+            mapping_digest=(
+                mapping.confirmed_digest
+                if mapping and not (task_field or delivered_field)
+                else None
+            ),
         )
         if mapping is not None:
-            # Fully explicit: what was confirmed is what is applied.
-            _say(f"mapping:  {mapping_name} (confirmed {mapping.confirmed_at})")
+            overridden = " (fields overridden by flags; not the confirmed mapping)"
+            _say(
+                f"mapping:  {mapping_name} (confirmed {mapping.confirmed_at})"
+                + (overridden if task_field or delivered_field else "")
+            )
             _say(f"task:     {', '.join(workflow.task_fields) or 'none'}")
             _say(f"answer:   {workflow.delivered_field or 'none'}")
     if workflow is not None and mapping is None and (not task_field or not delivered_field):
