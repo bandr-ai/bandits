@@ -173,7 +173,7 @@ def test_mine_rlm_then_materialize_rlm_taskset_through_the_real_cli(tmp_path) ->
     artifact_store.write(corpus, source_path="synthetic")
     analysis_envelope = save_analysis(analyze_corpus(corpus), derived_store)
 
-    def fake_predictor(*, model, view, max_tokens):
+    def fake_predictor(*, model, view, **_settings):
         def predict(*, chunk, taxonomy, question):
             trace_ids = [row["trace_id"] for row in json.loads(chunk)]
             return SimpleNamespace(
@@ -511,3 +511,162 @@ def test_accounting_that_does_not_add_up_saves_nothing(tmp_path, monkeypatch) ->
     assert "record accounting does not add up" in plain(result.stdout)
     assert "nothing was saved" in plain(result.stdout)
     assert not (tmp_path / ".bandits").exists()
+
+
+def _full_trajectory_project(tmp_path: Path) -> str:
+    from bandits.analyze import analyze_corpus, save_analysis
+    from bandits.store import ArtifactStore
+    from bandits.traces import TraceCorpus
+    from tests.analyze.rlm_test import _workflow_trace
+
+    corpus = TraceCorpus(
+        source="otlp", traces=(_workflow_trace("w1"), _workflow_trace("w2"), _workflow_trace("w3"))
+    )
+    ArtifactStore(tmp_path / ".bandits").write(corpus, source_path="synthetic")
+    return save_analysis(analyze_corpus(corpus), DerivedStore(tmp_path / ".bandits")).artifact_id
+
+
+def test_full_trajectory_mining_through_the_cli_selects_accounts_and_names_the_project(
+    tmp_path,
+):
+    from tests.analyze.rlm_test import _account, _family_predict
+
+    analysis_id = _full_trajectory_project(tmp_path)
+    account_runs: list[str] = []
+
+    def fake_account_predictor(*, catalog, **_settings):
+        def predict(*, run_index, question=""):
+            run_id = json.loads(run_index)["run_id"]
+            account_runs.append(run_id)
+            catalog.get_evidence(run_id, "clue1.first_model_prompt.json", 0, 40)
+            return SimpleNamespace(account=_account(run_id))
+
+        predict.completion = {"mode": "submit", "iterations_used": 2, "iterations_to_submit": 2}
+        return predict
+
+    def fake_family_predictor(**_settings):
+        return _family_predict
+
+    with (
+        mock.patch("bandits.cli.build_rlm_predictor", fake_family_predictor),
+        mock.patch("bandits.analyze.rlm_mine.build_account_predictor", fake_account_predictor),
+    ):
+        refused = runner.invoke(
+            app,
+            [
+                "mine-rlm",
+                analysis_id,
+                "--view",
+                "full-trajectory",
+                "--trace-id",
+                "w1",
+                "--trace-id",
+                "nope",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+        assert refused.exit_code == 1 and "nope" in plain(refused.stdout)
+        assert account_runs == [], "nothing was dispatched for an invalid selection"
+
+        mined = runner.invoke(
+            app,
+            [
+                "mine-rlm",
+                analysis_id,
+                "--view",
+                "full-trajectory",
+                "--trace-id",
+                "w3",
+                "--trace-id",
+                "w1",
+                "--root-max-iterations",
+                "8",
+                "--max-subcalls",
+                "4",
+                "--max-llm-calls",
+                "24",
+                "--max-output-chars",
+                "2000",
+                "--subcall-workers",
+                "1",
+                "--provider-retries",
+                "0",
+                "--max-attempts",
+                "1",
+                "--contract-repairs",
+                "0",
+                "--temperature",
+                "1.0",
+                "--top-p",
+                "0.95",
+                "--model",
+                "openai/test-model",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+    out = plain(mined.stdout)
+    assert mined.exit_code == 0, out
+    assert sorted(account_runs) == ["w1", "w3"]
+    project = str(tmp_path.resolve())
+    session_id = next(line.split()[1] for line in out.splitlines() if line.startswith("session:"))
+    flat = " ".join(out.split())  # rich wraps long lines
+    assert f"bandits rlm-session {session_id} --project {project} --watch" in flat
+    assert "bandits rlm-families rlm-clustering-run-" in flat
+    assert flat.split("review the families:")[1].split("--project ")[1].startswith(project)
+    assert "account_complete 2" in flat and "source_accessed 2" in flat
+    assert re.search(r"accounts:\s+rlm-account-set-", out)
+
+    shown = runner.invoke(
+        app, ["rlm-session", session_id, "--accounts", "--project", str(tmp_path)]
+    )
+    shown_out = plain(shown.stdout)
+    assert shown.exit_code == 0, shown_out
+    shown_flat = " ".join(shown_out.split())
+    assert "selection: w3, w1" in shown_flat
+    assert "intent (inferred)" in shown_flat and "submit" in shown_flat
+
+    evidence = runner.invoke(
+        app,
+        [
+            "rlm-evidence",
+            analysis_id,
+            "--trace-id",
+            "w1",
+            "--ref",
+            "clue1.first_model_prompt.suffix",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert evidence.exit_code == 0, evidence.stdout
+    assert json.loads(evidence.stdout)["origin"] == "clue.first_model_prompt.suffix"
+
+    with (
+        mock.patch("bandits.cli.build_rlm_predictor", fake_family_predictor),
+        mock.patch("bandits.analyze.rlm_mine.build_account_predictor", fake_account_predictor),
+    ):
+        mismatch = runner.invoke(
+            app,
+            [
+                "mine-rlm",
+                analysis_id,
+                "--view",
+                "full-trajectory",
+                "--trace-id",
+                "w3",
+                "--trace-id",
+                "w1",
+                "--temperature",
+                "0.0",
+                "--model",
+                "openai/test-model",
+                "--resume",
+                session_id,
+                "--project",
+                str(tmp_path),
+            ],
+        )
+    assert mismatch.exit_code == 1
+    assert "different generation or invocation settings" in " ".join(plain(mismatch.stdout).split())

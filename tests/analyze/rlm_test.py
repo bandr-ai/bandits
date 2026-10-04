@@ -958,8 +958,11 @@ def test_path_f_prompt_forbids_grouping_by_agent_behavior() -> None:
     from bandits.analyze.rlm_mine import instruction_for
 
     prompt = instruction_for(TraceView.FULL_TRAJECTORY)
-    assert "never by how the agent went about it" in prompt
-    assert "Never group by tool sequence" in prompt
+    assert "never by tool sequence" in prompt
+    assert "whether a run appears to have gone well" in prompt
+    # The old wording promoted every internal prompt to "what the user asked for".
+    assert "USER ASKED FOR" not in prompt
+    assert "not automatically the run's task" in prompt
 
 
 def test_prompt_digest_covers_every_view_wording() -> None:
@@ -2196,7 +2199,7 @@ def test_the_whole_prompt_reaches_the_model() -> None:
     for required in (
         "required_outcome_shape",
         "Preserve the existing contract_id",
-        "Refund an eligible order",
+        "One family is a correct answer",
         "Do not emit KEEP",
     ):
         assert required in text
@@ -2838,13 +2841,22 @@ def test_the_audit_asks_for_uncertain_rather_than_leaning_to_split() -> None:
     assert "only because two contracts fixed different parameter values" in text
 
 
-def test_mining_examples_are_not_all_one_domain() -> None:
-    """Four flight examples would specialize the miner while appearing to help."""
-    from bandits.analyze.rlm_mine import instruction_for
+def test_mining_instruction_carries_no_domain_examples() -> None:
+    """Domain examples anchored a diagnostic corpus on flights and refunds.
 
-    text = instruction_for(TraceView.USER_MESSAGES)
-    block = text[text.index("Examples, drawn") : text.index("Before creating")]
-    assert "order" in block and "password" in block, "examples span more than one domain"
+    Saved reasoning from the incident considered airline and refund readings of
+    a UI-test diagnostic service; the examples were the only source of either.
+    """
+    from bandits.analyze.rlm_mine import account_instruction, instruction_for
+
+    for text in (
+        instruction_for(TraceView.USER_MESSAGES),
+        instruction_for(TraceView.FULL_TRAJECTORY),
+        account_instruction(TraceView.FULL_TRAJECTORY),
+    ):
+        lowered = text.lower()
+        for word in ("flight", "refund", "password", "reservation", "cabin", "airline"):
+            assert word not in lowered, word
 
 
 def test_the_repair_instruction_scopes_itself_to_contracts() -> None:
@@ -2853,3 +2865,681 @@ def test_the_repair_instruction_scopes_itself_to_contracts() -> None:
     assert "Do not reconsider" in _REPAIR_INSTRUCTION
     # Still short enough to be shown whole rather than as a peek.
     assert len(_REPAIR_INSTRUCTION) < 900
+
+
+# --- evidence index, accounts, provenance, scheduling (named fixture cases) ---
+
+_SYSTEM = "You are an inspector for one failed step. Return ONLY JSON: {conclusion}."
+_CONTEXT = (
+    'Context:\n{"error": "element not found", "platform": "WEB", '
+    '"element": {"name": "Password field", "role": "textbox"}}\n'
+    "Hint: the sign-in form changed last week."
+)
+
+
+def _workflow_trace(trace_id: str = "w1", *, context: str = _CONTEXT, calls: int = 2) -> Trace:
+    """A machine-invoked diagnostic run: no user turns, an unexported invocation span,
+    internal model calls with a repeated system prompt and a tool-call-only turn."""
+    from bandits.traces import EvidenceLink, TentativeTask, WorkflowRequest
+
+    moment = datetime(2024, 1, 1, tzinfo=UTC)
+
+    def at(second: int) -> datetime:
+        return moment.replace(second=second)
+
+    spans = [
+        Span(
+            span_id="step",
+            parent_span_id="inv",
+            kind=SpanKind.TOOL,
+            name="pipeline",
+            started_at=at(0),
+            ended_at=at(0),
+            arguments={"input": "diagnose_step"},
+            output={"outcome": "success", "detail": "ran"},
+        ),
+        Span(
+            span_id="m1",
+            parent_span_id="inv",
+            kind=SpanKind.MODEL,
+            name="inspector",
+            started_at=at(1),
+            ended_at=at(1),
+            attributes={
+                "gen_ai.input.messages": [
+                    {"role": "system", "parts": [{"type": "text", "content": _SYSTEM}]},
+                    {"role": "user", "parts": [{"type": "text", "content": context}]},
+                ],
+                "gen_ai.output.messages": [
+                    {
+                        "role": "assistant",
+                        "parts": [
+                            {
+                                "type": "tool_call",
+                                "name": "lookup",
+                                "arguments": {"name": "Password field"},
+                                "id": "c1",
+                            },
+                            {
+                                "type": "tool_call",
+                                "name": "screenshot",
+                                "arguments": {"kind": "page"},
+                                "id": "c2",
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+        Span(
+            span_id="m1:tool:c1",
+            parent_span_id="m1",
+            kind=SpanKind.TOOL,
+            name="lookup",
+            started_at=at(2),
+            ended_at=at(2),
+            arguments={"name": "Password field"},
+            output={"matches": 0},
+        ),
+    ]
+    for i in range(calls):
+        spans.append(
+            Span(
+                span_id=f"m{i + 2}",
+                parent_span_id="inv",
+                kind=SpanKind.MODEL,
+                name="inspector",
+                started_at=at(3 + i),
+                ended_at=at(3 + i),
+                output='{"conclusion": "different_page"}',
+                attributes={
+                    "gen_ai.input.messages": [
+                        {"role": "system", "parts": [{"type": "text", "content": _SYSTEM}]},
+                        {"role": "user", "parts": [{"type": "text", "content": context}]},
+                        {
+                            "role": "tool",
+                            "parts": [
+                                {"type": "tool_call_response", "id": "c1", "result": "0 matches"}
+                            ],
+                        },
+                        {"role": "user", "parts": [{"type": "blob", "mime_type": "image/png"}]},
+                    ],
+                },
+            )
+        )
+    return Trace(
+        trace_id=trace_id,
+        source="otlp",
+        source_digest="0" * 64,
+        interaction="workflow",
+        request=WorkflowRequest(
+            source_span_id="inv",
+            invocation_basis="sole outermost non-container span",
+            tentative_tasks=(
+                TentativeTask(span_id="step", clue="step_input", value="diagnose_step"),
+                TentativeTask(span_id="m1", clue="first_model_prompt", value=context),
+            ),
+        ),
+        evidence=(
+            EvidenceLink(
+                call_span_id="m1",
+                kind="tool_result",
+                target_span_id="m1:tool:c1",
+                basis="tool result recorded as answering this call",
+            ),
+        ),
+        spans=tuple(spans),
+    )
+
+
+def _catalog(*traces: Trace):
+    corpus = ReadOnlyCorpus(
+        _corpus(*traces), view=TraceView.FULL_TRAJECTORY, corpus_version="corpus-test"
+    )
+    return corpus, corpus.evidence()
+
+
+def test_diagnostic_input_origin_refs_resolve_and_keep_origin() -> None:
+    """Operation/context/system refs resolve, and a user-role prompt inside an
+    internal call is labeled as that call's input, never as a person's turn."""
+    _, catalog = _catalog(_workflow_trace())
+    page = catalog.inspect_run("w1")
+    candidates = {c["ref"]: c for c in page["candidate_instructions"]}
+    assert candidates["clue0.step_input"]["origin"] == "clue.step_input"
+    assert candidates["clue1.first_model_prompt"]["origin"] == "clue.first_model_prompt"
+    assert "request.input" in candidates  # absent, but listed as such
+    assert any("structural reference only" in limit for limit in page["limitations"])
+    first = page["events"][1]
+    roles = [entry["origin"] for entry in first["inputs"]]
+    assert roles == ["model_input.system", "model_input.user"]
+    assert "user_turn" not in " ".join(roles)
+
+    unavailable = catalog.get_evidence("w1", "request.input")
+    assert unavailable["available"] is False and unavailable["content"] is None
+
+
+def test_context_json_with_trailing_hints_parses_without_losing_the_suffix() -> None:
+    from bandits.analyze.rlm_evidence import parse_labeled_json
+
+    parsed = parse_labeled_json(_CONTEXT)
+    assert parsed.status == "parsed" and parsed.label == "Context"
+    assert parsed.value["platform"] == "WEB"
+    assert _CONTEXT[parsed.suffix_start :].strip() == "Hint: the sign-in form changed last week."
+
+    _, catalog = _catalog(_workflow_trace())
+    payload = catalog.get_evidence("w1", "clue1.first_model_prompt.json")
+    assert payload["representation"] == "json-sorted-v1"
+    assert payload["source_ref"].startswith("request.tentative_tasks[1][9:")
+    suffix = catalog.get_evidence("w1", "clue1.first_model_prompt.suffix")
+    assert "sign-in form changed" in suffix["content"]
+
+
+def test_missing_or_invalid_context_stays_raw_and_explicit() -> None:
+    from bandits.analyze.rlm_evidence import parse_labeled_json
+
+    assert parse_labeled_json("Context:\n{not json").status == "malformed"
+    assert parse_labeled_json("just prose, no payload").status == "no_json"
+
+    _, catalog = _catalog(_workflow_trace(context='Context:\n{"broken": '))
+    index = catalog.index("w1")
+    assert "clue1.first_model_prompt" in index.candidates
+    assert "clue1.first_model_prompt.json" not in index.candidates
+    assert any("does not decode" in limit for limit in index.limitations)
+    raw = catalog.get_evidence("w1", "clue1.first_model_prompt")
+    assert raw["content"] == 'Context:\n{"broken": '
+
+    unknown = catalog.get_evidence("w1", "../../etc/passwd")
+    assert unknown["available"] is False and unknown["content"] is None
+    assert "not a reference this index issued" in unknown["limitations"][0]
+    with pytest.raises(ValueError, match="limit must be"):
+        catalog.get_evidence("w1", "clue0.step_input", 0, 9000)
+    with pytest.raises(ValueError, match="start must be"):
+        catalog.get_evidence("w1", "clue0.step_input", -1)
+    with pytest.raises(ValueError, match="cursor"):
+        catalog.inspect_run("w1", cursor=-2)
+    with pytest.raises(ValueError, match="past the end"):
+        catalog.inspect_run("w1", cursor=999)
+
+
+def test_tool_call_only_output_is_visible_and_linked() -> None:
+    """The incident's empty assistant lines held 139 tool-call parts."""
+    trace = _workflow_trace()
+    view = build_view(trace, TraceView.FULL_TRAJECTORY)
+    line = next(m for m in view.messages if m.startswith("[assistant:inspector]"))
+    assert "tool_call lookup" in line and "tool_call screenshot" in line
+
+    _, catalog = _catalog(trace)
+    row = catalog.inspect_run("w1")["events"][1]
+    names = [call["name"] for call in row["tool_calls"]]
+    assert names == ["lookup", "screenshot"]
+    linked = row["tool_calls"][0]
+    assert linked["call_id"] == "c1" and linked["result_span"] == "m1:tool:c1"
+    result = catalog.get_evidence("w1", linked["result_refs"][-1])
+    assert '"matches":0' in result["content"]
+    later = catalog.inspect_run("w1")["events"][3]
+    assert "responds-to:e1.out0" in later["linked"]
+
+
+def test_repeated_system_prompt_is_one_source_with_every_occurrence_navigable() -> None:
+    _, catalog = _catalog(_workflow_trace(calls=3))
+    page = catalog.inspect_run("w1")
+    prompts = page["system_prompts"]
+    assert len(prompts) == 1 and prompts[0]["occurrences"] == 4
+    shared = catalog.get_evidence("w1", prompts[0]["shared_id"])
+    occurrence = catalog.get_evidence("w1", "e4.in0")
+    assert shared["content"] == occurrence["content"] == _SYSTEM
+    assert shared["digest"] == occurrence["digest"]
+    # The repeated user context appears once as text; later occurrences point back.
+    repeated = page["events"][3]["inputs"][1]
+    assert repeated["repeat_of"] == "clue1.first_model_prompt" and "excerpt" not in repeated
+    # Binary parts are described, never presented as text.
+    blob = catalog.get_evidence("w1", "e3.in3")
+    assert blob["available"] is False and blob["evidence_type"] == "binary"
+
+
+def test_inspect_run_pages_within_its_ceiling_and_always_progresses() -> None:
+    from bandits.analyze.rlm_evidence import INSPECT_MAX_CHARS, serialize
+
+    trace = _workflow_trace(calls=40, context="x" * 50_000)
+    _, catalog = _catalog(trace)
+    cursor, pages, seen = 0, 0, []
+    while cursor is not None:
+        page = catalog.inspect_run("w1", cursor, 40)
+        assert len(serialize(page)) <= INSPECT_MAX_CHARS
+        assert page["events"], "a page must make progress"
+        seen.extend(e["order"] for e in page["events"])
+        cursor = page["next_cursor"]
+        pages += 1
+    assert seen == list(range(page["total_events"]))
+    assert pages > 1
+    full = catalog.get_evidence("w1", "clue1.first_model_prompt", 0, 8192)
+    assert full["total_length"] == 50_000 and full["next_start"] == 8192
+    tail = catalog.get_evidence("w1", "clue1.first_model_prompt", 49_990, 8192)
+    assert tail["range_end"] == 50_000 and tail["next_start"] is None
+
+
+def test_helpers_refuse_runs_outside_the_invocation() -> None:
+    _, catalog = _catalog(_workflow_trace("w1"), _workflow_trace("w2"))
+    catalog.set_scope(("w1",))
+    with pytest.raises(ValueError, match="not in this invocation"):
+        catalog.inspect_run("w2")
+    catalog.set_scope(None)
+    assert catalog.inspect_run("w2")["run_id"] == "w2"
+
+
+def test_view_policy_withholds_outcome_keys_and_says_so() -> None:
+    _, catalog = _catalog(_workflow_trace())
+    step = catalog.get_evidence("w1", "e0.result")
+    assert "success" not in step["content"]
+    assert any("outcome" in limit for limit in step["limitations"])
+
+
+def _account(run_id: str = "w1", **intent) -> dict:
+    return {
+        "run_id": run_id,
+        "intent": {
+            "candidate_goal": "Diagnose why a recorded UI test step failed",
+            "status": "inferred",
+            "evidence_refs": ["clue1.first_model_prompt.json", "sys:" + _sys_digest()],
+            **intent,
+        },
+        "execution": {
+            "milestones": [{"description": "looked up the element", "span_refs": ["m1"]}]
+        },
+        "result": {"observations": [], "assessment": "unknown"},
+        "limitations": [],
+    }
+
+
+def _sys_digest() -> str:
+    import hashlib
+
+    return hashlib.sha256(_SYSTEM.encode()).hexdigest()[:10]
+
+
+def test_host_validation_rejects_unsupported_declared_intent_and_unknown_refs() -> None:
+    """Field names in a payload do not make a declared request (the incident's c1 case)."""
+    from bandits.analyze.rlm_account import ProposedAccount, validate_account
+
+    _, catalog = _catalog(_workflow_trace())
+    ok = ProposedAccount.model_validate(_account())
+    assert validate_account(ok, run_id="w1", catalog=catalog) == ()
+
+    declared = ProposedAccount.model_validate(
+        _account(status="declared", candidate_goal="Reset a password")
+    )
+    errors = validate_account(declared, run_id="w1", catalog=catalog)
+    assert any("'declared'" in e for e in errors)
+
+    invented = ProposedAccount.model_validate(_account(evidence_refs=["msg-7"]))
+    assert any("msg-7" in e for e in validate_account(invented, run_id="w1", catalog=catalog))
+
+    other_run = ProposedAccount.model_validate(_account(run_id="w9"))
+    assert validate_account(other_run, run_id="w1", catalog=catalog)
+
+
+class _AccountMiner:
+    """An injected account predictor that can read evidence, fail, or not submit."""
+
+    def __init__(self, catalog, script):
+        self.catalog = catalog
+        self.script = list(script)
+        self.calls: list[tuple[str, str]] = []
+        self.completion = {"mode": "submit", "iterations_used": 2, "iterations_to_submit": 2}
+
+    def __call__(self, *, run_index, question=""):
+        import json
+
+        run_id = json.loads(run_index)["run_id"]
+        self.calls.append((run_id, question))
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            self.completion = {"mode": "error", "iterations_used": 1}
+            raise step
+        mode, account = step
+        self.completion = {
+            "mode": mode,
+            "iterations_used": 3,
+            "iterations_to_submit": 3 if mode == "submit" else None,
+        }
+        self.catalog.get_evidence(run_id, "clue1.first_model_prompt.json", 0, 100)
+        return SimpleNamespace(account=account(run_id) if callable(account) else account)
+
+
+def _identity(run_id: str):
+    from bandits.analyze.rlm_account import AccountIdentity
+
+    return AccountIdentity(
+        run_id=run_id,
+        corpus_version="corpus-test",
+        index_version=1,
+        view_policy="full-trajectory/v1",
+        prompt_version=9,
+        prompt_digest="p",
+        model="m",
+        settings_digest="s",
+    )
+
+
+def _family_predict(*, chunk, taxonomy, question):
+    import json
+
+    rows = json.loads(chunk)
+    for row in rows:
+        assert "result" not in row and "evaluator_claims" not in json.dumps(row)
+    return SimpleNamespace(
+        contracts=[
+            {
+                "contract_id": "c1",
+                "name": "Diagnose a failed test step",
+                "definition": "explain why the requested test step failed",
+                "required_outcome_shape": ["a diagnosis of the failed step is produced"],
+            }
+        ],
+        operations=[],
+        assignments={row["trace_id"]: "c1" for row in rows},
+        ambiguous_trace_ids=[],
+        uncovered_trace_ids=[],
+    )
+
+
+def test_accounts_feed_families_and_unknown_intent_stays_unassigned() -> None:
+    corpus, catalog = _catalog(_workflow_trace("w1"), _workflow_trace("w2"))
+    miner = _AccountMiner(
+        catalog,
+        [("submit", lambda r: _account(r)), ("submit", lambda r: _account(r, status="unknown"))],
+    )
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_family_predict,
+        account_predict=miner,
+        identity_for=_identity,
+        seed=0,
+    )
+    statuses = {a.run_id: (a.status, a.account.intent.status) for a in run.accounts}
+    assert all(status == "accepted" for status, _ in statuses.values())
+    assigned = set(run.assignments)
+    unknown = next(r for r, (_, intent) in statuses.items() if intent == "unknown")
+    assert unknown not in assigned and run.unassigned_reasons[unknown] == "missing_intent"
+    assert run.coverage["account_complete"] == 2 and run.coverage["eligible"] == 1
+    assert run.coverage["source_accessed"] == 2
+    accepted = next(a for a in run.accounts if a.run_id != unknown)
+    assert accepted.completion.mode == "submit"
+    (inspected,) = accepted.completion.inspected_ranges
+    assert inspected.startswith("clue1.first_model_prompt.json[0:")
+
+
+def test_host_rejection_preserves_the_candidate_and_retries_with_the_errors() -> None:
+    corpus, catalog = _catalog(_workflow_trace("w1"))
+    miner = _AccountMiner(
+        catalog,
+        [
+            ("submit", lambda r: _account(r, status="declared")),
+            ("submit", lambda r: _account(r)),
+        ],
+    )
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_family_predict,
+        account_predict=miner,
+        identity_for=_identity,
+    )
+    first, second = run.accounts
+    assert first.status == "rejected" and '"declared"' in first.candidate
+    assert first.failure_kind == "host_rejected"
+    assert "rejected by host validation" in miner.calls[1][1]
+    assert second.status == "accepted" and second.attempt == 2
+
+
+def test_extract_quarantined_account_never_reaches_families() -> None:
+    corpus, catalog = _catalog(_workflow_trace("w1"))
+    miner = _AccountMiner(catalog, [("extract", lambda r: _account(r))] * 2)
+    calls = []
+
+    def family(**kwargs):
+        calls.append(kwargs)
+        return _family_predict(**kwargs)
+
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=family,
+        account_predict=miner,
+        identity_for=_identity,
+    )
+    assert [a.status for a in run.accounts] == ["quarantined", "quarantined"]
+    assert run.accounts[0].account is not None, "the candidate is kept for inspection"
+    assert not calls and not run.assignments and not run.contracts
+    assert run.unassigned_reasons == {"w1": "quarantined_extract"}
+    assert run.stop_reason is StopReason.NO_ELIGIBLE_ACCOUNTS
+    assert run.coverage["account_complete"] == 0 and run.coverage["quarantined"] == 1
+
+
+def test_extract_quarantined_chunk_does_not_mutate_the_taxonomy() -> None:
+    def predict(*, chunk, taxonomy, question):
+        return _family_predict(chunk=chunk, taxonomy=taxonomy, question=question)
+
+    predict.completion = {"mode": "extract", "iterations_used": 25}
+    corpus = ReadOnlyCorpus(_corpus(_trace("t1", "refund"), _trace("t2", "cancel")))
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2)
+    assert {c.status for c in run.chunks} == {"quarantined"}
+    assert all(c.completion_mode == "extract" and c.raw_reply for c in run.chunks)
+    assert not run.contracts and not run.assignments
+    assert not run.complete
+    assert run.unassigned_reasons == {"t1": "processing_failure", "t2": "processing_failure"}
+
+
+def test_fresh_before_retry_failed_batch_waits_for_fresh_traces() -> None:
+    import json
+
+    attempts: list[tuple[str, ...]] = []
+    failing = {"t0", "t1"}
+
+    def predict(*, chunk, taxonomy, question):
+        ids = tuple(row["trace_id"] for row in json.loads(chunk))
+        attempts.append(ids)
+        if set(ids) & failing:
+            raise RuntimeError("provider down")
+        return _family_predict(chunk=chunk, taxonomy=taxonomy, question=question)
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(6))))
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=2, seed=0)
+    first_failure = next(i for i, ids in enumerate(attempts) if set(ids) & failing)
+    retry = next(i for i, ids in enumerate(attempts) if i > first_failure and set(ids) & failing)
+    fresh = {t for ids in attempts[:retry] for t in ids}
+    assert fresh == {f"t{i}" for i in range(6)}, "every fresh trace ran before the retry"
+    assert len(attempts) == 4  # three fresh batches, one bounded retry
+    assert not run.complete and any("after 2 attempt(s)" in t for t in run.limitations)
+    assert [c.attempt for c in run.chunks] == [1, 1, 1, 2]
+    assert {c.failure_kind for c in run.chunks if c.status == "error"} == {"provider_error"}
+
+
+def test_one_attempt_budget_never_retries() -> None:
+    def predict(*, chunk, taxonomy, question):
+        raise RuntimeError("down")
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(3))))
+    run = mine_taxonomy(
+        corpus, "analysis-1", predict=predict, chunk_size=1, budget=Budget(max_attempts=1)
+    )
+    assert len(run.chunks) == 3
+
+
+def test_interrupted_account_resume_keeps_accepted_work_without_false_coverage(tmp_path) -> None:
+    from bandits.analyze.rlm_session import SessionRecorder, SessionStore
+
+    corpus, catalog = _catalog(_workflow_trace("w1"), _workflow_trace("w2"))
+    store = SessionStore(tmp_path)
+    recorder = SessionRecorder(
+        store, session_id="s1", analysis_id="analysis-1", view=TraceView.FULL_TRAJECTORY, model="m"
+    )
+    miner = _AccountMiner(catalog, [("submit", lambda r: _account(r)), KeyboardInterrupt()])
+    with pytest.raises(KeyboardInterrupt):
+        mine_taxonomy(
+            corpus,
+            "analysis-1",
+            predict=_family_predict,
+            account_predict=miner,
+            identity_for=_identity,
+            session=recorder,
+            seed=0,
+        )
+    recorder.fail("interrupted by the user", status="interrupted")
+    saved = store.read("s1")
+    assert saved.status == "interrupted"
+    assert [a.status for a in saved.accounts] == ["accepted"]
+    done = saved.accounts[0].run_id
+    coverage = saved.coverage()
+    assert coverage["account_complete"] == 1 and coverage["assigned"] == 0
+
+    corpus2, catalog2 = _catalog(_workflow_trace("w1"), _workflow_trace("w2"))
+    resumed_miner = _AccountMiner(catalog2, [("submit", lambda r: _account(r))])
+    resumed = SessionRecorder(
+        store,
+        session_id="s1",
+        analysis_id="analysis-1",
+        view=TraceView.FULL_TRAJECTORY,
+        model="m",
+        resumed_from="s1",
+        previous=saved,
+    )
+    run = mine_taxonomy(
+        corpus2,
+        "analysis-1",
+        predict=_family_predict,
+        account_predict=resumed_miner,
+        identity_for=_identity,
+        session=resumed,
+        resume=saved,
+        seed=0,
+    )
+    assert [rid for rid, _ in resumed_miner.calls] == [r for r in ("w1", "w2") if r != done]
+    assert set(run.assignments) == {"w1", "w2"}
+    assert sum(1 for a in run.accounts if a.status == "accepted") == 2
+
+
+def test_legacy_session_loads_with_unknown_provenance(tmp_path) -> None:
+    """Historical sessions keep their errors and usage; provenance stays unknown."""
+    import json
+
+    from bandits.analyze.rlm_session import SessionState
+
+    legacy = {
+        "session_id": "old",
+        "analysis_id": "a",
+        "view": "full-trajectory",
+        "model": "m",
+        "seed": 42,
+        "requested_passes": 1,
+        "status": "running",
+        "assignments": {"t1": "c1"},
+        "chunks": [
+            {
+                "index": 0,
+                "trace_ids": ["t1"],
+                "status": "error",
+                "error": "bad list",
+                "llm_calls": 32,
+                "tokens": {"prompt_tokens": 10},
+            }
+        ],
+        "llm_calls": 32,
+    }
+    state = SessionState.model_validate_json(json.dumps(legacy))
+    assert state.chunks[0].completion_mode == "unknown"
+    assert state.chunks[0].error == "bad list" and state.llm_calls == 32
+    assert state.observed_status().startswith("running (unverified")
+    assert state.accounts == () and state.coverage()["failed"] == 1
+
+
+def test_trace_selection_is_validated_before_dispatch() -> None:
+    corpus = _corpus(_trace("t1", "a"), _trace("t2", "b"), _trace("t3", "c"))
+    selected = ReadOnlyCorpus(corpus, trace_ids=["t3", "t1"])
+    assert selected.list_trace_ids() == ("t3", "t1")
+    with pytest.raises(KeyError, match="t9"):
+        ReadOnlyCorpus(corpus, trace_ids=["t1", "t9"])
+    with pytest.raises(ValueError, match="more than once"):
+        ReadOnlyCorpus(corpus, trace_ids=["t1", "t1"])
+
+
+def test_budget_guard_refuses_before_dispatch_and_never_counts_unknown_cost_as_free() -> None:
+    from bandits.analyze.rlm_budget import BudgetExhausted, SessionBudgetGuard
+
+    guard = SessionBudgetGuard(max_calls=2, max_seconds=60)
+    guard.settle(guard.admit(prompt="p", messages=None, max_tokens=10), None)
+    guard.settle(guard.admit(prompt="p", messages=None, max_tokens=10), None)
+    with pytest.raises(BudgetExhausted) as refused:
+        guard.admit(prompt="p", messages=None, max_tokens=10)
+    assert refused.value.reason is StopReason.MAX_LLM_CALLS and guard.calls_admitted == 2
+
+    unpriced = SessionBudgetGuard(max_calls=10, max_seconds=60, max_usd=1.0)
+    response = SimpleNamespace(
+        _hidden_params={"response_cost": 0.0},
+        usage=SimpleNamespace(total_tokens=100, prompt_tokens=90, completion_tokens=10),
+    )
+    unpriced.settle(unpriced.admit(prompt="p", messages=None, max_tokens=10), response)
+    assert unpriced.unknown_cost_calls == 1, "a zero price on a call that used tokens is unknown"
+    with pytest.raises(BudgetExhausted, match="no cost"):
+        unpriced.admit(prompt="p", messages=None, max_tokens=10)
+
+    priced = SessionBudgetGuard(
+        max_calls=10, max_seconds=60, max_usd=0.01, usd_per_mtok_in=1.0, usd_per_mtok_out=10.0
+    )
+    with pytest.raises(BudgetExhausted, match="needed for this call"):
+        priced.admit(prompt="x", messages=None, max_tokens=2000)  # 0.02 worst case
+
+    clock = iter([0.0, 120.0]).__next__
+    timed = SessionBudgetGuard(max_calls=10, max_seconds=60, clock=clock)
+    with pytest.raises(BudgetExhausted) as late:
+        timed.admit(prompt="p", messages=None, max_tokens=1)
+    assert late.value.reason is StopReason.MAX_SECONDS
+
+
+def test_a_guard_refusal_stops_the_run_with_its_reason() -> None:
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+
+    guard = SessionBudgetGuard(max_calls=1, max_seconds=60)
+
+    def predict(*, chunk, taxonomy, question):
+        guard.settle(guard.admit(prompt="p", messages=None, max_tokens=1), None)
+        return _family_predict(chunk=chunk, taxonomy=taxonomy, question=question)
+
+    corpus = ReadOnlyCorpus(_corpus(*(_trace(f"t{i}", "refund") for i in range(4))))
+    run = mine_taxonomy(corpus, "analysis-1", predict=predict, chunk_size=1, guard=guard)
+    assert run.stop_reason is StopReason.MAX_LLM_CALLS
+    assert len(run.chunks) == 1 and not run.complete
+
+
+def test_account_family_rows_omit_results_and_evaluator_claims() -> None:
+    """Same task, different outcome must look identical to family formation."""
+    from bandits.analyze.rlm_account import (
+        Completion,
+        ProposedAccount,
+        RunAccount,
+        family_row,
+    )
+
+    def account(assessment, claims):
+        proposed = ProposedAccount.model_validate(
+            {
+                **_account(),
+                "result": {
+                    "observations": ["x"],
+                    "assessment": assessment,
+                    "evidence_refs": ["e2.result"],
+                    "evaluator_claims": claims,
+                },
+            }
+        )
+        return RunAccount(
+            identity=_identity("w1"),
+            status="accepted",
+            account=proposed,
+            completion=Completion(mode="submit"),
+        )
+
+    ok = family_row(account("supported_complete", ["passed"]), "unseen")
+    failed = family_row(account("supported_incomplete", ["failed"]), "unseen")
+    assert ok == failed

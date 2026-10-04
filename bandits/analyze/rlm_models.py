@@ -25,10 +25,11 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
+from bandits.analyze.rlm_account import RunAccount
 from bandits.traces import Contract
 
 
@@ -103,16 +104,19 @@ VIEW_PREAMBLES: dict[TraceView, str] = {
         "existing label. Do not speculate about any of those."
     ),
     TraceView.FULL_TRAJECTORY: (
-        "You see the FULL trajectory of each episode: the user's messages, the "
-        "assistant's turns, and the tool calls and results, marked with [user], "
-        "[assistant] and [tool] prefixes. You do NOT see rewards, scores, evaluator "
-        "labels, or whether anything succeeded; those were withheld.\n\n"
-        "Read the agent's actions only as evidence of what the USER ASKED FOR. Group "
-        "by the work that was requested, never by how the agent went about it. Two "
-        "episodes calling the same tools are not one family if their users wanted "
-        "different things, and two episodes taking completely different paths are one "
-        "family if one verifier could evaluate both. Never group by tool sequence, "
-        "path length, or whether a run appears to have gone well."
+        "You see each run through an evidence index rather than a transcript: recorded "
+        "request fields and tentative clues, internal model calls with their system and "
+        "user-role inputs, structured tool calls and tool results, each by reference. "
+        "Rewards, scores and evaluator labels are withheld from what you read.\n\n"
+        "Recorded roles describe one model call, not who started the run: a user-role "
+        "message inside an internal call is the program's prompt to that call, and an "
+        "internal instruction is not automatically the run's task. Identify the work this "
+        "application run was invoked to perform, including required completion "
+        "conditions. Establish the scope and instruction origin from evidence. Preserve "
+        "unknowns and separate internal subtask objectives, input failure scenarios and "
+        "observed results. Group by requested work and required completion conditions, "
+        "never by tool sequence, path length, which internal steps ran, or whether a run "
+        "appears to have gone well."
     ),
 }
 """What each arm may read, stated to the model in its own words.
@@ -455,8 +459,25 @@ class ChunkResult(Contract):
     """
 
     duration_seconds: float | None = Field(default=None, ge=0)
-    status: Literal["success", "error"] = "success"
+    status: Literal["success", "error", "quarantined"] = "success"
+    """``quarantined``: an answer exists but came from fallback extraction after the
+    iteration cap. Kept in ``raw_reply`` for inspection; never applied."""
+
     error: str = ""
+
+    completion_mode: Literal["submit", "extract", "error", "unknown"] = "unknown"
+    """How the invocation ended, recorded by the host before extraction starts.
+    ``unknown`` on chunks saved before provenance existed — never assumed to be
+    ``submit`` retroactively."""
+
+    iterations_used: int | None = None
+    iterations_to_submit: int | None = None
+    submit_rejections: tuple[str, ...] = ()
+    failure_kind: str = ""
+    """provider_error, no_submit, truncated, budget or interrupted when not a success."""
+
+    attempt: int = Field(default=1, ge=1)
+    kind: Literal["family", "account"] = "family"
 
     raw_reply: str = ""
     """Exactly what the model returned, before any parsing.
@@ -736,9 +757,16 @@ class Budget(Contract):
     """
 
     max_llm_calls: int = Field(default=400, ge=1)
+    """Every model call in the session: roots, subcalls, adapter fallbacks,
+    extraction and repair, counted before dispatch."""
+
     max_seconds: float = Field(default=3600.0, gt=0)
     max_usd: float | None = Field(default=None, gt=0)
     """None means no monetary ceiling was set, not that the run was free."""
+
+    max_attempts: int = Field(default=2, ge=1)
+    """Invocations any one trace may take part in per pass, first try included.
+    Failed traces wait until every fresh trace has been tried before a retry."""
 
 
 class AuditBudget(Contract):
@@ -786,6 +814,9 @@ class StopReason(str, Enum):
     MAX_SECONDS = "max_seconds"
     MAX_USD = "max_usd"
     ERROR = "error"
+    INTERRUPTED = "interrupted"
+    NO_ELIGIBLE_ACCOUNTS = "no_eligible_accounts"
+    """Accounts were produced but none carried an intent reading to group on."""
 
 
 COMPLETE_STOP_REASONS = frozenset({StopReason.PASSES_COMPLETE})
@@ -836,6 +867,25 @@ class RLMClusteringRun(Contract):
 
     resume_scope: ResumeScope | None = None
     """What a resumed session re-examined. None on a first run."""
+
+    accounts: tuple[RunAccount, ...] = ()
+    """Every account attempt, accepted or not, so a rejected or quarantined
+    candidate stays inspectable beside the taxonomy it did not change."""
+
+    selection: tuple[str, ...] = ()
+    """Explicitly selected trace ids, in the order given; empty means all."""
+
+    settings: dict[str, Any] = Field(default_factory=dict)
+    """Generation and invocation settings as requested and as verified to reach
+    the provider (``effective``), so no ignored flag reads as active."""
+
+    unassigned_reasons: dict[str, str] = Field(default_factory=dict)
+    """trace -> missing_intent, contradictory_evidence, uncertain_boundary,
+    processing_failure or quarantined_extract."""
+
+    coverage: dict[str, int] = Field(default_factory=dict)
+    """attempted, source_accessed, account_complete, eligible, assigned,
+    unresolved, quarantined and failed, counted separately."""
 
     ambiguous_trace_ids: tuple[str, ...] = ()
     uncovered_trace_ids: tuple[str, ...] = ()

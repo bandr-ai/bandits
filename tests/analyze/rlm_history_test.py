@@ -234,3 +234,297 @@ def test_shared_history_is_recorded_once_across_worker_threads(tmp_path, monkeyp
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(rows) == 1
     assert rows[0]["response"]["text"] == "result"
+
+
+# --- real DSPy, controlled provider responses, real sandbox --------------------
+#
+# These run only where the audit extra is installed. Every provider response is
+# scripted at ``dspy.LM.forward``; no network or paid call is made. The account
+# tests use DSPy's own Deno/Pyodide interpreter, so the evidence helpers are
+# exercised through the actual tool bridge rather than a mock interpreter.
+
+
+def _real_dspy():
+    dspy = pytest.importorskip("dspy")
+    pytest.importorskip("litellm")
+    return dspy
+
+
+def _sandbox_available() -> bool:
+    try:
+        from dspy.primitives.python_interpreter import _find_deno_executable, _get_deno_version
+    except ImportError:
+        return False
+    return _get_deno_version(_find_deno_executable()) is not None
+
+
+def _reply(text: str, finish: str = "stop"):
+    from litellm import ModelResponse
+
+    return ModelResponse(
+        model="openai/test",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": finish,
+                "message": {"role": "assistant", "content": text},
+            }
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+
+
+def _action(code: str) -> str:
+    return (
+        "[[ ## reasoning ## ]]\nnext step\n[[ ## code ## ]]\n```python\n"
+        + code
+        + "\n```\n[[ ## completed ## ]]"
+    )
+
+
+class _ScriptedProvider:
+    """Replays root actions in order; answers extraction calls with ``extract``."""
+
+    def __init__(self, actions, extract=None):
+        self.actions = list(actions)
+        self.extract = extract
+        self.calls: list[str] = []
+
+    def __call__(self, lm, prompt=None, messages=None, **kwargs):
+        system = (messages or [{}])[0].get("content", "") if messages else ""
+        if "extract the final outputs now" in system:
+            self.calls.append("extract")
+            return _reply(self.extract)
+        self.calls.append("root")
+        return _reply(_action(self.actions.pop(0)))
+
+
+def _workflow_corpus():
+    from tests.analyze.rlm_test import _catalog, _workflow_trace
+
+    return _catalog(_workflow_trace("w1"))
+
+
+def _valid_account_code() -> str:
+    from tests.analyze.rlm_test import _account
+
+    account = _account("w1")
+    return f"SUBMIT(account={json.dumps(account)})"
+
+
+def _predictor(dspy, monkeypatch, provider, *, catalog, guard=None, iterations=6):
+    from bandits import providers
+    from bandits.analyze.rlm_mine import GenerationSettings, build_account_predictor
+
+    def forward(lm, prompt=None, messages=None, **kwargs):
+        return provider(lm, prompt=prompt, messages=messages, **kwargs)
+
+    monkeypatch.setattr(dspy.LM, "forward", forward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    return build_account_predictor(
+        catalog=catalog,
+        model="openai/test-model",
+        settings=GenerationSettings(root_max_iterations=iterations, max_output_chars=2000),
+        guard=guard,
+    )
+
+
+def test_submit_type_feedback_in_real_dspy_through_the_real_sandbox(monkeypatch):
+    """A malformed SUBMIT is refused inside the loop with DSPy's own type error,
+    the corrected SUBMIT is accepted, and the helpers ran in the real sandbox."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits.analyze.rlm_mine import _run_account
+    from tests.analyze.rlm_test import _identity
+
+    corpus, catalog = _workflow_corpus()
+    provider = _ScriptedProvider(
+        [
+            'page = inspect_run("w1")\n'
+            'ev = get_evidence("w1", "clue1.first_model_prompt.json", 0, 50)\n'
+            'print(page["total_events"], ev["range_end"], ev["origin"])',
+            'SUBMIT(account={"run_id": "w1", "intent": {"status": "maybe"}})',
+            _valid_account_code(),
+        ]
+    )
+    predict = _predictor(dspy, monkeypatch, provider, catalog=catalog)
+    account = _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+
+    assert account.status == "accepted", account.validation_errors or account.completion.error
+    assert account.completion.mode == "submit"
+    assert account.completion.iterations_to_submit == 3
+    assert len(account.completion.submit_rejections) == 1
+    assert "account" in account.completion.submit_rejections[0]
+    assert account.completion.inspected_ranges == ("clue1.first_model_prompt.json[0:50]",)
+    assert provider.calls == ["root", "root", "root"]
+
+
+def test_iteration_cap_extraction_is_quarantined_in_real_dspy(monkeypatch):
+    """Provenance is set before extraction runs; its answer is kept, never accepted."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits.analyze.rlm_mine import _run_account
+    from tests.analyze.rlm_test import _account, _identity
+
+    corpus, catalog = _workflow_corpus()
+    extracted = "[[ ## account ## ]]\n" + json.dumps(_account("w1")) + "\n[[ ## completed ## ]]"
+    provider = _ScriptedProvider(['print("still looking")'], extract=extracted)
+    predict = _predictor(dspy, monkeypatch, provider, catalog=catalog, iterations=1)
+    account = _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+
+    assert provider.calls == ["root", "extract"]
+    assert account.status == "quarantined" and account.failure_kind == "no_submit"
+    assert account.completion.mode == "extract"
+    assert account.completion.iterations_to_submit is None
+    assert account.account is not None and '"run_id": "w1"' in account.candidate
+    assert not account.eligible_for_families
+
+
+def test_session_guard_refuses_calls_before_dispatch_in_real_dspy(monkeypatch):
+    """Roots, adapter retries and extraction all pass ``forward``; the third is refused."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+    from bandits.analyze.rlm_mine import _run_account
+    from bandits.analyze.rlm_models import StopReason
+    from tests.analyze.rlm_test import _identity
+
+    corpus, catalog = _workflow_corpus()
+    provider = _ScriptedProvider(['print("a")', 'print("b")', 'print("c")'])
+    guard = SessionBudgetGuard(max_calls=2, max_seconds=600)
+    predict = _predictor(dspy, monkeypatch, provider, catalog=catalog, guard=guard)
+    account = _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+
+    assert provider.calls == ["root", "root"], "the refused call never reached the provider"
+    assert guard.calls_admitted == 2
+    assert account.status == "failed" and account.failure_kind == "budget"
+    assert guard.refusals and "call ceiling" in guard.refusals[0]
+    assert StopReason.MAX_LLM_CALLS.value == "max_llm_calls"
+
+
+def test_provider_effective_settings_come_from_the_request_body():
+    """LiteLLM keeps chat_template_kwargs through its parameter mapping and then
+    drops it from the Fireworks body; only the body is evidence."""
+    _real_dspy()
+    from bandits import providers
+
+    fireworks = "accounts/fireworks/models/test-model"
+    checked = providers.preflight_settings(
+        fireworks,
+        {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": 4096,
+            "extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}},
+        },
+    )
+    assert checked["verified"] is True
+    assert checked["effective"]["temperature"] == 1.0 and checked["effective"]["top_p"] == 0.95
+    assert checked["dropped"] == ["extra_body"]
+
+    vllm = providers.preflight_settings(
+        "hosted_vllm/test-model",
+        {"chat_template_kwargs": {"force_nonempty_content": True}},
+    )
+    assert vllm["dropped"] == []
+    assert vllm["effective"]["chat_template_kwargs"] == {"force_nonempty_content": True}
+
+    with pytest.raises(providers.ProviderError, match="does not support"):
+        # A model LiteLLM knows refuses top_p alongside temperature.
+        providers.preflight_settings(
+            "anthropic/claude-sonnet-5", {"temperature": 1.0, "top_p": 0.9}
+        )
+
+
+def test_full_trajectory_accounts_then_families_end_to_end_in_real_dspy(monkeypatch):
+    """Both real RLM stages, one shared guard, controlled responses: an accepted
+    account becomes the only input family formation sees."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits import providers
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+    from bandits.analyze.rlm_mine import (
+        GenerationSettings,
+        build_account_predictor,
+        build_predictor,
+        mine_taxonomy,
+    )
+    from bandits.analyze.rlm_models import TraceView
+    from tests.analyze.rlm_test import _identity
+
+    corpus, catalog = _workflow_corpus()
+    family = {
+        "contracts": [
+            {
+                "contract_id": "diagnose-step",
+                "name": "Diagnose a failed test step",
+                "definition": "explain why the requested test step failed",
+                "required_outcome_shape": ["a supported diagnosis of the failed step"],
+            }
+        ],
+        "operations": [
+            {
+                "operation": "CREATE",
+                "contract_ids": ["diagnose-step"],
+                "trace_ids": ["w1"],
+                "rationale": "first run",
+            }
+        ],
+        "assignments": {"w1": "diagnose-step"},
+        "ambiguous_trace_ids": [],
+        "uncovered_trace_ids": [],
+    }
+    seen_chunks: list[dict] = []
+    calls: list[str] = []
+
+    def forward(lm, prompt=None, messages=None, **kwargs):
+        system = messages[0]["content"]
+        if "ACCOUNT of one recorded run" in system:
+            calls.append("account")
+            return _reply(_action(_valid_account_code()))
+        calls.append("family")
+        code = f"import json\nrows = json.loads(chunk)\nSUBMIT(**{json.dumps(family)})"
+        return _reply(_action(code))
+
+    monkeypatch.setattr(dspy.LM, "forward", forward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    guard = SessionBudgetGuard(max_calls=10, max_seconds=600)
+    settings = GenerationSettings(root_max_iterations=3)
+    account_predict = build_account_predictor(
+        catalog=catalog, model="openai/test-model", settings=settings, guard=guard
+    )
+    family_predict = build_predictor(
+        model="openai/test-model",
+        view=TraceView.FULL_TRAJECTORY,
+        settings=settings,
+        guard=guard,
+        catalog=catalog,
+        accounts_mode=True,
+    )
+
+    def spy(**inputs):
+        seen_chunks.extend(json.loads(inputs["chunk"]))
+        return family_predict(**inputs)
+
+    spy.completion = family_predict.completion
+    spy.spend = family_predict.spend
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=spy,
+        account_predict=account_predict,
+        identity_for=_identity,
+        guard=guard,
+        contract_repairs=0,
+    )
+    assert calls == ["account", "family"]
+    assert run.assignments == {"w1": "diagnose-step"}
+    assert run.chunks[0].completion_mode == "submit"
+    assert run.chunks[0].iterations_to_submit == 1
+    assert run.accounts[0].status == "accepted"
+    assert set(seen_chunks[0]) == {"trace_id", "status", "intent", "milestones", "limitations"}
+    assert guard.calls_admitted == 2 and run.complete

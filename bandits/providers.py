@@ -23,6 +23,7 @@ called, so the core install and the Jev recipe's environment never need it.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,8 +167,16 @@ def credentials(ref: ModelRef, *, api_key: str | None = None) -> dict[str, str]:
     return found
 
 
-def dspy_lm(model: str, *, api_key: str | None = None, **kwargs: Any) -> Any:
-    """A ``dspy.LM`` for ``model``. The caller has already imported DSPy."""
+def dspy_lm(
+    model: str, *, api_key: str | None = None, call_guard: Any = None, **kwargs: Any
+) -> Any:
+    """A ``dspy.LM`` for ``model``. The caller has already imported DSPy.
+
+    ``call_guard``, when given, admits every request at ``forward`` — the one
+    method each root, subcall, adapter fallback and extraction passes through —
+    before it is dispatched, bounds it by the remaining wall time, and settles
+    what it cost afterwards.
+    """
     import dspy
 
     from bandits import ledger
@@ -205,5 +214,139 @@ def dspy_lm(model: str, *, api_key: str | None = None, **kwargs: Any) -> Any:
             finally:
                 record_history(self.history[before:], language_model=self)
 
+        def forward(self, prompt=None, messages=None, **call_kwargs):
+            if call_guard is None:
+                return super().forward(prompt=prompt, messages=messages, **call_kwargs)
+            ticket = call_guard.admit(
+                prompt=prompt,
+                messages=messages,
+                max_tokens=call_kwargs.get("max_tokens", self.kwargs.get("max_tokens")),
+            )
+            if "timeout" not in call_kwargs:
+                call_kwargs["timeout"] = max(1.0, call_guard.remaining_seconds())
+            try:
+                response = super().forward(prompt=prompt, messages=messages, **call_kwargs)
+            except BaseException:
+                call_guard.settle(ticket, None)
+                raise
+            call_guard.settle(ticket, response)
+            return response
+
+        async def aforward(self, prompt=None, messages=None, **call_kwargs):
+            if call_guard is not None:
+                # Not a supported path for guarded sessions: refused rather than
+                # run outside admission and accounting.
+                raise ProviderError("async model calls are not supported in a budgeted session")
+            return await super().aforward(prompt=prompt, messages=messages, **call_kwargs)
+
     ref = resolve(model)
     return RecordedLM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)
+
+
+_SETTING_ALIASES: dict[str, tuple[str, ...]] = {
+    "max_tokens": ("max_tokens", "max_completion_tokens", "max_output_tokens"),
+    "reasoning_effort": ("reasoning_effort", "reasoning", "thinking"),
+}
+
+
+def preflight_settings(model: str, settings: dict[str, Any]) -> dict[str, Any]:
+    """What a request with these settings would actually send, without sending it.
+
+    Requested keyword arguments are not evidence: LiteLLM can accept a setting,
+    keep it through its own parameter mapping, and still leave it out of the
+    request body (its Fireworks route drops ``chat_template_kwargs``). So the
+    request is built by LiteLLM itself, against an in-process HTTP transport
+    that records the body and returns a canned reply — no network, no cost.
+
+    Returns ``requested``, ``effective`` (the sent body without messages),
+    ``dropped`` (requested and absent from the body) and ``verified`` (False
+    when this provider's route does not use the injectable HTTP client, so the
+    body could not be observed). Raises :class:`ProviderError` when LiteLLM
+    itself refuses a setting for this model.
+    """
+    requested = {key: value for key, value in settings.items() if value is not None}
+    try:
+        litellm = load_litellm()
+    except ProviderError:
+        # Without LiteLLM nothing can be sent at all; the body is unobservable,
+        # and saying so is the only honest record.
+        return {
+            "requested": requested,
+            "effective": {},
+            "dropped": [],
+            "verified": False,
+            "note": "LiteLLM is not installed, so the request body could not be built",
+        }
+    import httpx
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    ref = resolve(model)
+    sent: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        try:
+            sent.append(json.loads(request.content or b"{}"))
+        except ValueError:
+            sent.append({})
+        return httpx.Response(
+            200,
+            json={
+                "id": "preflight",
+                "object": "chat.completion",
+                "created": 0,
+                "model": ref.litellm_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(respond)))
+    try:
+        litellm.completion(
+            model=ref.litellm_id,
+            messages=[{"role": "user", "content": "preflight"}],
+            api_key="preflight-no-network",
+            api_base="http://preflight.invalid/v1"
+            if ref.provider in _REQUIRED
+            and any(arg == "api_base" for arg in _REQUIRED[ref.provider].values())
+            else None,
+            client=client,
+            num_retries=0,
+            **requested,
+        )
+    except Exception as exc:  # noqa: BLE001 - LiteLLM's own refusal is the finding
+        # A failure after the body was sent (parsing the canned reply) does not
+        # matter: the body is what this checks.
+        if not sent and (
+            "UnsupportedParams" in type(exc).__name__ or "does not support" in str(exc)
+        ):
+            raise ProviderError(f"{model}: {exc}".splitlines()[0]) from exc
+        if not sent:
+            return {
+                "requested": requested,
+                "effective": {},
+                "dropped": [],
+                "verified": False,
+                "note": f"request body not observable offline ({type(exc).__name__})",
+            }
+    if not sent:
+        return {
+            "requested": requested,
+            "effective": {},
+            "dropped": [],
+            "verified": False,
+            "note": "this provider route does not use the injectable HTTP client",
+        }
+    body = {k: v for k, v in sent[-1].items() if k not in ("messages", "model")}
+    dropped = [
+        key
+        for key in requested
+        if not any(alias in body for alias in _SETTING_ALIASES.get(key, (key,)))
+    ]
+    return {"requested": requested, "effective": body, "dropped": dropped, "verified": True}

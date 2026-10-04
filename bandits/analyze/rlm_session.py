@@ -31,6 +31,7 @@ from typing import Any
 
 from pydantic import Field
 
+from bandits.analyze.rlm_account import RunAccount, latest_by_run
 from bandits.analyze.rlm_models import (
     ChunkResult,
     FamilyContract,
@@ -59,8 +60,13 @@ class SessionState(Contract):
     requested_passes: int = Field(ge=1)
 
     status: str = "running"
-    """One of running, awaiting_review, failed. Written before anything else so
-    a crashed run is distinguishable from one still working."""
+    """One of running, awaiting_review, incomplete, interrupted, failed. Written
+    before anything else so a crashed run is distinguishable from one still
+    working; see :meth:`observed_status` for a run whose process is gone."""
+
+    pid: int | None = None
+    """The process writing this session, so a reader can tell a live run from
+    one that died without closing its file."""
 
     pass_index: int = Field(default=0, ge=0)
     """The pass currently in flight, zero-based."""
@@ -99,15 +105,91 @@ class SessionState(Contract):
     resume_scope: ResumeScope | None = None
     last_error: str = ""
 
+    accounts: tuple[RunAccount, ...] = ()
+    """Every account attempt so far. Accepted ones survive an interruption and
+    are reused on resume; nothing else is assumed complete."""
+
+    selection: tuple[str, ...] = ()
+    """Explicitly selected trace ids; empty means the whole corpus."""
+
+    settings: dict[str, Any] = Field(default_factory=dict)
+    settings_digest: str = ""
+    """Digest of the generation/invocation settings. Resume refuses a mismatch."""
+
+    budget_usage: dict[str, Any] = Field(default_factory=dict)
+    """The admission guard's own counts: calls admitted before dispatch,
+    reported and estimated spend, unknown-cost calls, refusals."""
+
+    def observed_status(self, *, alive: Any = None) -> str:
+        """``status``, except a "running" session whose process is gone is said so."""
+        if self.status != "running":
+            return self.status
+        if self.pid is None:
+            return "running (unverified: no process id recorded)"
+        check = alive or _process_alive
+        return self.status if check(self.pid) else "stale (process gone)"
+
+    def coverage(self) -> dict[str, int]:
+        """Counted separately; ``read`` never means an id merely appeared in a batch."""
+        latest = latest_by_run(self.accounts)
+        attempted = {t for c in self.chunks for t in c.trace_ids} | set(latest)
+        return {
+            "attempted": len(attempted),
+            "source_accessed": sum(1 for a in latest.values() if a.completion.inspected_refs),
+            "account_complete": sum(1 for a in latest.values() if a.status == "accepted"),
+            "eligible": sum(1 for a in latest.values() if a.eligible_for_families),
+            "quarantined": sum(1 for a in latest.values() if a.status == "quarantined")
+            + sum(1 for c in self.chunks if c.status == "quarantined"),
+            "failed": sum(1 for a in latest.values() if a.status in ("failed", "rejected"))
+            + sum(1 for c in self.chunks if c.status == "error"),
+            "assigned": len(self.assignments),
+            "unresolved": len(set(self.ambiguous_trace_ids) | set(self.uncovered_trace_ids)),
+        }
+
     @property
     def progress(self) -> str:
         """One line a person can read mid-run without parsing anything."""
-        return (
+        line = (
             f"pass {self.pass_index + 1}/{self.requested_passes} · "
             f"{self.traces_seen_this_pass}/{self.traces_total} traces · "
             f"chunk {self.chunk_index} · {len(self.contracts)} contracts · "
             f"{self.llm_calls} calls · ${self.cost_usd:.4f}"
         )
+        if self.accounts:
+            cov = self.coverage()
+            line += (
+                f" · accounts {cov['account_complete']}/{self.traces_total} "
+                f"({cov['quarantined']} quarantined, {cov['failed']} failed)"
+            )
+        return line
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _summed_calls(chunks: Any, accounts: Any) -> int:
+    return sum(record.llm_calls or 0 for record in [*chunks, *accounts])
+
+
+def _summed_usd(chunks: Any, accounts: Any) -> float:
+    """Reported cost only; unknown cost stays visible in each record, never as zero spend."""
+    return sum(record.cost_usd or 0.0 for record in [*chunks, *accounts])
+
+
+def _summed_tokens(chunks: Any, accounts: Any) -> dict[str, int]:
+    """Top-level tokens summed from what each invocation reported; empty if none did."""
+    totals: dict[str, int] = {}
+    for record in [*chunks, *accounts]:
+        for field, value in (record.tokens or {}).items():
+            totals[field] = totals.get(field, 0) + value
+    return totals
 
 
 class SessionStore:
@@ -222,8 +304,16 @@ class SessionRecorder:
         model: str,
         resumed_from: str | None = None,
         resume_scope: ResumeScope | None = None,
+        selection: tuple[str, ...] = (),
+        settings: dict[str, Any] | None = None,
+        settings_digest: str = "",
+        guard: Any = None,
+        previous: SessionState | None = None,
     ) -> None:
         self._store = store
+        self._guard = guard
+        self._previous_accounts = previous.accounts if previous is not None else ()
+        self._previous_chunks = previous.chunks if previous is not None else ()
         self._state = SessionState(
             session_id=session_id,
             analysis_id=analysis_id,
@@ -235,6 +325,11 @@ class SessionRecorder:
             updated_at=datetime.now(UTC).isoformat(),
             resumed_from=resumed_from,
             resume_scope=resume_scope,
+            selection=selection,
+            settings=settings or {},
+            settings_digest=settings_digest,
+            pid=os.getpid(),
+            accounts=tuple(self._previous_accounts),
         )
 
     @property
@@ -251,6 +346,7 @@ class SessionRecorder:
             requested_passes=requested_passes,
             seed=seed,
             status="running",
+            pid=os.getpid(),
             updated_at=datetime.now(UTC).isoformat(),
         )
         self._store.write(self._state)
@@ -298,12 +394,20 @@ class SessionRecorder:
             seen_this_pass=tuple(sorted(seen_this_pass)),
             pass_order=pass_order,
             passes=tuple(passes),
-            chunks=tuple(chunks),
-            llm_calls=calls,
-            cost_usd=usd,
+            chunks=tuple(self._previous_chunks) + tuple(chunks),
+            llm_calls=_summed_calls(
+                tuple(self._previous_chunks) + tuple(chunks), self._state.accounts
+            ),
+            cost_usd=_summed_usd(
+                tuple(self._previous_chunks) + tuple(chunks), self._state.accounts
+            ),
+            tokens=_summed_tokens(
+                tuple(self._previous_chunks) + tuple(chunks), self._state.accounts
+            ),
             elapsed_seconds=elapsed,
             updated_at=datetime.now(UTC).isoformat(),
-            last_error=chunk.error if chunk.status == "error" else "",
+            last_error=chunk.error if chunk.status != "success" else "",
+            budget_usage=self._guard.summary() if self._guard is not None else {},
         )
         self._store.write(self._state)
         self._store.append_event(
@@ -321,6 +425,41 @@ class SessionRecorder:
                 "cost_usd": round(usd, 6),
                 "status": chunk.status,
                 "error": chunk.error,
+                "completion_mode": chunk.completion_mode,
+                "iterations_used": chunk.iterations_used,
+                "failure_kind": chunk.failure_kind,
+                "attempt": chunk.attempt,
+            },
+        )
+
+    def checkpoint_account(self, account: RunAccount, accounts: Any, *, elapsed: float) -> None:
+        """Persist every account attempt as it lands, accepted or not."""
+        self._state = self._state.replace(
+            accounts=tuple(accounts),
+            llm_calls=_summed_calls(self._state.chunks, tuple(accounts)),
+            cost_usd=_summed_usd(self._state.chunks, tuple(accounts)),
+            tokens=_summed_tokens(self._state.chunks, tuple(accounts)),
+            elapsed_seconds=elapsed,
+            updated_at=datetime.now(UTC).isoformat(),
+            last_error=account.completion.error or "; ".join(account.validation_errors[:2]),
+            budget_usage=self._guard.summary() if self._guard is not None else {},
+        )
+        self._store.write(self._state)
+        self._store.append_event(
+            self.session_id,
+            {
+                "event": "account_complete",
+                "run_id": account.run_id,
+                "attempt": account.attempt,
+                "status": account.status,
+                "completion_mode": account.completion.mode,
+                "iterations_used": account.completion.iterations_used,
+                "iterations_to_submit": account.completion.iterations_to_submit,
+                "inspected": len(account.completion.inspected_ranges),
+                "failure_kind": account.failure_kind,
+                "errors": list(account.validation_errors[:3]),
+                "calls": self._state.llm_calls,
+                "cost_usd": round(self._state.cost_usd, 6),
             },
         )
 
@@ -359,10 +498,23 @@ class SessionRecorder:
             },
         )
 
-    def fail(self, error: str) -> None:
-        """Record that the run died, so a crashed session is not read as idle."""
+    def fail(self, error: str, *, status: str = "failed") -> None:
+        """Record that the run died or was interrupted, so it is not read as running.
+
+        Whatever was checkpointed stays: accepted accounts and applied chunks
+        are resumable; the in-flight invocation is not counted.
+        """
         self._state = self._state.replace(
-            status="failed", last_error=error, updated_at=datetime.now(UTC).isoformat()
+            status=status,
+            last_error=error,
+            updated_at=datetime.now(UTC).isoformat(),
+            budget_usage=self._guard.summary() if self._guard is not None else {},
         )
         self._store.write(self._state)
-        self._store.append_event(self.session_id, {"event": "session_failed", "error": error})
+        self._store.append_event(
+            self.session_id,
+            {
+                "event": "session_interrupted" if status == "interrupted" else "session_failed",
+                "error": error,
+            },
+        )
