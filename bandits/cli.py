@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import shutil
 import tempfile
 import time
 from contextlib import nullcontext
@@ -97,12 +98,14 @@ from bandits.export import (
 )
 from bandits.ingest import (
     CANONICAL_SOURCES,
+    NATIVE_SOURCES,
     IngestReport,
     UnknownSourceError,
     detect_source,
     iter_corpus,
     load_corpus,
 )
+from bandits.ingest.bundle import bundle_json_documents
 from bandits.ingest.discovery import (
     Discovery,
     discover,
@@ -193,6 +196,7 @@ def check_source(
 
 @app.command()
 def ingest(
+    ctx: typer.Context,
     path: Path,
     source: str = typer.Option(
         "auto", "--source", help=f"Auto-detect, or one of: {', '.join(CANONICAL_SOURCES)}"
@@ -305,6 +309,23 @@ def ingest(
             f"this file is read in {mode} mode, where the request is the person's first message",
             "drop them, or use --mode workflow (otlp-std and platform exports only)",
         )
+
+    # A native reader takes one file: a folder of one-document exports is read
+    # as one JSONL of them, archived as read, listing each line's file.
+    origin, bundled = path, None
+    if path.is_dir() and source in NATIVE_SOURCES:
+        joined = Path(tempfile.mkdtemp(prefix=".bandits-bundle-", dir=_scratch(project)))
+        ctx.call_on_close(lambda: shutil.rmtree(joined, ignore_errors=True))
+        path = joined / f"{origin.name or 'bundle'}.jsonl"
+        try:
+            bundled = bundle_json_documents(origin, path)
+        except (ValueError, OSError) as exc:
+            _fail(
+                f"cannot read the files under {origin} as one export",
+                str(exc),
+                "each .json file must hold one exported document; move other files out",
+            )
+        _say(f"bundled:  {len(bundled)} file(s) under {origin}, one document per JSONL line")
 
     report = IngestReport()
 
@@ -451,7 +472,7 @@ def ingest(
             _say("problems: none")
         if workflow is not None and mapping is None:
             _say(
-                f"to save these choices: bandits mapping propose {path} --source {source} --name NAME"
+                f"to save these choices: bandits mapping propose {origin} --source {source} --name NAME"
             )
         if dry_run:
             _say("dry run:  nothing saved")
@@ -459,15 +480,19 @@ def ingest(
 
         if reported:
             envelope = staged.commit(
-                source_path=str(path),
+                source_path=str(origin),
                 problem_count=len(health.warnings) + len(health.fatal),
                 report=report.as_dict(),
+                archive_from=str(path) if bundled else None,
+                bundled_from=bundled,
             )
         else:
             envelope = store.write(
                 corpus,
-                source_path=str(path),
+                source_path=str(origin),
                 problem_count=len(health.warnings) + len(health.fatal),
+                archive_from=str(path) if bundled else None,
+                bundled_from=bundled,
             )
         _say(f"artifact_id: {envelope.artifact_id}")
         fidelity = check_fidelity(store, envelope.artifact_id, sample.kept.values(), source)

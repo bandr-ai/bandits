@@ -1215,7 +1215,7 @@ def test_langchain_messages_recorded_by_langfuse_keep_turns_and_calls() -> None:
         ("user", ["text"]),
         ("assistant", ["tool_call"]),
         ("assistant", ["tool_call"]),
-        ("tool", ["text"]),
+        ("tool", ["tool_call_response"]),  # the one call before it, by position
     ]
     assert messages[1]["parts"][0]["content"] == "Hi"
     assert (
@@ -1322,3 +1322,26 @@ def test_otlp_steps_point_at_their_raw_span_and_keep_its_kind(tmp_path: Path) ->
     store = ArtifactStore(tmp_path / ".bandits")
     artifact = store.write(corpus, source_path=str(path)).artifact_id
     assert store.read_native_record(artifact, pointer)["spanId"] == "call"
+
+
+def test_id_less_tool_results_answer_their_calls_by_position() -> None:
+    from bandits.ingest.otlp_standard import _messages
+
+    call = lambda i: {"id": f"c{i}", "name": f"t{i}", "args": {}}  # noqa: E731
+    history = [
+        {"role": "human", "content": "go"},
+        {"role": "ai", "content": "", "tool_calls": [call(1), call(2)]},
+        {"role": "tool", "content": "one"},
+        {"role": "tool", "content": "two"},
+    ]
+    parts = [m["parts"] for m in _messages(history)[2:]]
+    assert parts == [
+        [{"type": "tool_call_response", "id": "c1", "result": "one", "paired_by": "position"}],
+        [{"type": "tool_call_response", "id": "c2", "result": "two", "paired_by": "position"}],
+    ]
+    # A count that does not match the calls proves nothing: left as text.
+    short = _messages(history[:3])
+    assert short[2]["parts"] == [{"type": "text", "content": "one"}]
+    # A result with its own id keeps it, and the block is not reassigned.
+    labelled = [*history[:2], {"role": "tool", "tool_call_id": "c2", "content": "two"}, history[3]]
+    assert [p.get("id") for m in _messages(labelled)[2:] for p in m["parts"]] == ["c2", None]

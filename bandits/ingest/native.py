@@ -613,7 +613,11 @@ _FAILPROOFAI_IO: dict[str, tuple[str, tuple[str, ...]]] = {
 
 _FAILPROOFAI_ATTRIBUTES: dict[str, dict[str, str]] = {
     "agent_start": {"parent_id": "failproofai.agent.parent_id"},
-    "model_request": {"model": "gen_ai.request.model", "request_id": "failproofai.request_id"},
+    "model_request": {
+        "model": "gen_ai.request.model",
+        "request_id": "failproofai.request_id",
+        "tools": "gen_ai.request.tools",
+    },
     "model_response": {
         "model": "gen_ai.response.model",
         "input_tokens": "gen_ai.usage.input_tokens",
@@ -1098,7 +1102,8 @@ class NativeConversion:
             raise ValueError(f"unknown native source {source_name!r}")
         if path.is_dir():
             raise ValueError(
-                f"{source_name} reads one export file; {path} is a directory — ingest each file"
+                f"{source_name} reads one export file; {path} is a directory — join it with "
+                "bandits.ingest.bundle.bundle_json_documents (bandits ingest does)"
             )
         self.path, self.source_name, self.ruleset = path, source_name, ruleset
         self.scratch_dir = scratch_dir
