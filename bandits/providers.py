@@ -23,8 +23,11 @@ called, so the core install and the Jev recipe's environment never need it.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -167,77 +170,188 @@ def credentials(ref: ModelRef, *, api_key: str | None = None) -> dict[str, str]:
     return found
 
 
+_request_body: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "bandits_request_body", default=None
+)
+"""Where LiteLLM's pre-call hook leaves the body it is about to send, for the
+call that set the slot. A context variable, so concurrent calls never cross."""
+
+
+def _install_body_capture(litellm: Any) -> None:
+    """Register (once) a LiteLLM hook that hands each request body to its call.
+
+    ``complete_input_dict`` is the provider request body LiteLLM built — the
+    same body the HTTP layer sends, verified against a captured request — so a
+    setting LiteLLM accepted and then dropped shows up as absent here.
+    """
+    from litellm.integrations.custom_logger import CustomLogger
+
+    class _BodyCapture(CustomLogger):
+        bandits_body_capture = True
+
+        def _keep(self, kwargs: Any) -> None:
+            slot = _request_body.get()
+            if slot is None:
+                return
+            body = (kwargs.get("additional_args") or {}).get("complete_input_dict")
+            if body is not None:
+                slot["body"] = json.loads(json.dumps(body, default=str))
+
+        def log_pre_api_call(self, model, messages, kwargs):
+            self._keep(kwargs)
+
+        async def async_log_pre_api_call(self, model, messages, kwargs):
+            self._keep(kwargs)
+
+    if not any(getattr(cb, "bandits_body_capture", False) for cb in litellm.callbacks):
+        litellm.callbacks.append(_BodyCapture())
+
+
 def dspy_lm(
     model: str, *, api_key: str | None = None, call_guard: Any = None, **kwargs: Any
 ) -> Any:
     """A ``dspy.LM`` for ``model``. The caller has already imported DSPy.
 
-    ``call_guard``, when given, admits every request at ``forward`` — the one
-    method each root, subcall, adapter fallback and extraction passes through —
-    before it is dispatched, bounds it by the remaining wall time, and settles
-    what it cost afterwards.
+    Every request is recorded at ``forward`` — the one method each root,
+    subcall, adapter fallback and extraction passes through — with a call id
+    shared by its start and its single terminal row, the settings DSPy passed,
+    the body LiteLLM actually built, and the whole returned response. Capture
+    there does not depend on DSPy's retained history, which can be disabled or
+    evict entries before they are read.
+
+    ``call_guard``, when given, admits each request before dispatch, bounds it
+    by the remaining wall time, and settles what it cost afterwards.
     """
     import dspy
 
     from bandits import ledger
     from bandits.analyze.rlm_history import record_history
 
+    try:
+        import litellm
+
+        _install_body_capture(litellm)
+    except ImportError:  # pragma: no cover - DSPy depends on LiteLLM
+        pass
+
     class RecordedLM(dspy.LM):
+        def __init__(self, *args, **init_kwargs):
+            super().__init__(*args, **init_kwargs)
+            self.call_log: list[dict[str, Any]] = []
+            """One entry per request that reached ``forward``, failed or not.
+            Append-only and independent of DSPy's history settings, so
+            per-prediction spend never depends on retained history."""
+
         def __call__(self, *args, **call_kwargs):
             before = len(self.history)
+            try:
+                return super().__call__(*args, **call_kwargs)
+            finally:
+                # Only entries ``forward`` did not already record: a backend
+                # whose call never reached ``forward`` still leaves a row.
+                record_history(self.history[before:], language_model=self)
+
+        def _begin(self, prompt, messages, call_kwargs):
+            ledger.raise_if_failed()
+            ticket = None
+            if call_guard is not None:
+                ticket = call_guard.admit(
+                    prompt=prompt,
+                    messages=messages,
+                    max_tokens=call_kwargs.get("max_tokens", self.kwargs.get("max_tokens")),
+                )
+                if "timeout" not in call_kwargs:
+                    call_kwargs["timeout"] = max(1.0, call_guard.remaining_seconds())
+            call_id = uuid.uuid4().hex
+            settings = {
+                key: value
+                for key, value in {**self.kwargs, **call_kwargs}.items()
+                if not key.startswith("api_")
+            }
             ledger.record(
                 {
                     "event_type": "model_call_start",
+                    "call_id": call_id,
                     "model": model,
-                    "request": {
-                        "prompt": call_kwargs.get("prompt", args[0] if args else None),
-                        "messages": call_kwargs.get("messages"),
-                        "temperature": call_kwargs.get(
-                            "temperature", self.kwargs.get("temperature")
-                        ),
-                        "max_tokens": call_kwargs.get("max_tokens", self.kwargs.get("max_tokens")),
-                    },
+                    "request": {"prompt": prompt, "messages": messages, "settings": settings},
+                }
+            )
+            slot: dict[str, Any] = {}
+            return call_id, ticket, slot, _request_body.set(slot), time.monotonic(), settings
+
+        def _fail(self, state, prompt, messages, exc):
+            call_id, ticket, slot, token, started, settings = state
+            _request_body.reset(token)
+            if call_guard is not None and ticket is not None:
+                call_guard.settle(ticket, None)
+            self.call_log.append(
+                {"call_id": call_id, "usage": None, "cost": None, "error": str(exc)}
+            )
+            ledger.record(
+                {
+                    "event_type": "model_call_error",
+                    "call_id": call_id,
+                    "model": model,
+                    "request": {"prompt": prompt, "messages": messages, "settings": settings},
+                    "effective_request": slot.get("body"),
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                }
+            )
+
+        def _finish(self, state, prompt, messages, response):
+            from bandits.analyze.rlm_history import response_record
+
+            call_id, ticket, slot, token, started, settings = state
+            _request_body.reset(token)
+            if call_guard is not None and ticket is not None:
+                call_guard.settle(ticket, response)
+            ledger.record(
+                {
+                    "event_type": "model_call",
+                    "provider": "dspy",
+                    "call_id": call_id,
+                    "model": model,
+                    "request": {"prompt": prompt, "messages": messages, "settings": settings},
+                    "effective_request": slot.get("body"),
+                    **response_record(response),
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                    "status": "success",
+                }
+            )
+            usage = getattr(response, "usage", None)
+            self.call_log.append(
+                {
+                    "call_id": call_id,
+                    "usage": dict(usage) if usage is not None else None,
+                    "cost": (getattr(response, "_hidden_params", None) or {}).get("response_cost"),
+                    "response": response,
                 }
             )
             try:
-                return super().__call__(*args, **call_kwargs)
-            except BaseException as exc:
-                ledger.record(
-                    {
-                        "event_type": "model_call_error",
-                        "model": model,
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    }
-                )
-                raise
-            finally:
-                record_history(self.history[before:], language_model=self)
-
-        def forward(self, prompt=None, messages=None, **call_kwargs):
-            if call_guard is None:
-                return super().forward(prompt=prompt, messages=messages, **call_kwargs)
-            ticket = call_guard.admit(
-                prompt=prompt,
-                messages=messages,
-                max_tokens=call_kwargs.get("max_tokens", self.kwargs.get("max_tokens")),
-            )
-            if "timeout" not in call_kwargs:
-                call_kwargs["timeout"] = max(1.0, call_guard.remaining_seconds())
-            try:
-                response = super().forward(prompt=prompt, messages=messages, **call_kwargs)
-            except BaseException:
-                call_guard.settle(ticket, None)
-                raise
-            call_guard.settle(ticket, response)
+                response._bandits_recorded = True
+            except (AttributeError, TypeError, ValueError):  # pragma: no cover
+                pass
             return response
 
+        def forward(self, prompt=None, messages=None, **call_kwargs):
+            state = self._begin(prompt, messages, call_kwargs)
+            try:
+                response = super().forward(prompt=prompt, messages=messages, **call_kwargs)
+            except BaseException as exc:
+                self._fail(state, prompt, messages, exc)
+                raise
+            return self._finish(state, prompt, messages, response)
+
         async def aforward(self, prompt=None, messages=None, **call_kwargs):
-            if call_guard is not None:
-                # Not a supported path for guarded sessions: refused rather than
-                # run outside admission and accounting.
-                raise ProviderError("async model calls are not supported in a budgeted session")
-            return await super().aforward(prompt=prompt, messages=messages, **call_kwargs)
+            state = self._begin(prompt, messages, call_kwargs)
+            try:
+                response = await super().aforward(prompt=prompt, messages=messages, **call_kwargs)
+            except BaseException as exc:
+                self._fail(state, prompt, messages, exc)
+                raise
+            return self._finish(state, prompt, messages, response)
 
     ref = resolve(model)
     return RecordedLM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)

@@ -30,6 +30,7 @@ the call. One row, one id, always.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import json
 import os
@@ -48,13 +49,42 @@ _ENV_PATH = "BANDITS_LEDGER"
 
 _local = threading.local()
 
+_context_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "bandits_ledger_context", default=None
+)
+"""Stage/call context. A context variable rather than thread-local state, so a
+worker started with ``contextvars.copy_context()`` — DSPy's batched subcalls —
+records under the chunk and iteration that issued it instead of under nothing."""
+
+_failure_lock = threading.Lock()
+_failure: list[LedgerWriteError] = []
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def _context() -> dict[str, Any]:
-    return getattr(_local, "context", {})
+    return _context_var.get() or {}
+
+
+def raise_if_failed() -> None:
+    """Re-raise a required write that failed anywhere in this run.
+
+    A write failure inside a sandbox tool or a worker thread is caught by the
+    code that called it — DSPy turns a tool exception into REPL output — so the
+    failure is remembered here and raised at the next boundary that cannot
+    swallow it: the next model call, REPL step or invocation end. Cleared when
+    a recorded command starts and when it ends.
+    """
+    with _failure_lock:
+        if _failure:
+            raise LedgerWriteError(str(_failure[0]))
+
+
+def clear_failure() -> None:
+    with _failure_lock:
+        _failure.clear()
 
 
 _ENV_STRICT = "BANDITS_LEDGER_STRICT"
@@ -88,11 +118,11 @@ def stage(name: str, **fields: Any) -> Iterator[None]:
         "stage_id": uuid.uuid4().hex[:16],
         "parent_stage_id": previous.get("stage_id"),
     }
-    _local.context = merged
+    token = _context_var.set(merged)
     try:
         yield
     finally:
-        _local.context = previous
+        _context_var.reset(token)
 
 
 def enabled() -> bool:
@@ -117,10 +147,13 @@ def project_recording(function):
         # Sub-LM batches use worker threads; the destination must reach them too.
         os.environ[_ENV_PATH] = _local.ledger_path
         os.environ[_ENV_STRICT] = "1"
+        clear_failure()
         try:
             record({"event_type": "recording_started", "command": function.__name__})
             return function(*args, **kwargs)
         finally:
+            # A failure belongs to the run that hit it, never to the next one.
+            clear_failure()
             _local.ledger_path = previous
             _local.ledger_required = required
             for key, value in ((_ENV_PATH, old_path), (_ENV_STRICT, old_strict)):
@@ -166,10 +199,14 @@ def record(event: dict[str, Any]) -> None:
             handle.write(json.dumps(row, default=str) + "\n")
     except OSError as exc:
         if strict():
-            raise LedgerWriteError(
+            error = LedgerWriteError(
                 f"the ledger could not be written to {path!r}: {exc}. "
                 "The run is recording incompletely and BANDITS_LEDGER_STRICT is set."
-            ) from exc
+            )
+            with _failure_lock:
+                if not _failure:
+                    _failure.append(error)
+            raise error from exc
         # Loud even when not fatal. A silent drop is how a run finishes looking
         # complete while missing the records it was started to produce.
         print(  # noqa: T201 - deliberate: stderr must carry this past a rich console
@@ -206,7 +243,7 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
     previous = _context()
     # Published so the retries firing inside this block can name the call they
     # belong to without it being threaded through the transport's signature.
-    _local.context = {**previous, "logical_call_id": call_id}
+    token = _context_var.set({**previous, "logical_call_id": call_id})
     try:
         yield slot
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised untouched
@@ -242,7 +279,7 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
                 }
             )
         finally:
-            _local.context = previous
+            _context_var.reset(token)
 
 
 def record_attempt(*, attempt: int, error: Exception, delay: float) -> None:

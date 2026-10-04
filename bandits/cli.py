@@ -1965,6 +1965,7 @@ def mine_rlm_command(
                 ),
             )
         except KeyboardInterrupt:
+            ledger.record({"event_type": "interrupted", "session_id": recorder.session_id})
             recorder.fail("interrupted by the user", status="interrupted")
             console.print(
                 f"\n[yellow]interrupted.[/yellow] accepted accounts and applied chunks are "

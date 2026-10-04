@@ -79,7 +79,9 @@ def test_full_provider_reasoning_is_saved_immediately_without_duplicates(tmp_pat
     assert rows[0]["response"]["raw"]["choices"][0]["message"]["reasoning_content"] == text
     assert rows[0]["response"]["finish_reason"] == "length"
     record_history(lm.history, language_model=lm)
-    assert len(path.read_text().splitlines()) == 2
+    # This fake never reaches ``forward``, where starts and call ids are now
+    # written; its history-fallback row is the only one, and is not repeated.
+    assert len(path.read_text().splitlines()) == 1
 
 
 def test_final_repl_output_is_recorded_without_prompt_truncation(tmp_path, monkeypatch):
@@ -528,3 +530,276 @@ def test_full_trajectory_accounts_then_families_end_to_end_in_real_dspy(monkeypa
     assert run.accounts[0].status == "accepted"
     assert set(seen_chunks[0]) == {"trace_id", "status", "intent", "milestones", "limitations"}
     assert guard.calls_admitted == 2 and run.complete
+
+
+# --- recording gate: the synchronous mining path, verified against real DSPy ---
+
+
+def _rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _paired(rows):
+    """Every start has exactly one terminal row with its call id, and vice versa."""
+    starts = [r["call_id"] for r in rows if r["event_type"] == "model_call_start"]
+    ends = [r["call_id"] for r in rows if r["event_type"] in ("model_call", "model_call_error")]
+    assert len(starts) == len(set(starts))
+    assert sorted(starts) == sorted(ends)
+    return starts
+
+
+def test_every_call_in_an_account_invocation_is_recorded_with_lineage(tmp_path, monkeypatch):
+    """Roots, a reasoning-only reply and its JSON-adapter fallback, batched and
+    single subcalls, REPL steps, helper retrievals and SUBMIT — each recorded
+    once, under the invocation and iteration that caused it."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits import providers
+    from bandits.analyze.rlm_mine import GenerationSettings, _run_account, build_account_predictor
+    from tests.analyze.rlm_test import _identity
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    monkeypatch.setenv("BANDITS_LEDGER_STRICT", "1")
+    corpus, catalog = _workflow_corpus()
+    reasoning = "long returned reasoning " * 400
+    roots = iter(
+        [
+            "reasoning-only",
+            'ev = get_evidence("w1", "clue0.step_input")\n'
+            'print(llm_query_batched(["sub-a", "sub-b"]), llm_query("sub-c"), ev["content"])',
+            _valid_account_code(),
+        ]
+    )
+
+    def forward(lm, prompt=None, messages=None, **kwargs):
+        if prompt and prompt.startswith("sub-"):
+            return _reply(f"answer to {prompt}", finish="length" if prompt == "sub-b" else "stop")
+        if "response_format" in kwargs:  # JSONAdapter fallback after a failed parse
+            code = 'print("recovered")'
+            return _reply(json.dumps({"reasoning": "retry", "code": code}))
+        step = next(roots)
+        if step == "reasoning-only":
+            from litellm import ModelResponse
+
+            return ModelResponse(
+                model="openai/test",
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": reasoning,
+                        },
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 99, "total_tokens": 109},
+            )
+        return _reply(_action(step))
+
+    monkeypatch.setattr(dspy.LM, "forward", forward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    predict = build_account_predictor(
+        catalog=catalog,
+        model="openai/test-model",
+        settings=GenerationSettings(root_max_iterations=6, subcall_workers=2),
+    )
+    account = _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+    assert account.status == "accepted"
+
+    rows = _rows(path)
+    calls = _paired(rows)
+    completed = [r for r in rows if r["event_type"] == "model_call"]
+    assert len(calls) == len(completed) == account.llm_calls
+    # The reasoning-only, length-limited reply is kept whole.
+    assert any(r["response"]["reasoning"] == reasoning for r in completed)
+    assert sum(r["response"]["finish_reason"] == "length" for r in completed) == 2
+    # Every call — including batched workers — sits under this invocation.
+    for row in completed:
+        assert row["stage"] == "rlm_iteration", row["stage"]
+        assert row["run_id"] == "w1" and row["attempt"] == 1
+    assert len({r["parent_stage_id"] for r in completed}) == 1, "one invocation"
+    subcalls = [r for r in completed if (r["request"]["prompt"] or "").startswith("sub-")]
+    assert sorted(r["request"]["prompt"] for r in subcalls) == ["sub-a", "sub-b", "sub-c"]
+    assert all(r["iteration"] for r in subcalls) and len({r["iteration"] for r in subcalls}) == 1
+    assert any("response_format" in r["request"]["settings"] for r in completed)
+    kinds = [r["event_type"] for r in rows]
+    for kind in ("repl_start", "repl_end", "evidence_access", "submit_accepted"):
+        assert kind in kinds, kind
+    access = next(r for r in rows if r["event_type"] == "evidence_access")
+    assert access["returned"]["content"] == "diagnose_step"
+    assert not any(r.get("_bandits_recorded") for r in rows)
+
+
+@pytest.mark.parametrize("history", [{"max_history_size": 1}, {"disable_history": True}])
+def test_completions_survive_history_eviction_and_disabled_history(tmp_path, monkeypatch, history):
+    dspy = _real_dspy()
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    monkeypatch.setattr(
+        dspy.LM, "forward", lambda lm, prompt=None, messages=None, **kw: _reply(f"re: {prompt}")
+    )
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    lm = providers.dspy_lm("openai/test-model", cache=False)
+    with dspy.context(**history):
+        for prompt in ("one", "two", "three"):
+            lm(prompt=prompt)
+    rows = _rows(path)
+    assert len(_paired(rows)) == 3
+    assert [r["response"]["text"] for r in rows if r["event_type"] == "model_call"] == [
+        "re: one",
+        "re: two",
+        "re: three",
+    ]
+
+
+def test_a_provider_error_closes_its_own_call(tmp_path, monkeypatch):
+    dspy = _real_dspy()
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+
+    def forward(lm, prompt=None, messages=None, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(dspy.LM, "forward", forward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    lm = providers.dspy_lm("openai/test-model")
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        lm(prompt="q")
+    rows = _rows(path)
+    _paired(rows)
+    error = next(r for r in rows if r["event_type"] == "model_call_error")
+    assert error["error"] == "provider unavailable" and error["request"]["prompt"] == "q"
+
+
+def test_the_recorded_request_is_the_body_litellm_built(tmp_path, monkeypatch):
+    """Requested settings are not evidence; the body is — including from a
+    batched worker thread. Uses real LiteLLM against an in-process transport."""
+    dspy = _real_dspy()
+    import httpx
+
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    sent: list[dict] = []
+
+    def send(self, request, **kwargs):
+        sent.append(json.loads(request.content))
+        body = {
+            "id": "r",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    lm = providers.dspy_lm(
+        "accounts/fireworks/models/test-model",
+        api_key="test",
+        cache=False,
+        num_retries=0,
+        temperature=1.0,
+        top_p=0.95,
+        max_tokens=64,
+        extra_body={"chat_template_kwargs": {"force_nonempty_content": True}},
+    )
+    from concurrent.futures import ThreadPoolExecutor
+    import contextvars
+
+    lm(prompt="main")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda p: contextvars.copy_context().run(lm, prompt=p), ["w-a", "w-b"]))
+    rows = [r for r in _rows(path) if r["event_type"] == "model_call"]
+    assert len(rows) == 3 == len(sent)
+    for row in rows:
+        body = row["effective_request"]
+        assert body["temperature"] == 1.0 and body["top_p"] == 0.95
+        assert "chat_template_kwargs" not in json.dumps(body), "dropped on the wire, so absent"
+        assert "extra_body" in row["request"]["settings"], "the request still shows what was asked"
+        prompt = row["request"]["prompt"]
+        assert body["messages"][-1]["content"] == prompt
+
+
+def test_async_calls_are_recorded_too(tmp_path, monkeypatch):
+    import asyncio
+
+    dspy = _real_dspy()
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+
+    async def aforward(lm, prompt=None, messages=None, **kwargs):
+        return _reply("async reply")
+
+    monkeypatch.setattr(dspy.LM, "aforward", aforward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    lm = providers.dspy_lm("openai/test-model", cache=False)
+    asyncio.run(lm.acall(prompt="q"))
+    rows = _rows(path)
+    assert len(_paired(rows)) == 1
+    assert rows[-1]["response"]["text"] == "async reply"
+
+
+def test_a_write_failure_inside_a_sandbox_tool_stops_the_invocation(tmp_path, monkeypatch):
+    """DSPy turns a tool exception into REPL output; the failure must still stop the run."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from pathlib import Path
+
+    from bandits import ledger, providers
+    from bandits.analyze.rlm_mine import _run_account
+    from tests.analyze.rlm_test import _identity
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    monkeypatch.setenv("BANDITS_LEDGER_STRICT", "1")
+    ledger.clear_failure()
+    corpus, catalog = _workflow_corpus()
+    provider = _ScriptedProvider(['get_evidence("w1", "clue0.step_input")', _valid_account_code()])
+    predict = _predictor(dspy, monkeypatch, provider, catalog=catalog)
+    real_open = Path.open
+    import contextvars
+
+    inside_tool = contextvars.ContextVar("inside_tool", default=False)
+
+    def failing_open(self, *args, **kwargs):
+        if self == path and inside_tool.get():
+            raise OSError("disk full")
+        return real_open(self, *args, **kwargs)
+
+    original = catalog.get_evidence
+
+    def flagged(*args, **kwargs):
+        token = inside_tool.set(True)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            inside_tool.reset(token)
+
+    monkeypatch.setattr(catalog, "get_evidence", flagged)
+    monkeypatch.setattr(Path, "open", failing_open)
+    try:
+        with pytest.raises(ledger.LedgerWriteError, match="disk full"):
+            _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+        assert provider.calls == ["root"], "no further model call after the lost record"
+    finally:
+        ledger.clear_failure()

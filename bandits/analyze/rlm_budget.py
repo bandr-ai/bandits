@@ -120,7 +120,10 @@ class SessionBudgetGuard:
                 )
 
     def _refuse(self, reason: StopReason, detail: str) -> None:
+        from bandits import ledger
+
         self.refusals.append(detail)
+        ledger.record({"event_type": "budget_refusal", "reason": reason.value, "detail": detail})
         raise BudgetExhausted(reason, detail)
 
     def _worst_case(self, prompt: Any, messages: Any, max_tokens: Any) -> float:

@@ -67,6 +67,12 @@ def scoped_to_history(predict: Predictor, language_model: Any) -> Predictor:
     spend = _Spend()
 
     def wrapped(**inputs: Any) -> Any:
+        # A recorded LM's own call log when it has one: it is append-only and
+        # written at ``forward``, so it cannot lose calls to history eviction
+        # or disabled history the way slicing ``lm.history`` can.
+        log = getattr(language_model, "call_log", None)
+        source = log if isinstance(log, list) else None
+        before_log = len(source) if source is not None else 0
         before = len(getattr(language_model, "history", ()) or ())
         try:
             return predict(**inputs)
@@ -74,8 +80,9 @@ def scoped_to_history(predict: Predictor, language_model: Any) -> Predictor:
             # In `finally` because a failed prediction still spent calls, and
             # those are exactly the ones a rerun that behaved differently needs.
             history = getattr(language_model, "history", None)
-            spend.entries = list(history[before:]) if isinstance(history, list) else []
-            record_history(spend.entries, language_model=language_model)
+            added = list(history[before:]) if isinstance(history, list) else []
+            record_history(added, language_model=language_model)
+            spend.entries = list(source[before_log:]) if source is not None else added
 
     wrapped.spend = spend  # type: ignore[attr-defined]
     return wrapped
@@ -97,6 +104,35 @@ def wire_value(value: Any) -> Any:
     return json.loads(json.dumps(value, default=convert))
 
 
+def response_record(response: Any) -> dict[str, Any]:
+    """Everything a provider returned, plus the fields worth finding without parsing.
+
+    ``raw`` is the whole response; ``text``, ``reasoning``, ``finish_reason``,
+    usage and cost are lifted out of it. A reasoning-only or length-limited
+    reply keeps whatever it returned — nothing here decides it is unusable.
+    """
+    choices = getattr(response, "choices", None) or []
+    first = choices[0] if choices else None
+    message = getattr(first, "message", None)
+    text = getattr(message, "content", None) if message is not None else None
+    reasoning = getattr(message, "reasoning_content", None) if message is not None else None
+    usage = getattr(response, "usage", None)
+    hidden = getattr(response, "_hidden_params", None) or {}
+    return {
+        "response": {
+            "text": text,
+            "reasoning": reasoning,
+            "finish_reason": getattr(first, "finish_reason", None),
+            "raw": wire_value(response),
+        },
+        "generated_code": _CODE_BLOCK.findall(text or ""),
+        "usage": wire_value(usage) if usage is not None else None,
+        "cost_usd": hidden.get("response_cost"),
+        "cache_hit": getattr(response, "cache_hit", None),
+        "provider_request_id": getattr(response, "id", None),
+    }
+
+
 def record_repl(rlm: Any) -> Any:
     """Persist each execution before DSPy truncates its output for the next prompt."""
     execute = rlm._execute_code
@@ -111,6 +147,9 @@ def record_repl(rlm: Any) -> Any:
             ledger.record({"event_type": "repl_error", "code": code, "error": str(exc)})
             raise
         ledger.record({"event_type": "repl_end", "code": code, "output": wire_value(result)})
+        # A required write that failed inside a tool or subcall was swallowed
+        # into REPL output; it stops the run here instead.
+        ledger.raise_if_failed()
         return result
 
     rlm._execute_code = recorded
@@ -149,6 +188,10 @@ def _record_history(entries: Sequence[Any], *, language_model: Any = None) -> No
         if not isinstance(entry, dict):
             continue
         if entry.get("_bandits_recorded"):
+            continue
+        if getattr(entry.get("response"), "_bandits_recorded", False):
+            # Already recorded, with its call id, at the LM's ``forward``.
+            entry["_bandits_recorded"] = True
             continue
         outputs = entry.get("outputs") or []
         text = ""

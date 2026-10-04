@@ -407,21 +407,38 @@ def instrument_completion(rlm: Any) -> CompletionTracker:
 
     def iteration(*args, **kwargs):
         tracker.iterations += 1
-        return execute_iteration(*args, **kwargs)
+        # A stage per iteration: every model call, subcall and REPL step inside
+        # carries the iteration and the invocation's stage ids.
+        with ledger.stage("rlm_iteration", iteration=tracker.iterations):
+            return execute_iteration(*args, **kwargs)
 
     def final_output(*args, **kwargs):
         parsed, error = process_final(*args, **kwargs)
         if error:
             tracker.submit_rejections.append(error)
+            ledger.record(
+                {"event_type": "submit_rejected", "iteration": tracker.iterations, "error": error}
+            )
         else:
             tracker.mode = "submit"
             tracker.iterations_to_submit = tracker.iterations
+            ledger.record({"event_type": "submit_accepted", "iteration": tracker.iterations})
         return parsed, error
 
     def extract(*args, **kwargs):
         tracker.extract_started = True
         tracker.mode = "extract"
-        return extract_fallback(*args, **kwargs)
+        ledger.record({"event_type": "extract_start", "iterations_used": tracker.iterations})
+        try:
+            with ledger.stage("rlm_extract"):
+                result = extract_fallback(*args, **kwargs)
+        except BaseException as exc:
+            ledger.record(
+                {"event_type": "extract_error", "error": str(exc), "error_type": type(exc).__name__}
+            )
+            raise
+        ledger.record({"event_type": "extract_end"})
+        return result
 
     rlm._execute_iteration = iteration
     rlm._process_final_output = final_output

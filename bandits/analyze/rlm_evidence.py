@@ -723,9 +723,14 @@ class EvidenceCatalog:
                 seen.setdefault(access["ref"], None)
         return tuple(seen)
 
-    def _log(self, entry: dict[str, Any]) -> None:
+    def _log(self, entry: dict[str, Any], returned: dict[str, Any] | None = None) -> None:
         with self._lock:
             self.accesses.append(entry)
+        # What was actually handed to the miner, so a retrieval can be replayed
+        # from the record: refs, ranges and the returned content itself.
+        from bandits import ledger
+
+        ledger.record({"event_type": "evidence_access", **entry, "returned": returned})
 
     # --- the two helpers -----------------------------------------------------------
 
@@ -794,7 +799,8 @@ class EvidenceCatalog:
                 "limit": limit,
                 "returned_events": [r["order"] for r in rows],
                 "available": True,
-            }
+            },
+            page,
         )
         return page
 
@@ -902,7 +908,10 @@ class EvidenceCatalog:
                     "use refs returned by inspect_run"
                 ],
             }
-            self._log({"tool": "get_evidence", "run_id": run_id, "ref": ref, "available": False})
+            self._log(
+                {"tool": "get_evidence", "run_id": run_id, "ref": ref, "available": False},
+                response,
+            )
             return response
         base = {
             "ref": resolved,
@@ -914,10 +923,7 @@ class EvidenceCatalog:
             "limitations": list(item.limitations),
         }
         if not item.available:
-            self._log(
-                {"tool": "get_evidence", "run_id": run_id, "ref": resolved, "available": False}
-            )
-            return {
+            unavailable = {
                 **base,
                 "content": None,
                 "descriptor": item.descriptor,
@@ -927,6 +933,11 @@ class EvidenceCatalog:
                 "next_start": None,
                 "available": False,
             }
+            self._log(
+                {"tool": "get_evidence", "run_id": run_id, "ref": resolved, "available": False},
+                unavailable,
+            )
+            return unavailable
         text = index.content(resolved) or ""
         total = len(text)
         if start > total:
@@ -950,7 +961,8 @@ class EvidenceCatalog:
                 "start": start,
                 "end": end,
                 "available": True,
-            }
+            },
+            response,
         )
         return response
 
