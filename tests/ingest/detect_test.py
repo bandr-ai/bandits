@@ -10,13 +10,14 @@ from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.detect import DetectionError, detect_source
 from bandits.store import ArtifactStore
+from tests.cli_test import plain as uncolored
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
 def plain(text: str) -> str:
-    """CLI output with terminal line wrapping undone."""
-    return " ".join(text.split())
+    """CLI output with color codes and terminal line wrapping undone."""
+    return " ".join(uncolored(text).split())
 
 
 def _write(path: Path, value: object) -> Path:
@@ -83,20 +84,20 @@ def test_auto_ingest_and_read_only_check(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["ingest", str(source), "--dry-run", "--project", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "format:   chat-json" in result.output
-    assert "nothing saved" in result.output
+    assert "format:   chat-json" in uncolored(result.output)
+    assert "nothing saved" in uncolored(result.output)
     assert not (tmp_path / ".bandits").exists()
     result = runner.invoke(app, ["ingest", str(source), "--project", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "artifact_id: corpus-" in result.output
+    assert "artifact_id: corpus-" in uncolored(result.output)
 
 
 def test_unknown_auto_ingest_stops_before_artifact(tmp_path: Path) -> None:
     source = _write(tmp_path / "unknown.json", {"items": [1]})
     result = CliRunner().invoke(app, ["ingest", str(source), "--project", str(tmp_path)])
     assert result.exit_code == 1
-    assert "could not tell what format this file is" in result.output
-    assert "fix: pass --source NAME" in result.output
+    assert "could not tell what format this file is" in uncolored(result.output)
+    assert "fix: pass --source NAME" in uncolored(result.output)
     assert not (tmp_path / ".bandits").exists()
 
 
@@ -120,16 +121,16 @@ def test_workflow_options_in_conversation_mode_are_explained(tmp_path: Path) -> 
         app, ["ingest", str(source), "--task-field", "input.q", "--project", str(tmp_path)]
     )
     assert result.exit_code == 1
-    assert "only apply to workflows" in result.output
-    assert "why:" in result.output and "fix:" in result.output
+    assert "only apply to workflows" in uncolored(result.output)
+    assert "why:" in uncolored(result.output) and "fix:" in uncolored(result.output)
 
 
 def test_check_reports_the_model_kind_used_by_the_reader() -> None:
     source = FIXTURES / "upstream/interlingua/vercel.json"
     result = CliRunner().invoke(app, ["ingest", str(source), "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "format:   otlp-std" in result.output
-    assert "read:     1 traces, 1 model calls" in result.output
+    assert "format:   otlp-std" in uncolored(result.output)
+    assert "read:     1 traces, 1 model calls" in uncolored(result.output)
 
 
 def _declared_chat(tmp_path: Path, input_messages: object) -> Path:
@@ -163,7 +164,7 @@ def test_check_reads_declared_messages_as_json(tmp_path: Path) -> None:
         tmp_path, [{"role": "user", "parts": [{"type": "text", "content": "hello"}]}]
     )
     result = CliRunner().invoke(app, ["ingest", str(source), "--dry-run"])
-    assert "malformed" not in result.output
+    assert "malformed" not in uncolored(result.output)
     assert result.exit_code == 0
 
 
@@ -190,4 +191,4 @@ def test_check_does_not_call_an_errored_model_response_lost(tmp_path: Path) -> N
     source.write_text(json.dumps(record))
     result = CliRunner().invoke(app, ["ingest", str(source), "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "no recorded output" not in result.output
+    assert "no output in a field Bandits reads" not in uncolored(result.output)

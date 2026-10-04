@@ -8,11 +8,13 @@ import pytest
 from typer.testing import CliRunner
 
 from bandits.cli import app
+from bandits.fields import step_view
 from bandits.ingest import detect_source, load_corpus
 from bandits.ingest.native import _ns
 from bandits.ingest.otlp_standard import _attributes
-from bandits.store import ArtifactStore
+from bandits.store import ArtifactStore, resolve_record
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
+from tests.cli_test import plain
 
 
 def _file(tmp_path: Path, name: str, payload: object) -> Path:
@@ -86,7 +88,9 @@ def test_native_langfuse_keeps_request_and_observation(tmp_path: Path) -> None:
     assert trace.request.delivered == "Dental."
     assert trace.user_turns == ()
     assert len(trace.spans) == 1 and trace.spans[0].kind == SpanKind.MODEL
-    assert json.loads(trace.spans[0].attributes["bandits.native.record"]) == model
+    pointer = trace.spans[0].attributes["bandits.source.record"]
+    assert json.loads(pointer) == {"line": 1, "observation_id": "a2"}
+    assert resolve_record(path.read_bytes(), pointer) == model
     assert trace.request.raw_input == observation["input"]
     assert trace.spans[0].attributes["bandits.otlp.source_context"]["resource"] == {}
     _assert_archived(tmp_path, path, corpus)
@@ -108,7 +112,7 @@ def test_native_langfuse_keeps_request_and_observation(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "read:     1 traces" in result.output
+    assert "read:     1 traces" in plain(result.output)
 
 
 def test_upstream_langfuse_trace_wrapper_preserves_all_observations() -> None:
@@ -172,7 +176,8 @@ def test_phoenix_sdk_server_export_retains_request_model_and_parent() -> None:
     assert model.parent_span_id == trace.request.source_span_id
     assert model.kind == SpanKind.MODEL
     assert model.attributes["openinference.span.kind"] == "LLM"
-    assert json.loads(model.attributes["bandits.native.record"])["attributes"]["input.value"] == (
+    record = resolve_record(source.read_bytes(), model.attributes["bandits.source.record"])
+    assert record["attributes"]["input.value"] == (
         '[{"role":"user","content":"Where is the order?"}]'
     )
     assert {span["context"]["span_id"] for span in raw["data"]} == {
@@ -219,7 +224,7 @@ def test_native_langsmith_maps_run_tree_and_messages(tmp_path: Path) -> None:
     assert span.attributes["gen_ai.output.messages"] == [
         {"role": "assistant", "parts": [{"type": "text", "content": "hi"}]}
     ]
-    assert json.loads(span.attributes["bandits.native.record"]) == llm
+    assert resolve_record(path.read_bytes(), span.attributes["bandits.source.record"]) == llm
     assert (
         span.parent_span_id == hashlib.sha256(f"langsmith:span:{root_id}".encode()).hexdigest()[:16]
     )
@@ -292,7 +297,8 @@ def test_langsmith_cli_export_run_id_shape(tmp_path: Path) -> None:
     assert len(corpus.traces) == 1
     assert len(corpus.traces[0].spans) == 1
     assert not [issue for issue in corpus.issues if issue.kind != "redaction"]
-    assert json.loads(corpus.traces[0].spans[0].attributes["bandits.native.record"]) == run
+    pointer = corpus.traces[0].spans[0].attributes["bandits.source.record"]
+    assert resolve_record(path.read_bytes(), pointer) == run
 
 
 def test_phoenix_getspans_response_uses_top_level_span_kind(tmp_path: Path) -> None:
@@ -375,9 +381,15 @@ def test_native_phoenix_preserves_openinference_and_links(tmp_path: Path) -> Non
     corpus = load_corpus(path, "phoenix")
     span = corpus.traces[0].spans[0]
     assert span.kind == SpanKind.MODEL
-    assert json.loads(span.attributes["bandits.native.record"]) == raw
+    assert resolve_record(path.read_bytes(), span.attributes["bandits.source.record"]) == raw
     assert span.attributes["bandits.otlp.source_context"]["links"] == raw["links"]
-    assert span.attributes["bandits.otlp.source_context"]["resource"] == {"service.name": "demo"}
+    # Stored once: the value lives in the attributes, the context keeps its key.
+    context = span.attributes["bandits.otlp.source_context"]
+    assert context["resource"] == {} and context["resource_keys"] == ["service.name"]
+    assert span.attributes["service.name"] == "demo"
+    from bandits.fields import resolve, step_view
+
+    assert resolve(step_view(span), "resource") == {"service.name": "demo"}
     assert span.status == SpanStatus.ERROR
     _assert_archived(tmp_path, path, corpus)
 
@@ -722,10 +734,19 @@ def test_captured_otel_keeps_every_attribute_of_retained_spans(dialect: str) -> 
     kept = [span for trace in corpus.traces for span in trace.spans]
     assert kept
     for span in (span for span in kept if span.span_id in original):
-        assert (
-            span.attributes["bandits.otlp.source_context"]["span_attributes"]
-            == original[span.span_id]
-        )
+        # Every declared attribute is either in the attributes as declared, or
+        # kept in the source context with its declared value; nothing else is.
+        declared = original[span.span_id]
+        context = span.attributes["bandits.otlp.source_context"]["span_attributes"]
+        assert set(context) <= set(declared)
+        stored = span.attributes.get("bandits.stored_as", {})
+        view = step_view(span)
+        for key, value in declared.items():
+            if key in stored:
+                # Stored once, in the step's own field, with the same value.
+                assert view[key] == json.loads(value), key
+                continue
+            assert span.attributes.get(key) == value or context.get(key) == value, key
 
     workflow = load_corpus(source, "otlp-std", workflow=WorkflowDeclaration(task_fields=()))
     represented = {span.span_id for trace in workflow.traces for span in trace.spans} | {
@@ -762,7 +783,9 @@ def test_langfuse_null_io_is_absent_not_the_text_null(tmp_path: Path) -> None:
     assert "gen_ai.input.messages" not in span.attributes
     assert "gen_ai.output.messages" not in span.attributes
     assert span.output is None
-    assert json.loads(span.attributes["bandits.native.record"])["input"] is None
+    assert (
+        resolve_record(path.read_bytes(), span.attributes["bandits.source.record"])["input"] is None
+    )
 
 
 def test_langfuse_embedding_generation_is_not_a_model_call(tmp_path: Path) -> None:
@@ -792,3 +815,166 @@ def test_langfuse_embedding_generation_is_not_a_model_call(tmp_path: Path) -> No
     )
     spans = load_corpus(path, "langfuse").traces[0].spans
     assert [s.name for s in spans if s.kind == SpanKind.MODEL] == ["chat"]
+
+
+def _repeated_records(tmp_path: Path, source: str) -> Path:
+    """One native record written twice, so its spans repeat across lines."""
+    if source == "langfuse":
+        upstream = Path(__file__).resolve().parents[1] / "fixtures/upstream/langfuse"
+        record = json.loads((upstream / "agno-2025-06-11.trace.json").read_text())
+    else:
+        record = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "trace_id": "11111111-1111-1111-1111-111111111111",
+            "run_type": "llm",
+            "name": "chat",
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": "2026-01-01T00:00:01Z",
+            "inputs": {"messages": [{"role": "user", "content": "hello"}]},
+            "outputs": {"messages": [{"role": "assistant", "content": "hi"}]},
+        }
+    path = tmp_path / f"{source}.jsonl"
+    path.write_text("\n".join([json.dumps(record)] * 2) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("source", ["langfuse", "langsmith"])
+def test_native_issue_locations_name_the_source_file_not_the_conversion(
+    tmp_path: Path, source: str
+) -> None:
+    # The conversion's temporary path in a stored issue made the corpus id
+    # differ on every ingest of the same file.
+    path = _repeated_records(tmp_path, source)
+    first, second = load_corpus(path, source), load_corpus(path, source)
+    located = [issue.location for issue in first.issues if issue.kind == "duplicate_span"]
+    assert located
+    assert all(location.startswith(f"{path}:2 observation ") for location in located)
+    assert first.model_dump_json() == second.model_dump_json()
+
+
+def _unmapped(span) -> dict:
+    value = span.attributes.get("bandits.unmapped") or {}
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _every_step(corpus):
+    return [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+
+
+def test_fields_no_converter_knows_are_kept_not_dropped(tmp_path: Path) -> None:
+    # A field nobody listed yet (a vendor adds one tomorrow) must come through
+    # every native converter, in the same place.
+    future = {"brand_new_field": {"nested": [1, 2]}}
+    langfuse = {
+        "id": "t1",
+        "user_id": "u-9",
+        "observations": [
+            {
+                "id": "o1",
+                "type": "GENERATION",
+                "name": "chat",
+                "parentObservationId": "never-exported",
+                "startTime": "2026-01-01T00:00:00Z",
+                "endTime": "2026-01-01T00:00:01Z",
+                "input": [{"role": "user", "content": "hi"}],
+                "output": "hello",
+                "usageDetails": {"input": 313, "output": 64, "total": 377},
+                "modelParameters": {"temperature": 0, "top_p": 0.7},
+                "costDetails": {"total": 4.1e-06},
+                **future,
+            }
+        ],
+    }
+    langsmith = {
+        "id": "r1",
+        "run_type": "llm",
+        "name": "chat",
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "inputs": {"messages": [{"role": "user", "content": "hi"}]},
+        "outputs": {"messages": [{"role": "assistant", "content": "hello"}]},
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "extra": {"invocation_params": {"temperature": 0.2}},
+        "tags": ["prod"],
+        **future,
+    }
+    phoenix = {
+        "name": "chat",
+        "context": {"trace_id": "t" * 8, "span_id": "s1"},
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {"openinference.span.kind": "LLM", "input.value": "hi"},
+        **future,
+    }
+    for source, record in (("langfuse", langfuse), ("langsmith", langsmith), ("phoenix", phoenix)):
+        corpus = load_corpus(_file(tmp_path, f"{source}.json", record), source)
+        (step,) = [s for s in _every_step(corpus) if _unmapped(s)]
+        assert _unmapped(step)["brand_new_field"] == {"nested": [1, 2]}, source
+
+    corpus = load_corpus(_file(tmp_path, "usage.json", langfuse), "langfuse")
+    (step,) = _every_step(corpus)
+    assert _unmapped(step)["costDetails"] == {"total": 4.1e-06}
+    assert step.attributes["gen_ai.usage.input_tokens"] == 313
+    assert step.attributes["gen_ai.usage.output_tokens"] == 64
+    assert step.attributes["gen_ai.request.temperature"] == 0
+    # The trace's own fields are on the trace, not its steps.
+    assert "bandits.native.trace_record" not in step.attributes
+    assert corpus.traces[0].source_record["user_id"] == "u-9"
+
+    corpus = load_corpus(_file(tmp_path, "ls.json", langsmith), "langsmith")
+    (step,) = [s for s in _every_step(corpus) if _unmapped(s)]
+    assert step.attributes["gen_ai.usage.input_tokens"] == 5
+    assert step.attributes["gen_ai.request.temperature"] == 0.2
+    assert _unmapped(step)["tags"] == ["prod"]
+
+
+def test_unmapped_keeps_nulls_empties_nested_leftovers_and_odd_shapes(tmp_path: Path) -> None:
+    from bandits.ingest.native import USED_FIELDS, unmapped_fields
+
+    observation = {
+        "id": "o1",
+        "type": "GENERATION",
+        "name": "step",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": "2026-01-01T00:00:01Z",
+        "input": "q",
+        "output": "a",
+        "custom_null": None,
+        "custom_empty": {},
+        "custom_zero": 0,
+        "custom_false": False,
+        "metadata": "not json",  # an odd shape: kept whole, not read
+        "input.value": "a field named like an attribute",  # a name collision
+    }
+    corpus = load_corpus(
+        _file(tmp_path, "lf.json", {"id": "t", "observations": [observation]}), "langfuse"
+    )
+    (step,) = [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+    kept = _unmapped(step)
+    assert kept == {
+        "custom_null": None,
+        "custom_empty": {},
+        "custom_zero": 0,
+        "custom_false": False,
+        "metadata": "not json",
+        "input.value": "a field named like an attribute",
+    }
+    assert kept == unmapped_fields(observation, USED_FIELDS["langfuse"](observation))
+
+    span = {
+        "name": "chat",
+        "context": {"trace_id": "t" * 8, "span_id": "s1", "trace_state": "vendor=1"},
+        "start_time": "2026-01-01T00:00:00Z",
+        "end_time": "2026-01-01T00:00:01Z",
+        "attributes": {"openinference.span.kind": "LLM", "input.value": "hi"},
+        "status": {"status_code": "OK", "detail": {"retries": 2}},
+        "resource": "flat-string",
+    }
+    corpus = load_corpus(_file(tmp_path, "px.json", {"spans": [span]}), "phoenix")
+    (step,) = [s for t in corpus.traces for s in (*t.spans, *t.workflow_nodes)]
+    assert _unmapped(step) == {
+        "context": {"trace_state": "vendor=1"},  # the unread key inside a read object
+        "status": {"detail": {"retries": 2}},
+        "resource": "flat-string",  # not the object the converter reads: kept whole
+    }

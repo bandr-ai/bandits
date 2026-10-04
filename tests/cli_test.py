@@ -421,3 +421,93 @@ def test_build_sft_selects_traces_and_writes_three_review_buckets(tmp_path, monk
     assert (output / "review.jsonl").exists()
     assert (output / "rejected.jsonl").exists()
     assert (output / "selection-report.json").exists()
+
+
+def test_list_shows_problems_and_warns_on_mixed_derivation_versions(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from bandits.store import ArtifactEnvelope, ArtifactStore
+    from bandits.traces import TraceCorpus, WorkflowDeclaration
+
+    store = ArtifactStore(tmp_path / ".bandits")
+    for version in (1, 2):
+        corpus = TraceCorpus(
+            source="otlp-std", traces=(), workflow=WorkflowDeclaration(derivation_version=version)
+        )
+        envelope = store.write(corpus, source_path="synthetic", problem_count=version)
+        assert envelope.derivation_version == version
+    store.write(TraceCorpus(source="otlp", traces=()), source_path="synthetic")
+    # An envelope written before these fields existed.
+    old = tmp_path / ".bandits" / "artifacts" / "corpus-old"
+    old.mkdir()
+    (old / "envelope.json").write_text(
+        ArtifactEnvelope(
+            schema_version=1,
+            artifact_id="corpus-old",
+            created_at=datetime.now(UTC).isoformat(),
+            source_path="x",
+            source="langfuse",
+            trace_count=0,
+            span_count=0,
+            issue_count=9,
+        ).model_dump_json(exclude={"derivation_version", "problem_count"})
+    )
+
+    result = runner.invoke(app, ["list", "--project", str(tmp_path)])
+    out = plain(result.stdout)
+    assert result.exit_code == 0
+    assert "problems" in out and "issues" not in out
+    assert "different versions (1, 2)" in " ".join(out.split())
+    row = next(line for line in out.splitlines() if "corpus-old" in line)
+    assert "?" in row and " - " in row  # derivation unknown, problems not recorded
+
+
+def test_list_is_quiet_when_derivation_versions_agree(tmp_path) -> None:
+    runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
+    result = runner.invoke(app, ["list", "--project", str(tmp_path)])
+    assert "different versions" not in plain(result.stdout)
+
+
+LANGFUSE_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures/upstream/langfuse/agno-2025-06-11.trace.json"
+)
+
+
+def test_ingest_prints_record_accounting_and_saves_the_report(tmp_path) -> None:
+    from bandits.store import ArtifactStore
+
+    result = runner.invoke(
+        app, ["ingest", str(LANGFUSE_FIXTURE), "--source", "langfuse", "--project", str(tmp_path)]
+    )
+    out = plain(result.stdout)
+    assert result.exit_code == 0, out
+    assert re.search(r"records:  6 seen → .* · 0 dropped \(unreadable items: 0\)", out)
+    artifact_id = re.search(r"artifact_id: (\S+)", out).group(1)
+    report = ArtifactStore(tmp_path / ".bandits").read_report(artifact_id)
+    assert report["spans_seen"] == 6 and report["dropped"] == 0
+
+
+def test_other_sources_print_no_accounting(tmp_path) -> None:
+    result = runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    assert "records:" not in plain(result.stdout)
+
+
+def test_accounting_that_does_not_add_up_saves_nothing(tmp_path, monkeypatch) -> None:
+    import bandits.cli
+
+    real = bandits.cli.iter_corpus
+
+    def broken(*args, report, **kwargs):
+        yield from real(*args, report=report, **kwargs)
+        report.accounting_errors.append("6 span(s) seen but 5 accounted for")
+
+    monkeypatch.setattr(bandits.cli, "iter_corpus", broken)
+    result = runner.invoke(
+        app, ["ingest", str(LANGFUSE_FIXTURE), "--source", "langfuse", "--project", str(tmp_path)]
+    )
+    assert result.exit_code == 1
+    assert "record accounting does not add up" in plain(result.stdout)
+    assert "nothing was saved" in plain(result.stdout)
+    assert not (tmp_path / ".bandits").exists()

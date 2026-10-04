@@ -8,7 +8,7 @@ from bandits.analyze.models import CorpusAnalysis, Evidence, TaskCandidate
 from bandits.analyze.outcomes import extract_outcome_evidence
 from bandits.analyze.tasks import extract_task
 from bandits.store import DerivedEnvelope, DerivedStore, compute_artifact_id
-from bandits.traces import TraceCorpus
+from bandits.traces import NOTICE_ISSUE_KINDS, TraceCorpus
 
 
 def compute_analysis_id(analysis: CorpusAnalysis) -> str:
@@ -31,7 +31,9 @@ def analyze_corpus(corpus: TraceCorpus) -> CorpusAnalysis:
         evidence.extend(outcome_evidence)
 
     limitations: list[str] = []
-    normalization_issues = [issue for issue in corpus.issues if issue.kind != "redaction"]
+    # Notices (a redaction, an excluded evaluator) describe handling, not a
+    # record that failed to normalize.
+    normalization_issues = [i for i in corpus.issues if i.kind not in NOTICE_ISSUE_KINDS]
     redactions = [issue for issue in corpus.issues if issue.kind == "redaction"]
     if normalization_issues:
         limitations.append(

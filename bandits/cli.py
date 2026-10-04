@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import functools
 import json
+import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import typer
@@ -93,16 +95,43 @@ from bandits.export import (
     save_direct_sft,
     write_direct_sft,
 )
-from bandits.ingest import CANONICAL_SOURCES, UnknownSourceError, detect_source, load_corpus
+from bandits.ingest import (
+    CANONICAL_SOURCES,
+    IngestReport,
+    UnknownSourceError,
+    detect_source,
+    iter_corpus,
+    load_corpus,
+)
+from bandits.ingest.discovery import (
+    Discovery,
+    discover,
+    discover_requests,
+    identity_coverage,
+    restricted,
+)
+from bandits.ingest.health import Health, collect, finish
 from bandits.ingest.health import check as check_health
-from bandits.ingest.health import detect_request_fields
+from bandits.ingest.mapping import (
+    Identity,
+    IngestMapping,
+    MappingError,
+    ShapeRef,
+    applicable,
+    load_mapping,
+    mapping_path,
+    save_mapping,
+)
+from bandits.ingest.mapping import confirm as confirm_mapping
+from bandits.inspect import TraceSample, check_fidelity, fidelity_line, issue_rows, write_page
 from bandits.redact import DEFAULT_RULESET, ruleset_by_name
-from bandits.store import ArtifactStore, DerivedStore
-from bandits.traces import WorkflowDeclaration
+from bandits.store import ArtifactStore, DerivedStore, StreamingWrite
+from bandits.traces import TraceCorpus, WorkflowDeclaration
 from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 
 app = typer.Typer(add_completion=False)
 console = Console()
+err_console = Console(stderr=True)
 
 _MAX_INLINE_ISSUES = 3
 _DEFAULT_PROJECT = Path(".")
@@ -126,6 +155,17 @@ def _fail(what: str, why: str, fix: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _scratch(project: Path) -> Path:
+    """The project directory, where a read's temporary files go (beside the
+    store, as the staged write's), not the working directory."""
+    try:
+        project.mkdir(parents=True, exist_ok=True)
+        tempfile.TemporaryDirectory(prefix=".bandits-check-", dir=project).cleanup()
+    except OSError as exc:
+        _fail(f"cannot write to {project}", str(exc), "pass a writable --project")
+    return project
+
+
 @app.command(name="check-source", hidden=True)
 def check_source(
     path: Path,
@@ -145,6 +185,7 @@ def check_source(
         task_field=task_field,
         delivered_field=delivered_field,
         request_origin="unknown",
+        mapping_name=None,
         project=_DEFAULT_PROJECT,
         dry_run=True,
     )
@@ -189,8 +230,9 @@ def ingest(
         [],
         "--task-field",
         help="Workflow only. Path into the run's record holding the request, "
-        "e.g. input.query. Default: a common field (query, question, ...) that is "
-        "text in every run, if there is one.",
+        "e.g. input.query. Repeatable. Default: found by reading the runs (a field "
+        "named query, question, ... up to two levels deep) when exactly one set of "
+        "fields picks one run in every trace; otherwise the options are printed.",
     ),
     delivered_field: str = typer.Option(
         None,
@@ -203,6 +245,13 @@ def ingest(
         "--request-origin",
         help="Workflow only. Who started the runs: human, machine or unknown. Only "
         "'human' records the request as a (declared) user turn.",
+    ),
+    mapping_name: str = typer.Option(
+        None,
+        "--mapping",
+        help="Workflow only. Apply a confirmed mapping (bandits mapping propose/confirm): "
+        "its fields, invocation identities and step kinds. Nothing is discovered. "
+        "--task-field/--delivered-field still override its fields.",
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Read and check the file; save nothing."),
@@ -247,14 +296,21 @@ def ingest(
                 "mode:     workflow (default: no text is labelled as typed by a person; "
                 "use --mode conversation if a person chatted with the agent)"
             )
-    if mode != "workflow" and (task_field or delivered_field or request_origin != "unknown"):
+    if mode != "workflow" and (
+        task_field or delivered_field or request_origin != "unknown" or mapping_name
+    ):
         _fail(
-            "--task-field, --delivered-field and --request-origin only apply to workflows",
+            "--task-field, --delivered-field, --request-origin and --mapping only apply to "
+            "workflows",
             f"this file is read in {mode} mode, where the request is the person's first message",
             "drop them, or use --mode workflow (otlp-std and platform exports only)",
         )
 
+    report = IngestReport()
+
     def load(workflow: WorkflowDeclaration | None):
+        nonlocal report
+        report = IngestReport()  # one per read; the last read is the corpus kept
         try:
             return load_corpus(
                 path,
@@ -262,6 +318,8 @@ def ingest(
                 ruleset_by_name(redaction),
                 pipeline_steps=pipeline_steps,
                 workflow=workflow,
+                report=report,
+                mapping=mapping,
             )
         except (UnknownSourceError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
             _fail(
@@ -273,77 +331,343 @@ def ingest(
             )
 
     workflow = None
+    found = Discovery()
+    mapping: IngestMapping | None = None
+    if mapping_name:
+        try:
+            mapping = applicable(load_mapping(project, mapping_name), mapping_name, source)
+        except MappingError as exc:
+            _fail(f"cannot apply mapping {mapping_name!r}", str(exc), "fix or confirm the mapping")
     if mode == "workflow":
         workflow = WorkflowDeclaration(
-            task_fields=tuple(task_field),
-            delivered_field=delivered_field,
+            task_fields=tuple(task_field) or (mapping.task_fields if mapping else ()),
+            delivered_field=delivered_field or (mapping.delivered_field if mapping else None),
             request_origin=request_origin,  # type: ignore[arg-type]
+            mapping_name=mapping_name if mapping else None,
+            mapping_digest=mapping.confirmed_digest if mapping else None,
         )
-    corpus = load(workflow)
-    if workflow is not None and (not task_field or not delivered_field):
-        found_task, found_answer = detect_request_fields(corpus)
-        chosen_task = tuple(task_field) or ((found_task,) if found_task else ())
-        chosen_answer = delivered_field or found_answer
-        if chosen_task != workflow.task_fields or chosen_answer != workflow.delivered_field:
-            workflow = workflow.model_copy(
-                update={"task_fields": chosen_task, "delivered_field": chosen_answer}
+        if mapping is not None:
+            # Fully explicit: what was confirmed is what is applied.
+            _say(f"mapping:  {mapping_name} (confirmed {mapping.confirmed_at})")
+            _say(f"task:     {', '.join(workflow.task_fields) or 'none'}")
+            _say(f"answer:   {workflow.delivered_field or 'none'}")
+    if workflow is not None and mapping is None and (not task_field or not delivered_field):
+        # A pre-pass reads the export for the request fields, so the corpus is
+        # built once, with them.
+        try:
+            summary = discover_requests(
+                path, source, ruleset_by_name(redaction), scratch_dir=_scratch(project)
             )
-            corpus = load(workflow)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            _fail(
+                f"could not read {path} as {source}",
+                str(exc),
+                "the file is not a complete export in this format (re-export it, or try "
+                "another --source)",
+            )
+        found = discover(summary, task_fields=tuple(task_field), delivered_field=delivered_field)
+        workflow = workflow.model_copy(
+            update={"task_fields": found.task_fields, "delivered_field": found.delivered_field}
+        )
         if not task_field:
-            _say(
-                f"task:     {found_task} (found; override with --task-field)"
-                if found_task
-                else "task:     not found (no common request field in every run; "
-                "use --task-field PATH)"
+            _say_found("task", "--task-field", found.task_fields, found.task_options)
+        if not delivered_field:
+            _say_found(
+                "answer",
+                "--delivered-field",
+                (found.delivered_field,) if found.delivered_field else (),
+                found.answer_options,
             )
-        if not delivered_field and found_answer:
-            _say(f"answer:   {found_answer} (found; override with --delivered-field)")
-    if control_marker:
-        corpus = corpus.replace(control_markers=tuple(control_marker))
+    store = ArtifactStore(_scratch(project) / ".bandits")
+    sample = TraceSample()
+    with StreamingWrite(store, source) if source in _WORKFLOW_SOURCES else nullcontext() as staged:
+        if source in _WORKFLOW_SOURCES:
+            health = Health()
+            try:
+                for item in iter_corpus(
+                    path,
+                    source,
+                    ruleset_by_name(redaction),
+                    pipeline_steps=pipeline_steps,
+                    workflow=workflow,
+                    report=report,
+                    mapping=mapping,
+                    scratch_dir=staged.directory,
+                ):
+                    if isinstance(item, TraceCorpus):
+                        corpus = item.replace(control_markers=tuple(control_marker))
+                        staged.finish(corpus)
+                    else:
+                        collect(health, item, source, workflow=workflow is not None)
+                        staged.add(item)
+                        sample.add(item)
+                health = finish(health, corpus, hints=found.hints() or None)
+            except (ValueError, OSError) as exc:
+                _fail(
+                    f"could not read {path} as {source}", str(exc), "check the export and options"
+                )
+        else:
+            corpus = load(workflow)
+            if control_marker:
+                corpus = corpus.replace(control_markers=tuple(control_marker))
+            health = check_health(corpus, source, hints=found.hints() or None)
+            for traced in corpus.traces:
+                sample.add(traced)
+        # Only the OTLP family fills the report; other readers print no accounting.
+        reported = source in _WORKFLOW_SOURCES
+        _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
+        if reported:
+            _say(f"records:  {report.summary()}")
+            if report.shapes:
+                _say(f"shapes:   {len(report.shapes)} trace shape(s)")
+                for line in report.shape_lines():
+                    _say(f"  {line}")
+            if report.evidence_links:
+                _say(f"evidence: {report.evidence_line()}")
+            if report.traces_with_absent_parents:
+                _say(
+                    f"parents:  {report.traces_with_absent_parents} trace(s) have top-level steps "
+                    f"whose parent was not exported (max {report.max_top_steps} per trace)"
+                )
+            # Every span must land somewhere; when it does not, the corpus cannot
+            # be trusted to be complete, whatever else looks fine.
+            health.fatal.extend(
+                f"record accounting does not add up: {error}" for error in report.accounting_errors
+            )
+        hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
+        _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
+        if health.fatal:
+            for problem in health.fatal:
+                _say(f"[red]error:[/red] {problem}")
+            for warning in health.warnings:
+                _say(f"  - {warning}")
+            _say("nothing was saved")
+            raise typer.Exit(code=1)
+        if health.warnings:
+            _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
+            for warning in health.warnings:
+                _say(f"  - {warning}")
+        else:
+            _say("problems: none")
+        if workflow is not None and mapping is None:
+            _say(
+                f"to save these choices: bandits mapping propose {path} --source {source} --name NAME"
+            )
+        if dry_run:
+            _say("dry run:  nothing saved")
+            return
 
-    health = check_health(corpus, source)
-    _say(f"read:     {health.traces} traces, {health.model_calls} model calls")
-    hidden = sum(issue.kind == "redaction" for issue in corpus.issues)
-    _say(f"redaction: {corpus.redaction_ruleset} ({hidden} value(s) hidden)")
-    if health.fatal:
-        for problem in health.fatal:
-            _say(f"[red]error:[/red] {problem}")
-        for warning in health.warnings:
-            _say(f"  - {warning}")
-        _say("nothing was saved")
-        raise typer.Exit(code=1)
-    if health.warnings:
-        _say(f"[yellow]warnings ({len(health.warnings)}):[/yellow]")
-        for warning in health.warnings:
-            _say(f"  - {warning}")
+        if reported:
+            envelope = staged.commit(
+                source_path=str(path),
+                problem_count=len(health.warnings) + len(health.fatal),
+                report=report.as_dict(),
+            )
+        else:
+            envelope = store.write(
+                corpus,
+                source_path=str(path),
+                problem_count=len(health.warnings) + len(health.fatal),
+            )
+        _say(f"artifact_id: {envelope.artifact_id}")
+        fidelity = check_fidelity(store, envelope.artifact_id, sample.kept.values(), source)
+        _say(f"raw vs parsed: {fidelity_line(fidelity)}")
+        page = write_page(
+            store._dir(envelope.artifact_id),
+            envelope.model_dump(mode="json"),
+            store.read_report(envelope.artifact_id),
+            corpus,
+            sample,
+            fidelity,
+        )
+        _say(f"inspect:  {page}")
+        if health.warnings:
+            _say(f"details:  bandits show {envelope.artifact_id} --issues")
+
+
+def _say_found(what: str, flag: str, chosen: tuple[str, ...], options: list) -> None:
+    label = f"{what}:".ljust(10)
+    if chosen:
+        _say(f"{label}{', '.join(chosen)} (found; override with {flag})")
+    elif not options:
+        _say(f"{label}not found (no common field in the runs; use {flag} PATH)")
     else:
-        _say("problems: none")
-    if dry_run:
-        _say("dry run:  nothing saved")
-        return
+        # Never picked between: several fields settle every run, or none does.
+        _say(f"{label}not chosen: {' · '.join(o.describe() for o in options)}")
+        _say(f"          pass {flag} PATH to say which")
 
-    store = ArtifactStore(project / ".bandits")
-    envelope = store.write(corpus, source_path=str(path))
-    _say(f"artifact_id: {envelope.artifact_id}")
-    if health.warnings:
-        _say(f"details:  bandits show {envelope.artifact_id} --issues")
+
+mapping_app = typer.Typer(help="Save the choices an export needs, confirm them, reuse them.")
+app.add_typer(mapping_app, name="mapping")
+
+
+@mapping_app.command(name="propose")
+def mapping_propose(
+    path: Path,
+    source: str = typer.Option(..., "--source"),
+    name: str = typer.Option(..., "--name"),
+    invocation: list[str] = typer.Option(
+        [],
+        "--invocation",
+        help="KIND_LABEL|NAME of the run that is the invocation. Repeatable. Only needed "
+        "when discovery found several; the options are printed.",
+    ),
+    redaction: str = typer.Option(DEFAULT_RULESET.name, "--redaction"),
+    force: bool = typer.Option(False, "--force", help="Replace an existing mapping."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Profile an export and write an unconfirmed mapping of its choices."""
+    try:
+        target = mapping_path(project, name)
+        identities = [Identity.parse(text) for text in invocation]
+    except MappingError as exc:
+        _fail("cannot propose this mapping", str(exc), "fix the option")
+    if target.exists() and not force:
+        _fail(
+            f"mapping {name!r} already exists",
+            "propose never overwrites a mapping",
+            "pass --force to replace it (it will need confirming again)",
+        )
+    try:
+        summary = discover_requests(
+            path, source, ruleset_by_name(redaction), scratch_dir=_scratch(project)
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        _fail(f"could not read {path} as {source}", str(exc), "check --source")
+    keys = {(i.kind_label, i.name) for i in identities}
+    found = discover(restricted(summary, keys) if keys else summary)
+    offered = discover(summary).task_options
+    chosen = next((o for o in found.task_options if o.paths == found.task_fields), None)
+    if not identities and chosen is not None:
+        # Saved only when the names alone choose the run, as applying the
+        # mapping will check: names shared by several runs in one trace would
+        # make the confirmed mapping refuse what discovery resolved by field.
+        names = {(k, n) for k, n in chosen.identities}
+        single, total = identity_coverage(summary, names)
+        if single == total:
+            identities = [Identity(kind_label=k, name=n) for k, n in sorted(names)]
+        else:
+            _say(
+                f"note:     invocation left open: its name matches several runs in "
+                f"{total - single}/{total} traces; the task field chooses the run"
+            )
+    elif identities:
+        single, total = identity_coverage(summary, keys)
+        if single != total:
+            _say(
+                f"[yellow]warning:[/yellow] --invocation picks exactly one run in only "
+                f"{single}/{total} traces; applying this mapping leaves the rest ambiguous"
+            )
+    shapes: dict[str, list[str]] = {}
+    for trace in summary.traces:
+        shapes.setdefault(trace.shape_id, []).append(trace.trace_id)
+    mapping = IngestMapping(
+        source=source,
+        task_fields=found.task_fields,
+        delivered_field=found.delivered_field,
+        invocation=tuple(identities),
+        candidate_identities=tuple(
+            sorted(
+                {Identity(kind_label=k, name=n) for o in offered for k, n in o.identities},
+                key=lambda i: i.key,
+            )
+        ),
+        shapes=tuple(
+            ShapeRef(shape_id=shape, example_trace_id=ids[0], trace_count=len(ids))
+            for shape, ids in sorted(shapes.items(), key=lambda item: -len(item[1]))
+        ),
+    )
+    save_mapping(project, name, mapping, overwrite=True)
+    _say(f"proposed: {target} (not confirmed)")
+    _say_mapping(mapping)
+    if not found.task_fields:
+        _say("[yellow]unresolved:[/yellow] no single request field; choose the invocation:")
+        for option in found.task_options or offered:
+            for kind, span_name in option.identities:
+                _say(
+                    f'  --invocation "{kind}|{span_name}"  '
+                    f"({', '.join(option.paths)}; {option.covered}/{option.total})"
+                )
+    if not found.delivered_field and found.answer_options:
+        _say(
+            "[yellow]unresolved:[/yellow] no single answer field: "
+            + " · ".join(o.describe() for o in found.answer_options)
+        )
+    _say(f"next:     review it, then: bandits mapping confirm {name}")
+
+
+@mapping_app.command(name="confirm")
+def mapping_confirm(name: str, project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
+    """Confirm a mapping as it stands; ingest --mapping then applies exactly this."""
+    try:
+        mapping = confirm_mapping(load_mapping(project, name))
+        save_mapping(project, name, mapping, overwrite=True)
+    except MappingError as exc:
+        _fail(f"cannot confirm mapping {name!r}", str(exc), "edit the mapping or re-propose it")
+    _say_mapping(mapping)
+    _say(f"confirmed: {name} ({mapping.confirmed_digest[:12]})")
+
+
+@mapping_app.command(name="show")
+def mapping_show(name: str, project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
+    """Print a mapping and whether it is confirmed and unmodified."""
+    try:
+        mapping = load_mapping(project, name)
+    except MappingError as exc:
+        _fail(f"cannot read mapping {name!r}", str(exc), "check the name")
+    _say_mapping(mapping)
+    _say(
+        "status:   "
+        + (
+            "confirmed, unmodified"
+            if mapping.unmodified
+            else "changed since it was confirmed"
+            if mapping.confirmed
+            else "not confirmed"
+        )
+    )
+
+
+def _say_mapping(mapping: IngestMapping) -> None:
+    _say(f"source:   {mapping.source}")
+    _say(f"task:     {', '.join(mapping.task_fields) or 'none'}")
+    _say(f"answer:   {mapping.delivered_field or 'none'}")
+    _say(f"invocation: {', '.join(i.key for i in mapping.invocation) or 'any'}")
+    for key, kind in sorted(mapping.step_kinds.items()):
+        _say(f"step kind: {key} → {kind}")
+    _say(f"shapes:   {len(mapping.shapes)} ({sum(s.trace_count for s in mapping.shapes)} traces)")
 
 
 @app.command(name="list")
 def list_artifacts(project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) -> None:
     """List every artifact in the local store."""
     store = ArtifactStore(project / ".bandits")
-    table = Table("artifact_id", "source", "traces", "spans", "issues", "created_at")
-    for envelope in store.list():
+    envelopes = store.list()
+    table = Table(
+        "artifact_id", "source", "traces", "spans", "problems", "derivation", "created_at"
+    )
+    for envelope in envelopes:
         table.add_row(
             envelope.artifact_id[:19],
             envelope.source,
             str(envelope.trace_count),
             str(envelope.span_count),
-            str(envelope.issue_count),
+            "-" if envelope.problem_count is None else str(envelope.problem_count),
+            # Envelopes written before the field existed cannot say; newer
+            # ones leave it None only for non-workflow corpora.
+            str(envelope.derivation_version)
+            if envelope.derivation_version is not None
+            else ("?" if envelope.schema_version < 2 else "-"),
             envelope.created_at,
         )
     console.print(table)
+    versions = sorted({e.derivation_version for e in envelopes if e.derivation_version is not None})
+    if len(versions) > 1:
+        _say(
+            f"[yellow]warning:[/yellow] workflow corpora here were derived by different "
+            f"versions ({', '.join(map(str, versions))}); re-ingest the older ones before "
+            "comparing them"
+        )
 
 
 @app.command()
@@ -351,6 +675,9 @@ def show(
     artifact_id: str,
     trace: str = typer.Option(None, "--trace"),
     issues: bool = typer.Option(False, "--issues"),
+    all_redactions: bool = typer.Option(
+        False, "--all-redactions", help="With --issues, list every redacted value, not a count."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Inspect one stored artifact."""
@@ -359,8 +686,8 @@ def show(
 
     if issues:
         table = Table("kind", "location", "detail")
-        for issue in corpus.issues:
-            table.add_row(issue.kind, issue.location or "", issue.detail)
+        for row in issue_rows(corpus.issues, all_redactions=all_redactions):
+            table.add_row(*row)
         console.print(table)
         return
 
@@ -388,6 +715,131 @@ def show(
         task = (traced.task or "")[:60]
         table.add_row(traced.trace_id, task, str(len(traced.spans)))
     console.print(table)
+
+
+@app.command(name="fields")
+def fields_command(
+    artifact_id: str,
+    as_json: bool = typer.Option(False, "--json", help="Print JSON, for scripts and agents."),
+    group: str = typer.Option(
+        None, "--group", help="Only one group: trace, step, normalized, metadata, misc, bandits."
+    ),
+    prefix: str = typer.Option(None, "--prefix", help="Only paths starting with this."),
+    kind: str = typer.Option(None, "--kind", help="Only steps of one kind: model, tool, step."),
+    limit: int = typer.Option(200, "--limit", help="At most this many paths; 0 for all."),
+    offset: int = typer.Option(0, "--offset", help="Skip this many paths first."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """List every field in a corpus: path, types, how many steps hold it, examples."""
+    from bandits.fields import fields
+
+    corpus = _read_corpus(project, artifact_id)
+    rows = [
+        r
+        for r in fields(corpus, kind=kind)
+        if (group is None or r["group"] == group)
+        and (prefix is None or r["path"].startswith(prefix))
+    ]
+    total = len(rows)
+    rows = rows[offset : offset + limit if limit else None]
+    if offset + len(rows) < total:
+        err_console.print(
+            f"showing {offset + 1}-{offset + len(rows)} of {total} paths;"
+            f" --offset {offset + len(rows)} for more, or narrow with --prefix/--group/--kind"
+        )
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, default=str))
+        return
+    table = Table("path", "group", "types", "held", "examples")
+    for row in rows:
+        table.add_row(
+            row["path"],
+            row["group"],
+            ", ".join(f"{t}×{n}" for t, n in row["types"].items()),
+            f"{row['count']}/{row['of']}",
+            " | ".join(row["examples"]),
+        )
+    console.print(table)
+
+
+@app.command(name="get")
+def get_command(
+    artifact_id: str,
+    field_path: str = typer.Option(..., "--field", help="A path from `bandits fields`."),
+    trace: list[str] = typer.Option([], "--trace", help="Only these traces. Repeatable."),
+    present_only: bool = typer.Option(
+        False, "--present", help="Leave out steps that do not hold the field."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON lines, one per step."),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Read one field across traces and steps; absent is told apart from null."""
+    from bandits.fields import values
+
+    corpus = _read_corpus(project, artifact_id)
+    rows = values(corpus, field_path, trace_ids=trace, present_only=present_only)
+    if as_json:
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False, default=str))
+        return
+    table = Table("trace_id", "step", "value")
+    for row in rows:
+        value = row["value"] if row["present"] else "(absent)"
+        text = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        table.add_row(row["trace_id"], row["step"] or "(trace)", text[:200])
+    console.print(table)
+
+
+def _read_corpus(project: Path, artifact_id: str) -> TraceCorpus:
+    try:
+        return ArtifactStore(project / ".bandits").read(artifact_id)
+    except FileNotFoundError:
+        _fail(
+            f"no artifact {artifact_id!r}",
+            f"nothing under {project / '.bandits'}",
+            "check --project",
+        )
+        raise
+
+
+@app.command(name="inspect")
+def inspect_command(
+    artifact_id: str,
+    debug: bool = typer.Option(
+        False, "--debug", help="Write inspect-debug.html, with each step's raw record."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Write (or rewrite) the artifact's inspect.html: counts, shapes, step trees, notes."""
+    store = ArtifactStore(project / ".bandits")
+    try:
+        envelope = store.read_envelope(artifact_id)
+    except FileNotFoundError:
+        _fail(
+            f"no artifact {artifact_id!r}",
+            f"nothing under {project / '.bandits'}",
+            "check --project",
+        )
+    report = store.read_report(artifact_id)
+    corpus = store.read(artifact_id)
+    wanted = [s.get("example_trace_id") for s in (report or {}).get("shapes") or []]
+    sample = TraceSample(wanted=[w for w in wanted if w])
+    for traced in corpus.traces:
+        sample.add(traced)
+    fidelity = check_fidelity(store, artifact_id, sample.kept.values(), envelope.source)
+    _say(f"raw vs parsed: {fidelity_line(fidelity)}")
+    page = write_page(
+        store._dir(artifact_id),
+        envelope.model_dump(mode="json"),
+        report,
+        corpus,
+        sample,
+        fidelity,
+        debug=debug,
+    )
+    _say(f"inspect:  {page}")
 
 
 @app.command()
@@ -572,7 +1024,9 @@ def build_sft_command(
         None, "--trace", help="Trace to consider. Repeat to select several; omit for all."
     ),
     output: Path = typer.Option(..., "--output", help="Directory for the three review buckets."),
-    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Review model, as <provider>/<model>."),
+    model: str = typer.Option(
+        DEFAULT_MODEL, "--model", help="Review model, as <provider>/<model>."
+    ),
     samples: int = typer.Option(3, "--samples", min=1, help="Independent LLM reviews per trace."),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
