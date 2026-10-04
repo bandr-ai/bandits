@@ -613,7 +613,44 @@ def _messages(value: object, default_role: str | None = None) -> list[dict[str, 
     messages = [
         m for m in (_message(item) for item in value if not _tool_definition(item)) if m is not None
     ]
+    _answer_by_position(messages)
     return [*system, *messages] or None
+
+
+def _answer_by_position(messages: list[dict[str, Any]]) -> None:
+    """Give id-less tool results the ids of the calls they answer, in place.
+
+    Some exporters drop ``tool_call_id`` from a history's tool messages. The
+    chat protocol still fixes their place: an assistant message's calls are
+    answered by the tool messages right after it, one each, in call order.
+    That is read only when the block holds exactly as many tool messages as
+    the assistant made calls, none carrying an id of its own; the part says
+    ``paired_by: position``. Anything else stays unanswered text.
+    """
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        ids = [p.get("id") for p in message["parts"] if p.get("type") == "tool_call"]
+        if not ids or not all(isinstance(i, str) and i for i in ids):
+            continue
+        end = index + 1
+        while end < len(messages) and messages[end]["role"] == "tool":
+            end += 1
+        block = messages[index + 1 : end]
+        if len(block) != len(ids) or any(
+            p.get("type") == "tool_call_response" for m in block for p in m["parts"]
+        ):
+            continue
+        for result, call_id in zip(block, ids, strict=True):
+            text = "\n".join(p["content"] for p in result["parts"] if p.get("type") == "text")
+            result["parts"] = [
+                {
+                    "type": "tool_call_response",
+                    "id": call_id,
+                    "result": text,
+                    "paired_by": "position",
+                }
+            ]
 
 
 def _prompt_strings(request: dict[str, Any]) -> list[str] | None:

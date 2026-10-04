@@ -242,7 +242,15 @@ def _embedded_tool_spans(spans: tuple[Span, ...]) -> tuple[Span, ...]:
                             arguments=arguments,
                             output=_tool_result(part.get("result")),
                             call_recorded=recorded,
-                            attributes={"synthetic_time": True, "source": "gen_ai.input.messages"},
+                            attributes={
+                                "synthetic_time": True,
+                                "source": "gen_ai.input.messages",
+                                **(
+                                    {"result_paired_by": part["paired_by"]}
+                                    if part.get("paired_by")
+                                    else {}
+                                ),
+                            },
                         )
                     )
                     emitted.add(call_id)
