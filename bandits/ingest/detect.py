@@ -87,6 +87,17 @@ def _shape(record: Any) -> tuple[str, str] | None:
         )
     ):
         return "otlp-std", "OTLP resourceSpans/batches"
+    events = record.get("events")
+    # The session envelope identifies it: an empty session is still one, and a
+    # single event's payload may be null in an export (kept with an issue).
+    if (
+        isinstance(record.get("schema_version"), str)
+        and isinstance(record.get("session_id"), str)
+        and "started_at" in record
+        and isinstance(events, list)
+        and all(isinstance(e, dict) and "event_type" in e and "ts" in e for e in events[:10])
+    ):
+        return "failproofai", "FailproofAI session transcript with typed events"
     if isinstance(record.get("observations"), list) and (
         record.get("trace_id")
         or record.get("id")

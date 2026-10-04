@@ -19,6 +19,12 @@ _ROLES = ("system", "developer", "user", "assistant", "tool")
 _EXAMPLES = 3
 
 
+CATALOGUED_SOURCES = frozenset({"failproofai"})
+"""Sources whose reader knows every record type the producer documents, so a
+file read without a model call recorded none. Any other source may hold model
+calls in a convention not recognized, so zero model calls still refuses it."""
+
+
 @dataclass
 class Health:
     traces: int = 0
@@ -59,7 +65,7 @@ def _has_content(value: Any) -> bool:
     )
 
 
-PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
+PER_CALL_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix", "failproofai")
 """Readers that record each model call's own input and output. The others keep a
 conversation at the trace level, so a call without its own input is normal there."""
 
@@ -103,10 +109,22 @@ def finish(health: Health, corpus: TraceCorpus, hints: list[str] | None = None) 
 
     if not health.traces:
         health.fatal.append("no traces could be read from this file")
-    elif not health.model_calls:
+    elif not health.model_calls and (
+        corpus.source not in CATALOGUED_SOURCES
+        or other["unrepresented_span"]
+        or other["empty_trace"]
+    ):
+        # Spans were read but none is a model call: the kinds are likely unknown.
         health.fatal.append(
             "no model calls were found; the file may use span kinds Bandits does not "
             "recognize (see `unrepresented_span` issues with --dry-run)"
+        )
+    elif not health.model_calls:
+        # Nothing unread: the sessions recorded no model call. Still sessions.
+        health.warnings.append(
+            f"{health.traces} trace(s) record no model call, so they give no model-call "
+            "examples\n    why: the source recorded none; every recorded event is kept on "
+            "its trace"
         )
     elif c["input_missing"] + c["input_unread"] == health.model_calls:
         health.fatal.append(

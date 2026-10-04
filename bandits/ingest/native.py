@@ -44,6 +44,9 @@ starting with ``[`` is read as one streamed array."""
 
 _DUPLICATE = "duplicate id in this record; the first copy is kept"
 _INSIDE_SKIPPED = "inside an observation that could not be converted"
+_ON_TRACE = "kept on the trace: "
+"""Prefix of a skip reason whose record is kept whole in the trace's
+``source_record``: counted as ``kept_on_trace``, not as lost."""
 
 
 class _Unconvertible(ValueError):
@@ -381,6 +384,7 @@ USED_FIELDS = {
     "langfuse": langfuse_used,
     "langsmith": lambda record: _LANGSMITH_USED,
     "phoenix": lambda record: _PHOENIX_USED,
+    "failproofai": lambda record: failproofai_used(record),
 }
 """Per source, the fields its converter consumes for one native record."""
 
@@ -543,7 +547,486 @@ def _phoenix(record: dict[str, Any], position: Position) -> tuple[list[dict[str,
     return [span], []
 
 
-_CONVERTERS = {"langfuse": _langfuse, "langsmith": _langsmith, "phoenix": _phoenix}
+FAILPROOFAI_VERSIONS = ("1", "2")
+"""FailproofAI session transcript versions read, each to its own contract.
+
+v1 is the body of the retired ``agenteye-evaluator`` ``EvalRequest`` and what
+``GET /sessions/{id}/export`` still returns: ``session_id``, ``agent_id``,
+``environment`` and ``started_at`` required; ``ended_at`` the ``agent_end``
+time or null; ``events`` may be empty; each event an integer ``id``, ``ts``,
+``event_type`` and an object ``payload`` (absent reads as ``{}``). v2 is
+``SessionTranscript.from_wire`` in failproofai_sdk.evaluator.protocol: string
+ids, and ``assignment_id``, ``session_revision_id``, ``ended_at`` and an
+``event_count`` equal to the events' number all required."""
+
+_FAILPROOFAI_REQUIRED = {
+    "1": ("session_id", "agent_id", "environment", "started_at"),
+    "2": (
+        "assignment_id",
+        "session_id",
+        "session_revision_id",
+        "agent_id",
+        "environment",
+        "started_at",
+        "ended_at",
+    ),
+}
+
+_FAILPROOFAI_PAIRS = (
+    # (opener, closer, the documented id both carry, span kind)
+    ("agent_start", "agent_end", "agent_id", "AGENT"),
+    ("model_request", "model_response", "request_id", "LLM"),
+    ("tool_use", "tool_result", "tool_call_id", "TOOL"),
+    ("hook_triggered", "hook_completed", "hook_id", "CHAIN"),
+    ("agent_pause", "agent_resume", "pause_id", "UNKNOWN"),
+    ("human_wait", "human_input", "input_id", "UNKNOWN"),
+)
+"""FailproofAI's documented opener/closer pairs (docs/reference/custom-agents:
+"give the closing event the same id as its opener"). Agents have no id of
+their own; a start and an end are the same agent by ``agent_id``."""
+
+FAILPROOFAI_EVENT_TYPES = frozenset(
+    {t for opener, closer, _, _ in _FAILPROOFAI_PAIRS for t in (opener, closer)}
+    | {"error", "human_pause", "human_interrupt"}
+)
+"""All fifteen documented event types; the last three stand alone."""
+
+_FAILPROOFAI_FAILED = frozenset({"failed", "error", "timeout", "rejected"})
+"""``agent_end.outcome`` values FailproofAI counts as a failed run; any other
+value, including ``"failure"``, counts as success."""
+
+_FAILPROOFAI_IO: dict[str, tuple[str, tuple[str, ...]]] = {
+    "agent_start": ("input", ("goal",)),
+    "agent_end": ("output", ("outcome", "summary")),
+    "model_request": ("input", ("messages", "system", "tools")),
+    # tool_calls is not an SDK field, but a model's calls are recorded beside
+    # its content in the LangChain/OpenAI message shape; the decoder reads them.
+    "model_response": ("output", ("role", "content", "tool_calls")),
+    "tool_use": ("input", ("input",)),
+    "tool_result": ("output", ("output",)),
+    "hook_triggered": ("input", ("input",)),
+    "hook_completed": ("output", ("output",)),
+    "human_wait": ("input", ("prompt", "options")),
+    "human_input": ("output", ("response",)),
+}
+"""Per event type: which side of the span its payload fills, and the fields."""
+
+_FAILPROOFAI_ATTRIBUTES: dict[str, dict[str, str]] = {
+    "agent_start": {"parent_id": "failproofai.agent.parent_id"},
+    "model_request": {"model": "gen_ai.request.model", "request_id": "failproofai.request_id"},
+    "model_response": {
+        "model": "gen_ai.response.model",
+        "input_tokens": "gen_ai.usage.input_tokens",
+        "output_tokens": "gen_ai.usage.output_tokens",
+        "request_id": "failproofai.request_id",
+    },
+    "tool_use": {"tool_name": "gen_ai.tool.name", "tool_call_id": "gen_ai.tool.call.id"},
+    "tool_result": {"tool_name": "gen_ai.tool.name", "tool_call_id": "gen_ai.tool.call.id"},
+    "hook_triggered": {
+        "hook_name": "failproofai.hook.name",
+        "hook_id": "failproofai.hook.id",
+        "trigger_event": "failproofai.hook.trigger_event",
+    },
+    "hook_completed": {
+        "hook_name": "failproofai.hook.name",
+        "hook_id": "failproofai.hook.id",
+        "outcome": "failproofai.hook.outcome",
+    },
+    "agent_pause": {"pause_id": "failproofai.pause.id", "reason": "failproofai.pause.reason"},
+    "agent_resume": {"pause_id": "failproofai.pause.id", "reason": "failproofai.resume.reason"},
+    "human_wait": {"input_id": "failproofai.human.input_id", "reason": "failproofai.human.reason"},
+    "human_input": {"input_id": "failproofai.human.input_id"},
+}
+"""Per event type: payload fields kept as span attributes, under these names.
+A closer's value lands only where its opener left the name unset."""
+
+_FAILPROOFAI_EVENT_KEYS = frozenset({"id", "ts", "event_type", "payload"})
+
+
+def failproofai_used(event: dict[str, Any]) -> Used:
+    """The fields of one transcript event the converter consumes: its envelope
+    and the payload fields it maps. The rest of the payload (the producer's
+    own fields, ``agent_id``, ``environment``) stays in ``bandits.unmapped``."""
+    event_type = event.get("event_type")
+    side = _FAILPROOFAI_IO.get(event_type, ("", ()))[1]
+    names = _FAILPROOFAI_ATTRIBUTES.get(event_type, {})
+    consumed = {"type", *side, *names}
+    if event_type in ("tool_result", "hook_completed"):
+        consumed.add("error")
+    if event_type == "model_response":
+        consumed.add("stop_reason")  # gen_ai.response.finish_reasons
+    return {k: None for k in _FAILPROOFAI_EVENT_KEYS - {"payload"}} | {
+        "payload": frozenset(consumed)
+    }
+
+
+def failproofai_declared(event: dict[str, Any], key: str) -> tuple[bool, Any] | None:
+    """What *event* (a span's opener, which its pointer names) declared under
+    I/O attribute *key*, built as the converter builds it: ``(True, value)``,
+    ``(False, None)`` when it declared none, or None when the value comes from
+    the closer, a record the pointer does not name."""
+    side, fields = _FAILPROOFAI_IO.get(event.get("event_type"), ("", ()))
+    if key != f"{side}.value":
+        return None
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    values = {f: payload[f] for f in fields if f in payload}
+    if not values:
+        return False, None
+    return True, values[fields[0]] if len(fields) == 1 else values
+
+
+RAW_DECLARED = {"failproofai": failproofai_declared}
+"""Per source whose I/O sits below the record's top level: what a raw record
+declared under an I/O attribute (see :func:`failproofai_declared`)."""
+
+
+def _failproofai_key(value: object) -> str | None:
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    return str(value) if isinstance(value, (str, int)) else None
+
+
+def _failproofai_pairs(
+    events: list[dict[str, Any]],
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any], str]], dict[int, str]]:
+    """Opener/closer pairs with the basis each was matched on, and the reason
+    every other pair event (by list position) was left unpaired.
+
+    The documented id comes first. Only events that carry none may pair on
+    ``correlation_id``, a field FailproofAI does not define but producers
+    write on both halves; that basis is named ``source_extension:…``. Either
+    way a pair needs exactly one opener and one closer sharing the value, with
+    the same ``tool_name``/``hook_name`` where both record one, and the closer
+    not before the opener. Arrival order is never a pairing: FailproofAI's own
+    fallback, and wrong whenever two calls overlap.
+    """
+    pairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    unpaired: dict[int, str] = {}
+    position = {id(e): i for i, e in enumerate(events)}
+    for opener, closer, key, _ in _FAILPROOFAI_PAIRS:
+        halves = [e for e in events if e["event_type"] in (opener, closer)]
+        for basis in (key, "correlation_id"):
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for event in halves:
+                if position[id(event)] in unpaired:
+                    continue
+                if basis != key and _failproofai_key(event["payload"].get(key)) is not None:
+                    continue  # carries the documented id, so is matched on it alone
+                value = _failproofai_key(event["payload"].get(basis))
+                if value is not None:
+                    groups.setdefault(value, []).append(event)
+            for value, group in groups.items():
+                openers = [e for e in group if e["event_type"] == opener]
+                closers = [e for e in group if e["event_type"] == closer]
+                reason = None
+                if len(openers) != 1 or len(closers) != 1:
+                    reason = (
+                        f"{len(openers)} {opener} and {len(closers)} {closer} share "
+                        f"{basis} {value!r}"
+                    )
+                else:
+                    first, last = openers[0]["payload"], closers[0]["payload"]
+                    started, ended = _ns(openers[0]["ts"]), _ns(closers[0]["ts"])
+                    name = next(
+                        (n for n in ("tool_name", "hook_name") if first.get(n) and last.get(n)),
+                        None,
+                    )
+                    if name and first[name] != last[name]:
+                        reason = f"{basis} {value!r} joins different {name}s"
+                    elif started is not None and ended is not None and ended < started:
+                        reason = f"{closer} with {basis} {value!r} is before its {opener}"
+                if reason is not None:
+                    for event in group:
+                        unpaired[position[id(event)]] = reason
+                    continue
+                label = basis if basis == key else f"source_extension:{basis}"
+                pairs.append((openers[0], closers[0], label))
+                for event in group:
+                    unpaired[position[id(event)]] = ""
+        for event in halves:
+            reason = unpaired.get(position[id(event)])
+            if reason is None:
+                unpaired[position[id(event)]] = (
+                    f"no {opener if event['event_type'] == closer else closer} "
+                    f"shares an id with it"
+                )
+    return pairs, {i: r for i, r in unpaired.items() if r}
+
+
+def _failproofai_envelope(record: dict[str, Any]) -> tuple[str, list[Any]]:
+    """The transcript's version and events, or ValueError naming the first
+    field its version's contract requires and the record lacks."""
+    version = record.get("schema_version")
+    if version not in FAILPROOFAI_VERSIONS:
+        raise ValueError(f"FailproofAI transcript schema_version {version!r} is not one of 1, 2")
+    for name in _FAILPROOFAI_REQUIRED[version]:
+        if not isinstance(record.get(name), str):
+            raise ValueError(f"FailproofAI v{version} transcript requires {name} as a string")
+    if _ns(record["started_at"]) is None:
+        raise ValueError(
+            f"FailproofAI transcript started_at {record['started_at']!r} is not a time"
+        )
+    ended = record.get("ended_at")
+    if version == "1" and ended is not None and _ns(ended) is None:
+        raise ValueError(f"FailproofAI v1 ended_at {ended!r} is neither a time nor null")
+    events = record.get("events", [] if version == "1" else None)
+    if not isinstance(events, list):
+        raise ValueError(f"FailproofAI v{version} transcript requires events[]")
+    if version == "2":
+        count = record.get("event_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("FailproofAI v2 transcript requires event_count as an integer")
+        if count != len(events):
+            raise ValueError(
+                f"event_count is {count!r} but the transcript has {len(events)} events"
+            )
+    return version, events
+
+
+def _failproofai_event(event: object, version: str) -> tuple[dict[str, Any] | None, str]:
+    """*event* as its version's contract reads it, or None and why not.
+
+    A v1 event's id is an integer (pydantic also takes its digits as a
+    string) and an absent payload reads as ``{}``; a v2 event's id is a
+    string and its payload is required. A null payload is invalid in both.
+    """
+    if not isinstance(event, dict):
+        return None, "not an event object"
+    event_id = event.get("id")
+    if version == "1":
+        valid_id = (isinstance(event_id, int) and not isinstance(event_id, bool)) or (
+            isinstance(event_id, str) and event_id.strip().lstrip("+-").isdigit()
+        )
+    else:
+        valid_id = isinstance(event_id, str)
+    problems = [] if valid_id else [f"id must be {'an integer' if version == '1' else 'a string'}"]
+    if not isinstance(event.get("ts"), str) or _ns(event["ts"]) is None:
+        problems.append("ts must be a time")
+    if not isinstance(event.get("event_type"), str):
+        problems.append("event_type must be a string")
+    payload = event.get("payload", {} if version == "1" else None)
+    if not isinstance(payload, dict):
+        problems.append("payload must be an object" + (" (it is null)" if payload is None else ""))
+    if problems:
+        return None, f"invalid v{version} event: " + "; ".join(problems)
+    return (event if "payload" in event else {**event, "payload": payload}), ""
+
+
+def _failproofai(
+    record: dict[str, Any], position: Position
+) -> tuple[list[dict[str, Any]], Skipped]:
+    spans, skipped, _ = _failproofai_session(record, position)
+    return spans, skipped
+
+
+def _failproofai_session(
+    record: dict[str, Any], position: Position
+) -> tuple[list[dict[str, Any]], Skipped, dict[str, Any] | None]:
+    """One FailproofAI session transcript: a session span, and a span per
+    proven opener/closer pair beneath it (beneath its agent's span when that
+    agent's start and end were paired).
+
+    Every event that does not become a span is kept whole in the trace
+    record under ``unpaired_events``, with the reason, and counted as
+    ``kept_on_trace``: invalid events (the version's contract names the
+    problem), unpaired or ambiguous halves, the standalone
+    ``error``/``human_pause``/``human_interrupt`` (FailproofAI names no span
+    they belong to), unknown types, and paired pauses and human waits, which
+    have no span kind of their own (``human_input`` is kept as recorded; its
+    authorship is FailproofAI's to state, not inferred here).
+
+    A session with no model or tool call, and no step under a session span,
+    is still a session: no spans are made, and the third value is the trace
+    (its id and record) for the caller to keep without any. A null
+    ``ended_at`` stays null: there is then no session span, never an
+    invented end.
+    """
+    version, events = _failproofai_envelope(record)
+    session_id = record["session_id"]
+    skipped: Skipped = []
+    readable: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []  # events preserved on the trace, not as spans
+    seen: set[str] = set()
+    for event in events:
+        read, problem = _failproofai_event(event, version)
+        if read is None:
+            kept.append({"reason": problem, "event": event})
+            continue
+        native_id = str(read["id"])
+        if native_id in seen:
+            kept.append({"reason": "duplicate event id; the first is used", "event": event})
+            continue
+        seen.add(native_id)
+        readable.append(read)
+    pairs, reasons = _failproofai_pairs(readable)
+    paired = {id(e) for opener, closer, _ in pairs for e in (opener, closer)}
+    for index, event in enumerate(readable):
+        if id(event) in paired:
+            continue
+        event_type = event["event_type"]
+        reason = reasons.get(index) or (
+            "standalone event; FailproofAI records no span it belongs to"
+            if event_type in FAILPROOFAI_EVENT_TYPES
+            else f"event type {event_type!r} is not in FailproofAI's documented catalog"
+        )
+        kept.append({"reason": reason, "event": event})
+
+    session_span: str | None = (
+        f"session:{session_id}" if _ns(record.get("ended_at")) is not None else None
+    )
+    agents = {
+        opener["payload"].get("agent_id"): opener
+        for opener, _, _ in pairs
+        if opener["event_type"] == "agent_start"
+    }
+    spans: list[dict[str, Any]] = []
+    made: list[tuple[dict[str, Any], dict[str, Any], str]] = []  # the pairs that became spans
+    for opener, closer, basis in pairs:
+        kind = next(k for o, _, _, k in _FAILPROOFAI_PAIRS if o == opener["event_type"])
+        if kind == "UNKNOWN":
+            for event, other in ((opener, closer), (closer, opener)):
+                kept.append(
+                    {
+                        "reason": f"paired by {basis} with event {other['id']}; no span kind "
+                        f"represents {opener['event_type']}/{closer['event_type']}",
+                        "event": event,
+                    }
+                )
+            continue
+        attributes: dict[str, Any] = {
+            "openinference.span.kind": kind,
+            "failproofai.pairing": basis,
+            "failproofai.closer_event_id": closer["id"],
+            "bandits.source.record": {**position, "observation_id": str(opener["id"])},
+        }
+        for event in (opener, closer):
+            payload = event["payload"]
+            side, fields = _FAILPROOFAI_IO.get(event["event_type"], ("", ()))
+            values = {f: payload[f] for f in fields if f in payload}
+            if values:
+                attributes[f"{side}.value"] = values[fields[0]] if len(fields) == 1 else values
+            for field, name in _FAILPROOFAI_ATTRIBUTES.get(event["event_type"], {}).items():
+                attributes.setdefault(name, payload.get(field))
+        if closer["event_type"] == "model_response" and closer["payload"].get("stop_reason"):
+            attributes["gen_ai.response.finish_reasons"] = [closer["payload"]["stop_reason"]]
+        _carry(attributes, opener, failproofai_used(opener))
+        closer_rest = unmapped_fields(closer, failproofai_used(closer))
+        if closer_rest:
+            attributes["failproofai.closer_unmapped"] = closer_rest
+        error = (
+            closer["payload"].get("error")
+            if closer["event_type"] in ("tool_result", "hook_completed")
+            else None
+        )
+        outcome = closer["payload"].get("outcome") if closer["event_type"] == "agent_end" else None
+        extra = (
+            {"status": {"code": 2, "message": str(error or outcome)}}
+            if error or (isinstance(outcome, str) and outcome in _FAILPROOFAI_FAILED)
+            else None
+        )
+        agent_id = opener["payload"].get("agent_id")
+        # A pair may open under one agent and close under another (documented);
+        # both ids stay on the span, and neither is taken as its owner.
+        crossed = opener["event_type"] != "agent_start" and agent_id != closer["payload"].get(
+            "agent_id"
+        )
+        owner = (
+            None
+            if crossed
+            else agents.get(
+                opener["payload"].get("parent_id")
+                if opener["event_type"] == "agent_start"
+                else agent_id
+            )
+        )
+        parent = (
+            f"agent_start:{owner['id']}" if owner is not None and owner is not opener else session_span
+        )
+        name = (
+            attributes.get("gen_ai.request.model")
+            or attributes.get("gen_ai.tool.name")
+            or attributes.get("failproofai.hook.name")
+            or (agent_id if kind == "AGENT" else None)
+            or opener["event_type"]
+        )
+        try:
+            spans.append(
+                _span(
+                    session_id,
+                    f"{opener['event_type']}:{opener['id']}",
+                    parent,
+                    name,
+                    opener["ts"],
+                    closer["ts"],
+                    attributes,
+                    namespace="failproofai",
+                    extra=extra,
+                )
+            )
+            made.append((opener, closer, basis))
+        except _Unconvertible as exc:
+            kept.extend({"reason": str(exc), "event": event} for event in (opener, closer))
+    calls = any(
+        a["key"] == "openinference.span.kind" and a["value"].get("stringValue") in ("LLM", "TOOL")
+        for span in spans
+        for a in span["attributes"]
+    )
+    session: dict[str, Any] | None = None
+    if not calls and not (session_span is not None and spans):
+        # Nothing the trace reader keeps as a step: the session is kept as a
+        # trace without spans, and the events these spans held stay on it.
+        for opener, closer, basis in made:
+            for event, other in ((opener, closer), (closer, opener)):
+                kept.append(
+                    {
+                        "reason": f"paired by {basis} with event {other['id']}; the session has "
+                        "no model or tool call, and no session span to hold it as a step",
+                        "event": event,
+                    }
+                )
+        spans, session_span = [], None
+    trace_record = {k: v for k, v in record.items() if k != "events"}
+    if kept:
+        trace_record["unpaired_events"] = kept
+    if not spans:
+        session = {"trace_id": _hex_id(session_id, 32, "failproofai:trace"), "record": trace_record}
+    elif session_span is not None:
+        spans.insert(
+            0,
+            _span(
+                session_id,
+                session_span,
+                None,
+                f"session {record.get('agent_id') or session_id}",
+                record["started_at"],
+                record["ended_at"],
+                {
+                    "openinference.span.kind": "CHAIN",
+                    "failproofai.agent_id": record.get("agent_id"),
+                    "failproofai.environment": record.get("environment"),
+                    TRACE_RECORD: trace_record,
+                },
+                namespace="failproofai",
+            ),
+        )
+    else:
+        # No session span to carry the record: every top span carries it.
+        for span in spans:
+            if "parentSpanId" not in span:
+                span["attributes"].append({"key": TRACE_RECORD, "value": _av(trace_record)})
+    for entry in kept:
+        event = entry["event"]
+        native_id = event.get("id") if isinstance(event, dict) else None
+        skipped.append((_ON_TRACE + entry["reason"], None if native_id is None else str(native_id)))
+    return spans, skipped, session
+
+
+_CONVERTERS = {
+    "langfuse": _langfuse,
+    "langsmith": _langsmith,
+    "phoenix": _phoenix,
+    "failproofai": _failproofai,
+}
 
 
 def _langsmith_runs(record: dict[str, Any], skipped: Skipped) -> Iterator[dict[str, Any]]:
@@ -626,6 +1109,11 @@ class NativeConversion:
         self.observations = 0
         # Native origin of each line in the current converted chunk.
         self.origins: list[str] = []
+        # Records kept whole on each trace's source_record, by OTLP trace id;
+        # see :meth:`drop_kept`.
+        self.kept_by_trace: dict[str, int] = {}
+        # Sessions kept as traces without spans (FailproofAI): id and record.
+        self.sessions: list[dict[str, Any]] = []
 
     def _source_records(self) -> Iterator[tuple[Position, dict[str, Any]]]:
         path, ruleset = self.path, self.ruleset
@@ -681,10 +1169,21 @@ class NativeConversion:
     def _skip(self, skipped: Skipped, position: Position) -> None:
         self.observations += len(skipped)
         for reason, observation_id in skipped:
-            bucket = "duplicate_native" if reason == _DUPLICATE else "unconvertible"
+            kept = reason.startswith(_ON_TRACE)
+            reason = reason.removeprefix(_ON_TRACE)
+            bucket = (
+                "kept_on_trace"
+                if kept
+                else "duplicate_native"
+                if reason == _DUPLICATE
+                else "unconvertible"
+            )
             self.report.buckets[bucket] += 1
-            if len(self.report.unconvertible_examples) < EXAMPLES:
-                self.report.unconvertible_examples.append(
+            examples = (
+                self.report.kept_on_trace_examples if kept else self.report.unconvertible_examples
+            )
+            if len(examples) < EXAMPLES:
+                examples.append(
                     f"{_where(self.path, position)} observation {observation_id or '?'}: {reason}"
                 )
 
@@ -724,7 +1223,12 @@ class NativeConversion:
                         try:
                             if not isinstance(record, dict):
                                 raise ValueError("expected an object")
-                            spans, dropped = _CONVERTERS[source_name](record, position)
+                            if source_name == "failproofai":
+                                spans, dropped, session = _failproofai_session(record, position)
+                                if session is not None:
+                                    self.sessions.append(session)
+                            else:
+                                spans, dropped = _CONVERTERS[source_name](record, position)
                         except (TypeError, ValueError) as exc:
                             self.issues.append(
                                 TraceIssue(
@@ -737,6 +1241,10 @@ class NativeConversion:
                             continue
                         self.observations += len(spans)
                         self._skip(dropped, position)
+                        on_trace = sum(reason.startswith(_ON_TRACE) for reason, _ in dropped)
+                        if on_trace and spans:
+                            trace = spans[0]["traceId"]
+                            self.kept_by_trace[trace] = self.kept_by_trace.get(trace, 0) + on_trace
                         for span in spans:
                             self.origins.append(_origin(self.path, span))
                             output.write(
@@ -770,12 +1278,29 @@ class NativeConversion:
             return issue.replace(location=self.origins[int(line) - 1])
         return issue.replace(location=str(self.path))
 
+    def drop_kept(self, kept_traces: set[str]) -> None:
+        """Recount records kept on a trace the decoder then dropped (it had no
+        model call, tool call or pipeline step) as unconvertible: the trace's
+        source_record went with it."""
+        for trace, count in self.kept_by_trace.items():
+            if trace in kept_traces:
+                continue
+            self.report.buckets["kept_on_trace"] -= count
+            self.report.buckets["unconvertible"] += count
+            if len(self.report.unconvertible_examples) < EXAMPLES:
+                self.report.unconvertible_examples.append(
+                    f"{self.path} trace {trace}: {count} record(s) kept on it were dropped with "
+                    "it; the trace has no model call, tool call or pipeline step"
+                )
+
     def finish(self, decoded: IngestReport) -> IngestReport:
         """Converter counts plus the decoded chunks' (*decoded*), checked to add up."""
         total = IngestReport()
         total.merge(self.report)
         total.merge(decoded)
-        lost = self.report.buckets["unconvertible"] + self.report.buckets["duplicate_native"]
+        lost = sum(
+            self.report.buckets[b] for b in ("unconvertible", "duplicate_native", "kept_on_trace")
+        )
         if self.observations != lost + decoded.spans_seen:
             total.accounting_errors.append(
                 f"{self.path}: {self.observations} observation(s) seen but {lost} skipped and "
@@ -874,6 +1399,19 @@ def iter_native(
             del chunk, items
     if conversion.source_hash.hexdigest() != digest:
         raise ValueError(f"source file changed during ingest: {path}")
+    for session in conversion.sessions:
+        if session["trace_id"] in seen_ids:
+            decoded.split_trace_ids += 1
+        seen_ids.add(session["trace_id"])
+        yield Trace(
+            trace_id=session["trace_id"],
+            source=source_name,
+            source_digest=digest,
+            interaction="workflow" if workflow is not None else "conversation",
+            source_record=session["record"],
+            spans=(),
+        )
+    conversion.drop_kept(seen_ids)
     internal = conversion.finish(decoded)
     deferred = aggregate_issues(
         internal,

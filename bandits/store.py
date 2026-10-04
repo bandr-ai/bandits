@@ -99,6 +99,8 @@ _NESTED = (
     *_WRAPPERS,
     "children",
     "child_runs",
+    # FailproofAI: a session transcript → its events
+    "events",
     # OTLP: request → resourceSpans → scopeSpans → spans
     "resourceSpans",
     "batches",

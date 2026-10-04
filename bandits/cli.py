@@ -144,7 +144,7 @@ def _say(*objects: object) -> None:
     console.print(*objects, soft_wrap=True)
 
 
-_WORKFLOW_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix")
+_WORKFLOW_SOURCES = ("otlp-std", "langfuse", "langsmith", "phoenix", "failproofai")
 """Sources that can be read as a workflow; the default for them is workflow mode."""
 
 

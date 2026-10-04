@@ -1,0 +1,437 @@
+{
+ "schema_version": "1",
+ "session_id": "session-demo-1",
+ "agent_id": "planner",
+ "environment": "test",
+ "started_at": "2026-05-10T12:00:00.000000Z",
+ "ended_at": "2026-05-10T12:00:25.000000Z",
+ "events": [
+  {
+   "id": 101,
+   "ts": "2026-05-10T12:00:00.000000Z",
+   "event_type": "agent_start",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:00.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "agent_start",
+    "environment": "test",
+    "goal": "Summarize the open tickets",
+    "fw_tenant": "demo"
+   }
+  },
+  {
+   "id": 102,
+   "ts": "2026-05-10T12:00:01.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:01.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "model_request",
+    "environment": "test",
+    "model": "model-a",
+    "request_id": "r1",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You triage tickets."
+     },
+     {
+      "role": "human",
+      "content": "List the open tickets."
+     }
+    ],
+    "tools": [
+     {
+      "name": "search_tickets"
+     }
+    ]
+   }
+  },
+  {
+   "id": 103,
+   "ts": "2026-05-10T12:00:02.000000Z",
+   "event_type": "model_response",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:02.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "model_response",
+    "environment": "test",
+    "model": "model-a",
+    "request_id": "r1",
+    "role": "ai",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call-1",
+      "name": "search_tickets",
+      "args": {
+       "status": "open"
+      }
+     }
+    ],
+    "input_tokens": 40,
+    "output_tokens": 12,
+    "stop_reason": "tool_calls",
+    "fw_cost": 0.01
+   }
+  },
+  {
+   "id": 104,
+   "ts": "2026-05-10T12:00:03.000000Z",
+   "event_type": "tool_use",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:03.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "tool_use",
+    "environment": "test",
+    "tool_name": "search_tickets",
+    "tool_call_id": "call-1",
+    "input": {
+     "status": "open"
+    }
+   }
+  },
+  {
+   "id": 105,
+   "ts": "2026-05-10T12:00:04.000000Z",
+   "event_type": "tool_result",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:04.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "tool_result",
+    "environment": "test",
+    "tool_name": "search_tickets",
+    "tool_call_id": "call-1",
+    "output": {
+     "tickets": [
+      1,
+      2
+     ]
+    }
+   }
+  },
+  {
+   "id": 106,
+   "ts": "2026-05-10T12:00:05.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:05.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_request",
+    "environment": "test",
+    "model": "model-b",
+    "correlation_id": "c-A",
+    "messages": [
+     {
+      "role": "human",
+      "content": "Summarize ticket 1."
+     }
+    ]
+   }
+  },
+  {
+   "id": 107,
+   "ts": "2026-05-10T12:00:06.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:06.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_request",
+    "environment": "test",
+    "model": "model-b",
+    "correlation_id": "c-B",
+    "messages": [
+     {
+      "role": "human",
+      "content": "Summarize ticket 2."
+     }
+    ]
+   }
+  },
+  {
+   "id": 108,
+   "ts": "2026-05-10T12:00:07.000000Z",
+   "event_type": "model_response",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:07.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_response",
+    "environment": "test",
+    "model": "model-b",
+    "correlation_id": "c-B",
+    "role": "ai",
+    "content": "Ticket 2: login bug."
+   }
+  },
+  {
+   "id": 109,
+   "ts": "2026-05-10T12:00:08.000000Z",
+   "event_type": "model_response",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:08.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_response",
+    "environment": "test",
+    "model": "model-b",
+    "correlation_id": "c-A",
+    "role": "ai",
+    "content": "Ticket 1: billing question."
+   }
+  },
+  {
+   "id": 110,
+   "ts": "2026-05-10T12:00:09.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:09.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_request",
+    "environment": "test",
+    "correlation_id": "c-dup",
+    "messages": [
+     {
+      "role": "human",
+      "content": "x"
+     }
+    ]
+   }
+  },
+  {
+   "id": 111,
+   "ts": "2026-05-10T12:00:10.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:10.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_request",
+    "environment": "test",
+    "correlation_id": "c-dup",
+    "messages": [
+     {
+      "role": "human",
+      "content": "y"
+     }
+    ]
+   }
+  },
+  {
+   "id": 112,
+   "ts": "2026-05-10T12:00:11.000000Z",
+   "event_type": "model_response",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:11.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "worker",
+    "type": "model_response",
+    "environment": "test",
+    "correlation_id": "c-dup",
+    "content": "z"
+   }
+  },
+  {
+   "id": 113,
+   "ts": "2026-05-10T12:00:12.000000Z",
+   "event_type": "model_request",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:12.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "model_request",
+    "environment": "test",
+    "request_id": "r2",
+    "messages": [
+     {
+      "role": "tool",
+      "content": "orphan result"
+     }
+    ]
+   }
+  },
+  {
+   "id": 114,
+   "ts": "2026-05-10T12:00:13.000000Z",
+   "event_type": "model_response",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:13.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "model_response",
+    "environment": "test",
+    "request_id": "r2",
+    "content": "done"
+   }
+  },
+  {
+   "id": 115,
+   "ts": "2026-05-10T12:00:14.000000Z",
+   "event_type": "hook_triggered",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:14.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "hook_triggered",
+    "environment": "test",
+    "hook_name": "pii_check",
+    "hook_id": "h1",
+    "trigger_event": "tool_use",
+    "input": {
+     "text": "hi"
+    }
+   }
+  },
+  {
+   "id": 116,
+   "ts": "2026-05-10T12:00:15.000000Z",
+   "event_type": "hook_completed",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:15.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "hook_completed",
+    "environment": "test",
+    "hook_name": "pii_check",
+    "hook_id": "h1",
+    "outcome": "allow"
+   }
+  },
+  {
+   "id": 117,
+   "ts": "2026-05-10T12:00:16.000000Z",
+   "event_type": "human_wait",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:16.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "human_wait",
+    "environment": "test",
+    "input_id": "i1",
+    "prompt": "Approve the summary?",
+    "options": [
+     "yes",
+     "no"
+    ]
+   }
+  },
+  {
+   "id": 118,
+   "ts": "2026-05-10T12:00:17.000000Z",
+   "event_type": "human_input",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:17.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "human_input",
+    "environment": "test",
+    "input_id": "i1",
+    "response": "yes"
+   }
+  },
+  {
+   "id": 119,
+   "ts": "2026-05-10T12:00:18.000000Z",
+   "event_type": "agent_pause",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:18.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "agent_pause",
+    "environment": "test",
+    "pause_id": "p1",
+    "reason": "rate limit"
+   }
+  },
+  {
+   "id": 120,
+   "ts": "2026-05-10T12:00:19.000000Z",
+   "event_type": "agent_resume",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:19.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "agent_resume",
+    "environment": "test",
+    "pause_id": "p1"
+   }
+  },
+  {
+   "id": 121,
+   "ts": "2026-05-10T12:00:20.000000Z",
+   "event_type": "error",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:20.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "error",
+    "environment": "test",
+    "error_type": "Timeout",
+    "message": "search slow"
+   }
+  },
+  {
+   "id": 122,
+   "ts": "2026-05-10T12:00:21.000000Z",
+   "event_type": "human_interrupt",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:21.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "human_interrupt",
+    "environment": "test",
+    "reason": "user stopped"
+   }
+  },
+  {
+   "id": 123,
+   "ts": "2026-05-10T12:00:22.000000Z",
+   "event_type": "tool_result",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:22.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "tool_result",
+    "environment": "test",
+    "tool_name": "search_tickets",
+    "tool_call_id": "call-unknown",
+    "output": "late"
+   }
+  },
+  {
+   "id": 124,
+   "ts": "2026-05-10T12:00:23.000000Z",
+   "event_type": "custom_metric",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:23.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "custom_metric",
+    "environment": "test",
+    "value": 3
+   }
+  },
+  {
+   "id": 125,
+   "ts": "2026-05-10T12:00:24.000000Z",
+   "event_type": "agent_end",
+   "payload": {
+    "timestamp": "2026-05-10T12:00:24.000000Z",
+    "session_id": "session-demo-1",
+    "agent_id": "planner",
+    "type": "agent_end",
+    "environment": "test",
+    "outcome": "success",
+    "summary": "Two tickets summarized."
+   }
+  }
+ ]
+}
