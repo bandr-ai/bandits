@@ -30,7 +30,10 @@ the call. One row, one id, always.
 
 from __future__ import annotations
 
+import contextvars
+import fcntl
 import functools
+import hashlib
 import json
 import os
 import sys
@@ -48,13 +51,42 @@ _ENV_PATH = "BANDITS_LEDGER"
 
 _local = threading.local()
 
+_context_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "bandits_ledger_context", default=None
+)
+"""Stage/call context. A context variable rather than thread-local state, so a
+worker started with ``contextvars.copy_context()`` — DSPy's batched subcalls —
+records under the chunk and iteration that issued it instead of under nothing."""
+
+_failure_lock = threading.Lock()
+_failure: list[LedgerWriteError] = []
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def _context() -> dict[str, Any]:
-    return getattr(_local, "context", {})
+    return _context_var.get() or {}
+
+
+def raise_if_failed() -> None:
+    """Re-raise a required write that failed anywhere in this run.
+
+    A write failure inside a sandbox tool or a worker thread is caught by the
+    code that called it — DSPy turns a tool exception into REPL output — so the
+    failure is remembered here and raised at the next boundary that cannot
+    swallow it: the next model call, REPL step or invocation end. Cleared when
+    a recorded command starts and when it ends.
+    """
+    with _failure_lock:
+        if _failure:
+            raise LedgerWriteError(str(_failure[0]))
+
+
+def clear_failure() -> None:
+    with _failure_lock:
+        _failure.clear()
 
 
 _ENV_STRICT = "BANDITS_LEDGER_STRICT"
@@ -88,11 +120,11 @@ def stage(name: str, **fields: Any) -> Iterator[None]:
         "stage_id": uuid.uuid4().hex[:16],
         "parent_stage_id": previous.get("stage_id"),
     }
-    _local.context = merged
+    token = _context_var.set(merged)
     try:
         yield
     finally:
-        _local.context = previous
+        _context_var.reset(token)
 
 
 def enabled() -> bool:
@@ -114,16 +146,27 @@ def project_recording(function):
         _local.ledger_path = os.environ.get(_ENV_PATH) or str(project / ".bandits" / "ledger.jsonl")
         _local.ledger_required = True
         old_path, old_strict = os.environ.get(_ENV_PATH), os.environ.get(_ENV_STRICT)
+        old_fsync = os.environ.get(_ENV_FSYNC)
         # Sub-LM batches use worker threads; the destination must reach them too.
         os.environ[_ENV_PATH] = _local.ledger_path
         os.environ[_ENV_STRICT] = "1"
+        # A recorded command's rows are made durable one by one, unless the
+        # caller set a policy of their own.
+        os.environ.setdefault(_ENV_FSYNC, "1")
+        clear_failure()
         try:
             record({"event_type": "recording_started", "command": function.__name__})
             return function(*args, **kwargs)
         finally:
+            # A failure belongs to the run that hit it, never to the next one.
+            clear_failure()
             _local.ledger_path = previous
             _local.ledger_required = required
-            for key, value in ((_ENV_PATH, old_path), (_ENV_STRICT, old_strict)):
+            for key, value in (
+                (_ENV_PATH, old_path),
+                (_ENV_STRICT, old_strict),
+                (_ENV_FSYNC, old_fsync),
+            ):
                 if value is None:
                     os.environ.pop(key, None)
                 else:
@@ -138,6 +181,113 @@ def strict() -> bool:
     ) and enabled()
 
 
+LEDGER_SCHEMA = "bandits-ledger/2"
+"""2: large strings stored once as content-addressed blobs; rows carry ``pid``/``seq``."""
+
+_ENV_BLOB_MIN = "BANDITS_LEDGER_BLOB_MIN"
+"""Strings at least this many characters long are stored as blobs (default 8192;
+0 keeps every value inline)."""
+
+_ENV_FSYNC = "BANDITS_LEDGER_FSYNC"
+"""Set to fsync the ledger after every row. Blobs are always fsynced before the
+row that references them, so a reference never points at a file that a crash
+could lose while the row survived."""
+
+_DEFAULT_BLOB_MIN = 8192
+_write_lock = threading.Lock()
+_seq_lock = threading.Lock()
+_seq = [0]
+
+
+class LedgerCorrupt(ValueError):
+    """A ledger row or blob reference could not be read back as written."""
+
+
+def _blob_min() -> int:
+    raw = os.environ.get(_ENV_BLOB_MIN)
+    try:
+        return _DEFAULT_BLOB_MIN if raw is None else max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_BLOB_MIN
+
+
+def blob_dir(ledger_path: str | Path) -> Path:
+    """Where a ledger's blobs live: beside it, named after it."""
+    path = Path(ledger_path)
+    return path.with_name(path.name + ".blobs")
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platforms without directory fds
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _ensure_dir(directory: Path) -> None:
+    """Create ``directory`` and any missing parents, each durably.
+
+    A new directory exists after power loss only once its own parent's entry
+    has been synced, so every directory created here has its parent fsynced.
+    """
+    missing = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for created in reversed(missing):
+        created.mkdir(exist_ok=True)
+        _fsync_dir(created.parent)
+
+
+_BLOB_ENCODING = ("utf-8", "surrogatepass")
+"""Lone surrogates (malformed text a source or model can produce) are stored
+byte-exact rather than failing the write; reading reverses the same encoding."""
+
+
+def _store_blob(directory: Path, text: str) -> str:
+    """Write ``text`` once under its sha256, durably, and return the digest."""
+    data = text.encode(*_BLOB_ENCODING)
+    digest = hashlib.sha256(data).hexdigest()
+    target = directory / digest
+    if target.exists():
+        return digest
+    _ensure_dir(directory)
+    tmp = directory / f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with tmp.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+    _fsync_dir(directory)
+    return digest
+
+
+def _externalize(value: Any, directory: Path, minimum: int) -> Any:
+    """Replace long strings, at any depth, with verified blob references."""
+    if minimum <= 0:
+        return value
+    if isinstance(value, str):
+        if len(value) < minimum:
+            return value
+        return {"$blob": f"sha256:{_store_blob(directory, value)}", "length": len(value)}
+    if isinstance(value, dict):
+        return {key: _externalize(item, directory, minimum) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_externalize(item, directory, minimum) for item in value]
+    return value
+
+
+def _next_seq() -> int:
+    with _seq_lock:
+        _seq[0] += 1
+        return _seq[0]
+
+
 def record(event: dict[str, Any]) -> None:
     """Append one event, stamped with an identity unique to this row.
 
@@ -145,31 +295,61 @@ def record(event: dict[str, Any]) -> None:
     would trade the thing being recorded for the record of it. Under
     ``BANDITS_LEDGER_STRICT`` the trade goes the other way and the failure is
     raised, because a formal experiment missing records is not a partial
-    result — it is one that cannot be checked.
+    result — it is one that cannot be checked. Every failure counts: a value
+    that cannot be serialized fails the same way as a full disk.
+
+    Large strings are stored once as blobs (see ``BANDITS_LEDGER_BLOB_MIN``) and
+    restored by :func:`read_events`; nothing is truncated. ``seq`` is assigned
+    under the write lock, so within one process it follows file order exactly;
+    rows from several processes are kept whole by ``flock`` and told apart by
+    ``pid``.
     """
     path = _path()
     if not path:
         return
-    row = {
-        "recorded_at": _now(),
-        **_context(),
-        **event,
-        # Last, so the row's identity is the ledger's to assign. A caller
-        # passing `event_id` would otherwise silently collide two rows, which
-        # is the failure this field exists to make impossible.
-        "event_id": uuid.uuid4().hex,
-    }
     try:
+        plain = json.loads(json.dumps(event, default=str))
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, default=str) + "\n")
-    except OSError as exc:
+        _ensure_dir(target.parent)
+        payload = _externalize(plain, blob_dir(target), _blob_min())
+        row = {
+            "recorded_at": _now(),
+            "schema": LEDGER_SCHEMA,
+            "pid": os.getpid(),
+            **_context(),
+            **payload,
+            # Last, so the row's identity is the ledger's to assign. A caller
+            # passing `event_id` would otherwise silently collide two rows,
+            # which is the failure this field exists to make impossible.
+            "event_id": uuid.uuid4().hex,
+        }
+        with _write_lock:
+            created = not target.exists()
+            row["seq"] = _next_seq()
+            line = json.dumps(row, default=str) + "\n"
+            with target.open("a", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.write(line)
+                    handle.flush()
+                    if os.environ.get(_ENV_FSYNC):
+                        os.fsync(handle.fileno())
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if created:
+                # The new file's directory entry, so the ledger itself survives.
+                _fsync_dir(target.parent)
+    except Exception as exc:  # noqa: BLE001 - any lost row is a recording failure
         if strict():
-            raise LedgerWriteError(
-                f"the ledger could not be written to {path!r}: {exc}. "
+            error = LedgerWriteError(
+                f"the ledger could not be written to {path!r}: "
+                f"{type(exc).__name__}: {exc}. "
                 "The run is recording incompletely and BANDITS_LEDGER_STRICT is set."
-            ) from exc
+            )
+            with _failure_lock:
+                if not _failure:
+                    _failure.append(error)
+            raise error from exc
         # Loud even when not fatal. A silent drop is how a run finishes looking
         # complete while missing the records it was started to produce.
         print(  # noqa: T201 - deliberate: stderr must carry this past a rich console
@@ -177,6 +357,53 @@ def record(event: dict[str, Any]) -> None:
             file=sys.stderr,
             flush=True,
         )
+
+
+def _restore(value: Any, directory: Path) -> Any:
+    if isinstance(value, dict):
+        reference = value.get("$blob")
+        if isinstance(reference, str) and set(value) == {"$blob", "length"}:
+            digest = reference.removeprefix("sha256:")
+            try:
+                data = (directory / digest).read_bytes()
+            except OSError as exc:
+                raise LedgerCorrupt(f"blob {digest} is missing: {exc}") from exc
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise LedgerCorrupt(f"blob {digest} does not match its digest")
+            text = data.decode(*_BLOB_ENCODING)
+            if len(text) != value["length"]:
+                raise LedgerCorrupt(f"blob {digest} has the wrong length")
+            return text
+        return {key: _restore(item, directory) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore(item, directory) for item in value]
+    return value
+
+
+def read_events(path: str | Path, *, resolve: bool = True) -> list[dict[str, Any]]:
+    """Every row of a ledger, with blob references verified and restored.
+
+    A line that is not JSON — a write cut short by a crash — raises
+    :class:`LedgerCorrupt` naming its line, unless it is the last line, which
+    is reported as ``{"event_type": "truncated_row", ...}`` because an
+    interrupted append is the one corruption a crash is expected to leave.
+    """
+    target = Path(path)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    directory = blob_dir(target)
+    rows: list[dict[str, Any]] = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            if number == len(lines):
+                rows.append({"event_type": "truncated_row", "line": number, "text": line})
+                continue
+            raise LedgerCorrupt(f"line {number} of {target} is not JSON: {exc}") from exc
+        rows.append(_restore(row, directory) if resolve else row)
+    return rows
 
 
 @contextmanager
@@ -206,7 +433,7 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
     previous = _context()
     # Published so the retries firing inside this block can name the call they
     # belong to without it being threaded through the transport's signature.
-    _local.context = {**previous, "logical_call_id": call_id}
+    token = _context_var.set({**previous, "logical_call_id": call_id})
     try:
         yield slot
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised untouched
@@ -242,7 +469,7 @@ def model_call(*, provider: str, model: str, request: Any) -> Iterator[dict[str,
                 }
             )
         finally:
-            _local.context = previous
+            _context_var.reset(token)
 
 
 def record_attempt(*, attempt: int, error: Exception, delay: float) -> None:

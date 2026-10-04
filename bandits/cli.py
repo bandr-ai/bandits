@@ -1579,11 +1579,17 @@ if __name__ == "__main__":
 # stability, and downstream verifier transfer. Nothing here feeds `mine`.
 
 
-def _rlm_corpus(analysis_id: str, project: Path, view: str):
-    """The read-only user-message view of the corpus behind an analysis.
+def _rlm_corpus(
+    analysis_id: str,
+    project: Path,
+    view: str,
+    trace_ids: tuple[str, ...] | None = None,
+    page_chars: int | None = None,
+):
+    """The read-only view of the corpus behind an analysis.
 
-    The miner is handed this and never the corpus, so there is no path from a
-    mining command to an assistant message, a tool call, or an outcome.
+    The miner is handed this and never the corpus. ``trace_ids`` selects runs
+    explicitly, validated here before anything is dispatched.
     """
     store = _derived(project)
     try:
@@ -1596,11 +1602,20 @@ def _rlm_corpus(analysis_id: str, project: Path, view: str):
     except FileNotFoundError as exc:
         console.print(f"[red]error:[/red] no corpus {analysis.corpus_id!r} behind this analysis")
         raise typer.Exit(code=1) from exc
-    return (
-        analysis,
-        ReadOnlyCorpus(corpus, view=TraceView(view), control_markers=corpus.control_markers),
-        store,
-    )
+    try:
+        view_corpus = ReadOnlyCorpus(
+            corpus,
+            view=TraceView(view),
+            control_markers=corpus.control_markers,
+            trace_ids=trace_ids or None,
+            corpus_version=analysis.corpus_id,
+            analysis=analysis,
+            page_chars=page_chars,
+        )
+    except (KeyError, ValueError) as exc:
+        console.print(f"[red]error:[/red] {exc.args[0] if exc.args else exc}")
+        raise typer.Exit(code=1) from exc
+    return analysis, view_corpus, store
 
 
 def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
@@ -1614,6 +1629,15 @@ def _report_unresolved(ambiguous: int, uncovered: int, unreadable: int) -> None:
             console.print(f"[yellow]{label}:[/yellow]   {count} trace(s) {note}")
 
 
+def _project_flag(project: Path) -> str:
+    """The ``--project`` every printed follow-up command carries, absolute.
+
+    Always present: a hint without it silently reads whichever project the
+    reader's shell happens to be in.
+    """
+    return f" --project {Path(project).resolve()}"
+
+
 @app.command(name="mine-rlm")
 @ledger.project_recording
 def mine_rlm_command(
@@ -1622,10 +1646,16 @@ def mine_rlm_command(
         TraceView.USER_MESSAGES.value,
         "--view",
         help=(
-            "user-messages (Path U), full-trajectory (Path F: adds assistant turns and "
-            "tool activity, rewards withheld), first-user-message, or request "
-            "(workflow corpora: the request each run received, never its internal prompts)."
+            "user-messages (Path U), full-trajectory (Path F: per-run evidence accounts "
+            "through indexed retrieval, then families over accounts; rewards withheld), "
+            "first-user-message, or request (workflow corpora: the request each run "
+            "received, never its internal prompts)."
         ),
+    ),
+    trace_ids: list[str] = typer.Option(
+        None,
+        "--trace-id",
+        help="Mine only these traces (repeatable). Unknown ids are refused before any call.",
     ),
     chunk_size: int = typer.Option(RLM_CHUNK_SIZE, "--chunk-size"),
     passes: int = typer.Option(
@@ -1636,14 +1666,78 @@ def mine_rlm_command(
     max_iterations: int = typer.Option(
         200, "--max-iterations", help="Emergency guard on chunk count, not the stopping rule."
     ),
-    max_llm_calls: int = typer.Option(400, "--max-llm-calls"),
+    max_llm_calls: int = typer.Option(
+        400,
+        "--max-llm-calls",
+        help="Session-wide model calls (roots, subcalls, adapter, extract, repair), "
+        "admitted before dispatch.",
+    ),
+    root_max_iterations: int = typer.Option(
+        25, "--root-max-iterations", help="Root REPL iterations per invocation."
+    ),
+    max_subcalls: int = typer.Option(
+        60, "--max-subcalls", help="llm_query/llm_query_batched calls per invocation."
+    ),
     max_tokens: int = typer.Option(
         RLM_MAX_TOKENS,
         "--max-tokens",
         help="Maximum completion tokens for each model call.",
     ),
+    temperature: float = typer.Option(0.0, "--temperature"),
+    top_p: float = typer.Option(None, "--top-p"),
+    reasoning_effort: str = typer.Option(
+        None,
+        "--reasoning-effort",
+        help="LiteLLM reasoning_effort: a level (none, low, medium, high) or a positive "
+        "integer reasoning-token cap where the provider supports one. Refused if the "
+        "provider route drops it.",
+    ),
+    max_output_chars: int = typer.Option(
+        10_000, "--max-output-chars", help="REPL output shown back per observation (display only)."
+    ),
+    inspect_page_chars: int = typer.Option(
+        6000,
+        "--inspect-page-chars",
+        help="Ceiling on one inspect_run page, header to next_cursor (1000-50000).",
+    ),
+    subcall_workers: int = typer.Option(
+        8, "--subcall-workers", help="Concurrency of llm_query_batched; 1 is sequential."
+    ),
+    provider_retries: int = typer.Option(
+        0,
+        "--provider-retries",
+        help="LiteLLM transport retries beneath one recorded call; not individually "
+        "counted or recorded, but reserved for.",
+    ),
+    lm_cache: bool = typer.Option(
+        False, "--lm-cache/--no-lm-cache", help="DSPy response cache. Off by default."
+    ),
+    stop_at_completed: bool = typer.Option(
+        True,
+        "--stop-at-completed/--no-stop-at-completed",
+        help="Stop each reply at DSPy's [[ ## completed ## ]] marker (ends runaway replies).",
+    ),
+    max_attempts: int = typer.Option(
+        2,
+        "--max-attempts",
+        help="Invocations per trace per pass, first included; retries wait for fresh traces.",
+    ),
+    contract_repairs: int = typer.Option(
+        1, "--contract-repairs", help="Extra full RLM runs per chunk to fix rejected contracts."
+    ),
     max_seconds: float = typer.Option(3600.0, "--max-seconds"),
     max_usd: float = typer.Option(None, "--max-usd", help="Monetary ceiling. Unset means none."),
+    usd_per_mtok_in: float = typer.Option(
+        None, "--usd-per-mtok-in", help="Input price, to reserve each call against --max-usd."
+    ),
+    usd_per_mtok_out: float = typer.Option(
+        None, "--usd-per-mtok-out", help="Output price, to reserve each call against --max-usd."
+    ),
+    reuse_accounts: str = typer.Option(
+        None,
+        "--reuse-accounts",
+        help="Account-set artifact to reuse; accounts whose identity differs are not reused.",
+    ),
     seed: int = typer.Option(RLM_SEED, "--seed"),
     model: str = typer.Option(RLM_MODEL, "--model"),
     resume: str = typer.Option(
@@ -1653,26 +1747,168 @@ def mine_rlm_command(
     ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
-    """Discover task families from raw user requests with an iterative RLM loop."""
+    """Discover task families with an iterative RLM loop."""
+    from rich.markup import escape
+
+    from bandits import providers
+    from bandits.analyze import rlm_mine
+    from bandits.analyze.rlm_account import (
+        ACCOUNT_SCHEMA_VERSION,
+        AccountIdentity,
+        AccountSet,
+        account_set_id,
+    )
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+    from bandits.analyze.rlm_evidence import INDEX_VERSION
+    from bandits.analyze.rlm_mine import PROMPT_VERSION, GenerationSettings, prompt_digest
+
     try:
         trace_view = TraceView(view)
     except ValueError as exc:
         console.print(f"[red]error:[/red] unknown view {view!r}")
         raise typer.Exit(code=1) from exc
+    selection = tuple(trace_ids or ())
+    effort: str | int | None = reasoning_effort
+    if reasoning_effort is not None and reasoning_effort.strip().lstrip("-").isdigit():
+        effort = int(reasoning_effort)
+        if effort <= 0:
+            console.print("[red]error:[/red] an integer --reasoning-effort must be positive")
+            raise typer.Exit(code=1)
 
-    analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value)
+    if not 1000 <= inspect_page_chars <= 50_000:
+        console.print("[red]error:[/red] --inspect-page-chars must be from 1000 to 50000")
+        raise typer.Exit(code=1)
+    analysis, corpus, store = _rlm_corpus(
+        analysis_id, project, trace_view.value, selection, page_chars=inspect_page_chars
+    )
     budget = Budget(
         passes=passes,
         max_iterations=max_iterations,
         max_llm_calls=max_llm_calls,
         max_seconds=max_seconds,
         max_usd=max_usd,
+        max_attempts=max_attempts,
     )
+    settings = GenerationSettings(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        reasoning_effort=effort,
+        root_max_iterations=root_max_iterations,
+        max_subcalls=max_subcalls,
+        max_output_chars=max_output_chars,
+        inspect_page_chars=inspect_page_chars,
+        subcall_workers=subcall_workers,
+        provider_retries=provider_retries,
+        lm_cache=lm_cache,
+        contract_repairs=contract_repairs,
+        stop_at_completed_marker=stop_at_completed,
+    )
+    # What the provider route would actually send, checked before any call: a
+    # setting LiteLLM accepts and then leaves out of the body is refused here
+    # rather than recorded as if it were in effect.
     try:
-        predict = build_rlm_predictor(model=model, view=trace_view, max_tokens=max_tokens)
+        effective = providers.preflight_settings(model, settings.request_settings())
+    except providers.ProviderError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if effective["dropped"]:
+        console.print(
+            f"[red]error:[/red] {model} would not send {', '.join(effective['dropped'])}: "
+            "the provider route drops it from the request body. Remove the flag or use a "
+            "route that supports it."
+        )
+        raise typer.Exit(code=1)
+    if not effective["verified"]:
+        console.print(
+            f"[yellow]note:[/yellow] the request body for {model} could not be observed offline "
+            f"({effective.get('note')}); settings are recorded as requested, not verified"
+        )
+    settings_record = {
+        **settings.model_dump(mode="json"),
+        "effective": effective,
+        "settings_digest": settings.digest(),
+    }
+    try:
+        guard = SessionBudgetGuard(
+            max_calls=max_llm_calls,
+            max_seconds=max_seconds,
+            max_usd=max_usd,
+            usd_per_mtok_in=usd_per_mtok_in,
+            usd_per_mtok_out=usd_per_mtok_out,
+            attempts_per_call=provider_retries + 1,
+        )
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    accounts_mode = trace_view is TraceView.FULL_TRAJECTORY
+    runs = len(corpus.readable_trace_ids())
+    # An estimate, not a minimum: each invocation that uses every iteration and
+    # then falls back to extraction makes N + 1 root calls before subcalls.
+    per_invocation = root_max_iterations + 1
+    family_invocations = -(-runs // max(chunk_size, 1)) * passes
+    likely = (runs if accounts_mode else 0) * per_invocation + family_invocations * per_invocation
+    if max_llm_calls < likely:
+        console.print(
+            f"[yellow]warning:[/yellow] --max-llm-calls {max_llm_calls} covers fewer calls than "
+            f"{runs} run(s) can use at {per_invocation} root call(s) per invocation (about "
+            f"{likely}, before subcalls); later runs may get none. The session will stop "
+            "cleanly at the ceiling and report what it did not reach."
+        )
+    # Accounts read every recorded field; family formation reopens evidence only
+    # under the grouping policy, with outcome-bearing keys withheld.
+    catalog = corpus.evidence("account") if accounts_mode else None
+    grouping = corpus.evidence("grouping") if accounts_mode else None
+    try:
+        predict = build_rlm_predictor(
+            model=model,
+            view=trace_view,
+            settings=settings,
+            guard=guard,
+            catalog=grouping,
+            accounts_mode=accounts_mode,
+        )
+        account_predict = (
+            rlm_mine.build_account_predictor(
+                catalog=catalog, model=model, view=trace_view, settings=settings, guard=guard
+            )
+            if accounts_mode
+            else None
+        )
     except MiningError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    def identity_for(run_id: str) -> AccountIdentity:
+        return AccountIdentity(
+            run_id=run_id,
+            corpus_version=analysis.corpus_id,
+            index_version=INDEX_VERSION,
+            view_policy=catalog.policy if catalog is not None else trace_view.value,
+            schema_version=ACCOUNT_SCHEMA_VERSION,
+            prompt_version=PROMPT_VERSION,
+            prompt_digest=prompt_digest(model),
+            model=model,
+            settings_digest=settings.digest(),
+        )
+
+    reused: tuple = ()
+    if reuse_accounts:
+        try:
+            account_set = AccountSet.model_validate_json(store.read_payload(reuse_accounts))
+        except FileNotFoundError as exc:
+            console.print(f"[red]error:[/red] no account set {reuse_accounts!r}")
+            raise typer.Exit(code=1) from exc
+        wanted = identity_for("_").key()
+        if account_set.identity_key != wanted:
+            console.print(
+                f"[red]error:[/red] account set {reuse_accounts!r} was produced under a "
+                "different corpus, index, view policy, prompt, model or settings; it stays "
+                "inspectable but is not reused"
+            )
+            raise typer.Exit(code=1)
+        reused = tuple(account_set.accepted().values())
 
     session_store = SessionStore(project / ".bandits")
     resumed_state = None
@@ -1683,8 +1919,6 @@ def mine_rlm_command(
             console.print(f"[red]error:[/red] no session {resume!r}")
             raise typer.Exit(code=1) from exc
         if resumed_state.analysis_id != analysis_id:
-            # Resuming onto a different corpus would carry a taxonomy built from
-            # one set of requests onto another and call the result one run.
             console.print(
                 f"[red]error:[/red] session {resume!r} was mining "
                 f"{resumed_state.analysis_id!r}, not {analysis_id!r}"
@@ -1696,29 +1930,75 @@ def mine_rlm_command(
                 f"{resumed_state.view.value} view; the two arms are different experiments"
             )
             raise typer.Exit(code=1)
-        # The same seed, or the reshuffle of a later pass would differ from what
-        # the interrupted run would have done.
+        if tuple(resumed_state.selection) != selection:
+            console.print(
+                f"[red]error:[/red] session {resume!r} selected "
+                f"{list(resumed_state.selection) or 'every trace'}; pass the same --trace-id set"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.settings_digest and resumed_state.settings_digest != settings.digest():
+            console.print(
+                f"[red]error:[/red] session {resume!r} ran with different generation or "
+                "invocation settings; resume with the same flags"
+            )
+            raise typer.Exit(code=1)
+        if resumed_state.model != model:
+            console.print(
+                f"[red]error:[/red] session {resume!r} used model {resumed_state.model!r}"
+            )
+            raise typer.Exit(code=1)
         seed = resumed_state.seed
         console.print(
             f"resuming:    {resume} at pass {resumed_state.pass_index + 1}, "
             f"{resumed_state.traces_seen_this_pass}/{resumed_state.traces_total} read, "
-            f"{len(resumed_state.contracts)} contract(s) restored"
+            f"{len(resumed_state.contracts)} contract(s), "
+            f"{sum(1 for a in resumed_state.accounts if a.status == 'accepted')} accepted "
+            "account(s) restored"
         )
 
     recorder = SessionRecorder(
         session_store,
-        # A resume continues writing to the same session, so one interrupted run
-        # stays one row in the listing rather than fragmenting across restarts.
         session_id=resume or new_session_id(analysis_id, trace_view, seed),
         analysis_id=analysis_id,
         view=trace_view,
         model=model,
         resumed_from=resume,
+        selection=selection,
+        settings=settings_record,
+        settings_digest=settings.digest(),
+        guard=guard,
+        previous=resumed_state,
     )
+    flag = _project_flag(project)
     console.print(f"session:     {recorder.session_id}")
-    console.print(f"[dim]watch: bandits rlm-session {recorder.session_id}[/dim]\n")
+    console.print(f"[dim]watch: bandits rlm-session {recorder.session_id}{flag} --watch[/dim]\n")
 
-    with ledger.stage("rlm_mining_run", analysis_id=analysis_id, view=trace_view.value, seed=seed):
+    def on_account(account) -> None:
+        mode = account.completion.mode
+        detail = (
+            f"{len(account.completion.inspected_ranges)} range(s) read, "
+            f"{account.completion.iterations_used} iteration(s)"
+        )
+        reason = (
+            escape(
+                f" [{account.failure_kind}: "
+                f"{(account.completion.error or '; '.join(account.validation_errors))[:60]}]"
+            )
+            if account.status != "accepted"
+            else ""
+        )
+        console.print(
+            f"[dim]account {account.run_id} attempt {account.attempt}: {account.status} "
+            f"({mode}, {detail}){reason}[/dim]"
+        )
+
+    with ledger.stage(
+        "rlm_mining_run",
+        analysis_id=analysis_id,
+        view=trace_view.value,
+        seed=seed,
+        session_id=recorder.session_id,
+    ):
         try:
             draft = mine_taxonomy(
                 corpus,
@@ -1731,28 +2011,58 @@ def mine_rlm_command(
                 budget=budget,
                 session=recorder,
                 resume=resumed_state,
+                account_predict=account_predict,
+                identity_for=identity_for if accounts_mode else None,
+                reuse_accounts=reused,
+                on_account=on_account,
+                guard=guard,
+                contract_repairs=contract_repairs,
+                settings=settings_record,
                 on_chunk=lambda c: console.print(
                     f"[dim]pass {c.pass_index + 1} chunk {c.index}: "
-                    f"{len(c.trace_ids)} trace(s), {len(c.operations)} operation(s)"
-                    f"{' [failed: ' + c.error[:40] + ']' if c.status == 'error' else ''}[/dim]"
+                    f"{len(c.trace_ids)} trace(s), {len(c.operations)} operation(s), "
+                    f"{c.completion_mode}"
+                    f"{escape(' [' + c.status + ': ' + c.error[:40] + ']') if c.status != 'success' else ''}"
+                    "[/dim]"
                 ),
             )
+        except KeyboardInterrupt:
+            ledger.record({"event_type": "interrupted", "session_id": recorder.session_id})
+            recorder.fail("interrupted by the user", status="interrupted")
+            console.print(
+                f"\n[yellow]interrupted.[/yellow] accepted accounts and applied chunks are "
+                f"saved. [dim]resume with: bandits mine-rlm {analysis_id} --resume "
+                f"{recorder.session_id}{flag} (same flags)[/dim]"
+            )
+            raise typer.Exit(code=130) from None
         except MiningError as exc:
             recorder.fail(str(exc))
             console.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(code=1) from exc
         except Exception as exc:
-            # The session file is the only record of a run that died partway,
-            # so it must say so rather than being left reading as still running.
             recorder.fail(str(exc))
             raise
         envelope = save_clustering_run(draft, store)
+        account_envelope = None
+        if draft.accounts:
+            account_set = AccountSet(
+                analysis_id=analysis_id,
+                identity_key=identity_for("_").key(),
+                accounts=draft.accounts,
+            )
+            account_envelope = store.write(
+                account_set_id(account_set),
+                kind="rlm_account_set",
+                parent_artifact_id=analysis.corpus_id,
+                payload=account_set.model_dump_json().encode("utf-8"),
+                summary={
+                    "accounts": len(draft.accounts),
+                    "accepted": sum(1 for a in draft.accounts if a.status == "accepted"),
+                },
+            )
         recorder.finish(
             status="awaiting_review" if draft.complete else "incomplete",
             stop_reason=draft.stop_reason.value,
-            # run_id, not draft_id: the 6a822c2 rename ("taxonomy draft" ->
-            # "clustering run") missed this call site, so every mine-rlm run
-            # crashed here after mining actually completed.
             run_id=envelope.artifact_id,
             completed_passes=draft.completed_passes,
         )
@@ -1768,15 +2078,23 @@ def mine_rlm_command(
         )
 
     console.print(f"\ndraft_id:    {envelope.artifact_id}")
+    if account_envelope is not None:
+        console.print(f"accounts:    {account_envelope.artifact_id}")
     console.print(f"view:        {draft.view.value} (seed {draft.seed})")
     console.print(f"contracts:   {len(draft.contracts)}")
     console.print(f"chunks:      {len(draft.chunks)}")
     console.print(f"passes:      {draft.completed_passes}/{draft.requested_passes} complete")
-    # The distinction the whole artifact turns on: finishing the schedule is not
-    # convergence, and a run that hit a guard did not even finish the schedule.
+    if draft.coverage:
+        console.print("coverage:    " + ", ".join(f"{k} {v}" for k, v in draft.coverage.items()))
+    console.print(
+        f"budget:      {guard.calls_admitted} call(s) admitted, "
+        f"${guard.usd_reported:.4f} reported"
+        + (f" + ${guard.usd_estimated:.4f} estimated" if guard.usd_estimated else "")
+        + (f", {guard.unknown_cost_calls} unknown-cost call(s)" if guard.unknown_cost_calls else "")
+    )
     if draft.complete:
         console.print(
-            "[green]awaiting review[/green]  every requested pass read every trace; "
+            "[green]awaiting review[/green]  every requested pass read every eligible trace; "
             "this is a checkpoint, not a converged taxonomy"
         )
     else:
@@ -1786,16 +2104,26 @@ def mine_rlm_command(
         )
     console.print("")
     console.print(taxonomy_overview(draft.contracts, members=_run_members(draft)))
-    # What the second look changed. The question a reviewer has at a pause, and
-    # one no total over the whole run answers.
     console.print("")
     print_pass_history(draft, console)
-    console.print(f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}[/dim]")
+    console.print(
+        f"\n[dim]review the families: bandits rlm-families {envelope.artifact_id}{flag}[/dim]"
+    )
+    if draft.accounts:
+        console.print(
+            f"[dim]review the accounts: bandits rlm-session {recorder.session_id}{flag} "
+            "--accounts[/dim]"
+        )
     _report_unresolved(
         len(draft.ambiguous_trace_ids),
         len(draft.uncovered_trace_ids),
         len(draft.unreadable_trace_ids),
     )
+    reasons: dict[str, int] = {}
+    for reason in draft.unassigned_reasons.values():
+        reasons[reason] = reasons.get(reason, 0) + 1
+    for reason, count in sorted(reasons.items()):
+        console.print(f"[yellow]unassigned:[/yellow]  {count} trace(s) {reason}")
     for limitation in draft.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
 
@@ -2044,6 +2372,9 @@ def rlm_session_command(
         False, "--watch", help="Redraw as the run progresses. Exits when it finishes."
     ),
     interval: float = typer.Option(1.0, "--interval", help="Seconds between redraws."),
+    accounts: bool = typer.Option(
+        False, "--accounts", help="Show every account attempt: status, provenance, intent."
+    ),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Inspect a mining or audit session, including one still running.
@@ -2066,7 +2397,11 @@ def rlm_session_command(
             kind, latest = max(candidates, key=lambda pair: pair[1].updated_at)
             session_id = latest.session_id
             _watch_session(
-                kind, mining_store if kind == "mining" else audit_store, session_id, interval
+                kind,
+                mining_store if kind == "mining" else audit_store,
+                session_id,
+                interval,
+                project=project,
             )
             return
         kind, _ = _find_session(mining_store, audit_store, session_id)
@@ -2074,7 +2409,11 @@ def rlm_session_command(
             console.print(f"[red]error:[/red] no session {session_id!r}")
             raise typer.Exit(code=1)
         _watch_session(
-            kind, mining_store if kind == "mining" else audit_store, session_id, interval
+            kind,
+            mining_store if kind == "mining" else audit_store,
+            session_id,
+            interval,
+            project=project,
         )
         return
 
@@ -2088,16 +2427,17 @@ def rlm_session_command(
         sessions.sort(key=lambda pair: pair[1].updated_at, reverse=True)
         table = Table("kind", "session", "status", "progress", "updated")
         for kind, state in sessions:
+            status = state.observed_status() if hasattr(state, "observed_status") else state.status
             colour = {
                 "running": "cyan",
                 "awaiting_review": "green",
                 "failed": "red",
                 "interrupted": "yellow",
-            }.get(state.status, "yellow")
+            }.get(status, "yellow")
             table.add_row(
                 kind,
                 state.session_id,
-                f"[{colour}]{state.status}[/{colour}]",
+                f"[{colour}]{status}[/{colour}]",
                 state.progress,
                 state.updated_at[:19],
             )
@@ -2128,9 +2468,32 @@ def rlm_session_command(
     else:
         console.print(f"session:     {state.session_id}")
         console.print("kind:        mining")
-        console.print(f"status:      {state.status}")
+        console.print(f"status:      {state.observed_status()}")
         console.print(f"view:        {state.view.value} (seed {state.seed})")
+        if state.selection:
+            console.print(f"selection:   {', '.join(state.selection)}")
         console.print(f"progress:    {state.progress}")
+        console.print("coverage:    " + ", ".join(f"{k} {v}" for k, v in state.coverage().items()))
+        if state.budget_usage:
+            usage = state.budget_usage
+            console.print(
+                f"budget:      {usage.get('calls_admitted')} call(s) admitted, "
+                f"${usage.get('usd_reported', 0):.4f} reported, "
+                f"{usage.get('unknown_cost_calls', 0)} unknown-cost call(s)"
+            )
+        modes: dict[str, int] = {}
+        for chunk in state.chunks:
+            modes[chunk.completion_mode] = modes.get(chunk.completion_mode, 0) + 1
+        if modes:
+            console.print(
+                "chunk modes: "
+                + ", ".join(f"{k} {v}" for k, v in sorted(modes.items()))
+                + (
+                    "  [dim](unknown: recorded before completion provenance)[/dim]"
+                    if "unknown" in modes
+                    else ""
+                )
+            )
         console.print(
             f"passes:      {state.completed_passes}/{state.requested_passes} complete, "
             f"pass {state.pass_index + 1} in flight"
@@ -2141,6 +2504,8 @@ def rlm_session_command(
             console.print(f"  {contract.contract_id}  {contract.name}")
         if state.last_error:
             console.print(f"[red]last error:[/red] {state.last_error}")
+        if accounts:
+            _print_accounts(state.accounts)
 
     if events:
         console.print("")
@@ -2154,7 +2519,64 @@ def rlm_session_command(
             console.print(f"[dim]{event.get('at', '')[:19]}  {name}  {detail}[/dim]")
 
 
-def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
+def _print_accounts(accounts) -> None:
+    """Every account attempt, with what produced it and what it claims."""
+    from rich.markup import escape
+
+    if not accounts:
+        console.print("[dim]no accounts in this session[/dim]")
+        return
+    for account in accounts:
+        colour = {"accepted": "green", "rejected": "red", "quarantined": "yellow"}.get(
+            account.status, "red"
+        )
+        completion = account.completion
+        console.print(
+            f"\n[{colour}]{account.status}[/{colour}] {account.run_id} attempt "
+            f"{account.attempt} · {completion.mode} · iterations {completion.iterations_used}"
+            + (
+                f" (submitted at {completion.iterations_to_submit})"
+                if completion.iterations_to_submit
+                else ""
+            )
+            + f" · {len(completion.inspected_ranges)} range(s) read"
+        )
+        growth = [t for t in completion.prompt_tokens_per_call if t is not None]
+        if growth:
+            console.print(
+                f"  prompt tokens per call: first {growth[0]}, max {max(growth)}, "
+                f"last {growth[-1]} over {len(completion.prompt_tokens_per_call)} call(s)"
+            )
+        if account.account is not None:
+            intent = account.account.intent
+            console.print(f"  intent ({intent.status}): {escape(intent.candidate_goal or '—')}")
+            if intent.required_outcome:
+                console.print(f"  required outcome: {escape(intent.required_outcome)}")
+            console.print(f"  intent refs: {escape(', '.join(intent.evidence_refs) or '—')}")
+            console.print(f"  result: {account.account.result.assessment}")
+            for limitation in account.account.limitations:
+                console.print(
+                    f"  limitation {escape(limitation.kind)}: {escape(limitation.detail)}"
+                )
+            for gap in account.account.evidence_gaps:
+                console.print(
+                    f"  evidence {gap.status} ({escape(gap.ref or 'not recorded')}): "
+                    f"{escape(gap.detail)}"
+                )
+        for error in account.validation_errors:
+            console.print(f"  [red]rejected:[/red] {escape(error)}")
+        for rejection in completion.submit_rejections:
+            console.print(f"  [dim]SUBMIT refused in-loop: {escape(rejection[:160])}[/dim]")
+        if completion.error:
+            console.print(f"  [red]error:[/red] {escape(completion.error[:200])}")
+        reason = account.unassigned_reason()
+        if reason:
+            console.print(f"  [yellow]unassigned:[/yellow] {reason}")
+
+
+def _watch_session(
+    kind: str, store, session_id: str, interval: float, *, project: Path = _DEFAULT_PROJECT
+) -> None:
     """Redraw one session until it stops running.
 
     Reads the session file rather than hooking into the run, so this works on a
@@ -2185,25 +2607,175 @@ def _watch_session(kind: str, store, session_id: str, interval: float) -> None:
                 # file atomically, so the next poll gets a whole one.
                 continue
 
+    flag = _project_flag(project)
     if state.status == "awaiting_review":
+        draft = _finished_run_id(store, session_id)
         if kind == "audit":
             console.print(
                 "\n[green]audit complete.[/green] "
-                "[dim]bandits rlm-families <draft_id> --audit <audit_id>[/dim]"
+                f"[dim]bandits rlm-families {state.run_id} --audit <audit_id>{flag}[/dim]"
             )
         else:
             console.print(
                 "\n[green]paused for review.[/green] "
-                "[dim]families: bandits rlm-families <draft_id>[/dim]"
+                f"[dim]families: bandits rlm-families {draft or '<draft_id>'}{flag}[/dim]"
             )
     elif state.status in ("interrupted", "incomplete"):
         if kind == "audit":
-            resume_command = f"bandits audit-rlm {state.run_id} --resume {session_id}"
+            resume_command = f"bandits audit-rlm {state.run_id} --resume {session_id}{flag}"
         else:
-            resume_command = f"bandits mine-rlm {state.analysis_id} --resume {session_id}"
+            resume_command = (
+                f"bandits mine-rlm {state.analysis_id} --resume {session_id}{flag} (same flags)"
+            )
         console.print(
             f"\n[yellow]{state.status}.[/yellow] [dim]resume with: {resume_command}[/dim]"
         )
+
+
+def _finished_run_id(store, session_id: str) -> str | None:
+    """The run artifact a finished session wrote, from its own progress log."""
+    for event in reversed(store.read_events(session_id)):
+        if event.get("event") == "session_finished" and event.get("run_id"):
+            return event["run_id"]
+    return None
+
+
+@app.command(name="rlm-evidence")
+def rlm_evidence_command(
+    analysis_id: str,
+    trace_id: str = typer.Option(..., "--trace-id", help="The run to inspect."),
+    ref: str = typer.Option(None, "--ref", help="Print one ref's text instead of the overview."),
+    cursor: int = typer.Option(0, "--cursor"),
+    limit: int = typer.Option(20, "--limit", help="Event rows (inspect) or characters (--ref)."),
+    start: int = typer.Option(0, "--start"),
+    policy: str = typer.Option(
+        "account",
+        "--policy",
+        help="account (what accounts read) or grouping (what family formation reads).",
+    ),
+    page_chars: int = typer.Option(6000, "--page-chars"),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Show exactly what the miner's evidence helpers return for one run. No model call.
+
+    The same deterministic ``inspect_run``/``get_evidence`` the miner uses, as
+    JSON, so a reviewer can check an account's citations against the source.
+    """
+    if policy not in ("account", "grouping"):
+        console.print("[red]error:[/red] --policy is account or grouping")
+        raise typer.Exit(code=1)
+    try:
+        _, corpus, _ = _rlm_corpus(
+            analysis_id,
+            project,
+            TraceView.FULL_TRAJECTORY.value,
+            (trace_id,),
+            page_chars=page_chars,
+        )
+        catalog = corpus.evidence(policy)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    try:
+        if ref:
+            result = catalog.get_evidence(trace_id, ref, start, limit)
+        else:
+            result = catalog.inspect_run(trace_id, cursor, limit)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@app.command(name="rlm-ledger")
+def rlm_ledger_command(
+    session_id: str = typer.Argument(None, help="Mining session to check; omit for every row."),
+    call: str = typer.Option(None, "--call", help="Print one call's rows in full, blobs restored."),
+    ledger_path: Path = typer.Option(
+        None, "--ledger", help="Ledger file (default: the project ledger or BANDITS_LEDGER)."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Reconstruct a mining session from its ledger and check that it adds up.
+
+    Pairs every call start with its terminal row and every invocation and REPL
+    step with its end, verifies stored blobs, sums reported usage and cost, and
+    compares the totals with the session. Exits 1 when anything does not agree.
+    """
+    import os
+
+    from bandits.analyze.rlm_ledger import call_rows, load_session_rows, reconcile
+    from bandits.ledger import LedgerCorrupt
+
+    path = ledger_path or Path(
+        os.environ.get("BANDITS_LEDGER") or project / ".bandits" / "ledger.jsonl"
+    )
+    try:
+        rows = load_session_rows(path, session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no ledger at {path}")
+        raise typer.Exit(code=1) from exc
+    except LedgerCorrupt as exc:
+        console.print(f"[red]corrupt ledger:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if call:
+        selected = call_rows(rows, call)
+        if not selected:
+            console.print(f"[red]error:[/red] no call {call!r} in this ledger")
+            raise typer.Exit(code=1)
+        typer.echo(json.dumps(selected, indent=2, ensure_ascii=False))
+        return
+    session = None
+    if session_id:
+        store = SessionStore(project / ".bandits")
+        if store.exists(session_id):
+            session = store.read(session_id)
+    report = reconcile(rows, session=session)
+    console.print(f"ledger:      {path}")
+    console.print(f"rows:        {report.rows}")
+    console.print(
+        f"calls:       {report.calls_started} started, {report.calls_completed} completed, "
+        f"{report.calls_failed} failed · "
+        + ", ".join(f"{role} {n}" for role, n in sorted(report.calls_by_role.items()))
+    )
+    console.print(
+        f"usage:       {report.prompt_tokens} prompt + {report.completion_tokens} completion "
+        f"tokens ({report.usage_missing} call(s) reported none)"
+    )
+    console.print(
+        f"cost:        ${report.cost_reported:.6f} reported, {report.cost_unknown} call(s) "
+        f"unknown, {report.cache_hits} cache hit(s)"
+    )
+    console.print(
+        "finish:      "
+        + ", ".join(f"{reason} {n}" for reason, n in report.finish_reasons.most_common())
+    )
+    console.print(
+        f"invocations: {len(report.invocations)} · REPL steps: {report.repl_steps} · "
+        f"duplicate helper reads: {report.duplicate_reads} · "
+        + ", ".join(
+            f"{name} {report.events[name]}"
+            for name in (
+                "submit_accepted",
+                "submit_rejected",
+                "extract_start",
+                "evidence_access",
+                "budget_refusal",
+                "interrupted",
+            )
+            if report.events[name]
+        )
+    )
+    if report.run_finished:
+        console.print(f"finished:    {report.run_finished.get('stop_reason')}")
+    elif report.run_started:
+        console.print("[yellow]finished:    no run_finished row (stopped early)[/yellow]")
+    if report.consistent:
+        console.print("[green]consistent[/green]")
+        return
+    for problem in report.problems():
+        console.print(f"[red]problem:[/red] {problem}")
+    raise typer.Exit(code=1)
 
 
 @app.command(name="rlm-families")
@@ -2270,5 +2842,32 @@ def rlm_families_command(
         len(draft.uncovered_trace_ids),
         len(draft.unreadable_trace_ids),
     )
+    if draft.accounts:
+        _print_account_table(draft)
+    for trace_id, reason in sorted(draft.unassigned_reasons.items()):
+        console.print(f"[yellow]unassigned:[/yellow]  {trace_id}  {reason}")
+    if draft.coverage:
+        console.print("coverage:    " + ", ".join(f"{k} {v}" for k, v in draft.coverage.items()))
     for limitation in draft.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+def _print_account_table(draft) -> None:
+    """Each run's latest account beside its placement, so a family can be checked run by run."""
+    from rich.markup import escape
+
+    from bandits.analyze.rlm_account import latest_by_run
+
+    table = Table("run", "account", "intent", "candidate goal", "family", "refs read")
+    for run_id, account in sorted(latest_by_run(draft.accounts).items()):
+        intent = account.account.intent if account.account is not None else None
+        table.add_row(
+            run_id,
+            f"{account.status} ({account.completion.mode})",
+            intent.status if intent else "—",
+            escape(intent.candidate_goal or "—") if intent else "—",
+            draft.assignments.get(run_id, draft.unassigned_reasons.get(run_id, "—")),
+            str(len(account.completion.inspected_ranges)),
+        )
+    console.print("")
+    console.print(table)

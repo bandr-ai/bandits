@@ -134,6 +134,41 @@ def _redact(payload: Any, removed: set[str], depth: int = 0) -> Any:
     return payload
 
 
+def _output_parts(span: Span, removed: set[str]) -> list[str]:
+    """A model span's recorded output messages: text and structured tool calls.
+
+    Workflow exports often record a model's turn only as ``tool_call`` parts in
+    ``gen_ai.output.messages``, with no completion text at all. Reading only
+    ``output`` rendered those turns as empty assistant lines and hid every
+    action they took.
+    """
+    raw = span.attributes.get("gen_ai.output.messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    rendered: list[str] = []
+    for message in raw:
+        if not isinstance(message, dict):
+            continue
+        for part in message.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("content"), str):
+                rendered.append(part["content"])
+            elif part.get("type") == "tool_call":
+                arguments = json.dumps(
+                    _redact(part.get("arguments"), removed), sort_keys=True, default=str
+                )
+                rendered.append(f"tool_call {part.get('name')} {arguments}")
+    return rendered
+
+
 def _render_span(span: Span, removed: set[str]) -> str:
     """One span as a line the miner can read, with outcome fields withheld.
 
@@ -145,7 +180,10 @@ def _render_span(span: Span, removed: set[str]) -> str:
     body: list[str] = []
     if span.arguments:
         body.append(json.dumps(_redact(span.arguments, removed), sort_keys=True, default=str))
-    if span.output is not None:
+    outputs = _output_parts(span, removed) if span.kind is SpanKind.MODEL else []
+    if outputs:
+        body.extend(outputs)
+    elif span.output is not None:
         body.append(json.dumps(_redact(span.output, removed), sort_keys=True, default=str))
     text = " ".join(body)
     if len(text) > _MAX_PAYLOAD_CHARS:
@@ -172,7 +210,19 @@ def _trajectory_messages(
             by_anchor.setdefault(turn.after_span_id, []).append(f"{label} {text}")
 
     known = {span.span_id for span in trace.spans}
-    lines: list[str] = list(by_anchor.pop(None, []))
+    lines: list[str] = []
+    # Task candidates once, with their origin: a tentative clue is evidence about
+    # the request, not the request, and its label says which rule found it.
+    if trace.request is not None:
+        if trace.request.task is not None:
+            lines.append(f"[request task, declared] {trace.request.task}")
+        for clue in trace.request.tentative_tasks:
+            text = _strip_control_markers(clue.value, control_markers, removed)
+            if len(text) > _MAX_PAYLOAD_CHARS:
+                text = text[:_MAX_PAYLOAD_CHARS] + "…[truncated]"
+            if text:
+                lines.append(f"[tentative clue:{clue.clue}] {text}")
+    lines.extend(by_anchor.pop(None, []))
     for anchor in list(by_anchor):
         if anchor not in known:
             lines.extend(by_anchor.pop(anchor))
@@ -303,6 +353,10 @@ class ReadOnlyCorpus:
         *,
         view: TraceView = TraceView.USER_MESSAGES,
         control_markers: Sequence[str] = (),
+        trace_ids: Sequence[str] | None = None,
+        corpus_version: str = "",
+        analysis: Any = None,
+        page_chars: int | None = None,
     ) -> None:
         """``control_markers`` declares literal tokens to strip from message
         text before the miner ever reads it — empty unless the caller knows
@@ -311,9 +365,27 @@ class ReadOnlyCorpus:
         constructs this corpus for a specific source, not to this class.
         """
         self._view = view
+        self._markers = tuple(control_markers)
+        self.corpus_version = corpus_version
+        traces = list(corpus.traces)
+        if trace_ids is not None:
+            # Validated before anything is dispatched: a typo must not quietly
+            # shrink a diagnostic to the runs that happened to match.
+            by_id = {trace.trace_id: trace for trace in traces}
+            unknown = [tid for tid in trace_ids if tid not in by_id]
+            if unknown:
+                raise KeyError(f"unknown trace id(s): {', '.join(unknown)}")
+            if len(set(trace_ids)) != len(trace_ids):
+                raise ValueError("a trace id was selected more than once")
+            traces = [by_id[tid] for tid in trace_ids]
+        self._traces = {trace.trace_id: trace for trace in traces}
+        self.selected = trace_ids is not None
+        self._analysis = analysis
+        self._page_chars = page_chars
+        self._catalogs: dict[Any, Any] = {}
         self._views: dict[str, UserMessageView] = {
             trace.trace_id: build_view(trace, view, control_markers=control_markers)
-            for trace in corpus.traces
+            for trace in traces
         }
         # Source order, not sorted: the corpus order is a fact about the export,
         # and any shuffling this miner does is seeded and recorded separately.
@@ -322,6 +394,34 @@ class ReadOnlyCorpus:
     @property
     def view(self) -> TraceView:
         return self._view
+
+    def evidence(self, policy: Any = None):
+        """The evidence index over the same traces under ``policy``, built lazily.
+
+        ``account`` (the default) for writing accounts, ``grouping`` for family
+        formation; see :class:`~bandits.analyze.rlm_evidence.EvidencePolicy`.
+        """
+        from bandits.analyze.rlm_evidence import (
+            INSPECT_PAGE_CHARS,
+            EvidenceCatalog,
+            EvidencePolicy,
+        )
+
+        policy = EvidencePolicy(policy or EvidencePolicy.ACCOUNT)
+        if policy not in self._catalogs:
+            self._catalogs[policy] = EvidenceCatalog(
+                self._traces,
+                corpus_version=self.corpus_version,
+                policy=policy,
+                control_markers=self._markers,
+                analysis=self._analysis,
+                page_chars=self._page_chars or INSPECT_PAGE_CHARS,
+            )
+        return self._catalogs[policy]
+
+    def evidence_catalogs(self) -> tuple[Any, ...]:
+        """Every catalog built so far, for coverage across both policies."""
+        return tuple(self._catalogs.values())
 
     def count_traces(self) -> int:
         return len(self._ids)
@@ -384,7 +484,19 @@ class ReadOnlyCorpus:
         """
         if analysis is None or not self._view.reads_agent_behavior:
             return ()
-        return audit_view_leakage(self._views, analysis)
+        findings = set(audit_view_leakage(self._views, analysis))
+        # Family formation can retrieve every item its grouping index holds, not
+        # only what the view renders, so the same value check runs there too.
+        # The account index deliberately keeps outcomes and is not checked.
+        catalog = self.evidence("grouping")
+        indexed = {
+            run_id: UserMessageView(
+                trace_id=run_id, messages=tuple(catalog.index(run_id).all_text()) or ("",)
+            )
+            for run_id in self._traces
+        }
+        findings.update(audit_view_leakage(indexed, analysis))
+        return tuple(sorted(findings))
 
     def readable_trace_ids(self) -> tuple[str, ...]:
         return tuple(tid for tid, view in self._views.items() if view.readable)
