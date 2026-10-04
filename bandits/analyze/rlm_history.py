@@ -14,9 +14,12 @@ share it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
+import time
+import uuid
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -127,33 +130,99 @@ def response_record(response: Any) -> dict[str, Any]:
         },
         "generated_code": _CODE_BLOCK.findall(text or ""),
         "usage": wire_value(usage) if usage is not None else None,
-        "cost_usd": hidden.get("response_cost"),
-        "cache_hit": getattr(response, "cache_hit", None),
+        # A cache hit replays the original response and its price; nothing was
+        # billed for this call. The original figure stays in ``raw``.
+        "cost_usd": 0.0 if getattr(response, "cache_hit", False) else hidden.get("response_cost"),
+        "cache_hit": bool(getattr(response, "cache_hit", False)),
         "provider_request_id": getattr(response, "id", None),
     }
 
 
 def record_repl(rlm: Any) -> Any:
-    """Persist each execution before DSPy truncates its output for the next prompt."""
+    """Persist each execution before DSPy truncates its output for the next prompt.
+
+    Each execution runs inside its own ``rlm_repl`` stage, so the subcalls and
+    helper reads its code triggers — including batched workers, which DSPy
+    starts with a copy of the caller's context — record under it. The sandbox
+    each invocation starts and stops is recorded too.
+    """
     execute = rlm._execute_code
 
     def recorded(repl, code, input_args):
-        ledger.record(
-            {"event_type": "repl_start", "code": code, "variables": wire_value(input_args)}
-        )
-        try:
-            result = execute(repl, code, input_args)
-        except BaseException as exc:
-            ledger.record({"event_type": "repl_error", "code": code, "error": str(exc)})
-            raise
-        ledger.record({"event_type": "repl_end", "code": code, "output": wire_value(result)})
+        with ledger.stage("rlm_repl", repl_id=uuid.uuid4().hex[:16]):
+            ledger.record(
+                {"event_type": "repl_start", "code": code, "variables": wire_value(input_args)}
+            )
+            started = time.monotonic()
+            try:
+                result = execute(repl, code, input_args)
+            except BaseException as exc:
+                ledger.record(
+                    {
+                        "event_type": "repl_error",
+                        "code": code,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "duration_seconds": round(time.monotonic() - started, 4),
+                    }
+                )
+                raise
+            ledger.record(
+                {
+                    "event_type": "repl_end",
+                    "code": code,
+                    "output": wire_value(result),
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                }
+            )
         # A required write that failed inside a tool or subcall was swallowed
         # into REPL output; it stops the run here instead.
         ledger.raise_if_failed()
         return result
 
     rlm._execute_code = recorded
+    _record_sandbox(rlm)
     return rlm
+
+
+def _record_sandbox(rlm: Any) -> None:
+    """Record the interpreter an invocation starts and shuts down (DSPy 3.3.1)."""
+    context = getattr(rlm, "_interpreter_context", None)
+    if context is None:  # pragma: no cover - other DSPy versions
+        return
+
+    @contextlib.contextmanager
+    def recorded(execution_tools, interpreter):
+        owned = interpreter is None
+        started = time.monotonic()
+        ledger.record(
+            {
+                "event_type": "sandbox_start",
+                "owned": owned,
+                "tools": sorted(execution_tools),
+            }
+        )
+        try:
+            with context(execution_tools, interpreter) as repl:
+                yield repl
+        except BaseException as exc:
+            ledger.record(
+                {
+                    "event_type": "sandbox_error",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                }
+            )
+            raise
+        ledger.record(
+            {
+                "event_type": "sandbox_end",
+                "duration_seconds": round(time.monotonic() - started, 4),
+            }
+        )
+
+    rlm._interpreter_context = recorded
 
 
 _history_record_lock = threading.Lock()

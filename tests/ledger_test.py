@@ -276,3 +276,100 @@ def test_a_strict_write_failure_does_not_leak_the_call_it_was_recording(tmp_path
             pass
 
     assert "logical_call_id" not in ledger._context()
+
+
+# --- schema 2: blobs, ordering, durability, verified reading ---------------------
+
+
+def test_large_values_are_stored_once_as_verified_blobs_and_restored_whole(ledger_path):
+    text = "returned reasoning " * 2000
+    ledger.record({"event_type": "a", "reasoning": text, "nested": {"again": [text]}})
+    ledger.record({"event_type": "b", "reasoning": text})
+    raw = _rows(ledger_path)
+    assert raw[0]["reasoning"]["$blob"].startswith("sha256:")
+    assert raw[0]["reasoning"]["length"] == len(text)
+    blobs = list(ledger.blob_dir(ledger_path).iterdir())
+    assert len(blobs) == 1, "the same content is stored once"
+    restored = ledger.read_events(ledger_path)
+    assert restored[0]["reasoning"] == text and restored[0]["nested"]["again"] == [text]
+    assert restored[1]["reasoning"] == text
+    assert raw[0]["schema"] == "bandits-ledger/2"
+    assert raw[1]["seq"] == raw[0]["seq"] + 1 and raw[0]["pid"] == raw[1]["pid"]
+
+
+def test_a_tampered_or_missing_blob_is_reported_never_returned(ledger_path):
+    ledger.record({"event_type": "a", "text": "x" * 10_000})
+    (blob,) = ledger.blob_dir(ledger_path).iterdir()
+    blob.write_text("y" * 10_000)
+    with pytest.raises(ledger.LedgerCorrupt, match="does not match"):
+        ledger.read_events(ledger_path)
+    blob.unlink()
+    with pytest.raises(ledger.LedgerCorrupt, match="missing"):
+        ledger.read_events(ledger_path)
+
+
+def test_a_row_cut_short_by_a_crash_is_reported_and_earlier_corruption_raises(ledger_path):
+    ledger.record({"event_type": "a"})
+    with ledger_path.open("a") as handle:
+        handle.write('{"event_type": "model_call", "call_id": "x"')
+    rows = ledger.read_events(ledger_path)
+    assert rows[-1]["event_type"] == "truncated_row"
+    with ledger_path.open("a") as handle:
+        handle.write("\n")
+    ledger.record({"event_type": "after"})
+    with pytest.raises(ledger.LedgerCorrupt, match="line 2"):
+        ledger.read_events(ledger_path)
+
+
+def test_concurrent_writers_never_interleave_a_row(ledger_path):
+    payload = "z" * 4000  # below the blob threshold: long inline lines
+
+    def write(worker: int) -> None:
+        for i in range(50):
+            ledger.record({"event_type": "w", "worker": worker, "i": i, "payload": payload})
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    rows = _rows(ledger_path)
+    assert len(rows) == 400 and all(row["payload"] == payload for row in rows)
+    assert len({row["seq"] for row in rows}) == 400
+
+
+def test_fsync_policy_is_honoured(ledger_path, monkeypatch):
+    synced = []
+    real = __import__("os").fsync
+    monkeypatch.setattr("os.fsync", lambda fd: synced.append(fd) or real(fd))
+    ledger.record({"event_type": "a"})
+    assert synced == []
+    monkeypatch.setenv("BANDITS_LEDGER_FSYNC", "1")
+    ledger.record({"event_type": "b"})
+    assert len(synced) == 1
+    monkeypatch.delenv("BANDITS_LEDGER_FSYNC")
+    ledger.record({"event_type": "c", "text": "q" * 10_000})
+    # The blob file and its directory entry, before the referencing row.
+    assert len(synced) == 3, "a blob is always made durable before its reference"
+
+
+def test_recorded_commands_fsync_by_default_and_restore_the_setting(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.delenv("BANDITS_LEDGER", raising=False)
+    monkeypatch.delenv("BANDITS_LEDGER_FSYNC", raising=False)
+    seen = []
+
+    @ledger.project_recording
+    def run(*, project):
+        seen.append(os.environ.get("BANDITS_LEDGER_FSYNC"))
+
+    run(project=tmp_path)
+    assert seen == ["1"] and "BANDITS_LEDGER_FSYNC" not in os.environ
+
+
+def test_blobs_can_be_disabled(ledger_path, monkeypatch):
+    monkeypatch.setenv("BANDITS_LEDGER_BLOB_MIN", "0")
+    ledger.record({"event_type": "a", "text": "x" * 20_000})
+    assert _rows(ledger_path)[0]["text"] == "x" * 20_000
+    assert not ledger.blob_dir(ledger_path).exists()

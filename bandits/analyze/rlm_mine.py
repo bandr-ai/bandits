@@ -33,6 +33,7 @@ import hashlib
 import json
 import random
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -1395,10 +1396,26 @@ class _Scheduler:
         if fresh:
             return fresh
         retryable = [t for t in remaining if self.attempts.get(t, 0) < self.max_attempts]
-        self.exhausted.update(t for t in remaining if t not in retryable)
+        newly = [t for t in remaining if t not in retryable and t not in self.exhausted]
+        self.exhausted.update(newly)
+        if newly:
+            ledger.record(
+                {
+                    "event_type": "schedule_exhausted",
+                    "trace_ids": newly,
+                    "max_attempts": self.max_attempts,
+                }
+            )
         if not retryable:
             return None
         self.waiting.clear()
+        ledger.record(
+            {
+                "event_type": "schedule_retry_sweep",
+                "trace_ids": retryable,
+                "attempts": {t: self.attempts.get(t, 0) for t in retryable},
+            }
+        )
         return retryable
 
     def attempt_of(self, trace_ids: Sequence[str]) -> int:
@@ -1431,6 +1448,7 @@ def _run_account(
     identity: AccountIdentity,
     attempt: int,
     correction: str = "",
+    invocation_id: str = "",
 ) -> RunAccount:
     """One account invocation for one run, validated by the host.
 
@@ -1446,7 +1464,9 @@ def _run_account(
     error = ""
     failure = ""
     try:
-        with ledger.stage("rlm_account", run_id=run_id, attempt=attempt):
+        with ledger.stage(
+            "rlm_account", run_id=run_id, attempt=attempt, invocation_id=invocation_id
+        ):
             prediction = predict(
                 run_index=json.dumps(catalog.overview_for(run_id)), question=correction
             )
@@ -1586,6 +1606,17 @@ def mine_accounts(
         run_id = available[0]
         attempt = scheduler.attempt_of((run_id,))
         previous = last.get(run_id)
+        invocation_id = uuid.uuid4().hex[:16]
+        ledger.record(
+            {
+                "event_type": "invocation_start",
+                "invocation_id": invocation_id,
+                "kind": "account",
+                "trace_ids": [run_id],
+                "attempt": attempt,
+                "correction": bool(previous),
+            }
+        )
         account = _run_account(
             corpus,
             run_id,
@@ -1593,6 +1624,22 @@ def mine_accounts(
             identity=identity_for(run_id),
             attempt=attempt,
             correction=_correction_for(previous) if previous else "",
+            invocation_id=invocation_id,
+        )
+        ledger.record(
+            {
+                "event_type": "invocation_end",
+                "invocation_id": invocation_id,
+                "kind": "account",
+                "trace_ids": [run_id],
+                "attempt": attempt,
+                "status": account.status,
+                "completion_mode": account.completion.mode,
+                "failure_kind": account.failure_kind,
+                "validation_errors": list(account.validation_errors),
+                "llm_calls": account.llm_calls,
+                "cost_usd": account.cost_usd,
+            }
         )
         accounts.append(account)
         last[run_id] = account
@@ -1692,6 +1739,21 @@ def mine_taxonomy(
 
     if session is not None:
         session.begin(traces_total=len(readable), requested_passes=budget.passes, seed=seed)
+    ledger.record(
+        {
+            "event_type": "run_started",
+            "analysis_id": analysis_id,
+            "view": corpus.view.value,
+            "seed": seed,
+            "traces": readable,
+            "selection": list(corpus.list_trace_ids()) if corpus.selected else [],
+            "accounts_mode": account_predict is not None,
+            "budget": budget.model_dump(mode="json"),
+            "settings": settings or {},
+            "resumed": resume is not None,
+            "reused_accounts": [a.run_id for a in reuse_accounts],
+        }
+    )
 
     if accounts_mode:
         existing = list(resumed_accounts)
@@ -2021,6 +2083,18 @@ def mine_taxonomy(
         accounts_mode=accounts_mode,
     )
 
+    ledger.record(
+        {
+            "event_type": "run_finished",
+            "stop_reason": stop_reason.value,
+            "completed_passes": completed_passes,
+            "contracts": sorted(state.contracts),
+            "assignments": dict(state.assignments),
+            "unassigned_reasons": unassigned,
+            "coverage": coverage,
+            "budget_usage": guard.summary() if guard is not None else None,
+        }
+    )
     return RLMClusteringRun(
         analysis_id=analysis_id,
         view=corpus.view,
@@ -2144,7 +2218,70 @@ def _run_chunk(
     payload: Callable[[Sequence[str], dict[str, str]], str] | None = None,
     attempt: int = 1,
 ) -> ChunkResult:
-    """One call over one chunk, with its output cleaned at the boundary."""
+    """One invocation over one chunk, bracketed by invocation start/end events."""
+    invocation_id = uuid.uuid4().hex[:16]
+    ledger.record(
+        {
+            "event_type": "invocation_start",
+            "invocation_id": invocation_id,
+            "kind": "family",
+            "chunk_index": index,
+            "pass_index": pass_index,
+            "trace_ids": list(trace_ids),
+            "attempt": attempt,
+        }
+    )
+    result = _run_chunk_inner(
+        corpus,
+        state,
+        trace_ids=trace_ids,
+        statuses=statuses,
+        index=index,
+        pass_index=pass_index,
+        predict=predict,
+        limitations=limitations,
+        session_id=session_id,
+        repairs_left=repairs_left,
+        payload=payload,
+        attempt=attempt,
+        invocation_id=invocation_id,
+    )
+    ledger.record(
+        {
+            "event_type": "invocation_end",
+            "invocation_id": invocation_id,
+            "kind": "family",
+            "chunk_index": index,
+            "trace_ids": list(trace_ids),
+            "attempt": attempt,
+            "status": result.status,
+            "completion_mode": result.completion_mode,
+            "failure_kind": result.failure_kind,
+            "operations": [op.operation.value for op in result.operations],
+            "assignments": result.assignments,
+            "llm_calls": result.llm_calls,
+            "cost_usd": result.cost_usd,
+        }
+    )
+    return result
+
+
+def _run_chunk_inner(
+    corpus: ReadOnlyCorpus,
+    state: _TaxonomyState,
+    *,
+    trace_ids: tuple[str, ...],
+    statuses: dict[str, str],
+    index: int,
+    pass_index: int,
+    predict: _Predictor,
+    limitations: list[str],
+    session_id: str,
+    repairs_left: int,
+    payload: Callable[[Sequence[str], dict[str, str]], str] | None,
+    attempt: int,
+    invocation_id: str,
+) -> ChunkResult:
     chunk_json = (
         payload(trace_ids, statuses)
         if payload is not None
@@ -2162,6 +2299,7 @@ def _run_chunk(
             pass_index=pass_index,
             session_id=session_id,
             traces=len(trace_ids),
+            invocation_id=invocation_id,
         ):
             prediction = predict(
                 chunk=chunk_json,
@@ -2261,13 +2399,14 @@ def _run_chunk(
         # Hand the model its own invalid output and the reason, rather than
         # discarding work it already paid to produce. One whole extra RLM run:
         # set ``contract_repairs`` to 0 to forbid it.
-        repaired = _repair_contracts(
-            dropped_contracts,
-            chunk_json=chunk_json,
-            taxonomy_json=taxonomy_json,
-            predict=predict,
-            known=known,
-        )
+        with ledger.stage("rlm_repair", chunk_index=index, invocation_id=invocation_id):
+            repaired = _repair_contracts(
+                dropped_contracts,
+                chunk_json=chunk_json,
+                taxonomy_json=taxonomy_json,
+                predict=predict,
+                known=known,
+            )
         if repaired:
             contracts.extend(repaired)
             limitations.append(

@@ -263,6 +263,21 @@ def dspy_lm(
                 # whose call never reached ``forward`` still leaves a row.
                 record_history(self.history[before:], language_model=self)
 
+        def _get_cached_completion_fn(self, completion_fn, cache):
+            # DSPy 3.3.1 keys its response cache on every request kwarg. The
+            # guard passes each call its remaining wall time as ``timeout``,
+            # which differs on every call and would make --lm-cache never hit;
+            # it is a transport bound, not part of what is asked, so it is left
+            # out of the key alongside DSPy's own credential exclusions.
+            from dspy.clients.cache import request_cache
+
+            if cache:
+                completion_fn = request_cache(
+                    cache_arg_name="request",
+                    ignored_args_for_cache_key=["api_key", "api_base", "base_url", "timeout"],
+                )(completion_fn)
+            return completion_fn, {"no-cache": True, "no-store": True}
+
         def _begin(self, prompt, messages, call_kwargs):
             ledger.raise_if_failed()
             ticket = None
@@ -331,11 +346,17 @@ def dspy_lm(
                 }
             )
             usage = getattr(response, "usage", None)
+            cached = bool(getattr(response, "cache_hit", False))
             self.call_log.append(
                 {
                     "call_id": call.call_id,
                     "usage": dict(usage) if usage is not None else None,
-                    "cost": (getattr(response, "_hidden_params", None) or {}).get("response_cost"),
+                    # A cache hit replays the original response, price included;
+                    # nothing was billed for this call.
+                    "cost": 0.0
+                    if cached
+                    else (getattr(response, "_hidden_params", None) or {}).get("response_cost"),
+                    "cache_hit": cached,
                     "response": response,
                 }
             )

@@ -1973,7 +1973,13 @@ def mine_rlm_command(
             f"({mode}, {detail}){reason}[/dim]"
         )
 
-    with ledger.stage("rlm_mining_run", analysis_id=analysis_id, view=trace_view.value, seed=seed):
+    with ledger.stage(
+        "rlm_mining_run",
+        analysis_id=analysis_id,
+        view=trace_view.value,
+        seed=seed,
+        session_id=recorder.session_id,
+    ):
         try:
             draft = mine_taxonomy(
                 corpus,
@@ -2655,6 +2661,96 @@ def rlm_evidence_command(
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@app.command(name="rlm-ledger")
+def rlm_ledger_command(
+    session_id: str = typer.Argument(None, help="Mining session to check; omit for every row."),
+    call: str = typer.Option(None, "--call", help="Print one call's rows in full, blobs restored."),
+    ledger_path: Path = typer.Option(
+        None, "--ledger", help="Ledger file (default: the project ledger or BANDITS_LEDGER)."
+    ),
+    project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
+) -> None:
+    """Reconstruct a mining session from its ledger and check that it adds up.
+
+    Pairs every call start with its terminal row and every invocation and REPL
+    step with its end, verifies stored blobs, sums reported usage and cost, and
+    compares the totals with the session. Exits 1 when anything does not agree.
+    """
+    import os
+
+    from bandits.analyze.rlm_ledger import call_rows, load_session_rows, reconcile
+    from bandits.ledger import LedgerCorrupt
+
+    path = ledger_path or Path(
+        os.environ.get("BANDITS_LEDGER") or project / ".bandits" / "ledger.jsonl"
+    )
+    try:
+        rows = load_session_rows(path, session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]error:[/red] no ledger at {path}")
+        raise typer.Exit(code=1) from exc
+    except LedgerCorrupt as exc:
+        console.print(f"[red]corrupt ledger:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if call:
+        selected = call_rows(rows, call)
+        if not selected:
+            console.print(f"[red]error:[/red] no call {call!r} in this ledger")
+            raise typer.Exit(code=1)
+        typer.echo(json.dumps(selected, indent=2, ensure_ascii=False))
+        return
+    session = None
+    if session_id:
+        store = SessionStore(project / ".bandits")
+        if store.exists(session_id):
+            session = store.read(session_id)
+    report = reconcile(rows, session=session)
+    console.print(f"ledger:      {path}")
+    console.print(f"rows:        {report.rows}")
+    console.print(
+        f"calls:       {report.calls_started} started, {report.calls_completed} completed, "
+        f"{report.calls_failed} failed · "
+        + ", ".join(f"{role} {n}" for role, n in sorted(report.calls_by_role.items()))
+    )
+    console.print(
+        f"usage:       {report.prompt_tokens} prompt + {report.completion_tokens} completion "
+        f"tokens ({report.usage_missing} call(s) reported none)"
+    )
+    console.print(
+        f"cost:        ${report.cost_reported:.6f} reported, {report.cost_unknown} call(s) "
+        f"unknown, {report.cache_hits} cache hit(s)"
+    )
+    console.print(
+        "finish:      "
+        + ", ".join(f"{reason} {n}" for reason, n in report.finish_reasons.most_common())
+    )
+    console.print(
+        f"invocations: {len(report.invocations)} · REPL steps: {report.repl_steps} · "
+        + ", ".join(
+            f"{name} {report.events[name]}"
+            for name in (
+                "submit_accepted",
+                "submit_rejected",
+                "extract_start",
+                "evidence_access",
+                "budget_refusal",
+                "interrupted",
+            )
+            if report.events[name]
+        )
+    )
+    if report.run_finished:
+        console.print(f"finished:    {report.run_finished.get('stop_reason')}")
+    elif report.run_started:
+        console.print("[yellow]finished:    no run_finished row (stopped early)[/yellow]")
+    if report.consistent:
+        console.print("[green]consistent[/green]")
+        return
+    for problem in report.problems():
+        console.print(f"[red]problem:[/red] {problem}")
+    raise typer.Exit(code=1)
 
 
 @app.command(name="rlm-families")

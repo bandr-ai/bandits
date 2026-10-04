@@ -86,6 +86,9 @@ class SessionBudgetGuard:
         the provider did not price."""
 
         self.unknown_cost_calls = 0
+        self.cache_hits = 0
+        """Calls answered from a local cache: admitted, but no provider request."""
+
         self.reserved = 0.0
         self.refusals: list[str] = []
 
@@ -177,6 +180,10 @@ class SessionBudgetGuard:
                 else:
                     self.unknown_cost_calls += 1
                 return
+            if getattr(response, "cache_hit", False):
+                # Served from a local cache: no provider request, nothing billed.
+                self.cache_hits += 1
+                return
             cost = (getattr(response, "_hidden_params", None) or {}).get("response_cost")
             usage = getattr(response, "usage", None)
             tokens = getattr(usage, "total_tokens", None) if usage is not None else None
@@ -208,6 +215,7 @@ class SessionBudgetGuard:
             "usd_reported": round(self.usd_reported, 8),
             "usd_estimated": round(self.usd_estimated, 8),
             "unknown_cost_calls": self.unknown_cost_calls,
+            "cache_hits": self.cache_hits,
             "elapsed_seconds": round(self.elapsed(), 3),
             "refusals": list(self.refusals),
         }

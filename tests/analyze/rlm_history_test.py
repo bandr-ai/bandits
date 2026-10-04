@@ -71,11 +71,9 @@ def test_full_provider_reasoning_is_saved_immediately_without_duplicates(tmp_pat
     lm = providers.dspy_lm("test/model")
     lm()
     # Already durable before the enclosing prediction finishes or fails.
-    rows = [
-        json.loads(row)
-        for row in path.read_text().splitlines()
-        if json.loads(row)["event_type"] == "model_call"
-    ]
+    from bandits.ledger import read_events
+
+    rows = [row for row in read_events(path) if row["event_type"] == "model_call"]
     assert rows[0]["response"]["raw"]["choices"][0]["message"]["reasoning_content"] == text
     assert rows[0]["response"]["finish_reason"] == "length"
     record_history(lm.history, language_model=lm)
@@ -93,7 +91,9 @@ def test_final_repl_output_is_recorded_without_prompt_truncation(tmp_path, monke
     rlm = SimpleNamespace(_execute_code=lambda repl, code, inputs: output)
     record_repl(rlm)
     assert rlm._execute_code(None, "print(data)", {"chunk": "original input"}) == output
-    rows = [json.loads(row) for row in path.read_text().splitlines()]
+    from bandits.ledger import read_events
+
+    rows = read_events(path)
     assert rows[0]["variables"] == {"chunk": "original input"}
     assert rows[1]["output"] == output
 
@@ -543,7 +543,9 @@ def test_full_trajectory_accounts_then_families_end_to_end_in_real_dspy(monkeypa
 
 
 def _rows(path):
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    from bandits.ledger import read_events
+
+    return read_events(path)
 
 
 def _paired(rows):
@@ -626,12 +628,18 @@ def test_every_call_in_an_account_invocation_is_recorded_with_lineage(tmp_path, 
     assert sum(r["response"]["finish_reason"] == "length" for r in completed) == 2
     # Every call — including batched workers — sits under this invocation.
     for row in completed:
-        assert row["stage"] == "rlm_iteration", row["stage"]
         assert row["run_id"] == "w1" and row["attempt"] == 1
-    assert len({r["parent_stage_id"] for r in completed}) == 1, "one invocation"
+    assert len({r["invocation_id"] for r in completed}) == 1, "one invocation"
     subcalls = [r for r in completed if (r["request"]["prompt"] or "").startswith("sub-")]
+    roots = [r for r in completed if r not in subcalls]
+    assert {r["stage"] for r in roots} == {"rlm_iteration"}
     assert sorted(r["request"]["prompt"] for r in subcalls) == ["sub-a", "sub-b", "sub-c"]
-    assert all(r["iteration"] for r in subcalls) and len({r["iteration"] for r in subcalls}) == 1
+    # Every subcall, batched workers included, sits under the REPL step whose
+    # code issued it, inside that step's iteration.
+    issuing = next(r for r in rows if r["event_type"] == "repl_start" and "llm_query" in r["code"])
+    assert {r["stage"] for r in subcalls} == {"rlm_repl"}
+    assert {r["repl_id"] for r in subcalls} == {issuing["repl_id"]}
+    assert {r["iteration"] for r in subcalls} == {issuing["iteration"]}
     assert any("response_format" in r["request"]["settings"] for r in completed)
     kinds = [r["event_type"] for r in rows]
     for kind in ("repl_start", "repl_end", "evidence_access", "submit_accepted"):
@@ -941,3 +949,147 @@ def test_mine_rlm_cli_end_to_end_with_real_dspy_and_sandbox(tmp_path, monkeypatc
     }
     assert sum(r["event_type"] == "extract_start" for r in rows) == 1
     assert sum(r["event_type"] == "submit_accepted" for r in rows) == 3  # w1, w3, family
+    # Three account invocations and one family invocation, each bracketed and
+    # each with its own sandbox; the run itself is bracketed too.
+    assert sum(r["event_type"] == "invocation_start" for r in rows) == 4
+    assert sum(r["event_type"] == "invocation_end" for r in rows) == 4
+    assert sum(r["event_type"] == "sandbox_start" for r in rows) == 4
+    assert sum(r["event_type"] == "sandbox_end" for r in rows) == 4
+    assert [r["event_type"] for r in rows if r["event_type"].startswith("run_")] == [
+        "run_started",
+        "run_finished",
+    ]
+    assert {r.get("session_id") for r in completed} == {session_id}
+
+    # The ledger reconstructs and reconciles the session with no model call.
+    checked = runner.invoke(app, ["rlm-ledger", session_id, "--project", str(tmp_path)])
+    checked_out = " ".join(checked.stdout.split())
+    assert checked.exit_code == 0, checked_out
+    assert "calls: 6 started, 6 completed, 0 failed" in checked_out
+    assert "consistent" in checked_out
+    one = completed[0]["call_id"]
+    shown_call = runner.invoke(
+        app, ["rlm-ledger", session_id, "--call", one, "--project", str(tmp_path)]
+    )
+    call_rows = json.loads(shown_call.stdout)
+    assert [r["event_type"] for r in call_rows] == ["model_call_start", "model_call"]
+
+    # A call that started and never ended (a killed process) is reported.
+    with (tmp_path / ".bandits" / "ledger.jsonl").open("a") as handle:
+        handle.write(
+            json.dumps(
+                {"event_type": "model_call_start", "call_id": "dangling", "session_id": session_id}
+            )
+            + "\n"
+        )
+    broken = runner.invoke(app, ["rlm-ledger", session_id, "--project", str(tmp_path)])
+    assert broken.exit_code == 1
+    assert "started and never ended" in " ".join(broken.stdout.split())
+
+
+def _fireworks_transport(monkeypatch, *, content="ok", cost_model=None):
+    """Real LiteLLM against an in-process transport; returns the completion bodies sent."""
+    import httpx
+
+    sent: list[dict] = []
+
+    def send(self, request, **kwargs):
+        if not str(request.url).endswith("/chat/completions"):
+            return httpx.Response(404, request=request)
+        sent.append(json.loads(request.content))
+        body = {
+            "id": "r",
+            "object": "chat.completion",
+            "created": 0,
+            "model": cost_model or "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    return sent
+
+
+def test_cache_hits_are_recorded_as_such_and_never_billed(tmp_path, monkeypatch):
+    dspy = _real_dspy()
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    sent = _fireworks_transport(monkeypatch)
+    # Memory only, so the test writes no disk cache; DSPy's defaults are restored.
+    dspy.configure_cache(enable_disk_cache=False, enable_memory_cache=True)
+    try:
+        _check_cache_hits(dspy, path, sent, tmp_path)
+    finally:
+        dspy.configure_cache(enable_disk_cache=True, enable_memory_cache=True)
+
+
+def _check_cache_hits(dspy, path, sent, tmp_path):
+    from bandits import providers
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+
+    guard = SessionBudgetGuard(max_calls=10, max_seconds=600)
+    lm = providers.dspy_lm(
+        "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
+        api_key="test",
+        cache=True,
+        num_retries=0,
+        call_guard=guard,
+        temperature=0.3,
+    )
+    prompt = f"cache probe {tmp_path.name}"
+    lm(prompt=prompt)
+    lm(prompt=prompt)  # same request; only the per-call timeout differs
+    assert len(sent) == 1, "the second call never reached the provider"
+    rows = [r for r in _rows(path) if r["event_type"] == "model_call"]
+    assert [r["cache_hit"] for r in rows] == [False, True]
+    assert rows[1]["cost_usd"] == 0.0
+    assert guard.cache_hits == 1 and guard.calls_admitted == 2
+    assert lm.call_log[1]["cost"] == 0.0 and lm.call_log[1]["cache_hit"] is True
+
+
+def test_the_typed_dspy_call_path_is_recorded(tmp_path, monkeypatch):
+    dspy = _real_dspy()
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    monkeypatch.setattr(
+        dspy.LM, "forward", lambda lm, prompt=None, messages=None, **kw: _reply("typed reply")
+    )
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    lm = providers.dspy_lm("openai/test-model", cache=False)
+    with dspy.context(experimental=True):
+        lm(prompt="typed request")
+    rows = _rows(path)
+    assert len(_paired(rows)) == 1
+    assert rows[-1]["response"]["text"] == "typed reply"
+
+
+def test_no_credential_reaches_the_ledger_or_its_blobs(tmp_path, monkeypatch):
+    dspy = _real_dspy()
+    from bandits import providers
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    monkeypatch.setenv("BANDITS_LEDGER_BLOB_MIN", "10")
+    _fireworks_transport(monkeypatch, content="z" * 50)
+    lm = providers.dspy_lm(
+        "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
+        api_key="sk-never-recorded-123",
+        cache=False,
+        num_retries=0,
+    )
+    with dspy.context(lm=lm):
+        lm(prompt="prompt " * 10)
+    written = path.read_text() + "".join(
+        blob.read_text() for blob in (tmp_path / "ledger.jsonl.blobs").iterdir()
+    )
+    assert "sk-never-recorded-123" not in written
+    assert any(r.get("effective_request") for r in _rows(path))
