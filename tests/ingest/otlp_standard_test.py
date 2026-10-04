@@ -1324,24 +1324,45 @@ def test_otlp_steps_point_at_their_raw_span_and_keep_its_kind(tmp_path: Path) ->
     assert store.read_native_record(artifact, pointer)["spanId"] == "call"
 
 
-def test_id_less_tool_results_answer_their_calls_by_position() -> None:
+def test_an_id_less_result_answers_only_a_lone_call() -> None:
     from bandits.ingest.otlp_standard import _messages
 
     call = lambda i: {"id": f"c{i}", "name": f"t{i}", "args": {}}  # noqa: E731
-    history = [
-        {"role": "human", "content": "go"},
+    single = [
+        {"role": "ai", "content": "", "tool_calls": [call(1)]},
+        {"role": "tool", "content": {"rows": [1, 2]}},
+    ]
+    # One call, one result: the result is that call's, non-text content kept.
+    assert _messages(single)[1]["parts"] == [
+        {
+            "type": "tool_call_response",
+            "id": "c1",
+            "result": {"rows": [1, 2]},
+            "paired_by": "position",
+        }
+    ]
+    # Two calls: results may come back in any order, so neither is assigned.
+    double = [
         {"role": "ai", "content": "", "tool_calls": [call(1), call(2)]},
-        {"role": "tool", "content": "one"},
         {"role": "tool", "content": "two"},
+        {"role": "tool", "content": "one"},
     ]
-    parts = [m["parts"] for m in _messages(history)[2:]]
-    assert parts == [
-        [{"type": "tool_call_response", "id": "c1", "result": "one", "paired_by": "position"}],
-        [{"type": "tool_call_response", "id": "c2", "result": "two", "paired_by": "position"}],
+    assert [m["parts"] for m in _messages(double)[1:]] == [
+        [{"type": "text", "content": "two"}],
+        [{"type": "text", "content": "one"}],
     ]
-    # A count that does not match the calls proves nothing: left as text.
-    short = _messages(history[:3])
-    assert short[2]["parts"] == [{"type": "text", "content": "one"}]
-    # A result with its own id keeps it, and the block is not reassigned.
-    labelled = [*history[:2], {"role": "tool", "tool_call_id": "c2", "content": "two"}, history[3]]
-    assert [p.get("id") for m in _messages(labelled)[2:] for p in m["parts"]] == ["c2", None]
+    # A result with its own id keeps it.
+    labelled = [single[0], {"role": "tool", "tool_call_id": "c9", "content": "x"}]
+    assert _messages(labelled)[1]["parts"][0]["id"] == "c9"
+
+
+def test_a_request_system_field_opens_the_messages() -> None:
+    from bandits.ingest.otlp_standard import _messages
+
+    request = {"system": "Be brief.", "messages": [{"role": "user", "content": "hi"}]}
+    assert [m["role"] for m in _messages(request)] == ["system", "user"]
+    both = {
+        "system": "x",
+        "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+    }
+    assert [m["role"] for m in _messages(both)] == ["system", "user"]

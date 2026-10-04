@@ -569,6 +569,13 @@ def _messages(value: object, default_role: str | None = None) -> list[dict[str, 
     system: list[dict[str, Any]] = []
     if isinstance(value, dict):
         if isinstance(value.get("messages"), list):
+            # A request's own ``system`` (Anthropic, FailproofAI) opens the call
+            # unless the messages already carry one.
+            parts = _content_parts(value.get("system"))
+            if parts and not any(
+                isinstance(m, dict) and m.get("role") == "system" for m in value["messages"]
+            ):
+                system = [{"role": "system", "parts": parts}]
             value = value["messages"]
         elif default_role == "user" and _prompt_strings(value) is not None:
             # A completion request: OpenAI ``prompt``, LangChain LLM ``prompts``.
@@ -611,47 +618,55 @@ def _messages(value: object, default_role: str | None = None) -> list[dict[str, 
         )
     ):
         value = [{**item, "role": default_role} for item in value]
-    messages = [
-        m for m in (_message(item) for item in value if not _tool_definition(item)) if m is not None
+    read = [
+        (item, m)
+        for item in value
+        if not _tool_definition(item)
+        for m in (_message(item),)
+        if m is not None
     ]
-    _answer_by_position(messages)
-    return [*system, *messages] or None
+    _answer_by_position(read)
+    return [*system, *(m for _, m in read)] or None
 
 
-def _answer_by_position(messages: list[dict[str, Any]]) -> None:
-    """Give id-less tool results the ids of the calls they answer, in place.
+def _answer_by_position(read: list[tuple[Any, dict[str, Any]]]) -> None:
+    """Give an id-less tool result the id of the one call it answers, in place.
 
-    Some exporters drop ``tool_call_id`` from a history's tool messages. The
-    chat protocol still fixes their place: an assistant message's calls are
-    answered by the tool messages right after it, one each, in call order.
-    That is read only when the block holds exactly as many tool messages as
-    the assistant made calls, none carrying an id of its own; the part says
-    ``paired_by: position``. Anything else stays unanswered text.
+    Some exporters drop ``tool_call_id`` from a history's tool messages. Only
+    an assistant message making exactly one call, followed by exactly one tool
+    message without an id, proves which call that result answers. Several
+    calls with as many results prove nothing: results may come back in any
+    order, so they stay unanswered text. The result is read as if the id had
+    been recorded, so non-text content is kept; its part says ``paired_by:
+    position``.
     """
-    for index, message in enumerate(messages):
+    for index, (_, message) in enumerate(read):
         if message["role"] != "assistant":
             continue
         ids = [p.get("id") for p in message["parts"] if p.get("type") == "tool_call"]
-        if not ids or not all(isinstance(i, str) and i for i in ids):
+        if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
             continue
         end = index + 1
-        while end < len(messages) and messages[end]["role"] == "tool":
+        while end < len(read) and read[end][1]["role"] == "tool":
             end += 1
-        block = messages[index + 1 : end]
-        if len(block) != len(ids) or any(
-            p.get("type") == "tool_call_response" for m in block for p in m["parts"]
+        if end != index + 2:
+            continue
+        raw, result = read[index + 1]
+        if not isinstance(raw, dict) or any(
+            p.get("type") == "tool_call_response" for p in result["parts"]
         ):
             continue
-        for result, call_id in zip(block, ids, strict=True):
-            text = "\n".join(p["content"] for p in result["parts"] if p.get("type") == "text")
-            result["parts"] = [
-                {
-                    "type": "tool_call_response",
-                    "id": call_id,
-                    "result": text,
-                    "paired_by": "position",
-                }
-            ]
+        if isinstance(raw.get("kwargs"), dict) and raw.get("lc") is not None:
+            labelled = {**raw, "kwargs": {**raw["kwargs"], "tool_call_id": ids[0]}}
+        else:
+            labelled = {**raw, "tool_call_id": ids[0]}
+        answered = _message(labelled)
+        if answered is None:
+            continue
+        result["parts"] = [
+            {**p, "paired_by": "position"} if p.get("type") == "tool_call_response" else p
+            for p in answered["parts"]
+        ]
 
 
 def _prompt_strings(request: dict[str, Any]) -> list[str] | None:
