@@ -250,6 +250,10 @@ def _trace_view(trace: Trace) -> dict[str, Any]:
             {"span_id": c.span_id, "path": c.path, "value": _clip(c.value, 500)}
             for c in (request.task_candidates if request else ())
         ],
+        "tentative_tasks": [
+            {"span_id": t.span_id, "clue": t.clue, "value": _clip(t.value, 500)}
+            for t in (request.tentative_tasks if request else ())
+        ],
         "delivered": _clip(request.delivered) if request else None,
         "system_prompt": _clip(trace.system_prompt) if trace.system_prompt else None,
         # Shown nowhere else: the source's own trace-level record, and the
@@ -760,6 +764,7 @@ ${t.task_reason ? `<div class="muted">${esc(t.task_reason)}</div>` : ""}
 ${t.invocation_basis ? `<div class="muted">run: ${esc(t.invocation_basis)}</div>` : ""}
 ${t.task_candidates.length > 1 ? `<details><summary class="label">${t.task_status === "conflict" ? "different questions recorded (none chosen)" : "recorded in " + t.task_candidates.length + " fields (same text)"}</summary>
 <table>${t.task_candidates.map(c => `<tr><td><code>${esc(c.path)}</code><div class="muted"><code>${esc(c.span_id)}</code></div></td><td>${esc(c.value)}</td></tr>`).join("")}</table></details>` : ""}</td></tr>
+${(t.tentative_tasks || []).length ? `<tr><th>tentative task</th><td><span class="muted">clues only, not the task</span><table>${t.tentative_tasks.map(c => `<tr><td><code>${esc(c.clue)}</code><div class="muted"><code>${esc(c.span_id)}</code></div></td><td>${esc(c.value)}</td></tr>`).join("")}</table></td></tr>` : ""}
 <tr><th>answer</th><td>${pre(t.delivered)}</td></tr>
 ${t.system_prompt ? `<tr><th>system prompt</th><td>${pre(t.system_prompt)}</td></tr>` : ""}
 ${t.record ? `<tr><th>trace record</th><td><details><summary class="label">kept, not interpreted${typeof t.record === "object" ? ` (${Object.keys(t.record).length} fields)` : ""}</summary>${pre(t.record)}</details></td></tr>` : ""}

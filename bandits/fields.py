@@ -113,6 +113,7 @@ def trace_view(trace: Trace) -> dict[str, Any]:
                 "delivered": request.delivered,
                 "invocation_basis": request.invocation_basis,
                 "task_candidates": [c.model_dump() for c in request.task_candidates],
+                "tentative_tasks": [t.model_dump() for t in request.tentative_tasks],
             }
         )
     if trace.system_prompt is not None:
