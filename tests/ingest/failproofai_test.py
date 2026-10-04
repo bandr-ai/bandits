@@ -374,3 +374,41 @@ def test_a_pair_across_agents_has_no_owner(tmp_path: Path) -> None:
     opener = json.loads(model.attributes["bandits.unmapped"])["payload"]["agent_id"]
     closer = json.loads(model.attributes["failproofai.closer_unmapped"])["payload"]["agent_id"]
     assert (opener, closer) == ("a", "b")
+
+
+def test_each_model_call_keeps_the_tools_it_was_offered(tmp_path: Path) -> None:
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+    path = _write(
+        tmp_path,
+        [
+            _event(1, "model_request", 1, request_id="r1", messages=[], tools=tools),
+            _event(2, "model_response", 2, request_id="r1", content="ok"),
+            _event(3, "model_request", 3, request_id="r2", messages=[]),
+            _event(4, "model_response", 4, request_id="r2", content="ok"),
+        ],
+    )
+    _, trace = _load(path)
+    offered = [
+        s.attributes.get("gen_ai.request.tools") for s in trace.spans if s.kind is SpanKind.MODEL
+    ]
+    assert [json.loads(o) if o else None for o in offered] == [tools, None]
+
+
+def test_an_unresolved_task_keeps_tentative_clues_not_a_task(tmp_path: Path) -> None:
+    prompt = [{"role": "system", "content": "s"}, {"role": "human", "content": " Fix step 4 "}]
+    path = _write(
+        tmp_path,
+        [
+            _event(1, "agent_start", 1, goal="analyze_failure"),
+            _event(2, "model_request", 2, request_id="r1", messages=prompt),
+            _event(3, "model_response", 3, request_id="r1", content="done"),
+            _event(4, "agent_end", 4, outcome="success"),
+        ],
+    )
+    corpus = load_corpus(path, "failproofai", workflow=WorkflowDeclaration())
+    request = corpus.traces[0].request
+    assert request.task is None and request.task_status == "unresolved"
+    assert [(t.clue, t.value) for t in request.tentative_tasks] == [
+        ("step_input", "analyze_failure"),
+        ("first_model_prompt", "Fix step 4"),
+    ]

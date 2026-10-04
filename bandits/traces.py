@@ -165,8 +165,10 @@ class WorkflowDeclaration(Contract):
     when they were passed as flags or found. A different mapping is a different
     artifact even when it happens to choose the same fields."""
 
-    derivation_version: int = 3
+    derivation_version: int = 4
     """Bumped whenever how requests, nodes or links are derived changes.
+
+    4: a request whose task does not resolve keeps tentative task clues.
 
     3: the source's trace record on the trace, not its top steps; declared I/O
     values a step holds in its own fields stored once (``bandits.stored_as``).
@@ -180,6 +182,21 @@ class TaskCandidate(Contract):
 
     span_id: str
     path: str
+    value: str
+
+
+class TentativeTask(Contract):
+    """A clue to the task, read when no declared field holds one. Never the task.
+
+    Ingest does not decide what a run was asked to do from a clue; it keeps the
+    clue, with where it came from, for analysis to settle (the RLM clusters runs
+    into tasks). ``clue`` names the rule: ``step_input`` is the text input of the
+    first recorded step below the invocation, ``first_model_prompt`` the first
+    user-role message of the first model call.
+    """
+
+    span_id: str
+    clue: Literal["step_input", "first_model_prompt"]
     value: str
 
 
@@ -213,6 +230,10 @@ class WorkflowRequest(Contract):
     """Every non-empty value a declared task field holds on the invocation
     candidates. Declared tasks list where the agreeing text came from; a
     conflict keeps every differing value, for a consumer to choose from."""
+
+    tentative_tasks: tuple[TentativeTask, ...] = ()
+    """Clues to the task when none resolved (see :class:`TentativeTask`); empty
+    whenever ``task`` is set."""
 
     origin: Literal["human", "machine", "unknown"] = "unknown"
 
@@ -261,7 +282,12 @@ class EvidenceLink(Contract):
 
     call_span_id: str
     kind: Literal[
-        "tool_result", "enclosing_result", "text_match", "shared_result", "same_round", "delivery",
+        "tool_result",
+        "enclosing_result",
+        "text_match",
+        "shared_result",
+        "same_round",
+        "delivery",
         "input_context",
     ]
     target_span_id: str | None = None

@@ -72,6 +72,7 @@ from bandits.traces import (
     Span,
     SpanKind,
     SpanStatus,
+    TentativeTask,
     Trace,
     TraceCorpus,
     TraceIssue,
@@ -1613,6 +1614,58 @@ trace-level fields. Such a span records nothing the application did: it is a
 structural root, never the invocation."""
 
 
+def _tentative_tasks(
+    decoded: dict[str, _Decoded], invocation: str | None
+) -> tuple[TentativeTask, ...]:
+    """Clues to a task no declared field holds, in the order they were recorded.
+
+    The text input of the first recorded step below the invocation (an agent's
+    stated goal, say), and the first user-role message of the first model call.
+    Either can be boilerplate, or the program's prompt rather than the request;
+    each is kept as a clue for analysis, never set as the task.
+    """
+    ordered = sorted(decoded.values(), key=lambda s: (s.started_at, s.index))
+    found: list[TentativeTask] = []
+    step = next(
+        (
+            (span, value.strip())
+            for span in ordered
+            if span.role in (_STEP, _NONE)
+            and span.span_id != invocation
+            and not _is_container(span)
+            and isinstance(value := _io_value(span.attributes, _INPUT_VALUE_KEYS, Counter()), str)
+            and value.strip()
+        ),
+        None,
+    )
+    if step is not None:
+        found.append(TentativeTask(span_id=step[0].span_id, clue="step_input", value=step[1]))
+    model = next((span for span in ordered if span.role == _MODEL), None)
+    if model is not None:
+        messages = _normalized_messages(model.attributes, model.events, prompt_is_text=False)
+        text = next(
+            (
+                text.strip()
+                for message in messages.get("gen_ai.input.messages") or []
+                if message.get("role") == "user" and (text := _part_text(message)) and text.strip()
+            ),
+            None,
+        )
+        if text is not None:
+            found.append(
+                TentativeTask(span_id=model.span_id, clue="first_model_prompt", value=text)
+            )
+    return tuple(found)
+
+
+def _part_text(message: dict[str, Any]) -> str:
+    return "\n".join(
+        part["content"]
+        for part in message.get("parts") or []
+        if part.get("type") == "text" and isinstance(part.get("content"), str)
+    )
+
+
 def _is_container(span: _Decoded) -> bool:
     return any(span.attributes.get(key) == value for key, value in _CONTAINER_MARKERS)
 
@@ -2088,6 +2141,10 @@ def load_otlp_standard(
                 declaration=workflow,
                 allowed=allowed,
             )
+            if request.task is None:
+                request = request.model_copy(
+                    update={"tentative_tasks": _tentative_tasks(decoded, request.source_span_id)}
+                )
             if request.source_span_id is not None:
                 unparsed.update(scratch.get(request.source_span_id, Counter()))
             if request.source_span_id is None:
