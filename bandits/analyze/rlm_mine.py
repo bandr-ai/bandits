@@ -202,7 +202,9 @@ evaluator claims are deliberately absent. Group on intent.candidate_goal, \
 intent.required_outcome, parameters and constraints. An intent with status \
 "inferred" is an interpretation, not a declared request. To settle a disputed \
 boundary you may read evidence with inspect_run(run_id) and get_evidence(run_id, \
-ref) for runs in this chunk; do not reread runs that are not in dispute."""
+ref) for runs in this chunk; that evidence withholds outcome-bearing fields, \
+because families group requested work, not results. Do not reread runs that are \
+not in dispute."""
 
 
 _ACCOUNT_INSTRUCTION = """You are writing an evidence-backed ACCOUNT of one recorded run.
@@ -213,8 +215,9 @@ The variable `run_index` is a JSON object: run_id, total_events, \
 candidate_instructions (refs, origins and short excerpts of where a request \
 may have been recorded), distinct_system_prompts and limitations. Read the run \
 with the two helpers, not by guessing:
-- inspect_run(run_id, cursor=0, limit=20) -> dict: chronological event rows with \
-input/output/tool-call refs and next_cursor (null at the end). Page with cursor.
+- inspect_run(run_id, cursor=0, limit=20) -> dict: a bounded page of rows \
+(candidate instructions, system prompts and limitations first, then chronological \
+events with input/output/tool-call refs) and next_cursor (null at the end).
 - get_evidence(run_id, ref, start=0, limit=4096) -> dict: exact text of a ref \
 (max limit 8192); continue with next_start when it is not null.
 Keep what you read in Python variables; print only short excerpts.
@@ -231,9 +234,11 @@ instructions, and from the scenario or failure described in its inputs.
 milestones citing event span ids or refs. Not every event.
 3. Result: what was observed and whether evidence supports completion \
 (supported_complete), non-completion (supported_incomplete) or neither \
-(unknown). Put claims some component made about success in evaluator_claims; do \
-not adopt them as your assessment. A reported diagnosis is a claim to assess, \
-not automatically the truth.
+(unknown). Evidence marked analysis_claims "evaluator_assertion:..." is somebody's \
+judgement of the run: put it in evaluator_claims, never adopt it as your \
+assessment. A reported diagnosis is likewise a claim to assess, not automatically \
+the truth. Fields named like "expected" or "outcome" are ordinary data: read them \
+for what they say.
 
 Record missing or conflicting evidence in limitations (kind \
 "missing_requirement", "contradictory_evidence", "unavailable_source" or \
@@ -344,11 +349,17 @@ class GenerationSettings(Contract):
     max_output_chars: int = Field(default=10_000, ge=100)
     """REPL output shown back to the root per observation. Display only."""
 
+    inspect_page_chars: int = Field(default=6000, ge=1000, le=50_000)
+    """Ceiling on one ``inspect_run`` page. Changes what the root reads per
+    call, so it is part of the settings identity."""
+
     subcall_workers: int = Field(default=8, ge=1)
     """Concurrency of ``llm_query_batched``; 1 runs subcalls sequentially."""
 
-    provider_retries: int = Field(default=3, ge=0)
-    """LiteLLM transport retries, invisible above it; 0 makes every attempt a call."""
+    provider_retries: int = Field(default=0, ge=0)
+    """LiteLLM transport retries beneath one admitted, recorded call. Zero by
+    default (a reviewed change from DSPy's 3): a retry is a provider attempt the
+    call count, the recording and the cost figures cannot see individually."""
 
     lm_cache: bool = False
     """DSPy's response cache. Off by default (a reviewed change): with it on, a
@@ -692,6 +703,23 @@ def _spend_of(predict: Any) -> tuple[int | None, dict[str, int]]:
         return spend()
     except Exception:  # noqa: BLE001 - a bookkeeping failure must not lose the chunk
         return None, {}
+
+
+def _prompt_tokens(predict: Any) -> tuple[int | None, ...]:
+    """Each call's reported prompt tokens, in order: how the root's history grew.
+
+    A page limit bounds one observation, not the conversation: everything printed
+    is resent on every later root call. This is the measurement that shows
+    whether that accumulation matters. ``None`` where a call reported no usage.
+    """
+    spend = getattr(predict, "spend", None)
+    entries = getattr(spend, "entries", None) or ()
+    growth: list[int | None] = []
+    for entry in entries:
+        usage = entry.get("usage") if isinstance(entry, dict) else None
+        value = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        growth.append(value if isinstance(value, int) else None)
+    return tuple(growth)
 
 
 def _added_spend(
@@ -1411,7 +1439,7 @@ def _run_account(
     it returned), or a failure. What was actually retrieved is read from the
     helpers' access log, not from what the model says it read.
     """
-    catalog = corpus.evidence()
+    catalog = corpus.evidence("account")
     catalog.set_scope((run_id,))
     mark = len(catalog.accesses)
     prediction = None
@@ -1445,6 +1473,7 @@ def _run_account(
         submit_rejections=tuple(snapshot.get("submit_rejections", ())),
         inspected_refs=refs,
         inspected_ranges=ranges,
+        prompt_tokens_per_call=_prompt_tokens(predict),
         unresolved_refs=tuple(proposed.unresolved_refs) if proposed else (),
         error=error,
     )
@@ -1926,11 +1955,21 @@ def mine_taxonomy(
             "reported a cost, so the run was bounded only by its call, iteration and "
             "time limits"
         )
-    if guard is not None and budget.max_usd is not None and not guard.can_reserve:
+    if guard is not None and budget.max_usd is not None:
         limitations.append(
-            "the monetary ceiling was enforced on reported spend before each call; without "
-            "per-token prices no call could be reserved in advance, so the last admitted "
-            "call may overshoot it by its own cost"
+            "the monetary ceiling reserved an estimated worst case per call (request bytes "
+            "as input tokens plus the output allowance); provider template tokens are not "
+            "in that estimate"
+            if guard.can_reserve
+            else "the monetary ceiling was enforced on reported spend before each call; "
+            "without per-token prices no call could be reserved in advance, so the last "
+            "admitted call may overshoot it by its own cost"
+        )
+    if guard is not None and guard.attempts_per_call > 1:
+        limitations.append(
+            f"provider retries were allowed ({guard.attempts_per_call - 1} per call): the "
+            "call count and recording see one call per admitted request, not each "
+            "transport attempt beneath it"
         )
     if corpus.view.reads_agent_behavior:
         limitations.append(
@@ -2032,8 +2071,12 @@ def _coverage(
     failed_chunks = in_chunks - read - quarantined_chunks
     accessed: set[str] = set()
     if corpus.view.reads_agent_behavior:
-        catalog = corpus.evidence()
-        accessed = {run_id for run_id in readable if catalog.retrieved(run_id)[0]}
+        accessed = {
+            run_id
+            for catalog in corpus.evidence_catalogs()
+            for run_id in readable
+            if catalog.retrieved(run_id)[0]
+        }
 
     reasons: dict[str, str] = {}
     for trace_id in readable:
@@ -2109,7 +2152,7 @@ def _run_chunk(
     )
     taxonomy_json = _taxonomy_payload(state)
     started = time.monotonic()
-    catalog = corpus.evidence() if corpus.view.reads_agent_behavior else None
+    catalog = corpus.evidence("grouping") if corpus.view.reads_agent_behavior else None
     if catalog is not None:
         catalog.set_scope(trace_ids)
     try:
@@ -2141,6 +2184,7 @@ def _run_chunk(
             status="error",
             error=str(exc),
             completion_mode="extract" if completion.get("mode") == "extract" else "error",
+            prompt_tokens_per_call=_prompt_tokens(predict),
             iterations_used=completion.get("iterations_used"),
             submit_rejections=tuple(completion.get("submit_rejections", ())),
             failure_kind=_failure_kind(exc),
@@ -2151,6 +2195,7 @@ def _run_chunk(
             catalog.set_scope(None)
     completion = _completion_of(predict)
     provenance = {
+        "prompt_tokens_per_call": _prompt_tokens(predict),
         "completion_mode": completion.get("mode", "unknown"),
         "iterations_used": completion.get("iterations_used"),
         "iterations_to_submit": completion.get("iterations_to_submit"),

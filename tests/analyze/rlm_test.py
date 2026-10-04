@@ -2992,11 +2992,19 @@ def _workflow_trace(trace_id: str = "w1", *, context: str = _CONTEXT, calls: int
     )
 
 
-def _catalog(*traces: Trace):
+def _catalog(*traces: Trace, analysis=None, page_chars=None):
     corpus = ReadOnlyCorpus(
-        _corpus(*traces), view=TraceView.FULL_TRAJECTORY, corpus_version="corpus-test"
+        _corpus(*traces),
+        view=TraceView.FULL_TRAJECTORY,
+        corpus_version="corpus-test",
+        analysis=analysis,
+        page_chars=page_chars,
     )
-    return corpus, corpus.evidence()
+    return corpus, corpus.evidence("account")
+
+
+def _rows(page, kind):
+    return [row for row in page["rows"] if row["type"] == kind]
 
 
 def test_diagnostic_input_origin_refs_resolve_and_keep_origin() -> None:
@@ -3004,12 +3012,14 @@ def test_diagnostic_input_origin_refs_resolve_and_keep_origin() -> None:
     internal call is labeled as that call's input, never as a person's turn."""
     _, catalog = _catalog(_workflow_trace())
     page = catalog.inspect_run("w1")
-    candidates = {c["ref"]: c for c in page["candidate_instructions"]}
+    candidates = {c["ref"]: c for c in _rows(page, "candidate")}
     assert candidates["clue0.step_input"]["origin"] == "clue.step_input"
     assert candidates["clue1.first_model_prompt"]["origin"] == "clue.first_model_prompt"
     assert "request.input" in candidates  # absent, but listed as such
-    assert any("structural reference only" in limit for limit in page["limitations"])
-    first = page["events"][1]
+    (limitation,) = _rows(page, "limitation")
+    assert "structural reference only" in limitation["excerpt"]
+    assert "structural reference only" in catalog.get_evidence("w1", limitation["ref"])["content"]
+    first = _rows(page, "event")[1]
     roles = [entry["origin"] for entry in first["inputs"]]
     assert roles == ["model_input.system", "model_input.user"]
     assert "user_turn" not in " ".join(roles)
@@ -3069,49 +3079,57 @@ def test_tool_call_only_output_is_visible_and_linked() -> None:
     assert "tool_call lookup" in line and "tool_call screenshot" in line
 
     _, catalog = _catalog(trace)
-    row = catalog.inspect_run("w1")["events"][1]
+    events = _rows(catalog.inspect_run("w1"), "event")
+    row = events[1]
     names = [call["name"] for call in row["tool_calls"]]
     assert names == ["lookup", "screenshot"]
     linked = row["tool_calls"][0]
     assert linked["call_id"] == "c1" and linked["result_span"] == "m1:tool:c1"
     result = catalog.get_evidence("w1", linked["result_refs"][-1])
     assert '"matches":0' in result["content"]
-    later = catalog.inspect_run("w1")["events"][3]
+    later = events[3]
     assert "responds-to:e1.out0" in later["linked"]
 
 
 def test_repeated_system_prompt_is_one_source_with_every_occurrence_navigable() -> None:
     _, catalog = _catalog(_workflow_trace(calls=3))
     page = catalog.inspect_run("w1")
-    prompts = page["system_prompts"]
+    prompts = _rows(page, "system_prompt")
     assert len(prompts) == 1 and prompts[0]["occurrences"] == 4
     shared = catalog.get_evidence("w1", prompts[0]["shared_id"])
     occurrence = catalog.get_evidence("w1", "e4.in0")
     assert shared["content"] == occurrence["content"] == _SYSTEM
     assert shared["digest"] == occurrence["digest"]
     # The repeated user context appears once as text; later occurrences point back.
-    repeated = page["events"][3]["inputs"][1]
+    repeated = _rows(page, "event")[3]["inputs"][1]
     assert repeated["repeat_of"] == "clue1.first_model_prompt" and "excerpt" not in repeated
     # Binary parts are described, never presented as text.
     blob = catalog.get_evidence("w1", "e3.in3")
     assert blob["available"] is False and blob["evidence_type"] == "binary"
 
 
+def _pages(catalog, run_id="w1", limit=40):
+    cursor, pages = 0, []
+    while cursor is not None:
+        page = catalog.inspect_run(run_id, cursor, limit)
+        assert page["rows"], "a page must make progress"
+        pages.append(page)
+        cursor = page["next_cursor"]
+    return pages
+
+
 def test_inspect_run_pages_within_its_ceiling_and_always_progresses() -> None:
-    from bandits.analyze.rlm_evidence import INSPECT_MAX_CHARS, serialize
+    from bandits.analyze.rlm_evidence import INSPECT_PAGE_CHARS, serialize
 
     trace = _workflow_trace(calls=40, context="x" * 50_000)
     _, catalog = _catalog(trace)
-    cursor, pages, seen = 0, 0, []
-    while cursor is not None:
-        page = catalog.inspect_run("w1", cursor, 40)
-        assert len(serialize(page)) <= INSPECT_MAX_CHARS
-        assert page["events"], "a page must make progress"
-        seen.extend(e["order"] for e in page["events"])
-        cursor = page["next_cursor"]
-        pages += 1
-    assert seen == list(range(page["total_events"]))
-    assert pages > 1
+    pages = _pages(catalog)
+    assert all(len(serialize(page)) <= INSPECT_PAGE_CHARS for page in pages)
+    rows = [row["row"] for page in pages for row in page["rows"]]
+    assert rows == list(range(pages[0]["total_rows"]))
+    events = [r["order"] for page in pages for r in page["rows"] if r["type"] == "event"]
+    assert events == list(range(pages[0]["total_events"]))
+    assert len(pages) > 1
     full = catalog.get_evidence("w1", "clue1.first_model_prompt", 0, 8192)
     assert full["total_length"] == 50_000 and full["next_start"] == 8192
     tail = catalog.get_evidence("w1", "clue1.first_model_prompt", 49_990, 8192)
@@ -3127,11 +3145,57 @@ def test_helpers_refuse_runs_outside_the_invocation() -> None:
     assert catalog.inspect_run("w2")["run_id"] == "w2"
 
 
-def test_view_policy_withholds_outcome_keys_and_says_so() -> None:
-    _, catalog = _catalog(_workflow_trace())
-    step = catalog.get_evidence("w1", "e0.result")
+def test_grouping_policy_withholds_outcome_keys_and_says_so() -> None:
+    corpus, _ = _catalog(_workflow_trace())
+    step = corpus.evidence("grouping").get_evidence("w1", "e0.result")
     assert "success" not in step["content"]
     assert any("outcome" in limit for limit in step["limitations"])
+    assert "status" not in _rows(corpus.evidence("grouping").inspect_run("w1"), "event")[0]
+
+
+def test_account_policy_keeps_expected_and_outcome_fields_and_marks_evaluator_claims() -> None:
+    """Accounts describe results; ordinary fields named like outcomes are data.
+
+    An ``expected`` key holding a requirement and an ``outcome`` key holding an
+    observed change both survive, nested arbitrarily deep; a recorded score is
+    kept and labeled an evaluator assertion by the analysis's own classification.
+    """
+    from bandits.analyze.models import Evidence
+
+    deep = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"expected": "the field is saved"}}}}}}}}
+    trace = _workflow_trace()
+    step = trace.spans[0].replace(
+        output={"outcome": "document updated", "expected": "title changed", "deep": deep}
+    )
+    trace = trace.replace(spans=(step, *trace.spans[1:]))
+    analysis = SimpleNamespace(
+        evidence=(
+            Evidence(
+                evidence_id="e1",
+                claim="recorded_score",
+                value=0.25,
+                visibility="post_hoc",
+                provenance="observed",
+                strength="strong",
+                trace_id="w1",
+                span_id="step",
+            ),
+        )
+    )
+    corpus, account = _catalog(trace, analysis=analysis)
+    kept = account.get_evidence("w1", "e0.result", 0, 8192)
+    assert '"outcome":"document updated"' in kept["content"]
+    assert '"expected":"title changed"' in kept["content"]
+    assert '"expected":"the field is saved"' in kept["content"], "no depth truncation"
+    assert kept["limitations"] == []
+    assert kept["analysis_claims"] == [
+        {"claim": "recorded_score", "kind": "evaluator_assertion", "value": 0.25}
+    ]
+    event = _rows(account.inspect_run("w1"), "event")[0]
+    assert event["status"] == "ok"
+    assert event["payloads"][-1]["analysis_claims"] == ["evaluator_assertion:recorded_score"]
+    grouped = corpus.evidence("grouping").get_evidence("w1", "e0.result", 0, 8192)
+    assert "document updated" not in grouped["content"] and not grouped["analysis_claims"]
 
 
 def _account(run_id: str = "w1", **intent) -> dict:
@@ -3514,7 +3578,12 @@ def test_a_guard_refusal_stops_the_run_with_its_reason() -> None:
 
 
 def test_account_family_rows_omit_results_and_evaluator_claims() -> None:
-    """Same task, different outcome must look identical to family formation."""
+    """Accounts differing only in result fields give identical family rows.
+
+    A narrow property: milestones and limitations are model-written and can
+    still mention outcomes, and family formation can reopen evidence (under the
+    grouping policy). This shows the result fields themselves never reach it.
+    """
     from bandits.analyze.rlm_account import (
         Completion,
         ProposedAccount,
@@ -3592,3 +3661,105 @@ def test_a_ceiling_mid_accounts_stops_with_its_reason_and_leaves_the_rest_not_at
     assert run.accounts[0].status == "accepted"
     assert run.unassigned_reasons == {"w1": "not_attempted", "w2": "not_attempted"}
     assert run.coverage["attempted"] == 1 and run.coverage["failed"] == 0
+
+
+def test_metadata_heavy_first_page_stays_within_its_ceiling() -> None:
+    """The reviewer's reproduction: many long candidates once produced 9,836
+    characters on a page that promised 6,000, before any event row."""
+    from bandits.analyze.rlm_evidence import INSPECT_PAGE_CHARS, serialize
+    from bandits.traces import TentativeTask
+
+    trace = _workflow_trace()
+    clues = tuple(
+        TentativeTask(span_id="m1", clue="first_model_prompt", value=f"x{i} " * 200)
+        for i in range(30)
+    )
+    trace = trace.replace(request=trace.request.replace(tentative_tasks=clues))
+    _, catalog = _catalog(trace)
+    pages = _pages(catalog)
+    assert all(len(serialize(page)) <= INSPECT_PAGE_CHARS for page in pages)
+    candidates = [r["ref"] for page in pages for r in page["rows"] if r["type"] == "candidate"]
+    assert candidates == catalog.index("w1").candidates, "every candidate is on some page"
+
+
+def test_an_event_too_large_for_any_page_becomes_a_retrievable_pointer() -> None:
+    import json
+
+    from bandits.analyze.rlm_evidence import serialize
+
+    trace = _workflow_trace()
+    many = trace.spans[1].replace(
+        attributes={
+            **trace.spans[1].attributes,
+            "gen_ai.input.messages": [
+                {"role": "user", "parts": [{"type": "text", "content": f"part {i}"}]}
+                for i in range(400)
+            ],
+        }
+    )
+    trace = trace.replace(spans=(trace.spans[0], many, *trace.spans[2:]))
+    _, catalog = _catalog(trace, page_chars=1000)
+    pages = _pages(catalog, limit=1)
+    assert all(len(serialize(page)) <= 1000 for page in pages)
+    pointer = next(r for p in pages for r in p["rows"] if r.get("refs_ref"))
+    refs = json.loads(catalog.get_evidence("w1", pointer["refs_ref"], 0, 8192)["content"])
+    assert refs == catalog.index("w1").events[pointer["order"]].refs()
+    assert len([r for r in refs if ".in" in r]) == 400
+
+
+def test_a_page_ceiling_outside_its_range_is_refused() -> None:
+    with pytest.raises(ValueError, match="1,000 to 50,000"):
+        _catalog(_workflow_trace(), page_chars=500)[0].evidence("account")
+
+
+def test_a_failed_unpriced_call_counts_as_unknown_cost() -> None:
+    """A failure with no response is not free; without prices the session stops."""
+    from bandits.analyze.rlm_budget import BudgetExhausted, SessionBudgetGuard
+
+    guard = SessionBudgetGuard(max_calls=10, max_seconds=60, max_usd=1.0)
+    guard.settle(guard.admit(prompt="p", messages=None, max_tokens=10), None)
+    assert guard.unknown_cost_calls == 1
+    with pytest.raises(BudgetExhausted, match="no cost"):
+        guard.admit(prompt="p", messages=None, max_tokens=10)
+
+
+def test_reservations_cover_every_transport_attempt() -> None:
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+
+    one = SessionBudgetGuard(
+        max_calls=10, max_seconds=60, max_usd=1.0, usd_per_mtok_in=1.0, usd_per_mtok_out=1.0
+    )
+    three = SessionBudgetGuard(
+        max_calls=10,
+        max_seconds=60,
+        max_usd=1.0,
+        usd_per_mtok_in=1.0,
+        usd_per_mtok_out=1.0,
+        attempts_per_call=3,
+    )
+    single = one.admit(prompt="p", messages=None, max_tokens=1000).reserved
+    tripled = three.admit(prompt="p", messages=None, max_tokens=1000).reserved
+    assert tripled == pytest.approx(3 * single)
+
+
+def test_family_chunks_read_evidence_under_the_grouping_policy() -> None:
+    """Family formation may reopen evidence, but only with outcome keys withheld."""
+    corpus, _ = _catalog(_workflow_trace("w1"))
+    seen = {}
+
+    def predict(*, chunk, taxonomy, question):
+        grouping = corpus.evidence("grouping")
+        seen["content"] = grouping.get_evidence("w1", "e0.result")["content"]
+        seen["scoped"] = grouping._scope
+        return _family_predict(chunk=chunk, taxonomy=taxonomy, question=question)
+
+    miner = _AccountMiner(corpus.evidence("account"), [("submit", lambda r: _account(r))])
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=predict,
+        account_predict=miner,
+        identity_for=_identity,
+    )
+    assert run.assignments == {"w1": "c1"}
+    assert "success" not in seen["content"] and seen["scoped"] == ("w1",)

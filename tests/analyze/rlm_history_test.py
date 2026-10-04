@@ -511,7 +511,7 @@ def test_full_trajectory_accounts_then_families_end_to_end_in_real_dspy(monkeypa
         view=TraceView.FULL_TRAJECTORY,
         settings=settings,
         guard=guard,
-        catalog=catalog,
+        catalog=corpus.evidence("grouping"),
         accounts_mode=True,
     )
 

@@ -130,6 +130,9 @@ class Completion(Contract):
     """``ref[start:end]`` actually retrieved through get_evidence."""
 
     unresolved_refs: tuple[str, ...] = ()
+    prompt_tokens_per_call: tuple[int | None, ...] = ()
+    """Reported prompt tokens of each call, in order: the root history's growth."""
+
     error: str = ""
 
 

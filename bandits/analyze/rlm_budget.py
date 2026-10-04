@@ -7,15 +7,22 @@ spent 30 to 39 calls before the next check could fire. So the check moves to
 the one place every call passes — the language model's ``forward`` — and runs
 *before* dispatch.
 
-What it can promise and what it cannot. Call counts and wall time are exact at
-admission. Money is harder: a provider prices a call only after it returns. With
-per-token prices supplied, each call reserves its worst case (prompt bytes as an
-upper bound on input tokens, plus the full output allowance) before it is sent,
-so the ceiling is never crossed by admitted work. Without prices, admission can
-only refuse once *reported* spend reaches the ceiling, so the last admitted call
-can overshoot by its own cost; that is reported, never hidden. A call whose cost
-comes back unknown is not counted as free: with a ceiling and no prices to bound
-it, the session stops.
+What it can promise and what it cannot. What is counted is every ``forward``
+invocation, the unit DSPy issues. Transport retries LiteLLM makes beneath one
+invocation are not separately visible here, which is why mining defaults to
+zero of them; when retries are configured, each admitted call reserves for all
+of its possible attempts.
+
+Money is an estimate, not a guarantee: a provider prices a call only after it
+returns, and the price depends on tokens this side cannot count exactly. With
+per-token prices supplied, each call reserves an estimated worst case — the
+encoded request's bytes as its input tokens (an upper bound on the content's
+tokens, but not on chat-template or provider-added tokens) plus the full output
+allowance — before it is sent. Without prices, admission refuses once reported
+spend reaches the ceiling, so the last admitted call can overshoot by its own
+cost. Either way the run says which applied. A call whose cost is unknown —
+returned without a price, or failed with no response — is never counted as free:
+with a ceiling and no prices to estimate it, the session stops.
 """
 
 from __future__ import annotations
@@ -53,10 +60,16 @@ class SessionBudgetGuard:
         max_usd: float | None = None,
         usd_per_mtok_in: float | None = None,
         usd_per_mtok_out: float | None = None,
+        attempts_per_call: int = 1,
         clock: Any = time.monotonic,
     ) -> None:
         if (usd_per_mtok_in is None) != (usd_per_mtok_out is None):
             raise ValueError("give both input and output prices, or neither")
+        if attempts_per_call < 1:
+            raise ValueError("attempts_per_call is at least 1")
+        self.attempts_per_call = attempts_per_call
+        """Transport attempts one admitted call may make (provider retries + 1)."""
+
         self.max_calls = max_calls
         self.max_seconds = max_seconds
         self.max_usd = max_usd
@@ -134,7 +147,8 @@ class SessionBudgetGuard:
             json.dumps({"prompt": prompt, "messages": messages}, default=str).encode("utf-8")
         )
         output = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else 0
-        return size / 1e6 * self.price_in + output / 1e6 * self.price_out
+        per_attempt = size / 1e6 * self.price_in + output / 1e6 * self.price_out
+        return per_attempt * self.attempts_per_call
 
     def admit(self, *, prompt: Any, messages: Any, max_tokens: Any) -> _Ticket:
         with self._lock:
@@ -155,8 +169,13 @@ class SessionBudgetGuard:
             self.reserved -= ticket.reserved
             self.calls_settled += 1
             if response is None:
-                # Failed calls may still be billed; with a reservation, keep it.
-                self.usd_estimated += ticket.reserved
+                # A failed call may still have been billed, and nothing says how
+                # much. With prices, its reservation stands as the estimate;
+                # without, its cost is unknown, exactly like an unpriced reply.
+                if self.can_reserve:
+                    self.usd_estimated += ticket.reserved
+                else:
+                    self.unknown_cost_calls += 1
                 return
             cost = (getattr(response, "_hidden_params", None) or {}).get("response_cost")
             usage = getattr(response, "usage", None)

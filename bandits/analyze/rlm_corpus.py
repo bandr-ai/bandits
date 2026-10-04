@@ -355,6 +355,8 @@ class ReadOnlyCorpus:
         control_markers: Sequence[str] = (),
         trace_ids: Sequence[str] | None = None,
         corpus_version: str = "",
+        analysis: Any = None,
+        page_chars: int | None = None,
     ) -> None:
         """``control_markers`` declares literal tokens to strip from message
         text before the miner ever reads it — empty unless the caller knows
@@ -378,7 +380,9 @@ class ReadOnlyCorpus:
             traces = [by_id[tid] for tid in trace_ids]
         self._traces = {trace.trace_id: trace for trace in traces}
         self.selected = trace_ids is not None
-        self._catalog = None
+        self._analysis = analysis
+        self._page_chars = page_chars
+        self._catalogs: dict[Any, Any] = {}
         self._views: dict[str, UserMessageView] = {
             trace.trace_id: build_view(trace, view, control_markers=control_markers)
             for trace in traces
@@ -391,18 +395,33 @@ class ReadOnlyCorpus:
     def view(self) -> TraceView:
         return self._view
 
-    def evidence(self):
-        """The evidence index over the same traces, built lazily per run."""
-        if self._catalog is None:
-            from bandits.analyze.rlm_evidence import EvidenceCatalog
+    def evidence(self, policy: Any = None):
+        """The evidence index over the same traces under ``policy``, built lazily.
 
-            self._catalog = EvidenceCatalog(
+        ``account`` (the default) for writing accounts, ``grouping`` for family
+        formation; see :class:`~bandits.analyze.rlm_evidence.EvidencePolicy`.
+        """
+        from bandits.analyze.rlm_evidence import (
+            INSPECT_PAGE_CHARS,
+            EvidenceCatalog,
+            EvidencePolicy,
+        )
+
+        policy = EvidencePolicy(policy or EvidencePolicy.ACCOUNT)
+        if policy not in self._catalogs:
+            self._catalogs[policy] = EvidenceCatalog(
                 self._traces,
                 corpus_version=self.corpus_version,
-                view=self._view,
+                policy=policy,
                 control_markers=self._markers,
+                analysis=self._analysis,
+                page_chars=self._page_chars or INSPECT_PAGE_CHARS,
             )
-        return self._catalog
+        return self._catalogs[policy]
+
+    def evidence_catalogs(self) -> tuple[Any, ...]:
+        """Every catalog built so far, for coverage across both policies."""
+        return tuple(self._catalogs.values())
 
     def count_traces(self) -> int:
         return len(self._ids)
@@ -466,9 +485,10 @@ class ReadOnlyCorpus:
         if analysis is None or not self._view.reads_agent_behavior:
             return ()
         findings = set(audit_view_leakage(self._views, analysis))
-        # The helpers can retrieve every indexed item, not only what the view
-        # renders, so the same value check runs over the index's content too.
-        catalog = self.evidence()
+        # Family formation can retrieve every item its grouping index holds, not
+        # only what the view renders, so the same value check runs there too.
+        # The account index deliberately keeps outcomes and is not checked.
+        catalog = self.evidence("grouping")
         indexed = {
             run_id: UserMessageView(
                 trace_id=run_id, messages=tuple(catalog.index(run_id).all_text()) or ("",)

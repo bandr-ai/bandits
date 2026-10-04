@@ -1580,7 +1580,11 @@ if __name__ == "__main__":
 
 
 def _rlm_corpus(
-    analysis_id: str, project: Path, view: str, trace_ids: tuple[str, ...] | None = None
+    analysis_id: str,
+    project: Path,
+    view: str,
+    trace_ids: tuple[str, ...] | None = None,
+    page_chars: int | None = None,
 ):
     """The read-only view of the corpus behind an analysis.
 
@@ -1605,6 +1609,8 @@ def _rlm_corpus(
             control_markers=corpus.control_markers,
             trace_ids=trace_ids or None,
             corpus_version=analysis.corpus_id,
+            analysis=analysis,
+            page_chars=page_chars,
         )
     except (KeyError, ValueError) as exc:
         console.print(f"[red]error:[/red] {exc.args[0] if exc.args else exc}")
@@ -1689,11 +1695,19 @@ def mine_rlm_command(
     max_output_chars: int = typer.Option(
         10_000, "--max-output-chars", help="REPL output shown back per observation (display only)."
     ),
+    inspect_page_chars: int = typer.Option(
+        6000,
+        "--inspect-page-chars",
+        help="Ceiling on one inspect_run page, header to next_cursor (1000-50000).",
+    ),
     subcall_workers: int = typer.Option(
         8, "--subcall-workers", help="Concurrency of llm_query_batched; 1 is sequential."
     ),
     provider_retries: int = typer.Option(
-        3, "--provider-retries", help="LiteLLM transport retries (invisible above it)."
+        0,
+        "--provider-retries",
+        help="LiteLLM transport retries beneath one recorded call; not individually "
+        "counted or recorded, but reserved for.",
     ),
     lm_cache: bool = typer.Option(
         False, "--lm-cache/--no-lm-cache", help="DSPy response cache. Off by default."
@@ -1756,7 +1770,12 @@ def mine_rlm_command(
             console.print("[red]error:[/red] an integer --reasoning-effort must be positive")
             raise typer.Exit(code=1)
 
-    analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value, selection)
+    if not 1000 <= inspect_page_chars <= 50_000:
+        console.print("[red]error:[/red] --inspect-page-chars must be from 1000 to 50000")
+        raise typer.Exit(code=1)
+    analysis, corpus, store = _rlm_corpus(
+        analysis_id, project, trace_view.value, selection, page_chars=inspect_page_chars
+    )
     budget = Budget(
         passes=passes,
         max_iterations=max_iterations,
@@ -1773,6 +1792,7 @@ def mine_rlm_command(
         root_max_iterations=root_max_iterations,
         max_subcalls=max_subcalls,
         max_output_chars=max_output_chars,
+        inspect_page_chars=inspect_page_chars,
         subcall_workers=subcall_workers,
         provider_retries=provider_retries,
         lm_cache=lm_cache,
@@ -1810,20 +1830,24 @@ def mine_rlm_command(
             max_usd=max_usd,
             usd_per_mtok_in=usd_per_mtok_in,
             usd_per_mtok_out=usd_per_mtok_out,
+            attempts_per_call=provider_retries + 1,
         )
     except ValueError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     accounts_mode = trace_view is TraceView.FULL_TRAJECTORY
-    catalog = corpus.evidence() if accounts_mode else None
+    # Accounts read every recorded field; family formation reopens evidence only
+    # under the grouping policy, with outcome-bearing keys withheld.
+    catalog = corpus.evidence("account") if accounts_mode else None
+    grouping = corpus.evidence("grouping") if accounts_mode else None
     try:
         predict = build_rlm_predictor(
             model=model,
             view=trace_view,
             settings=settings,
             guard=guard,
-            catalog=catalog,
+            catalog=grouping,
             accounts_mode=accounts_mode,
         )
         account_predict = (
@@ -2492,6 +2516,12 @@ def _print_accounts(accounts) -> None:
             )
             + f" · {len(completion.inspected_ranges)} range(s) read"
         )
+        growth = [t for t in completion.prompt_tokens_per_call if t is not None]
+        if growth:
+            console.print(
+                f"  prompt tokens per call: first {growth[0]}, max {max(growth)}, "
+                f"last {growth[-1]} over {len(completion.prompt_tokens_per_call)} call(s)"
+            )
         if account.account is not None:
             intent = account.account.intent
             console.print(f"  intent ({intent.status}): {escape(intent.candidate_goal or '—')}")
@@ -2588,7 +2618,12 @@ def rlm_evidence_command(
     cursor: int = typer.Option(0, "--cursor"),
     limit: int = typer.Option(20, "--limit", help="Event rows (inspect) or characters (--ref)."),
     start: int = typer.Option(0, "--start"),
-    view: str = typer.Option(TraceView.FULL_TRAJECTORY.value, "--view"),
+    policy: str = typer.Option(
+        "account",
+        "--policy",
+        help="account (what accounts read) or grouping (what family formation reads).",
+    ),
+    page_chars: int = typer.Option(6000, "--page-chars"),
     project: Path = typer.Option(_DEFAULT_PROJECT, "--project"),
 ) -> None:
     """Show exactly what the miner's evidence helpers return for one run. No model call.
@@ -2596,8 +2631,21 @@ def rlm_evidence_command(
     The same deterministic ``inspect_run``/``get_evidence`` the miner uses, as
     JSON, so a reviewer can check an account's citations against the source.
     """
-    _, corpus, _ = _rlm_corpus(analysis_id, project, view, (trace_id,))
-    catalog = corpus.evidence()
+    if policy not in ("account", "grouping"):
+        console.print("[red]error:[/red] --policy is account or grouping")
+        raise typer.Exit(code=1)
+    try:
+        _, corpus, _ = _rlm_corpus(
+            analysis_id,
+            project,
+            TraceView.FULL_TRAJECTORY.value,
+            (trace_id,),
+            page_chars=page_chars,
+        )
+        catalog = corpus.evidence(policy)
+    except ValueError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     try:
         if ref:
             result = catalog.get_evidence(trace_id, ref, start, limit)

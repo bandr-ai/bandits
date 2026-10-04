@@ -479,6 +479,8 @@ class ChunkResult(Contract):
     ``no_submit`` (fallback extraction) or ``truncated``."""
 
     attempt: int = Field(default=1, ge=1)
+    prompt_tokens_per_call: tuple[int | None, ...] = ()
+    """Reported prompt tokens of each call in this invocation, in order."""
 
     raw_reply: str = ""
     """Exactly what the model returned, before any parsing.

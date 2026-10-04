@@ -20,6 +20,17 @@ payload locates it, it does not make it the task.
 
 References are identifiers, never paths, expressions or URLs: a reference that
 the index did not issue for that run resolves to nothing.
+
+Two evidence policies, because two consumers need different things. An
+*account* must describe intent, execution and result, so it reads every recorded
+field — an ``expected`` key can hold a requirement and an ``outcome`` key an
+observed change — with values the deterministic analysis classified annotated by
+that classification, so an evaluator's score is marked as a claim instead of
+being hidden or mistaken for an observation. *Grouping* (family formation) keeps
+the trajectory view's outcome-key redaction: it should reopen requested work,
+not results. Key redaction narrows what grouping sees; it cannot remove outcome
+information that model-written milestones or free text carry, and nothing here
+claims it does.
 """
 
 from __future__ import annotations
@@ -30,24 +41,49 @@ import re
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
-from bandits.analyze.rlm_corpus import _redact
-from bandits.analyze.rlm_models import TraceView
+from bandits.analyze.rlm_corpus import _OUTCOME_CLAIMS, _redact
 from bandits.traces import Span, SpanKind, Trace, WorkflowNode
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 """Bumped whenever references, origins or serialization change. Part of every
 account's identity, so an account citing refs from another index version is
-never silently reused against this one."""
+never silently reused against this one.
+
+2: evidence policies; overview pages are one bounded row stream; event ref
+lists and limitations are retrievable items."""
 
 SERIALIZATION = "json-sorted-v1"
 """How structured values become text, so character offsets into them are stable."""
 
-VIEW_POLICY_VERSION = 1
-"""Which fields the mining view withholds (see ``rlm_corpus._WITHHELD_KEYS``)."""
+POLICY_VERSION = 1
 
-INSPECT_MAX_CHARS = 6000
+
+class EvidencePolicy(str, Enum):
+    ACCOUNT = "account"
+    """Every recorded field and span status; nothing withheld by key name.
+    Analysis-classified values are annotated, never removed."""
+
+    GROUPING = "grouping"
+    """Outcome-bearing keys withheld (``rlm_corpus._WITHHELD_KEYS``) and span
+    status omitted, for family formation."""
+
+
+EVALUATOR_CLAIMS = frozenset({"recorded_score"})
+"""Analysis claims that report somebody's judgement of a run, not what happened.
+
+Classified by the deterministic analysis's own rules (``outcomes.py``), not by
+key name here. The other outcome claims — exit codes, final state fields, span
+errors — are observations of the run and are annotated as such."""
+
+INSPECT_PAGE_CHARS = 6000
+"""Default ceiling on one serialized overview page. A starting budget, not a
+measured optimum: it bounds what one call prints into the root's history, and
+nothing it leaves out is lost — every row is on some page and every ref is
+retrievable."""
+
 INSPECT_DEFAULT_ROWS = 20
 INSPECT_MAX_ROWS = 40
 EVIDENCE_DEFAULT_LIMIT = 4096
@@ -157,6 +193,10 @@ class EvidenceItem:
     descriptor: dict[str, Any] = field(default_factory=dict)
     """For binary/unavailable items: what is known about the missing content."""
 
+    analysis_claims: tuple[dict[str, Any], ...] = ()
+    """What the deterministic analysis read off this item's span, each labeled
+    ``evaluator_assertion`` or ``observation``. Account policy only."""
+
 
 @dataclass
 class EventRow:
@@ -170,15 +210,20 @@ class EventRow:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     payload_refs: list[str] = field(default_factory=list)
     linked_spans: list[str] = field(default_factory=list)
+    status: str | None = None
+    """The span's recorded status; account policy only."""
+
+    def refs(self) -> list[str]:
+        return self.inputs + self.outputs + self.payload_refs
 
 
 class RunIndex:
     """Every indexed item of one run, in chronological order of its events."""
 
-    def __init__(self, run_id: str, *, corpus_version: str, view: TraceView) -> None:
+    def __init__(self, run_id: str, *, corpus_version: str, policy: EvidencePolicy) -> None:
         self.run_id = run_id
         self.corpus_version = corpus_version
-        self.view = view
+        self.policy = policy
         self.items: dict[str, EvidenceItem] = {}
         self.events: list[EventRow] = []
         self.candidates: list[str] = []
@@ -228,9 +273,9 @@ class RunIndex:
         return self._content.values()
 
 
-def _structured(value: Any, view: TraceView) -> tuple[Any, tuple[str, ...]]:
-    """A structured payload under the view policy, plus the keys it withheld."""
-    if not view.reads_agent_behavior:
+def _structured(value: Any, policy: EvidencePolicy) -> tuple[Any, tuple[str, ...]]:
+    """A structured payload under the policy, plus the keys it withheld."""
+    if policy is EvidencePolicy.ACCOUNT:
         return value, ()
     removed: set[str] = set()
     kept = _redact(value, removed)
@@ -256,11 +301,19 @@ def _text_of(part: dict[str, Any]) -> str | None:
 
 
 class _Builder:
-    def __init__(self, trace: Trace, index: RunIndex, control_markers: Sequence[str]) -> None:
+    def __init__(
+        self,
+        trace: Trace,
+        index: RunIndex,
+        control_markers: Sequence[str],
+        claims: dict[str, list[dict[str, Any]]],
+    ) -> None:
         self.trace = trace
         self.index = index
-        self.view = index.view
+        self.policy = index.policy
         self.markers = tuple(control_markers)
+        self.claims = claims if index.policy is EvidencePolicy.ACCOUNT else {}
+        """span id -> analysis claims read off that span."""
         self.call_refs: dict[str, str] = {}
         """Recorded tool-call id -> the ref of the call part that issued it."""
 
@@ -271,6 +324,12 @@ class _Builder:
                 removed.append(marker)
                 text = text.replace(marker, "")
         return text, tuple(removed)
+
+    def _claims(self, span_id: str | None, origin: str) -> tuple[dict[str, Any], ...]:
+        # Attached to what a span returned or carried, not to the prompts sent to it.
+        if span_id is None or origin.startswith(("model_input", "clue", "request", "user_turn")):
+            return ()
+        return tuple(self.claims.get(span_id, ()))
 
     def text(self, ref: str, text: str, *, source_ref: str, origin: str, span_id: str | None):
         text, removed = self._strip(text)
@@ -284,6 +343,7 @@ class _Builder:
                 representation="text",
                 span_id=span_id,
                 withheld=removed,
+                analysis_claims=self._claims(span_id, origin),
             ),
             text,
         )
@@ -291,7 +351,7 @@ class _Builder:
     def structured(
         self, ref: str, value: Any, *, source_ref: str, origin: str, span_id: str | None
     ):
-        kept, withheld = _structured(value, self.view)
+        kept, withheld = _structured(value, self.policy)
         return self.index.add(
             EvidenceItem(
                 ref=ref,
@@ -303,10 +363,14 @@ class _Builder:
                 span_id=span_id,
                 withheld=withheld,
                 limitations=(
-                    (f"withheld by view policy v{VIEW_POLICY_VERSION}: {', '.join(withheld)}",)
+                    (
+                        f"withheld by the {self.policy.value} policy v{POLICY_VERSION}: "
+                        f"{', '.join(withheld)}",
+                    )
                     if withheld
                     else ()
                 ),
+                analysis_claims=self._claims(span_id, origin),
             ),
             serialize(kept),
         )
@@ -527,6 +591,8 @@ class _Builder:
         rows_by_span: dict[str, EventRow] = {}
         for order, (_, is_span, _, record) in enumerate(timeline):
             row = self._span_row(order, record) if is_span else self._node_row(order, record)
+            if self.policy is EvidencePolicy.ACCOUNT:
+                row.status = record.status.value
             rows_by_span[record.span_id] = row
             self.index.events.append(row)
         for span_id, targets in links.items():
@@ -542,6 +608,29 @@ class _Builder:
                 if match is not None and match in rows_by_span:
                     call["result_span"] = match
                     call["result_refs"] = rows_by_span[match].payload_refs
+
+    def finish(self) -> None:
+        """Make every event's ref list and every limitation retrievable by ref.
+
+        An overview page that must shorten a row to fit keeps a pointer here, so
+        nothing a page leaves out stops being discoverable.
+        """
+        for event in self.index.events:
+            self.structured(
+                f"e{event.order}.refs",
+                event.refs(),
+                source_ref=f"index:e{event.order}/refs",
+                origin="index.event_refs",
+                span_id=None,
+            )
+        for i, text in enumerate(self.index.limitations):
+            self.text(
+                f"limitation{i}",
+                text,
+                source_ref=f"index:limitations[{i}]",
+                origin="index.limitation",
+                span_id=None,
+            )
 
     def _node_row(self, order: int, node: WorkflowNode) -> EventRow:
         row = EventRow(order, node.span_id, "node", node.name, node.parent_span_id)
@@ -637,13 +726,19 @@ class EvidenceCatalog:
         traces: dict[str, Trace],
         *,
         corpus_version: str,
-        view: TraceView,
+        policy: EvidencePolicy = EvidencePolicy.ACCOUNT,
         control_markers: Sequence[str] = (),
+        analysis: Any = None,
+        page_chars: int = INSPECT_PAGE_CHARS,
     ) -> None:
+        if not 1000 <= page_chars <= 50_000:
+            raise ValueError("an overview page must allow 1,000 to 50,000 characters")
         self._traces = traces
         self.corpus_version = corpus_version
-        self.view = view
+        self.evidence_policy = policy
+        self.page_chars = page_chars
         self._markers = tuple(control_markers)
+        self._claims = _claims_by_span(analysis)
         self._indexes: dict[str, RunIndex] = {}
         self._lock = threading.Lock()
         self._scope: tuple[str, ...] | None = None
@@ -651,7 +746,7 @@ class EvidenceCatalog:
 
     @property
     def policy(self) -> str:
-        return f"{self.view.value}/v{VIEW_POLICY_VERSION}"
+        return f"{self.evidence_policy.value}/v{POLICY_VERSION}"
 
     def index(self, run_id: str) -> RunIndex:
         with self._lock:
@@ -659,10 +754,13 @@ class EvidenceCatalog:
                 trace = self._traces.get(run_id)
                 if trace is None:
                     raise KeyError(f"no run {run_id!r} in this corpus")
-                index = RunIndex(run_id, corpus_version=self.corpus_version, view=self.view)
-                builder = _Builder(trace, index, self._markers)
+                index = RunIndex(
+                    run_id, corpus_version=self.corpus_version, policy=self.evidence_policy
+                )
+                builder = _Builder(trace, index, self._markers, self._claims.get(run_id, {}))
                 builder.request()
                 builder.spans()
+                builder.finish()
                 self._indexes[run_id] = index
             return self._indexes[run_id]
 
@@ -715,7 +813,15 @@ class EvidenceCatalog:
     # --- the two helpers -----------------------------------------------------------
 
     def inspect_run(self, run_id: str, cursor: int = 0, limit: int = INSPECT_DEFAULT_ROWS) -> dict:
-        """A deterministic, bounded overview of one run. No summary, no judgement."""
+        """A deterministic, bounded overview of one run. No summary, no judgement.
+
+        One stream of rows, paged by ``cursor``: candidate instructions, distinct
+        system prompts and limitations first, then events in chronological
+        order. The whole serialized page — header, rows and ``next_cursor`` —
+        stays within ``page_chars``. A row too large to fit is shortened to its
+        refs, and one too large even then to a pointer (``refs_ref``) whose full
+        ref list ``get_evidence`` returns; every page holds at least one row.
+        """
         if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
             raise ValueError("cursor must be a non-negative integer from a previous next_cursor")
         if (
@@ -725,64 +831,117 @@ class EvidenceCatalog:
         ):
             raise ValueError(f"limit must be an integer from 1 to {INSPECT_MAX_ROWS}")
         index = self._check_run(run_id)
-        total = len(index.events)
+        stream = self._stream(index)
+        total = len(stream)
         if cursor > total:
-            raise ValueError(f"cursor {cursor} is past the end; this run has {total} events")
+            raise ValueError(f"cursor {cursor} is past the end; this run has {total} rows")
 
-        page: dict[str, Any] = {
+        header: dict[str, Any] = {
             "run_id": run_id,
             "corpus_version": index.corpus_version,
             "index_version": INDEX_VERSION,
-            "view_policy": self.policy,
-            "total_events": total,
+            "evidence_policy": self.policy,
+            "total_rows": total,
+            "total_events": len(index.events),
             "cursor": cursor,
         }
         if cursor == 0:
-            page["candidate_instructions"] = [
-                self._candidate(index, ref) for ref in index.candidates
-            ]
-            page["system_prompts"] = [
-                {
-                    "ref": occurrences[0],
-                    "shared_id": shared,
-                    "occurrences": len(occurrences),
-                    "length": len(index.content(occurrences[0]) or ""),
-                    "excerpt": excerpt(index.content(occurrences[0]) or "", 120),
-                }
-                for shared, occurrences in index.system_prompts.items()
-            ]
-            page["limitations"] = list(index.limitations)
-        else:
-            page["note"] = "candidate_instructions, system_prompts and limitations are on cursor 0"
-
+            header["note"] = (
+                "rows of type candidate, system_prompt and limitation come first, then "
+                "events in chronological order; read any ref with get_evidence"
+            )
         rows: list[dict[str, Any]] = []
         position = cursor
         stop = min(total, cursor + limit)
         while position < stop:
-            row = self._row(index, index.events[position], full=True)
-            trial = len(serialize({**page, "events": rows + [row]}))
-            if trial > INSPECT_MAX_CHARS:
+            kind, payload = stream[position]
+            # A row that does not fit whole moves to the next page whole. Only a
+            # row that cannot fit even alone is shortened, so shortening means
+            # "too large for any page", never "the page was nearly full".
+            details = ("full",) if rows else ("full", "short", "pointer")
+            fitted = None
+            for detail in details:
+                row = self._render(index, kind, payload, position, detail)
+                if self._fits(header, rows + [row], total):
+                    fitted = row
+                    break
+            if fitted is None:
                 if rows:
                     break
-                row = self._row(index, index.events[position], full=False)
-                if len(serialize({**page, "events": [row]})) > INSPECT_MAX_CHARS:
-                    row = self._minimal_row(index.events[position])
-            rows.append(row)
+                fitted = self._render(index, kind, payload, position, "pointer")
+            rows.append(fitted)
             position += 1
-        page["events"] = rows
-        page["next_cursor"] = position if position < total else None
+        page = {**header, "rows": rows, "next_cursor": position if position < total else None}
         self._log(
             {
                 "tool": "inspect_run",
                 "run_id": run_id,
                 "cursor": cursor,
                 "limit": limit,
-                "returned_events": [r["order"] for r in rows],
+                "returned_rows": [r["row"] for r in rows],
                 "available": True,
             },
             page,
         )
         return page
+
+    def _fits(self, header: dict[str, Any], rows: list[dict[str, Any]], total: int) -> bool:
+        # Measured with the largest next_cursor this run can produce, so adding
+        # the real one afterwards cannot push the page over.
+        return len(serialize({**header, "rows": rows, "next_cursor": total})) <= self.page_chars
+
+    @staticmethod
+    def _stream(index: RunIndex) -> list[tuple[str, Any]]:
+        return (
+            [("candidate", ref) for ref in index.candidates]
+            + [("system_prompt", item) for item in index.system_prompts.items()]
+            + [("limitation", i) for i in range(len(index.limitations))]
+            + [("event", event) for event in index.events]
+        )
+
+    def _render(
+        self, index: RunIndex, kind: str, payload: Any, row: int, detail: str
+    ) -> dict[str, Any]:
+        if kind == "candidate":
+            entry = {"row": row, "type": "candidate", **self._candidate(index, payload)}
+            if detail != "full":
+                entry.pop("excerpt", None)
+                entry.pop("source_ref", None)
+            if detail == "pointer":
+                entry.pop("limitations", None)
+            return entry
+        if kind == "system_prompt":
+            shared, occurrences = payload
+            text = index.content(occurrences[0]) or ""
+            entry = {
+                "row": row,
+                "type": "system_prompt",
+                "ref": occurrences[0],
+                "shared_id": shared,
+                "occurrences": len(occurrences),
+                "length": len(text),
+            }
+            if detail == "full":
+                entry["excerpt"] = excerpt(text, 120)
+            return entry
+        if kind == "limitation":
+            text = index.limitations[payload]
+            entry = {"row": row, "type": "limitation", "ref": f"limitation{payload}"}
+            if detail == "full":
+                entry["excerpt"] = excerpt(text, 300)
+            return entry
+        event: EventRow = payload
+        if detail == "pointer":
+            return {
+                "row": row,
+                "type": "event",
+                "order": event.order,
+                "span_id": event.span_id[:80],
+                "kind": event.kind,
+                "refs_ref": f"e{event.order}.refs",
+                "note": "shortened to fit the page; get_evidence on refs_ref lists every ref",
+            }
+        return {"row": row, "type": "event", **self._event(index, event, full=detail == "full")}
 
     def _candidate(self, index: RunIndex, ref: str) -> dict[str, Any]:
         item = index.items[ref]
@@ -803,7 +962,7 @@ class EvidenceCatalog:
             "excerpt": excerpt(text),
         }
 
-    def _row(self, index: RunIndex, event: EventRow, *, full: bool) -> dict[str, Any]:
+    def _event(self, index: RunIndex, event: EventRow, *, full: bool) -> dict[str, Any]:
         def describe(ref: str) -> dict[str, Any]:
             item = index.items[ref]
             entry: dict[str, Any] = {"ref": ref, "origin": item.origin}
@@ -812,6 +971,10 @@ class EvidenceCatalog:
                 return entry
             text = index.content(ref) or ""
             entry["length"] = len(text)
+            if item.analysis_claims:
+                entry["analysis_claims"] = [
+                    c["kind"] + ":" + c["claim"] for c in item.analysis_claims
+                ]
             if item.origin.startswith("model_input.system"):
                 entry["system_prompt"] = f"sys:{item.digest[:10]}"
                 return entry
@@ -829,6 +992,8 @@ class EvidenceCatalog:
             "name": event.name,
             "parent_span_id": event.parent_span_id,
         }
+        if event.status is not None:
+            row["status"] = event.status
         if event.inputs:
             row["inputs"] = [describe(ref) for ref in event.inputs]
         if event.outputs:
@@ -840,16 +1005,6 @@ class EvidenceCatalog:
         if event.linked_spans:
             row["linked"] = event.linked_spans
         return row
-
-    def _minimal_row(self, event: EventRow) -> dict[str, Any]:
-        return {
-            "order": event.order,
-            "span_id": event.span_id,
-            "kind": event.kind,
-            "name": event.name[:60],
-            "refs": event.inputs + event.outputs + event.payload_refs,
-            "note": "display fields shortened to fit; every ref is still retrievable",
-        }
 
     def get_evidence(
         self, run_id: str, ref: str, start: int = 0, limit: int = EVIDENCE_DEFAULT_LIMIT
@@ -901,6 +1056,7 @@ class EvidenceCatalog:
             "evidence_type": item.evidence_type,
             "representation": item.representation,
             "limitations": list(item.limitations),
+            "analysis_claims": list(item.analysis_claims),
         }
         if not item.available:
             unavailable = {
@@ -955,7 +1111,7 @@ class EvidenceCatalog:
         """
 
         def inspect_run(run_id: str, cursor: int = 0, limit: int = INSPECT_DEFAULT_ROWS) -> dict:
-            """Bounded chronological overview of one run: candidate instruction refs, system prompt refs, event rows with input/output/tool refs, limitations, total_events and next_cursor (null at the end). Deterministic; no summary."""
+            """Bounded overview of one run as rows: candidate instructions, system prompts and limitations first, then chronological events with input/output/tool refs. Page with cursor=next_cursor (null at the end). Deterministic; no summary."""
             return self.inspect_run(run_id, cursor, limit)
 
         def get_evidence(
@@ -1003,3 +1159,27 @@ def declared_origin(origin: str | None) -> bool:
     if origin is None:
         return False
     return any(origin == o or origin.startswith(o + ".") for o in DECLARED_ORIGINS)
+
+
+def _claims_by_span(analysis: Any) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Outcome claims the deterministic analysis read off each span, by run.
+
+    The provenance that tells an evaluator's judgement from an observation:
+    ``outcomes.py`` decided which spans carry a recorded score, an exit code or
+    a final state, by its own rules. The values stay in the evidence; this only
+    labels them.
+    """
+    found: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for evidence in getattr(analysis, "evidence", ()) or ():
+        if evidence.claim not in _OUTCOME_CLAIMS or evidence.span_id is None:
+            continue
+        found.setdefault(evidence.trace_id, {}).setdefault(evidence.span_id, []).append(
+            {
+                "claim": evidence.claim,
+                "kind": "evaluator_assertion"
+                if evidence.claim in EVALUATOR_CLAIMS
+                else "observation",
+                "value": evidence.value,
+            }
+        )
+    return found
