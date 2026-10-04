@@ -806,7 +806,13 @@ class EvidenceCatalog:
         # from the record: refs, ranges and the returned content itself.
         from bandits import ledger
 
-        ledger.record({"event_type": "evidence_access", **entry, "returned": returned})
+        ledger.record(
+            {
+                "event_type": "evidence_access",
+                **entry,
+                "returned": sandbox_safe(returned),
+            }
+        )
 
     # --- the two helpers -----------------------------------------------------------
 

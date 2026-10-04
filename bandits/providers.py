@@ -220,7 +220,12 @@ def _install_body_capture(litellm: Any) -> None:
 
 
 def dspy_lm(
-    model: str, *, api_key: str | None = None, call_guard: Any = None, **kwargs: Any
+    model: str,
+    *,
+    api_key: str | None = None,
+    call_guard: Any = None,
+    root_stop: list[str] | None = None,
+    **kwargs: Any,
 ) -> Any:
     """A ``dspy.LM`` for ``model``. The caller has already imported DSPy.
 
@@ -280,6 +285,16 @@ def dspy_lm(
 
         def _begin(self, prompt, messages, call_kwargs):
             ledger.raise_if_failed()
+            # ChatAdapter's marker terminates root code replies, not arbitrary
+            # child answers, JSON adapter replies, or extraction output.
+            effective_kwargs = {**self.kwargs, **call_kwargs}
+            if (
+                root_stop
+                and ledger._context().get("stage") == "rlm_iteration"
+                and not effective_kwargs.get("response_format")
+                and "stop" not in effective_kwargs
+            ):
+                call_kwargs["stop"] = root_stop
             ticket = None
             if call_guard is not None:
                 ticket = call_guard.admit(

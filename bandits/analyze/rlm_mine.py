@@ -76,7 +76,7 @@ DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 10
+PROMPT_VERSION = 11
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -274,7 +274,8 @@ Finishing. The `iteration` input shows k/N. Once k is N-2 or later, SUBMIT now \
 with what the evidence supports: "unknown" where it does not establish \
 something, and unresolved_refs for evidence you did not read. Do not make a \
 result more confident to finish. An honest partial account is valid; reaching N \
-without SUBMIT discards everything you found.
+without SUBMIT prevents account acceptance; your exploration and fallback \
+candidate remain recorded.
 
 SUBMIT(account=...) with a dict matching the account fields. If SUBMIT reports a \
 type error, fix exactly what it names and SUBMIT again; do not restart the \
@@ -507,10 +508,12 @@ def instrument_completion(rlm: Any) -> CompletionTracker:
 
 def _language_model(model: str, api_key: str | None, settings: GenerationSettings, guard: Any):
     kwargs = {key: value for key, value in settings.request_settings().items() if value is not None}
+    root_stop = kwargs.pop("stop", None)
     return providers.dspy_lm(
         model,
         api_key=api_key,
         call_guard=guard,
+        root_stop=root_stop,
         num_retries=settings.provider_retries,
         cache=settings.lm_cache,
         **kwargs,

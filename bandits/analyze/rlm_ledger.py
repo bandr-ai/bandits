@@ -171,6 +171,7 @@ def reconcile(rows: Sequence[dict[str, Any]], *, session: Any = None) -> LedgerR
             reads[
                 (
                     row.get("invocation_id"),
+                    row.get("run_id"),
                     row.get("tool"),
                     row.get("ref"),
                     row.get("cursor"),
