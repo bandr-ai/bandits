@@ -1351,6 +1351,11 @@ def test_an_id_less_result_answers_only_a_lone_call() -> None:
         [{"type": "text", "content": "two"}],
         [{"type": "text", "content": "one"}],
     ]
+    # A result naming another tool is not this call's.
+    other = [single[0], {"role": "tool", "name": "t2", "content": "x"}]
+    assert _messages(other)[1]["parts"] == [{"type": "text", "content": "x"}]
+    same = [single[0], {"role": "tool", "name": "t1", "content": "x"}]
+    assert _messages(same)[1]["parts"][0]["id"] == "c1"
     # A result with its own id keeps it.
     labelled = [single[0], {"role": "tool", "tool_call_id": "c9", "content": "x"}]
     assert _messages(labelled)[1]["parts"][0]["id"] == "c9"

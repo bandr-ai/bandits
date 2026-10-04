@@ -636,14 +636,16 @@ def _answer_by_position(read: list[tuple[Any, dict[str, Any]]]) -> None:
     an assistant message making exactly one call, followed by exactly one tool
     message without an id, proves which call that result answers. Several
     calls with as many results prove nothing: results may come back in any
-    order, so they stay unanswered text. The result is read as if the id had
+    order, so they stay unanswered text, as does a result naming another
+    tool than the call. The result is read as if the id had
     been recorded, so non-text content is kept; its part says ``paired_by:
     position``.
     """
     for index, (_, message) in enumerate(read):
         if message["role"] != "assistant":
             continue
-        ids = [p.get("id") for p in message["parts"] if p.get("type") == "tool_call"]
+        calls = [p for p in message["parts"] if p.get("type") == "tool_call"]
+        ids = [p.get("id") for p in calls]
         if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
             continue
         end = index + 1
@@ -656,6 +658,9 @@ def _answer_by_position(read: list[tuple[Any, dict[str, Any]]]) -> None:
             p.get("type") == "tool_call_response" for p in result["parts"]
         ):
             continue
+        named = result.get("name")
+        if isinstance(named, str) and named and named != calls[0].get("name"):
+            continue  # the result names another tool: it is not this call's
         if isinstance(raw.get("kwargs"), dict) and raw.get("lc") is not None:
             labelled = {**raw, "kwargs": {**raw["kwargs"], "tool_call_id": ids[0]}}
         else:
