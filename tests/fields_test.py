@@ -203,3 +203,47 @@ def test_fields_filters_by_kind_and_pages(tmp_path: Path) -> None:
     rows = json.loads(out.stdout)
     assert len(rows) == 2 and all(r["path"].startswith("misc.") for r in rows)
     assert "--offset 2 for more" in out.stderr
+
+
+def test_a_list_path_reads_every_item_and_names_each() -> None:
+    from bandits.fields import matches
+
+    view = {"l": [{"x": 1}, {"y": 2}, {"x": 3}], "t": '["p", "q"]'}
+    assert list(matches(view, "l[].x")) == [("l[0].x", 1), ("l[2].x", 3)]
+    assert list(matches(view, "t[]")) == [("t[0]", "p"), ("t[1]", "q")]  # JSON text too
+    assert list(matches(view, "l[-1].x")) == [("l[2].x", 3)]
+    assert list(matches(view, "l[].z")) == []
+    assert resolve(view, "l[].x") == 1  # the first
+
+
+def test_values_through_a_list_give_every_value_and_its_path(tmp_path: Path) -> None:
+    corpus = _corpus(tmp_path)
+    (row,) = values(corpus, "misc.tags[]", present_only=True)
+    assert row["value"] == ["a", "b"]
+    assert row["paths"] == ["misc.tags[0]", "misc.tags[1]"]
+    (one,) = values(corpus, row["paths"][1], present_only=True)
+    assert one["value"] == "b" and "paths" not in one
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_every_listed_path_reads_back_where_it_is_counted(tmp_path: Path) -> None:
+    """The contract agents rely on: `fields` lists a path held by `count`
+    steps (or traces), and `get` finds it in exactly those."""
+    corpora = [_corpus(tmp_path)]
+    for name, source in (
+        ("traces.otlp.jsonl", "otlp"),
+        ("traces.support.otlp.jsonl", "otlp"),
+        ("traces.coding.otlp.jsonl", "otlp"),
+        ("traces.multiturn.chat.json", "chat-json"),
+        ("session.multiturn.jsonl", "claude-code"),
+    ):
+        corpora.append(load_corpus(FIXTURES / name, source))
+    checked = 0
+    for corpus in corpora:
+        for row in fields(corpus):
+            held = sum(r["present"] for r in values(corpus, row["path"]))
+            assert held == row["count"], row["path"]
+            checked += "[]" in row["path"]
+    assert checked > 10

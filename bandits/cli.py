@@ -765,7 +765,9 @@ def fields_command(
 @app.command(name="get")
 def get_command(
     artifact_id: str,
-    field_path: str = typer.Option(..., "--field", help="A path from `bandits fields`."),
+    field_path: str = typer.Option(
+        ..., "--field", help="A path from `bandits fields`; `[]` reads every item, `[n]` one."
+    ),
     trace: list[str] = typer.Option([], "--trace", help="Only these traces. Repeatable."),
     present_only: bool = typer.Option(
         False, "--present", help="Leave out steps that do not hold the field."
