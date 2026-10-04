@@ -706,3 +706,61 @@ def test_reasoning_effort_accepts_an_integer_budget_and_refuses_a_non_positive_o
     assert mined.exit_code == 0, plain(mined.stdout)
     (state,) = SessionStore(tmp_path / ".bandits").list()
     assert state.settings["reasoning_effort"] == 1024
+
+
+def test_an_account_mode_run_flows_through_audit_and_task_set_materialization(tmp_path):
+    """Downstream commands read an account-mode run like any other clustering run."""
+    from tests.analyze.rlm_test import _account, _family_predict
+
+    analysis_id = _full_trajectory_project(tmp_path)
+
+    def fake_account_predictor(**_settings):
+        def predict(*, run_index, question=""):
+            return SimpleNamespace(account=_account(json.loads(run_index)["run_id"]))
+
+        predict.completion = {"mode": "submit", "iterations_used": 1, "iterations_to_submit": 1}
+        return predict
+
+    with (
+        mock.patch("bandits.cli.build_rlm_predictor", lambda **_: _family_predict),
+        mock.patch("bandits.analyze.rlm_mine.build_account_predictor", fake_account_predictor),
+    ):
+        mined = runner.invoke(
+            app,
+            ["mine-rlm", analysis_id, "--view", "full-trajectory", "--project", str(tmp_path)],
+        )
+    assert mined.exit_code == 0, plain(mined.stdout)
+    run_id = re.search(r"draft_id:\s+(\S+)", plain(mined.stdout)).group(1)
+    session_id = re.search(r"session:\s+(\S+)", plain(mined.stdout)).group(1)
+
+    watched = runner.invoke(app, ["rlm-session", session_id, "--watch", "--project", str(tmp_path)])
+    watched_out = " ".join(plain(watched.stdout).split())
+    assert watched.exit_code == 0, watched_out
+    assert f"rlm-families {run_id} --project {tmp_path.resolve()}" in watched_out
+
+    def fake_audit(*, model, view, max_tokens):
+        def predict(*, contract, sibling_contracts, members, outsiders, question=""):
+            return SimpleNamespace(
+                recommendation="keep",
+                least_compatible_pair=[],
+                strongest_outsider_trace_id="",
+                merge_with_contract_id="",
+                topical_only=False,
+                rationale="members request the same diagnosis",
+            )
+
+        return predict
+
+    with mock.patch("bandits.cli.build_taxonomy_audit_predictor", fake_audit):
+        audited = runner.invoke(app, ["audit-rlm", run_id, "--project", str(tmp_path)])
+    assert audited.exit_code == 0, plain(audited.stdout)
+    assert "keep" in plain(audited.stdout)
+
+    materialized = runner.invoke(
+        app, ["materialize-rlm-taskset", run_id, "--project", str(tmp_path)]
+    )
+    assert materialized.exit_code == 0, plain(materialized.stdout)
+    task_set_id = re.search(r"taskset_id:\s+(\S+)", plain(materialized.stdout)).group(1)
+    task_set = load_task_set(task_set_id, DerivedStore(tmp_path / ".bandits"))
+    members = {t for family in task_set.families for t in family.trace_ids}
+    assert members == {"w1", "w2", "w3"}
