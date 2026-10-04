@@ -613,7 +613,11 @@ _FAILPROOFAI_IO: dict[str, tuple[str, tuple[str, ...]]] = {
 
 _FAILPROOFAI_ATTRIBUTES: dict[str, dict[str, str]] = {
     "agent_start": {"parent_id": "failproofai.agent.parent_id"},
-    "model_request": {"model": "gen_ai.request.model", "request_id": "failproofai.request_id"},
+    "model_request": {
+        "model": "gen_ai.request.model",
+        "request_id": "failproofai.request_id",
+        "tools": "gen_ai.request.tools",
+    },
     "model_response": {
         "model": "gen_ai.response.model",
         "input_tokens": "gen_ai.usage.input_tokens",
