@@ -2558,6 +2558,11 @@ def _print_accounts(accounts) -> None:
                 console.print(
                     f"  limitation {escape(limitation.kind)}: {escape(limitation.detail)}"
                 )
+            for gap in account.account.evidence_gaps:
+                console.print(
+                    f"  evidence {gap.status} ({escape(gap.ref or 'not recorded')}): "
+                    f"{escape(gap.detail)}"
+                )
         for error in account.validation_errors:
             console.print(f"  [red]rejected:[/red] {escape(error)}")
         for rejection in completion.submit_rejections:

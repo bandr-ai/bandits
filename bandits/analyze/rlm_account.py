@@ -30,7 +30,7 @@ from bandits.traces import Contract
 if TYPE_CHECKING:
     from bandits.analyze.rlm_evidence import EvidenceCatalog
 
-ACCOUNT_SCHEMA_VERSION = 1
+ACCOUNT_SCHEMA_VERSION = 2
 
 
 class _Proposed(Contract):
@@ -80,6 +80,13 @@ class ProposedLimitation(_Proposed):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class ProposedEvidenceGap(_Proposed):
+    status: Literal["unread", "inconclusive", "unavailable"]
+    ref: str | None = None
+    detail: str = Field(min_length=1)
+    """Explain partial reads or uncertainty; missing evidence has no invented ref."""
+
+
 class ProposedAccount(_Proposed):
     """One run's account exactly as the model must SUBMIT it."""
 
@@ -90,6 +97,7 @@ class ProposedAccount(_Proposed):
     limitations: list[ProposedLimitation] = Field(default_factory=list)
     unresolved_refs: list[str] = Field(default_factory=list)
     """Refs you know matter and did not read, or could not resolve."""
+    evidence_gaps: list[ProposedEvidenceGap] = Field(default_factory=list)
 
 
 class AccountIdentity(Contract):
@@ -199,6 +207,11 @@ def _refs_of(account: ProposedAccount) -> list[tuple[str, str]]:
     for i, limitation in enumerate(account.limitations):
         found += [(f"limitations[{i}].evidence_refs", r) for r in limitation.evidence_refs]
     found += [("unresolved_refs", r) for r in account.unresolved_refs]
+    found += [
+        (f"evidence_gaps[{i}].ref", gap.ref)
+        for i, gap in enumerate(account.evidence_gaps)
+        if gap.ref is not None
+    ]
     return found
 
 
@@ -224,7 +237,13 @@ def validate_account(
     span_ids = index.span_ids()
     for where, ref in _refs_of(account):
         if not catalog.resolves(run_id, ref):
-            errors.append(f"{where}: {ref!r} is not a ref the index issued for this run")
+            event = ref.split(".", 1)[0]
+            alternatives = [r for r in index.items if r.startswith(event + ".")][:12]
+            errors.append(
+                f"{where}: {ref!r} is not a ref the index issued for this run. "
+                f"Indexed refs for that event: {alternatives}. Verify the intended evidence; "
+                "describe missing evidence in evidence_gaps with ref=null."
+            )
     for i, milestone in enumerate(account.execution.milestones):
         for ref in milestone.span_refs:
             if ref not in span_ids and not catalog.resolves(run_id, ref):
@@ -245,6 +264,27 @@ def validate_account(
         errors.append("intent.status is not 'unknown' but cites no evidence_refs")
     if account.result.assessment != "unknown" and not account.result.evidence_refs:
         errors.append("result.assessment is not 'unknown' but cites no evidence_refs")
+    if account.result.assessment != "unknown" and not (
+        account.intent.required_outcome and account.intent.required_outcome.strip()
+    ):
+        errors.append(
+            "result.assessment requires an established required_outcome; producing an output "
+            "alone does not establish task completion. Use unknown when requirements are unknown."
+        )
+    inspected = set(catalog.retrieved(run_id)[0])
+    explained = {gap.ref for gap in account.evidence_gaps if gap.ref is not None}
+    for ref in account.unresolved_refs:
+        if ref in inspected and ref not in explained:
+            errors.append(
+                f"unresolved_refs: {ref!r} was retrieved. Explain any partial read or "
+                "remaining uncertainty in evidence_gaps instead of calling it unread."
+            )
+    limitation_refs = {ref for item in account.limitations for ref in item.evidence_refs}
+    for position, limitation in enumerate(index.limitations):
+        if "failed_step_id is absent from recorded recent_steps" in limitation:
+            ref = f"limitation{position}"
+            if ref not in limitation_refs:
+                errors.append(f"limitations must cite {ref!r}: {limitation}")
     return tuple(errors)
 
 

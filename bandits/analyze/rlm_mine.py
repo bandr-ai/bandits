@@ -76,7 +76,7 @@ DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 11
+PROMPT_VERSION = 12
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -209,32 +209,26 @@ work, not results. Do not reread runs that are not in dispute. Once the \
 `iteration` input shows N-2 of N, SUBMIT, leaving unsettled traces ambiguous."""
 
 
-_ACCOUNT_INSTRUCTION = """You are writing an evidence-backed ACCOUNT of one recorded run.
+_ACCOUNT_INSTRUCTION = """Write an evidence-backed account of ONE run.
 
 {view}
 
-Already defined in the REPL. Do not import or redefine them; no other names \
-exist (there is no `iteration` variable):
-- run_index: dict with "run_id" and "first_page", the first page of \
-inspect_run for this run.
-- correction: str, empty on a first attempt.
-- inspect_run(run_id, cursor=0, limit=0) -> page dict. limit=0 gives as many rows \
-as fit.
-- get_evidence(run_id, ref, start=0, limit=4096) -> dict with "content" (str), \
-"available" (bool), "total_length", "done", and "next_start" while more remains. \
-When available is False, content is "" and "unavailable_reason" says why.
-- llm_query, llm_query_batched, SUBMIT.
+REPL names: run_index (dict: run_id, first_page), correction (str), inspect_run,
+get_evidence, llm_query, llm_query_batched, SUBMIT. These tools already exist;
+no imports are needed for them. There is no REPL variable named iteration.
 
-A page is {{"rows": [...], "done": bool, "remaining_rows": int, "next_call": str}} \
-plus "next_cursor" while not done. Rows of type "candidate", "system_prompt" and \
-"limitation" come first; each has one "ref". Rows of type "event" follow in \
-time order: {{"order", "span_id", "kind", "name", "inputs", "outputs", "payloads", \
-"tool_calls"}}, where inputs/outputs/payloads are lists of {{"ref", "origin", \
-"length", ...}} and tool_calls are {{"ref", "name", "result_refs"}}. An event too \
-large to show has "refs_ref" instead: get_evidence on it returns its refs as JSON.
+inspect_run(run_id, cursor=0, limit=0) fills a bounded page (0: as many rows as
+fit). A page contains rows, done, remaining_rows, next_call, and next_cursor
+while more remains. Candidate/system_prompt/limitation rows have one ref.
+Event rows have order, span_id, kind, name and optional inputs/outputs/payloads
+(lists of ref descriptors), tool_calls, or refs_ref for a retrievable ref list.
+get_evidence(run_id, ref, start=0, limit=4096) returns exact content, available,
+origin and source_ref; continue with next_start until done. If unavailable,
+content is empty and unavailable_reason explains why. Copy issued refs, never
+guess names. Missing evidence is a description, not a fabricated address.
 
-Read like this, keeping results in variables (never re-request a page or range \
-you already hold):
+Keep retrieved pages and evidence in variables; print short relevant excerpts.
+Start from run_index["first_page"], not another request for page zero:
 ```python
 rid = run_index["run_id"]
 page = run_index["first_page"]
@@ -242,44 +236,34 @@ rows = list(page["rows"])
 while not page["done"]:
     page = inspect_run(rid, cursor=page["next_cursor"])
     rows += page["rows"]
-events = [r for r in rows if r["type"] == "event"]
-context = get_evidence(rid, "<a ref from a row>")
 ```
 
-Answer three questions, citing refs returned by the helpers:
-1. Intent: what work was this run invoked to perform, with what parameters, \
-constraints and required completion conditions? status is "declared" only when a \
-ref records the request as such (a declared task field or a recorded user turn); \
-a parsed payload, an internal model prompt or a tentative clue supports \
-"inferred" at most. Use "unknown" when evidence does not establish it — that is a \
-valid answer. Keep the run-level job separate from internal subtask \
-instructions, and from the scenario or failure described in its inputs.
-2. Execution: the consequential actions, decisions and interactions, as \
-milestones citing event span ids or refs. Not every event.
-3. Result: what was observed and whether evidence supports completion \
-(supported_complete), non-completion (supported_incomplete) or neither \
-(unknown). Evidence marked analysis_claims "evaluator_assertion:..." is somebody's \
-judgement of the run: put it in evaluator_claims, never adopt it as your \
-assessment. A reported diagnosis is likewise a claim to assess, not automatically \
-the truth. Fields named like "expected" or "outcome" are ordinary data: read them \
-for what they say.
+Answer:
+1. Intent: requested work, parameters, constraints and required_outcome. Separate
+   the run-level job from internal subtasks and the failure scenario. Declared
+   intent needs a declared request/user-turn source. Clues and internal prompts
+   support inferred intent; absent requirements remain unknown.
+2. Execution: consequential actions and decisions, citing event spans or refs.
+3. Result: observed outputs and changes, separately from completion assessment.
+   Producing a diagnosis does not prove its correctness or task completion.
+   Use unknown if required_outcome is not established. Analysis-marked evaluator
+   assertions belong in evaluator_claims, not ground truth. Related or repeated
+   judgments are not independent verification without provenance establishing it.
 
-Record missing or conflicting evidence in limitations (kind \
-"missing_requirement", "contradictory_evidence", "unavailable_source" or \
-another short kind). List refs you know matter but did not read in \
-unresolved_refs. Every ref you cite must come from inspect_run or get_evidence \
-for this run_id; never invent one.
+Preserve source limitations and conflicting evidence. In particular, an absent
+failed_step_id in recent_steps means the failed action is not recoverable from
+that list. Cite its indexed limitation in the account's limitations.
+unresolved_refs contains existing refs not read. For partial reads, read-but-
+inconclusive evidence or unavailable evidence, use evidence_gaps entries with
+status unread/inconclusive/unavailable, ref when one exists, and detail explaining
+what remains unknown. Evidence that was never recorded has ref=null, not a guess.
 
-Finishing. The `iteration` input shows k/N. Once k is N-2 or later, SUBMIT now \
-with what the evidence supports: "unknown" where it does not establish \
-something, and unresolved_refs for evidence you did not read. Do not make a \
-result more confident to finish. An honest partial account is valid; reaching N \
-without SUBMIT prevents account acceptance; your exploration and fallback \
-candidate remain recorded.
-
-SUBMIT(account=...) with a dict matching the account fields. If SUBMIT reports a \
-type error, fix exactly what it names and SUBMIT again; do not restart the \
-investigation."""
+The model prompt's iteration input shows k/N. At N-2 or later, submit supported
+findings with unknowns and evidence gaps; reserve the remaining turns for fixes.
+SUBMIT(account=...) uses the typed schema. Type and host-validation errors return
+in the same working history: correct what they identify and resubmit. Do not
+restart exploration, silently rename citations or invent requirements to pass.
+An unsubmitted account is not accepted; its exploration remains recorded."""
 
 
 def instruction_for(view: TraceView) -> str:
@@ -437,6 +421,7 @@ class CompletionTracker:
     """
 
     def __init__(self) -> None:
+        self.validate_outputs: Callable[[dict[str, Any]], tuple[str, ...]] | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -475,10 +460,19 @@ def instrument_completion(rlm: Any) -> CompletionTracker:
 
     def final_output(*args, **kwargs):
         parsed, error = process_final(*args, **kwargs)
+        if not error and tracker.validate_outputs is not None:
+            errors = tracker.validate_outputs(parsed)
+            if errors:
+                error = "Host validation rejected SUBMIT: " + "\n".join(errors)
         if error:
             tracker.submit_rejections.append(error)
             ledger.record(
-                {"event_type": "submit_rejected", "iteration": tracker.iterations, "error": error}
+                {
+                    "event_type": "submit_rejected",
+                    "iteration": tracker.iterations,
+                    "error": error,
+                    "candidate": serialize_candidate(parsed),
+                }
             )
         else:
             tracker.mode = "submit"
@@ -678,6 +672,15 @@ def build_account_predictor(
 
     def predict(*, run_index: dict, question: str = "") -> Any:
         tracker.reset()
+        run_id = run_index["run_id"]
+
+        def validate_outputs(parsed: dict[str, Any]) -> tuple[str, ...]:
+            account = coerce_account(parsed.get("account"))
+            if account is None:
+                return ("SUBMIT must provide a typed account",)
+            return validate_account(account, run_id=run_id, catalog=catalog)
+
+        tracker.validate_outputs = validate_outputs
         with dspy.context(lm=language_model):
             return rlm(run_index=run_index, correction=question)
 

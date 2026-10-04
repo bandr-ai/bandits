@@ -47,7 +47,7 @@ from typing import Any
 from bandits.analyze.rlm_corpus import _OUTCOME_CLAIMS, _redact
 from bandits.traces import Span, SpanKind, Trace, WorkflowNode
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 """Bumped whenever references, origins or serialization change. Part of every
 account's identity, so an account citing refs from another index version is
 never silently reused against this one.
@@ -399,6 +399,20 @@ class _Builder:
         self.index.candidates.append(ref)
         parsed = parse_labeled_json(text)
         if parsed.status == "parsed":
+            context = parsed.value
+            if (
+                isinstance(context, dict)
+                and context.get("failed_step_id") is not None
+                and isinstance(context.get("recent_steps"), list)
+                and not any(
+                    isinstance(step, dict) and step.get("step_id") == context["failed_step_id"]
+                    for step in context["recent_steps"]
+                )
+            ):
+                self.index.limitations.append(
+                    f"{ref}: failed_step_id is absent from recorded recent_steps; "
+                    "the failed action cannot be recovered from that step list."
+                )
             self.structured(
                 f"{ref}.json",
                 parsed.value,
