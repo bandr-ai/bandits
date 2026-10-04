@@ -11,7 +11,7 @@ a trace into a family rather than admit nothing fits. Each of those has a test.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -2885,7 +2885,7 @@ def _workflow_trace(trace_id: str = "w1", *, context: str = _CONTEXT, calls: int
     moment = datetime(2024, 1, 1, tzinfo=UTC)
 
     def at(second: int) -> datetime:
-        return moment.replace(second=second)
+        return moment + timedelta(seconds=second)
 
     spans = [
         Span(
@@ -3025,7 +3025,8 @@ def test_diagnostic_input_origin_refs_resolve_and_keep_origin() -> None:
     assert "user_turn" not in " ".join(roles)
 
     unavailable = catalog.get_evidence("w1", "request.input")
-    assert unavailable["available"] is False and unavailable["content"] is None
+    assert unavailable["available"] is False and unavailable["content"] == ""
+    assert "not recorded" in unavailable["unavailable_reason"]
 
 
 def test_context_json_with_trailing_hints_parses_without_losing_the_suffix() -> None:
@@ -3059,10 +3060,13 @@ def test_missing_or_invalid_context_stays_raw_and_explicit() -> None:
     assert raw["content"] == 'Context:\n{"broken": '
 
     unknown = catalog.get_evidence("w1", "../../etc/passwd")
-    assert unknown["available"] is False and unknown["content"] is None
+    assert unknown["available"] is False and unknown["content"] == ""
+    assert "not a reference this index issued" in unknown["unavailable_reason"]
     assert "not a reference this index issued" in unknown["limitations"][0]
+    capped = catalog.get_evidence("w1", "clue1.first_model_prompt", 0, 9000)
+    assert capped["limit_capped_to"] == 8192 and capped["available"] is True
     with pytest.raises(ValueError, match="limit must be"):
-        catalog.get_evidence("w1", "clue0.step_input", 0, 9000)
+        catalog.get_evidence("w1", "clue0.step_input", 0, 0)
     with pytest.raises(ValueError, match="start must be"):
         catalog.get_evidence("w1", "clue0.step_input", -1)
     with pytest.raises(ValueError, match="cursor"):
@@ -3108,7 +3112,7 @@ def test_repeated_system_prompt_is_one_source_with_every_occurrence_navigable() 
     assert blob["available"] is False and blob["evidence_type"] == "binary"
 
 
-def _pages(catalog, run_id="w1", limit=40):
+def _pages(catalog, run_id="w1", limit=0):
     cursor, pages = 0, []
     while cursor is not None:
         page = catalog.inspect_run(run_id, cursor, limit)
@@ -3252,9 +3256,8 @@ class _AccountMiner:
         self.completion = {"mode": "submit", "iterations_used": 2, "iterations_to_submit": 2}
 
     def __call__(self, *, run_index, question=""):
-        import json
 
-        run_id = json.loads(run_index)["run_id"]
+        run_id = run_index["run_id"]
         self.calls.append((run_id, question))
         step = self.script.pop(0)
         if isinstance(step, BaseException):
@@ -3763,3 +3766,73 @@ def test_family_chunks_read_evidence_under_the_grouping_policy() -> None:
     )
     assert run.assignments == {"w1": "c1"}
     assert "success" not in seen["content"] and seen["scoped"] == ("w1",)
+
+
+def test_an_overview_has_no_row_ceiling_only_its_character_cap() -> None:
+    """The diagnostic's model asked for 100 and 50 rows and lost iterations to
+    errors. Any row count is accepted; the page stops when it is full."""
+    _, catalog = _catalog(_workflow_trace(calls=60))
+    big = catalog.inspect_run("w1", 0, 100)
+    assert big["rows"] and big["remaining_rows"] == big["total_rows"] - len(big["rows"])
+    one = catalog.inspect_run("w1", 0, 1)
+    assert len(one["rows"]) == 1
+    with pytest.raises(ValueError, match="non-negative"):
+        catalog.inspect_run("w1", 0, -1)
+
+
+def test_continuation_is_explicit_and_drives_paging_to_the_end() -> None:
+    _, catalog = _catalog(_workflow_trace(calls=60))
+    page = catalog.inspect_run("w1")
+    assert page["done"] is False
+    assert page["next_call"] == f"inspect_run('w1', cursor={page['next_cursor']})"
+    seen = len(page["rows"])
+    while not page["done"]:
+        page = catalog.inspect_run("w1", cursor=page["next_cursor"])
+        seen += len(page["rows"])
+    assert seen == page["total_rows"]
+    assert page["remaining_rows"] == 0 and page["next_call"] == ""
+
+
+def test_no_helper_response_carries_a_none_into_the_sandbox() -> None:
+    """The bridge turns None into JsNull, for which `is None` is false."""
+    from bandits.analyze.rlm_evidence import sandbox_safe
+
+    def nones(value) -> int:
+        if value is None:
+            return 1
+        if isinstance(value, dict):
+            return sum(nones(v) for v in value.values())
+        if isinstance(value, list):
+            return sum(nones(v) for v in value)
+        return 0
+
+    _, catalog = _catalog(_workflow_trace())
+    inspect_run, get_evidence = catalog.tools()
+    responses = [
+        inspect_run("w1"),
+        get_evidence("w1", "request.input"),  # unavailable
+        get_evidence("w1", "no-such-ref"),  # unknown
+        get_evidence("w1", "clue0.step_input"),  # complete in one read
+        catalog.run_index("w1"),
+    ]
+    last = inspect_run("w1")
+    while last.get("next_cursor") is not None:
+        last = inspect_run("w1", cursor=last["next_cursor"])
+    responses.append(last)
+    assert all(nones(r) == 0 for r in responses)
+    assert "next_cursor" not in last and last["done"] is True
+    assert responses[1]["content"] == "" and responses[1]["available"] is False
+    assert sandbox_safe({"a": [None, {"b": None}]}) == {"a": ["", {}]}
+
+
+def test_the_ledger_measures_duplicate_helper_reads() -> None:
+    from bandits.analyze.rlm_ledger import reconcile
+
+    read = {
+        "event_type": "evidence_access",
+        "invocation_id": "i",
+        "tool": "inspect_run",
+        "cursor": 0,
+    }
+    report = reconcile([read, read, read, {**read, "cursor": 5}])
+    assert report.duplicate_reads == 2

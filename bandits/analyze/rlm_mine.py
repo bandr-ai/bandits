@@ -76,7 +76,7 @@ DEFAULT_MODEL = providers.default_model(providers.RLM_FIREWORKS_DEFAULT)
 
 DEFAULT_CHUNK_SIZE = 20
 DEFAULT_SEED = 42
-PROMPT_VERSION = 9
+PROMPT_VERSION = 10
 
 CLEAN_SWEEPS_TO_FREEZE = 2
 """Consecutive clean sweeps required before a taxonomy may freeze.
@@ -202,26 +202,49 @@ execution milestones), produced earlier from the run's evidence; results and \
 evaluator claims are deliberately absent. Group on intent.candidate_goal, \
 intent.required_outcome, parameters and constraints. An intent with status \
 "inferred" is an interpretation, not a declared request. To settle a disputed \
-boundary you may read evidence with inspect_run(run_id) and get_evidence(run_id, \
-ref) for runs in this chunk; that evidence withholds outcome-bearing fields, \
-because families group requested work, not results. Do not reread runs that are \
-not in dispute."""
+boundary you may read evidence with inspect_run(run_id) (follow page["next_call"] \
+until page["done"]) and get_evidence(run_id, ref) for runs in this chunk; that \
+evidence withholds outcome-bearing fields, because families group requested \
+work, not results. Do not reread runs that are not in dispute. Once the \
+`iteration` input shows N-2 of N, SUBMIT, leaving unsettled traces ambiguous."""
 
 
 _ACCOUNT_INSTRUCTION = """You are writing an evidence-backed ACCOUNT of one recorded run.
 
 {view}
 
-The variable `run_index` is a JSON object: run_id, total_events, \
-candidate_instructions (refs, origins and short excerpts of where a request \
-may have been recorded), distinct_system_prompts and limitations. Read the run \
-with the two helpers, not by guessing:
-- inspect_run(run_id, cursor=0, limit=20) -> dict: a bounded page of rows \
-(candidate instructions, system prompts and limitations first, then chronological \
-events with input/output/tool-call refs) and next_cursor (null at the end).
-- get_evidence(run_id, ref, start=0, limit=4096) -> dict: exact text of a ref \
-(max limit 8192); continue with next_start when it is not null.
-Keep what you read in Python variables; print only short excerpts.
+Already defined in the REPL. Do not import or redefine them; no other names \
+exist (there is no `iteration` variable):
+- run_index: dict with "run_id" and "first_page", the first page of \
+inspect_run for this run.
+- correction: str, empty on a first attempt.
+- inspect_run(run_id, cursor=0, limit=0) -> page dict. limit=0 gives as many rows \
+as fit.
+- get_evidence(run_id, ref, start=0, limit=4096) -> dict with "content" (str), \
+"available" (bool), "total_length", "done", and "next_start" while more remains. \
+When available is False, content is "" and "unavailable_reason" says why.
+- llm_query, llm_query_batched, SUBMIT.
+
+A page is {{"rows": [...], "done": bool, "remaining_rows": int, "next_call": str}} \
+plus "next_cursor" while not done. Rows of type "candidate", "system_prompt" and \
+"limitation" come first; each has one "ref". Rows of type "event" follow in \
+time order: {{"order", "span_id", "kind", "name", "inputs", "outputs", "payloads", \
+"tool_calls"}}, where inputs/outputs/payloads are lists of {{"ref", "origin", \
+"length", ...}} and tool_calls are {{"ref", "name", "result_refs"}}. An event too \
+large to show has "refs_ref" instead: get_evidence on it returns its refs as JSON.
+
+Read like this, keeping results in variables (never re-request a page or range \
+you already hold):
+```python
+rid = run_index["run_id"]
+page = run_index["first_page"]
+rows = list(page["rows"])
+while not page["done"]:
+    page = inspect_run(rid, cursor=page["next_cursor"])
+    rows += page["rows"]
+events = [r for r in rows if r["type"] == "event"]
+context = get_evidence(rid, "<a ref from a row>")
+```
 
 Answer three questions, citing refs returned by the helpers:
 1. Intent: what work was this run invoked to perform, with what parameters, \
@@ -246,6 +269,12 @@ Record missing or conflicting evidence in limitations (kind \
 another short kind). List refs you know matter but did not read in \
 unresolved_refs. Every ref you cite must come from inspect_run or get_evidence \
 for this run_id; never invent one.
+
+Finishing. The `iteration` input shows k/N. Once k is N-2 or later, SUBMIT now \
+with what the evidence supports: "unknown" where it does not establish \
+something, and unresolved_refs for evidence you did not read. Do not make a \
+result more confident to finish. An honest partial account is valid; reaching N \
+without SUBMIT discards everything you found.
 
 SUBMIT(account=...) with a dict matching the account fields. If SUBMIT reports a \
 type error, fix exactly what it names and SUBMIT again; do not restart the \
@@ -323,6 +352,10 @@ lower or raise it explicitly and the ledger records the value actually used.
 """
 
 
+COMPLETED_MARKER = "[[ ## completed ## ]]"
+"""DSPy ChatAdapter's end-of-reply marker (DSPy 3.3.1)."""
+
+
 class GenerationSettings(Contract):
     """Every knob that changes what a mining invocation sends or may do.
 
@@ -370,12 +403,24 @@ class GenerationSettings(Contract):
     contract_repairs: int = Field(default=MAX_CONTRACT_REPAIRS, ge=0)
     """Full extra RLM runs allowed per chunk to fix rejected contracts."""
 
+    stop_at_completed_marker: bool = True
+    """Send DSPy's ChatAdapter end marker as a stop sequence.
+
+    The adapter tells every reply to end with ``[[ ## completed ## ]]``. In a
+    recorded Nemotron diagnostic 20 of 22 ChatAdapter replies ended exactly
+    there, and the one runaway reply went on past its first marker into an
+    imagined multi-turn transcript (15 markers, 15K characters) until the output
+    cap cut it. Stopping at the first marker leaves a well-formed reply as it
+    is, does nothing when a model omits the marker, and ends a runaway where it
+    began. The adapter parses a reply without the trailing marker."""
+
     def request_settings(self) -> dict[str, Any]:
         return {
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
             "reasoning_effort": self.reasoning_effort,
+            "stop": [COMPLETED_MARKER] if self.stop_at_completed_marker else None,
         }
 
     def digest(self) -> str:
@@ -615,8 +660,8 @@ def build_account_predictor(
     language_model = _language_model(model, api_key, settings, guard)
 
     class _Account(dspy.Signature):
-        run_index: str = dspy.InputField(
-            desc="the run to account for, with candidate instruction refs"
+        run_index: dict = dspy.InputField(
+            desc='{"run_id": ..., "first_page": the first inspect_run page}'
         )
         correction: str = dspy.InputField(
             desc="empty on a first attempt; otherwise why the last account was rejected"
@@ -628,7 +673,7 @@ def build_account_predictor(
         dspy, _Account, settings=settings, language_model=language_model, tools=catalog.tools()
     )
 
-    def predict(*, run_index: str, question: str = "") -> Any:
+    def predict(*, run_index: dict, question: str = "") -> Any:
         tracker.reset()
         with dspy.context(lm=language_model):
             return rlm(run_index=run_index, correction=question)
@@ -1467,9 +1512,7 @@ def _run_account(
         with ledger.stage(
             "rlm_account", run_id=run_id, attempt=attempt, invocation_id=invocation_id
         ):
-            prediction = predict(
-                run_index=json.dumps(catalog.overview_for(run_id)), question=correction
-            )
+            prediction = predict(run_index=catalog.run_index(run_id), question=correction)
     except ledger.LedgerWriteError:
         raise
     except Exception as exc:  # noqa: BLE001 - recorded on the account, not fatal

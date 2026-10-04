@@ -79,6 +79,10 @@ class LedgerReport:
     """Call rows with no call id: written outside the forward boundary, so they
     cannot be paired with a start or an invocation."""
 
+    duplicate_reads: int = 0
+    """Helper calls repeated with identical arguments in one invocation — the
+    re-reading a well-navigated account should not need. Measured, not refused."""
+
     brackets: list[_Brackets] = field(default_factory=list)
     mismatches: list[str] = field(default_factory=list)
 
@@ -137,6 +141,7 @@ def reconcile(rows: Sequence[dict[str, Any]], *, session: Any = None) -> LedgerR
     report.brackets = [calls, invocations, repl, runs]
     terminals: dict[str, dict[str, Any]] = {}
     calls_by_invocation: Counter = Counter()
+    reads: Counter = Counter()
     run_key = 0
     for row in rows:
         kind = row.get("event_type")
@@ -162,6 +167,18 @@ def reconcile(rows: Sequence[dict[str, Any]], *, session: Any = None) -> LedgerR
         elif kind == "invocation_end":
             invocations.ends[row["invocation_id"]] += 1
             report.invocations.setdefault(row["invocation_id"], {})["end"] = row
+        elif kind == "evidence_access":
+            reads[
+                (
+                    row.get("invocation_id"),
+                    row.get("tool"),
+                    row.get("ref"),
+                    row.get("cursor"),
+                    row.get("limit"),
+                    row.get("start"),
+                    row.get("end"),
+                )
+            ] += 1
         elif kind == "repl_start":
             repl.starts[row.get("repl_id", "?")] += 1
             report.repl_steps += 1
@@ -176,6 +193,7 @@ def reconcile(rows: Sequence[dict[str, Any]], *, session: Any = None) -> LedgerR
             runs.ends[f"run {run_key}"] += 1
             report.run_finished = row
 
+    report.duplicate_reads = sum(n - 1 for n in reads.values() if n > 1)
     report.calls_started = sum(calls.starts.values())
     for row in terminals.values():
         report.calls_by_role[_role(row)] += 1

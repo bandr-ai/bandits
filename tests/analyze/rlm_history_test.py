@@ -644,7 +644,9 @@ def test_every_call_in_an_account_invocation_is_recorded_with_lineage(tmp_path, 
     kinds = [r["event_type"] for r in rows]
     for kind in ("repl_start", "repl_end", "evidence_access", "submit_accepted"):
         assert kind in kinds, kind
-    access = next(r for r in rows if r["event_type"] == "evidence_access")
+    access = next(
+        r for r in rows if r["event_type"] == "evidence_access" and r["tool"] == "get_evidence"
+    )
     assert access["returned"]["content"] == "diagnose_step"
     assert not any(r.get("_bandits_recorded") for r in rows)
 
@@ -1093,3 +1095,63 @@ def test_no_credential_reaches_the_ledger_or_its_blobs(tmp_path, monkeypatch):
     )
     assert "sk-never-recorded-123" not in written
     assert any(r.get("effective_request") for r in _rows(path))
+
+
+def test_navigation_works_inside_the_real_sandbox(tmp_path, monkeypatch):
+    """Through DSPy's actual Deno/Pyodide bridge: run_index arrives as a dict, a
+    loop driven by page["done"] reaches the end, and unavailable evidence can be
+    sliced like any string. All three failed or were at risk in the diagnostic."""
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    from bandits.analyze.rlm_mine import _run_account
+    from tests.analyze.rlm_test import _catalog, _identity, _workflow_trace
+
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("BANDITS_LEDGER", str(path))
+    corpus, catalog = _catalog(_workflow_trace("w1", calls=60), page_chars=1500)
+    navigate = (
+        "rid = run_index['run_id']\n"
+        "page = run_index['first_page']\n"
+        "rows = list(page['rows'])\n"
+        "pages = 1\n"
+        "while not page['done']:\n"
+        "    page = inspect_run(rid, cursor=page['next_cursor'])\n"
+        "    rows += page['rows']\n"
+        "    pages += 1\n"
+        "missing = get_evidence(rid, 'request.input')\n"
+        "print('RESULT', type(run_index).__name__, pages, len(rows) == page['total_rows'], "
+        "repr(missing['content'][:10]), missing['available'], 'next_cursor' in page)"
+    )
+    provider = _ScriptedProvider([navigate, _valid_account_code()])
+    predict = _predictor(dspy, monkeypatch, provider, catalog=catalog)
+    account = _run_account(corpus, "w1", predict=predict, identity=_identity("w1"), attempt=1)
+    assert account.status == "accepted", account.completion.error or account.validation_errors
+
+    (output,) = [
+        str(r["output"])
+        for r in _rows(path)
+        if r["event_type"] == "repl_end" and "RESULT" in str(r["output"])
+    ]
+    kind, pages, complete, content, available, has_cursor = output.split("RESULT")[1].split()[:6]
+    assert kind == "dict"
+    assert int(pages) > 2, "the loop paged past the first page and stopped"
+    assert complete == "True" and has_cursor == "False"
+    assert content == "''" and available == "False"
+
+
+def test_the_completed_marker_stop_reaches_the_provider_body():
+    """Default settings stop each reply at DSPy's end marker; the body carries it."""
+    _real_dspy()
+    from bandits import providers
+    from bandits.analyze.rlm_mine import COMPLETED_MARKER, GenerationSettings
+
+    settings = GenerationSettings().request_settings()
+    assert settings["stop"] == [COMPLETED_MARKER]
+    checked = providers.preflight_settings(
+        "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
+        {k: v for k, v in settings.items() if v is not None},
+    )
+    assert checked["dropped"] == []
+    assert checked["effective"]["stop"] == [COMPLETED_MARKER]
+    assert GenerationSettings(stop_at_completed_marker=False).request_settings()["stop"] is None

@@ -391,6 +391,7 @@ def dspy_lm(
 _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
     "max_tokens": ("max_tokens", "max_completion_tokens", "max_output_tokens"),
     "reasoning_effort": ("reasoning_effort", "reasoning", "thinking"),
+    "stop": ("stop", "stop_sequences"),
 }
 
 

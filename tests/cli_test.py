@@ -536,7 +536,7 @@ def test_full_trajectory_mining_through_the_cli_selects_accounts_and_names_the_p
 
     def fake_account_predictor(*, catalog, **_settings):
         def predict(*, run_index, question=""):
-            run_id = json.loads(run_index)["run_id"]
+            run_id = run_index["run_id"]
             account_runs.append(run_id)
             catalog.get_evidence(run_id, "clue1.first_model_prompt.json", 0, 40)
             return SimpleNamespace(account=_account(run_id))
@@ -691,6 +691,20 @@ def test_reasoning_effort_accepts_an_integer_budget_and_refuses_a_non_positive_o
     ):
         refused = runner.invoke(app, [*base, "--reasoning-effort", "0", "--project", str(tmp_path)])
         assert refused.exit_code == 1 and "must be positive" in plain(refused.stdout)
+        tight = runner.invoke(
+            app,
+            [
+                *base,
+                "--max-llm-calls",
+                "3",
+                "--max-attempts",
+                "1",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+        tight_out = " ".join(plain(tight.stdout).split())
+        assert "warning:" in tight_out and "later runs may get none" in tight_out
         mined = runner.invoke(
             app,
             [
@@ -716,7 +730,7 @@ def test_an_account_mode_run_flows_through_audit_and_task_set_materialization(tm
 
     def fake_account_predictor(**_settings):
         def predict(*, run_index, question=""):
-            return SimpleNamespace(account=_account(json.loads(run_index)["run_id"]))
+            return SimpleNamespace(account=_account(run_index["run_id"]))
 
         predict.completion = {"mode": "submit", "iterations_used": 1, "iterations_to_submit": 1}
         return predict

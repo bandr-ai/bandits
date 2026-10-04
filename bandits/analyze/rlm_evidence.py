@@ -84,8 +84,6 @@ measured optimum: it bounds what one call prints into the root's history, and
 nothing it leaves out is lost — every row is on some page and every ref is
 retrievable."""
 
-INSPECT_DEFAULT_ROWS = 20
-INSPECT_MAX_ROWS = 40
 EVIDENCE_DEFAULT_LIMIT = 4096
 EVIDENCE_MAX_LIMIT = 8192
 _EXCERPT = 160
@@ -812,24 +810,22 @@ class EvidenceCatalog:
 
     # --- the two helpers -----------------------------------------------------------
 
-    def inspect_run(self, run_id: str, cursor: int = 0, limit: int = INSPECT_DEFAULT_ROWS) -> dict:
+    def inspect_run(self, run_id: str, cursor: int = 0, limit: int = 0) -> dict:
         """A deterministic, bounded overview of one run. No summary, no judgement.
 
         One stream of rows, paged by ``cursor``: candidate instructions, distinct
         system prompts and limitations first, then events in chronological
-        order. The whole serialized page — header, rows and ``next_cursor`` —
-        stays within ``page_chars``. A row too large to fit is shortened to its
+        order. The page fills until ``limit`` rows (0, the default: as many as
+        fit) or until the whole serialized page — header, rows and continuation
+        — would pass ``page_chars``. The character cap is the bound; there is no
+        row ceiling to trip over. A row too large to fit is shortened to its
         refs, and one too large even then to a pointer (``refs_ref``) whose full
         ref list ``get_evidence`` returns; every page holds at least one row.
         """
         if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
             raise ValueError("cursor must be a non-negative integer from a previous next_cursor")
-        if (
-            not isinstance(limit, int)
-            or isinstance(limit, bool)
-            or not 1 <= limit <= INSPECT_MAX_ROWS
-        ):
-            raise ValueError(f"limit must be an integer from 1 to {INSPECT_MAX_ROWS}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError("limit must be a non-negative integer (0: as many rows as fit)")
         index = self._check_run(run_id)
         stream = self._stream(index)
         total = len(stream)
@@ -852,7 +848,7 @@ class EvidenceCatalog:
             )
         rows: list[dict[str, Any]] = []
         position = cursor
-        stop = min(total, cursor + limit)
+        stop = total if limit == 0 else min(total, cursor + limit)
         while position < stop:
             kind, payload = stream[position]
             # A row that does not fit whole moves to the next page whole. Only a
@@ -871,7 +867,7 @@ class EvidenceCatalog:
                 fitted = self._render(index, kind, payload, position, "pointer")
             rows.append(fitted)
             position += 1
-        page = {**header, "rows": rows, "next_cursor": position if position < total else None}
+        page = {**header, "rows": rows, **self._continuation(run_id, position, total)}
         self._log(
             {
                 "tool": "inspect_run",
@@ -885,10 +881,22 @@ class EvidenceCatalog:
         )
         return page
 
+    @staticmethod
+    def _continuation(run_id: str, position: int, total: int) -> dict[str, Any]:
+        done = position >= total
+        return {
+            "done": done,
+            "remaining_rows": total - position,
+            "next_cursor": None if done else position,
+            "next_call": "" if done else f"inspect_run({run_id!r}, cursor={position})",
+        }
+
     def _fits(self, header: dict[str, Any], rows: list[dict[str, Any]], total: int) -> bool:
-        # Measured with the largest next_cursor this run can produce, so adding
+        # Measured with the longest continuation this run can produce, so adding
         # the real one afterwards cannot push the page over.
-        return len(serialize({**header, "rows": rows, "next_cursor": total})) <= self.page_chars
+        worst = self._continuation(header["run_id"], total - 1 if total else 0, total)
+        worst["remaining_rows"] = total
+        return len(serialize({**header, "rows": rows, **worst})) <= self.page_chars
 
     @staticmethod
     def _stream(index: RunIndex) -> list[tuple[str, Any]]:
@@ -1009,15 +1017,20 @@ class EvidenceCatalog:
     def get_evidence(
         self, run_id: str, ref: str, start: int = 0, limit: int = EVIDENCE_DEFAULT_LIMIT
     ) -> dict:
-        """Exact characters ``[start, start+limit)`` of one indexed item."""
+        """Exact characters ``[start, start+limit)`` of one indexed item.
+
+        ``limit`` above :data:`EVIDENCE_MAX_LIMIT` is capped, not refused: the
+        cap bounds one observation, and ``next_start`` continues the rest. Only
+        input that cannot mean anything — a negative offset, a non-integer, a
+        start past the end — is an error. Unknown and unavailable refs return
+        ``available: false`` with ``content: ""`` and an ``unavailable_reason``;
+        an available item that is genuinely empty has ``available: true``.
+        """
         if not isinstance(start, int) or isinstance(start, bool) or start < 0:
             raise ValueError("start must be a non-negative integer character offset")
-        if (
-            not isinstance(limit, int)
-            or isinstance(limit, bool)
-            or not 1 <= limit <= EVIDENCE_MAX_LIMIT
-        ):
-            raise ValueError(f"limit must be an integer from 1 to {EVIDENCE_MAX_LIMIT}")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer number of characters")
+        capped = min(limit, EVIDENCE_MAX_LIMIT)
         index = self._check_run(run_id)
         resolved = ref
         if isinstance(ref, str) and ref.startswith("sys:"):
@@ -1026,22 +1039,18 @@ class EvidenceCatalog:
             )
         item = index.items.get(resolved) if isinstance(resolved, str) else None
         if item is None:
+            reason = (
+                f"{ref!r} is not a reference this index issued for run {run_id}; "
+                "use refs returned by inspect_run"
+            )
             response = {
-                "source_ref": None,
+                "ref": ref,
                 "source_version": index.corpus_version,
-                "origin": None,
                 "evidence_type": "unknown",
-                "representation": None,
-                "content": None,
-                "range_start": None,
-                "range_end": None,
-                "total_length": None,
-                "next_start": None,
+                "content": "",
                 "available": False,
-                "limitations": [
-                    f"{ref!r} is not a reference this index issued for run {run_id}; "
-                    "use refs returned by inspect_run"
-                ],
+                "unavailable_reason": reason,
+                "limitations": [reason],
             }
             self._log(
                 {"tool": "get_evidence", "run_id": run_id, "ref": ref, "available": False},
@@ -1061,13 +1070,10 @@ class EvidenceCatalog:
         if not item.available:
             unavailable = {
                 **base,
-                "content": None,
-                "descriptor": item.descriptor,
-                "range_start": None,
-                "range_end": None,
-                "total_length": None,
-                "next_start": None,
+                "content": "",
                 "available": False,
+                "unavailable_reason": "; ".join(item.limitations) or "not recorded",
+                "descriptor": item.descriptor,
             }
             self._log(
                 {"tool": "get_evidence", "run_id": run_id, "ref": resolved, "available": False},
@@ -1078,7 +1084,7 @@ class EvidenceCatalog:
         total = len(text)
         if start > total:
             raise ValueError(f"start {start} is past the end of {resolved} ({total} characters)")
-        end = min(total, start + limit)
+        end = min(total, start + capped)
         response = {
             **base,
             "digest": item.digest,
@@ -1087,8 +1093,11 @@ class EvidenceCatalog:
             "range_end": end,
             "total_length": total,
             "next_start": end if end < total else None,
+            "done": end >= total,
             "available": True,
         }
+        if capped != limit:
+            response["limit_capped_to"] = capped
         self._log(
             {
                 "tool": "get_evidence",
@@ -1107,31 +1116,30 @@ class EvidenceCatalog:
 
         Plain functions with simple annotations: the installed interpreter
         registers a tool's parameters from its signature and passes only the
-        simple types through.
+        simple types through. Every response is made sandbox-safe on the way
+        out (see :func:`sandbox_safe`).
         """
 
-        def inspect_run(run_id: str, cursor: int = 0, limit: int = INSPECT_DEFAULT_ROWS) -> dict:
-            """Bounded overview of one run as rows: candidate instructions, system prompts and limitations first, then chronological events with input/output/tool refs. Page with cursor=next_cursor (null at the end). Deterministic; no summary."""
-            return self.inspect_run(run_id, cursor, limit)
+        def inspect_run(run_id: str, cursor: int = 0, limit: int = 0) -> dict:
+            """Bounded overview page of one run. Rows: type candidate/system_prompt/limitation (one "ref" each), then type event (inputs/outputs/payloads lists of {ref, origin, length}, tool_calls, or refs_ref when shortened). Continue with page["next_call"] until page["done"]. limit=0: as many rows as fit."""
+            return sandbox_safe(self.inspect_run(run_id, cursor, limit))
 
         def get_evidence(
             run_id: str, ref: str, start: int = 0, limit: int = EVIDENCE_DEFAULT_LIMIT
         ) -> dict:
-            """Exact text of one ref from inspect_run, characters [start, start+limit), limit at most 8192. Returns content, origin, source_ref, total_length and next_start (null at the end). Structured values are deterministic JSON text."""
-            return self.get_evidence(run_id, ref, start, limit)
+            """Exact text of one ref, characters [start, start+limit) (limit capped at 8192). Returns content, available, total_length, done, and next_start while more remains; when available is false, content is "" and unavailable_reason says why."""
+            return sandbox_safe(self.get_evidence(run_id, ref, start, limit))
 
         return [inspect_run, get_evidence]
 
-    def overview_for(self, run_id: str) -> dict[str, Any]:
-        """Small structured run metadata for an invocation's input, without access logging."""
-        index = self.index(run_id)
-        return {
-            "run_id": run_id,
-            "total_events": len(index.events),
-            "candidate_instructions": [self._candidate(index, ref) for ref in index.candidates],
-            "distinct_system_prompts": len(index.system_prompts),
-            "limitations": list(index.limitations),
-        }
+    def run_index(self, run_id: str) -> dict[str, Any]:
+        """What an account invocation starts with: the run id and its first page.
+
+        The first overview page itself, so no iteration goes to discovering the
+        structure, and nothing is described twice. Served through
+        :meth:`inspect_run`, so it is logged as read like any other page.
+        """
+        return sandbox_safe({"run_id": run_id, "first_page": self.inspect_run(run_id)})
 
     def resolves(self, run_id: str, ref: str) -> bool:
         index = self.index(run_id)
@@ -1183,3 +1191,20 @@ def _claims_by_span(analysis: Any) -> dict[str, dict[str, list[dict[str, Any]]]]
             }
         )
     return found
+
+
+def sandbox_safe(value: Any) -> Any:
+    """A helper response with no ``None`` anywhere, for the sandbox boundary.
+
+    DSPy 3.3.1's Deno/Pyodide bridge delivers JSON ``null`` as a JavaScript
+    ``JsNull`` proxy, for which ``is None`` is false — verified in the real
+    interpreter. A ``while page["next_cursor"] is not None`` loop would then
+    never end, and ``content[:500]`` on missing evidence fails confusingly. So
+    keys whose value is ``None`` are dropped (every response documents what an
+    absent key means) and ``None`` inside a list becomes ``""``.
+    """
+    if isinstance(value, dict):
+        return {key: sandbox_safe(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return ["" if item is None else sandbox_safe(item) for item in value]
+    return value

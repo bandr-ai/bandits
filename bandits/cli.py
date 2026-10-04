@@ -1712,6 +1712,11 @@ def mine_rlm_command(
     lm_cache: bool = typer.Option(
         False, "--lm-cache/--no-lm-cache", help="DSPy response cache. Off by default."
     ),
+    stop_at_completed: bool = typer.Option(
+        True,
+        "--stop-at-completed/--no-stop-at-completed",
+        help="Stop each reply at DSPy's [[ ## completed ## ]] marker (ends runaway replies).",
+    ),
     max_attempts: int = typer.Option(
         2,
         "--max-attempts",
@@ -1797,6 +1802,7 @@ def mine_rlm_command(
         provider_retries=provider_retries,
         lm_cache=lm_cache,
         contract_repairs=contract_repairs,
+        stop_at_completed_marker=stop_at_completed,
     )
     # What the provider route would actually send, checked before any call: a
     # setting LiteLLM accepts and then leaves out of the body is refused here
@@ -1837,6 +1843,19 @@ def mine_rlm_command(
         raise typer.Exit(code=1) from exc
 
     accounts_mode = trace_view is TraceView.FULL_TRAJECTORY
+    runs = len(corpus.readable_trace_ids())
+    # An estimate, not a minimum: each invocation that uses every iteration and
+    # then falls back to extraction makes N + 1 root calls before subcalls.
+    per_invocation = root_max_iterations + 1
+    family_invocations = -(-runs // max(chunk_size, 1)) * passes
+    likely = (runs if accounts_mode else 0) * per_invocation + family_invocations * per_invocation
+    if max_llm_calls < likely:
+        console.print(
+            f"[yellow]warning:[/yellow] --max-llm-calls {max_llm_calls} covers fewer calls than "
+            f"{runs} run(s) can use at {per_invocation} root call(s) per invocation (about "
+            f"{likely}, before subcalls); later runs may get none. The session will stop "
+            "cleanly at the ceiling and report what it did not reach."
+        )
     # Accounts read every recorded field; family formation reopens evidence only
     # under the grouping policy, with outcome-bearing keys withheld.
     catalog = corpus.evidence("account") if accounts_mode else None
@@ -2728,6 +2747,7 @@ def rlm_ledger_command(
     )
     console.print(
         f"invocations: {len(report.invocations)} · REPL steps: {report.repl_steps} · "
+        f"duplicate helper reads: {report.duplicate_reads} · "
         + ", ".join(
             f"{name} {report.events[name]}"
             for name in (
