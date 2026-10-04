@@ -1682,7 +1682,9 @@ def mine_rlm_command(
     reasoning_effort: str = typer.Option(
         None,
         "--reasoning-effort",
-        help="Passed as LiteLLM reasoning_effort; refused if the provider route drops it.",
+        help="LiteLLM reasoning_effort: a level (none, low, medium, high) or a positive "
+        "integer reasoning-token cap where the provider supports one. Refused if the "
+        "provider route drops it.",
     ),
     max_output_chars: int = typer.Option(
         10_000, "--max-output-chars", help="REPL output shown back per observation (display only)."
@@ -1747,6 +1749,12 @@ def mine_rlm_command(
         console.print(f"[red]error:[/red] unknown view {view!r}")
         raise typer.Exit(code=1) from exc
     selection = tuple(trace_ids or ())
+    effort: str | int | None = reasoning_effort
+    if reasoning_effort is not None and reasoning_effort.strip().lstrip("-").isdigit():
+        effort = int(reasoning_effort)
+        if effort <= 0:
+            console.print("[red]error:[/red] an integer --reasoning-effort must be positive")
+            raise typer.Exit(code=1)
 
     analysis, corpus, store = _rlm_corpus(analysis_id, project, trace_view.value, selection)
     budget = Budget(
@@ -1761,7 +1769,7 @@ def mine_rlm_command(
         max_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
-        reasoning_effort=reasoning_effort,
+        reasoning_effort=effort,
         root_max_iterations=root_max_iterations,
         max_subcalls=max_subcalls,
         max_output_chars=max_output_chars,
@@ -1785,6 +1793,11 @@ def mine_rlm_command(
             "route that supports it."
         )
         raise typer.Exit(code=1)
+    if not effective["verified"]:
+        console.print(
+            f"[yellow]note:[/yellow] the request body for {model} could not be observed offline "
+            f"({effective.get('note')}); settings are recorded as requested, not verified"
+        )
     settings_record = {
         **settings.model_dump(mode="json"),
         "effective": effective,
@@ -2660,5 +2673,32 @@ def rlm_families_command(
         len(draft.uncovered_trace_ids),
         len(draft.unreadable_trace_ids),
     )
+    if draft.accounts:
+        _print_account_table(draft)
+    for trace_id, reason in sorted(draft.unassigned_reasons.items()):
+        console.print(f"[yellow]unassigned:[/yellow]  {trace_id}  {reason}")
+    if draft.coverage:
+        console.print("coverage:    " + ", ".join(f"{k} {v}" for k, v in draft.coverage.items()))
     for limitation in draft.limitations:
         console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+
+def _print_account_table(draft) -> None:
+    """Each run's latest account beside its placement, so a family can be checked run by run."""
+    from rich.markup import escape
+
+    from bandits.analyze.rlm_account import latest_by_run
+
+    table = Table("run", "account", "intent", "candidate goal", "family", "refs read")
+    for run_id, account in sorted(latest_by_run(draft.accounts).items()):
+        intent = account.account.intent if account.account is not None else None
+        table.add_row(
+            run_id,
+            f"{account.status} ({account.completion.mode})",
+            intent.status if intent else "—",
+            escape(intent.candidate_goal or "—") if intent else "—",
+            draft.assignments.get(run_id, draft.unassigned_reasons.get(run_id, "—")),
+            str(len(account.completion.inspected_ranges)),
+        )
+    console.print("")
+    console.print(table)

@@ -670,3 +670,39 @@ def test_full_trajectory_mining_through_the_cli_selects_accounts_and_names_the_p
         )
     assert mismatch.exit_code == 1
     assert "different generation or invocation settings" in " ".join(plain(mismatch.stdout).split())
+
+
+def test_reasoning_effort_accepts_an_integer_budget_and_refuses_a_non_positive_one(tmp_path):
+    from bandits.analyze.rlm_session import SessionStore
+    from tests.analyze.rlm_test import _family_predict
+
+    analysis_id = _full_trajectory_project(tmp_path)
+
+    def fake_account_predictor(**_settings):
+        def predict(*, run_index, question=""):
+            raise RuntimeError("not needed")
+
+        return predict
+
+    base = ["mine-rlm", analysis_id, "--view", "full-trajectory", "--trace-id", "w1"]
+    with (
+        mock.patch("bandits.cli.build_rlm_predictor", lambda **_: _family_predict),
+        mock.patch("bandits.analyze.rlm_mine.build_account_predictor", fake_account_predictor),
+    ):
+        refused = runner.invoke(app, [*base, "--reasoning-effort", "0", "--project", str(tmp_path)])
+        assert refused.exit_code == 1 and "must be positive" in plain(refused.stdout)
+        mined = runner.invoke(
+            app,
+            [
+                *base,
+                "--reasoning-effort",
+                "1024",
+                "--max-attempts",
+                "1",
+                "--project",
+                str(tmp_path),
+            ],
+        )
+    assert mined.exit_code == 0, plain(mined.stdout)
+    (state,) = SessionStore(tmp_path / ".bandits").list()
+    assert state.settings["reasoning_effort"] == 1024

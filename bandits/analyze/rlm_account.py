@@ -151,8 +151,8 @@ class RunAccount(Contract):
     validation_errors: tuple[str, ...] = ()
     completion: Completion
     failure_kind: str = ""
-    """For non-accepted accounts: provider_error, no_submit, host_rejected,
-    budget, interrupted, unreadable."""
+    """For non-accepted accounts: ``provider_error``, ``budget:<stop reason>``,
+    ``no_submit`` (fallback extraction), ``truncated`` or ``host_rejected``."""
 
     llm_calls: int | None = None
     cost_usd: float | None = None
@@ -308,7 +308,8 @@ def family_row(account: RunAccount, status: str) -> dict[str, Any]:
     failed attempt at the same task belong together, and a grouping that could
     see the outcome could group by it.
     """
-    assert account.account is not None
+    if account.account is None:
+        raise ValueError(f"run {account.run_id} has no account to group on")
     intent = account.account.intent
     return {
         "trace_id": account.run_id,

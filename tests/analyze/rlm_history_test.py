@@ -402,7 +402,7 @@ def test_session_guard_refuses_calls_before_dispatch_in_real_dspy(monkeypatch):
 
     assert provider.calls == ["root", "root"], "the refused call never reached the provider"
     assert guard.calls_admitted == 2
-    assert account.status == "failed" and account.failure_kind == "budget"
+    assert account.status == "failed" and account.failure_kind == "budget:max_llm_calls"
     assert guard.refusals and "call ceiling" in guard.refusals[0]
     assert StopReason.MAX_LLM_CALLS.value == "max_llm_calls"
 
@@ -426,6 +426,13 @@ def test_provider_effective_settings_come_from_the_request_body():
     assert checked["verified"] is True
     assert checked["effective"]["temperature"] == 1.0 and checked["effective"]["top_p"] == 0.95
     assert checked["dropped"] == ["extra_body"]
+
+    # LiteLLM allows reasoning_effort per model; the Nemotron id is known to it.
+    nemotron = "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b"
+    budget = providers.preflight_settings(nemotron, {"reasoning_effort": 1024})
+    assert budget["dropped"] == [] and budget["effective"]["reasoning_effort"] == 1024
+    with pytest.raises(providers.ProviderError, match="reasoning_effort"):
+        providers.preflight_settings(fireworks, {"reasoning_effort": 1024})
 
     vllm = providers.preflight_settings(
         "hosted_vllm/test-model",
@@ -682,7 +689,7 @@ def test_a_provider_error_closes_its_own_call(tmp_path, monkeypatch):
 def test_the_recorded_request_is_the_body_litellm_built(tmp_path, monkeypatch):
     """Requested settings are not evidence; the body is — including from a
     batched worker thread. Uses real LiteLLM against an in-process transport."""
-    dspy = _real_dspy()
+    _real_dspy()
     import httpx
 
     from bandits import providers
@@ -720,8 +727,8 @@ def test_the_recorded_request_is_the_body_litellm_built(tmp_path, monkeypatch):
         max_tokens=64,
         extra_body={"chat_template_kwargs": {"force_nonempty_content": True}},
     )
-    from concurrent.futures import ThreadPoolExecutor
     import contextvars
+    from concurrent.futures import ThreadPoolExecutor
 
     lm(prompt="main")
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -765,7 +772,7 @@ def test_a_write_failure_inside_a_sandbox_tool_stops_the_invocation(tmp_path, mo
         pytest.skip("Deno sandbox not available")
     from pathlib import Path
 
-    from bandits import ledger, providers
+    from bandits import ledger
     from bandits.analyze.rlm_mine import _run_account
     from tests.analyze.rlm_test import _identity
 
@@ -803,3 +810,134 @@ def test_a_write_failure_inside_a_sandbox_tool_stops_the_invocation(tmp_path, mo
         assert provider.calls == ["root"], "no further model call after the lost record"
     finally:
         ledger.clear_failure()
+
+
+def test_mine_rlm_cli_end_to_end_with_real_dspy_and_sandbox(tmp_path, monkeypatch):
+    """The real command, real DSPy, real sandbox; only provider replies are scripted.
+
+    One run's account submits, another's never does (quarantined), a third is
+    accepted with unknown intent. Inspection commands then show each truthfully,
+    and the project ledger reconstructs every call.
+    """
+    dspy = _real_dspy()
+    if not _sandbox_available():
+        pytest.skip("Deno sandbox not available")
+    import re
+
+    from typer.testing import CliRunner
+
+    from bandits import providers
+    from bandits.analyze import analyze_corpus, save_analysis
+    from bandits.cli import app
+    from bandits.store import ArtifactStore, DerivedStore
+    from bandits.traces import TraceCorpus
+    from tests.analyze.rlm_test import _account, _workflow_trace
+
+    corpus = TraceCorpus(
+        source="otlp",
+        traces=(_workflow_trace("w1"), _workflow_trace("w2"), _workflow_trace("w3")),
+    )
+    ArtifactStore(tmp_path / ".bandits").write(corpus, source_path="synthetic")
+    analysis_id = save_analysis(
+        analyze_corpus(corpus), DerivedStore(tmp_path / ".bandits")
+    ).artifact_id
+    family = {
+        "contracts": [
+            {
+                "contract_id": "diagnose-step",
+                "name": "Diagnose a failed test step",
+                "definition": "explain why the requested test step failed",
+                "required_outcome_shape": ["a supported diagnosis of the failed step"],
+            }
+        ],
+        "operations": [],
+        "assignments": {"w1": "diagnose-step"},
+        "ambiguous_trace_ids": [],
+        "uncovered_trace_ids": [],
+    }
+
+    def forward(lm, prompt=None, messages=None, **kwargs):
+        system = messages[0]["content"]
+        user = messages[-1]["content"]
+        if "extract the final outputs now" in system:
+            extracted = json.dumps(_account("w2"))
+            return _reply(f"[[ ## account ## ]]\n{extracted}\n[[ ## completed ## ]]")
+        if "ACCOUNT of one recorded run" in system:
+            run_id = re.search(r'"run_id": "(w\d)"', user).group(1)
+            if run_id == "w2":
+                return _reply(_action('print(inspect_run("w2")["total_events"])'))
+            account = _account(run_id, status="unknown") if run_id == "w3" else _account(run_id)
+            code = (
+                f'ev = get_evidence("{run_id}", "clue1.first_model_prompt.json", 0, 64)\n'
+                f"SUBMIT(account={json.dumps(account)})"
+            )
+            return _reply(_action(code))
+        return _reply(_action(f"SUBMIT(**{json.dumps(family)})"))
+
+    monkeypatch.setattr(dspy.LM, "forward", forward)
+    monkeypatch.setattr(providers, "credentials", lambda *a, **k: {})
+    monkeypatch.delenv("BANDITS_LEDGER", raising=False)
+    runner = CliRunner()
+    mined = runner.invoke(
+        app,
+        [
+            "mine-rlm",
+            analysis_id,
+            "--view",
+            "full-trajectory",
+            "--model",
+            "openai/test-model",
+            "--root-max-iterations",
+            "2",
+            "--max-attempts",
+            "1",
+            "--contract-repairs",
+            "0",
+            "--provider-retries",
+            "0",
+            "--max-llm-calls",
+            "24",
+            "--chunk-size",
+            "3",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    out = " ".join(mined.stdout.split())
+    assert mined.exit_code == 0, out
+    session_id = re.search(r"session: (\S+)", out).group(1)
+    draft_id = re.search(r"draft_id: (\S+)", out).group(1)
+    assert "account_complete 2" in out and "quarantined 1" in out and "eligible 1" in out
+    assert "1 trace(s) quarantined_extract" in out and "1 trace(s) missing_intent" in out
+
+    shown = runner.invoke(
+        app, ["rlm-session", session_id, "--accounts", "--project", str(tmp_path)]
+    )
+    shown_out = " ".join(shown.stdout.split())
+    assert shown.exit_code == 0, shown_out
+    assert "quarantined w2 attempt 1 · extract" in shown_out
+    assert "accepted w1 attempt 1 · submit · iterations 1 (submitted at 1)" in shown_out
+
+    families = runner.invoke(app, ["rlm-families", draft_id, "--project", str(tmp_path)])
+    families_out = " ".join(families.stdout.split())
+    assert families.exit_code == 0, families_out
+    assert "Diagnose a failed test step" in families_out
+    assert "unassigned: w2 quarantined_extract" in families_out
+    assert "unassigned: w3 missing_intent" in families_out
+
+    rows = _rows(tmp_path / ".bandits" / "ledger.jsonl")
+    calls = _paired(rows)
+    completed = [r for r in rows if r["event_type"] == "model_call"]
+    # w1 one root; w2 two roots then extraction; w3 one root; one family root.
+    assert len(calls) == len(completed) == 6
+    by_run = {}
+    for row in completed:
+        by_run.setdefault(row.get("run_id", "family"), []).append(row["stage"])
+    assert by_run == {
+        "w1": ["rlm_iteration"],
+        "w2": ["rlm_iteration", "rlm_iteration", "rlm_extract"],
+        "w3": ["rlm_iteration"],
+        "family": ["rlm_iteration"],
+    }
+    assert sum(r["event_type"] == "extract_start" for r in rows) == 1
+    assert sum(r["event_type"] == "submit_accepted" for r in rows) == 3  # w1, w3, family

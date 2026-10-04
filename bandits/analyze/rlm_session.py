@@ -31,13 +31,14 @@ from typing import Any
 
 from pydantic import Field
 
-from bandits.analyze.rlm_account import RunAccount, latest_by_run
+from bandits.analyze.rlm_account import RunAccount
 from bandits.analyze.rlm_models import (
     ChunkResult,
     FamilyContract,
     PassResult,
     ResumeScope,
     TraceView,
+    coverage_of,
 )
 from bandits.traces import Contract
 
@@ -130,21 +131,15 @@ class SessionState(Contract):
         return self.status if check(self.pid) else "stale (process gone)"
 
     def coverage(self) -> dict[str, int]:
-        """Counted separately; ``read`` never means an id merely appeared in a batch."""
-        latest = latest_by_run(self.accounts)
-        attempted = {t for c in self.chunks for t in c.trace_ids} | set(latest)
-        return {
-            "attempted": len(attempted),
-            "source_accessed": sum(1 for a in latest.values() if a.completion.inspected_refs),
-            "account_complete": sum(1 for a in latest.values() if a.status == "accepted"),
-            "eligible": sum(1 for a in latest.values() if a.eligible_for_families),
-            "quarantined": sum(1 for a in latest.values() if a.status == "quarantined")
-            + sum(1 for c in self.chunks if c.status == "quarantined"),
-            "failed": sum(1 for a in latest.values() if a.status in ("failed", "rejected"))
-            + sum(1 for c in self.chunks if c.status == "error"),
-            "assigned": len(self.assignments),
-            "unresolved": len(set(self.ambiguous_trace_ids) | set(self.uncovered_trace_ids)),
-        }
+        """The same per-trace counts the finished run reports, from this checkpoint."""
+        return coverage_of(
+            selected=self.traces_total,
+            chunks=self.chunks,
+            accounts=self.accounts,
+            assignments=self.assignments,
+            unresolved=set(self.ambiguous_trace_ids) | set(self.uncovered_trace_ids),
+            accessed={a.run_id for a in self.accounts if a.completion.inspected_refs},
+        )
 
     @property
     def progress(self) -> str:
@@ -312,7 +307,6 @@ class SessionRecorder:
     ) -> None:
         self._store = store
         self._guard = guard
-        self._previous_accounts = previous.accounts if previous is not None else ()
         self._previous_chunks = previous.chunks if previous is not None else ()
         self._state = SessionState(
             session_id=session_id,
@@ -328,8 +322,7 @@ class SessionRecorder:
             selection=selection,
             settings=settings or {},
             settings_digest=settings_digest,
-            pid=os.getpid(),
-            accounts=tuple(self._previous_accounts),
+            accounts=previous.accounts if previous is not None else (),
         )
 
     @property

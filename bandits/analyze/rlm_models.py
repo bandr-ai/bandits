@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
-from bandits.analyze.rlm_account import RunAccount
+from bandits.analyze.rlm_account import RunAccount, latest_by_run
 from bandits.traces import Contract
 
 
@@ -474,10 +475,10 @@ class ChunkResult(Contract):
     iterations_to_submit: int | None = None
     submit_rejections: tuple[str, ...] = ()
     failure_kind: str = ""
-    """provider_error, no_submit, truncated, budget or interrupted when not a success."""
+    """When not a success: ``provider_error``, ``budget:<stop reason>``,
+    ``no_submit`` (fallback extraction) or ``truncated``."""
 
     attempt: int = Field(default=1, ge=1)
-    kind: Literal["family", "account"] = "family"
 
     raw_reply: str = ""
     """Exactly what the model returned, before any parsing.
@@ -881,7 +882,8 @@ class RLMClusteringRun(Contract):
 
     unassigned_reasons: dict[str, str] = Field(default_factory=dict)
     """trace -> missing_intent, contradictory_evidence, uncertain_boundary,
-    processing_failure or quarantined_extract."""
+    processing_failure, quarantined_extract, or not_attempted (a ceiling fired
+    before any invocation reached it)."""
 
     coverage: dict[str, int] = Field(default_factory=dict)
     """attempted, source_accessed, account_complete, eligible, assigned,
@@ -951,3 +953,40 @@ class RLMClusteringRun(Contract):
 
     def contract_by_id(self) -> dict[str, FamilyContract]:
         return {c.contract_id: c for c in self.contracts}
+
+
+def coverage_of(
+    *,
+    selected: int,
+    chunks: Sequence[ChunkResult],
+    accounts: Sequence[RunAccount],
+    assignments: dict[str, str],
+    unresolved: set[str],
+    accessed: set[str],
+) -> dict[str, int]:
+    """Coverage counted per trace, each kind separately.
+
+    ``attempted`` is any invocation that included the trace; ``source_accessed``
+    is a helper having returned its evidence; ``account_complete`` an accepted
+    account (unknowns included). None of them means "read" by appearing in a batch.
+    """
+    latest = latest_by_run(accounts)
+    in_chunks = {t for c in chunks for t in c.trace_ids}
+    read = {t for c in chunks if c.status == "success" for t in c.trace_ids}
+    quarantined = {t for c in chunks if c.status == "quarantined" for t in c.trace_ids} - read
+    return {
+        "selected": selected,
+        "attempted": len(in_chunks | set(latest)),
+        "source_accessed": len(accessed),
+        "account_complete": sum(1 for a in latest.values() if a.status == "accepted"),
+        "eligible": sum(1 for a in latest.values() if a.eligible_for_families),
+        "quarantined": len(
+            {t for t, a in latest.items() if a.status == "quarantined"} | quarantined
+        ),
+        "failed": len(
+            {t for t, a in latest.items() if a.status in ("failed", "rejected")}
+            | (in_chunks - read - quarantined)
+        ),
+        "assigned": len(assignments),
+        "unresolved": len(unresolved),
+    }

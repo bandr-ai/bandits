@@ -34,7 +34,7 @@ from typing import Any
 
 from bandits.analyze.rlm_corpus import _redact
 from bandits.analyze.rlm_models import TraceView
-from bandits.traces import Span, SpanKind, Trace
+from bandits.traces import Span, SpanKind, Trace, WorkflowNode
 
 INDEX_VERSION = 1
 """Bumped whenever references, origins or serialization change. Part of every
@@ -510,49 +510,25 @@ class _Builder:
         return f"sys:{item.digest[:10]}"
 
     def spans(self) -> None:
-        ordered = sorted(
-            enumerate(self.trace.spans), key=lambda pair: (pair[1].started_at, pair[0])
+        """One event per recorded span or workflow node, in start-time order.
+
+        The order is fixed before any ref is issued, so ``e<n>`` is always the
+        ``n``-th event of the chronology the overview pages through.
+        """
+        timeline = sorted(
+            [(span.started_at, 1, i, span) for i, span in enumerate(self.trace.spans)]
+            + [(node.started_at, 0, i, node) for i, node in enumerate(self.trace.workflow_nodes)],
+            key=lambda entry: entry[:3],
         )
-        nodes = sorted(self.trace.workflow_nodes, key=lambda n: n.started_at)
         links: dict[str, list[str]] = {}
         for link in self.trace.evidence:
             if link.kind == "tool_result" and link.target_span_id:
                 links.setdefault(link.call_span_id, []).append(link.target_span_id)
-        order = 0
         rows_by_span: dict[str, EventRow] = {}
-        for node in nodes:
-            row = EventRow(order, node.span_id, "node", node.name, node.parent_span_id)
-            prefix = f"e{order}"
-            if node.input is not None:
-                self.structured(
-                    f"{prefix}.input",
-                    node.input,
-                    source_ref=f"node:{node.span_id}/input",
-                    origin="node.input",
-                    span_id=node.span_id,
-                )
-                row.payload_refs.append(f"{prefix}.input")
-            if node.output is not None:
-                self.structured(
-                    f"{prefix}.output",
-                    node.output,
-                    source_ref=f"node:{node.span_id}/output",
-                    origin="node.output",
-                    span_id=node.span_id,
-                )
-                row.payload_refs.append(f"{prefix}.output")
+        for order, (_, is_span, _, record) in enumerate(timeline):
+            row = self._span_row(order, record) if is_span else self._node_row(order, record)
+            rows_by_span[record.span_id] = row
             self.index.events.append(row)
-            order += 1
-        for _, span in ordered:
-            row = self._span_row(order, span)
-            rows_by_span[span.span_id] = row
-            self.index.events.append(row)
-            order += 1
-        if nodes and ordered:
-            # Nodes and spans interleave by start time; reorder once both exist.
-            self.index.events.sort(key=lambda r: (self._start(r.span_id), r.order))
-            for position, row in enumerate(self.index.events):
-                row.order = position
         for span_id, targets in links.items():
             row = rows_by_span.get(span_id)
             if row is None:
@@ -567,14 +543,20 @@ class _Builder:
                     call["result_span"] = match
                     call["result_refs"] = rows_by_span[match].payload_refs
 
-    def _start(self, span_id: str):
-        for span in self.trace.spans:
-            if span.span_id == span_id:
-                return span.started_at
-        for node in self.trace.workflow_nodes:
-            if node.span_id == span_id:
-                return node.started_at
-        return None  # pragma: no cover
+    def _node_row(self, order: int, node: WorkflowNode) -> EventRow:
+        row = EventRow(order, node.span_id, "node", node.name, node.parent_span_id)
+        for name, value in (("input", node.input), ("output", node.output)):
+            if value is None:
+                continue
+            self.structured(
+                f"e{order}.{name}",
+                value,
+                source_ref=f"node:{node.span_id}/{name}",
+                origin=f"node.{name}",
+                span_id=node.span_id,
+            )
+            row.payload_refs.append(f"e{order}.{name}")
+        return row
 
     def _span_row(self, order: int, span: Span) -> EventRow:
         row = EventRow(order, span.span_id, span.kind.value, span.name, span.parent_span_id)
@@ -671,9 +653,6 @@ class EvidenceCatalog:
     def policy(self) -> str:
         return f"{self.view.value}/v{VIEW_POLICY_VERSION}"
 
-    def run_ids(self) -> tuple[str, ...]:
-        return tuple(self._traces)
-
     def index(self, run_id: str) -> RunIndex:
         with self._lock:
             if run_id not in self._indexes:
@@ -705,23 +684,24 @@ class EvidenceCatalog:
         except KeyError as exc:
             raise ValueError(f"unknown run {run_id!r}") from exc
 
-    def accesses_for(self, run_id: str) -> list[dict[str, Any]]:
-        return [a for a in self.accesses if a.get("run_id") == run_id]
+    def retrieved(self, run_id: str, *, since: int = 0) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Refs, and ``ref[start:end]`` ranges, actually returned for a run.
 
-    def inspected_ranges(self, run_id: str) -> tuple[str, ...]:
-        """``ref[start:end]`` for every successful retrieval of this run, in order."""
-        seen: dict[str, None] = {}
-        for access in self.accesses_for(run_id):
-            if access["tool"] == "get_evidence" and access.get("available"):
-                seen.setdefault(f"{access['ref']}[{access['start']}:{access['end']}]", None)
-        return tuple(seen)
-
-    def inspected_refs(self, run_id: str) -> tuple[str, ...]:
-        seen: dict[str, None] = {}
-        for access in self.accesses_for(run_id):
-            if access["tool"] == "get_evidence" and access.get("available"):
-                seen.setdefault(access["ref"], None)
-        return tuple(seen)
+        Read from the access log from position ``since``, so an invocation counts
+        only its own retrievals. A ref that merely appeared in an overview is
+        not here: only ``get_evidence`` returning content counts as read.
+        """
+        refs: dict[str, None] = {}
+        ranges: dict[str, None] = {}
+        for access in self.accesses[since:]:
+            if (
+                access.get("run_id") == run_id
+                and access["tool"] == "get_evidence"
+                and access.get("available")
+            ):
+                refs.setdefault(access["ref"], None)
+                ranges.setdefault(f"{access['ref']}[{access['start']}:{access['end']}]", None)
+        return tuple(refs), tuple(ranges)
 
     def _log(self, entry: dict[str, Any], returned: dict[str, Any] | None = None) -> None:
         with self._lock:

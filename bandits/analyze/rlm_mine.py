@@ -28,6 +28,7 @@ co-assignment rather than by the names they generate.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import random
@@ -64,6 +65,7 @@ from bandits.analyze.rlm_models import (
     StopReason,
     TaxonomyOperation,
     TraceView,
+    coverage_of,
 )
 from bandits.store import DerivedEnvelope, DerivedStore
 from bandits.traces import Contract
@@ -329,9 +331,11 @@ class GenerationSettings(Contract):
     explicitly, never substituted silently."""
 
     top_p: float | None = None
-    reasoning_effort: str | None = None
-    """Sent as LiteLLM's ``reasoning_effort``; preflight checks it reaches the
-    request body, not that the provider honours it."""
+    reasoning_effort: str | int | None = None
+    """Sent as LiteLLM's ``reasoning_effort``: a level (``none``, ``low``…) or, on
+    providers that document it (Fireworks), a positive integer hard cap on
+    reasoning tokens. Preflight checks it reaches the request body, not that the
+    provider honours it for this model."""
 
     root_max_iterations: int = Field(default=25, ge=1)
     max_subcalls: int = Field(default=60, ge=1)
@@ -382,7 +386,6 @@ class CompletionTracker:
         self.iterations = 0
         self.iterations_to_submit: int | None = None
         self.submit_rejections: list[str] = []
-        self.extract_started = False
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -426,7 +429,6 @@ def instrument_completion(rlm: Any) -> CompletionTracker:
         return parsed, error
 
     def extract(*args, **kwargs):
-        tracker.extract_started = True
         tracker.mode = "extract"
         ledger.record({"event_type": "extract_start", "iterations_used": tracker.iterations})
         try:
@@ -473,9 +475,11 @@ def _rlm(
             tools=tools or None,
         )
     )
-    if settings.subcall_workers != 8:
-        make = rlm._make_llm_tools
-        rlm._make_llm_tools = lambda max_workers=8: make(max_workers=settings.subcall_workers)
+    # DSPy builds fresh subcall tools per invocation with its own worker count;
+    # binding the count here is the one change, the tools themselves are DSPy's.
+    rlm._make_llm_tools = functools.partial(
+        rlm._make_llm_tools, max_workers=settings.subcall_workers
+    )
     return rlm, instrument_completion(rlm)
 
 
@@ -1382,7 +1386,13 @@ class _Scheduler:
                 self.waiting.add(trace_id)
 
 
-_NON_RETRYABLE = frozenset({"budget"})
+def _stop_of(failure_kind: str) -> StopReason | None:
+    """The ceiling a budget refusal names (``budget:<stop reason>``), else None.
+
+    A refusal is never retried: the ceiling that refused one call refuses the next.
+    """
+    kind, _, reason = failure_kind.partition(":")
+    return StopReason(reason) if kind == "budget" and reason else None
 
 
 def _run_account(
@@ -1422,23 +1432,11 @@ def _run_account(
     calls, tokens = _spend_of(predict)
     cost = _cost_of(predict)
     snapshot = _completion_of(predict)
-    accesses = [a for a in catalog.accesses[mark:] if a.get("run_id") == run_id]
-    ranges = tuple(
-        dict.fromkeys(
-            f"{a['ref']}[{a['start']}:{a['end']}]"
-            for a in accesses
-            if a["tool"] == "get_evidence" and a.get("available")
-        )
-    )
-    refs = tuple(
-        dict.fromkeys(
-            a["ref"] for a in accesses if a["tool"] == "get_evidence" and a.get("available")
-        )
-    )
+    refs, ranges = catalog.retrieved(run_id, since=mark)
     raw = getattr(prediction, "account", None) if prediction is not None else None
     proposed = coerce_account(raw) if raw is not None else None
     mode = snapshot.get("mode", "unknown")
-    if error and mode not in ("extract",):
+    if error and mode != "extract":
         mode = "error"
     completion = Completion(
         mode=mode if mode in ("submit", "extract", "error") else "unknown",
@@ -1460,13 +1458,9 @@ def _run_account(
         "tokens": tokens,
     }
     if error:
-        status = "quarantined" if mode == "extract" and proposed is not None else "failed"
-        return RunAccount(
-            status=status,
-            account=proposed,
-            failure_kind=failure if status == "failed" else "no_submit",
-            **common,
-        )
+        # An invocation that raised returned nothing to keep; whether it raised
+        # during extraction is still visible in ``completion.mode``.
+        return RunAccount(status="failed", failure_kind=failure, **common)
     if mode == "extract":
         return RunAccount(
             status="quarantined", account=proposed, failure_kind="no_submit", **common
@@ -1539,7 +1533,13 @@ def mine_accounts(
             scheduler.attempts[account.run_id] = max(
                 scheduler.attempts.get(account.run_id, 0), account.attempt
             )
-    last: dict[str, RunAccount] = {}
+    # The latest earlier attempt per run, so a resumed retry is still told why
+    # its previous account was rejected.
+    last: dict[str, RunAccount] = {
+        run_id: account
+        for run_id, account in latest_by_run(existing).items()
+        if account.status != "accepted"
+    }
     limitations: list[str] = []
     started = time.monotonic() if started is None else started
     calls = sum(a.llm_calls or 0 for a in accounts)
@@ -1572,13 +1572,8 @@ def mine_accounts(
         scheduler.record((run_id,), ok=account.status == "accepted")
         if on_account is not None:
             on_account(account, tuple(accounts))
-        if account.failure_kind in _NON_RETRYABLE:
-            stop = (
-                _budget_stop(
-                    budget, iterations=0, calls=calls, started=started, usd=usd, guard=guard
-                )
-                or StopReason.MAX_LLM_CALLS
-            )
+        stop = _stop_of(account.failure_kind)
+        if stop is not None:
             break
     if scheduler.exhausted:
         limitations.append(
@@ -1679,7 +1674,7 @@ def mine_taxonomy(
         def checkpoint_account(account: RunAccount, so_far: tuple[RunAccount, ...]) -> None:
             if on_account is not None:
                 on_account(account)
-            if session is not None and hasattr(session, "checkpoint_account"):
+            if session is not None:
                 session.checkpoint_account(account, so_far, elapsed=time.monotonic() - started)
 
         accounts, stop_reason, account_limits = mine_accounts(
@@ -1808,18 +1803,9 @@ def mine_taxonomy(
                     usd=usd,
                     elapsed=time.monotonic() - started,
                 )
-            if result.failure_kind in _NON_RETRYABLE:
-                stop_reason = (
-                    _budget_stop(
-                        budget,
-                        iterations=len(chunks),
-                        calls=calls,
-                        started=started,
-                        usd=usd,
-                        guard=guard,
-                    )
-                    or StopReason.MAX_LLM_CALLS
-                )
+            budget_stop = _stop_of(result.failure_kind)
+            if budget_stop is not None:
+                stop_reason = budget_stop
                 pass_complete = False
                 break
 
@@ -2015,7 +2001,7 @@ def mine_taxonomy(
         prompt_digest=prompt_digest(model),
         limitations=tuple(dict.fromkeys(limitations)),
         accounts=accounts,
-        selection=tuple(corpus.list_trace_ids()) if getattr(corpus, "selected", False) else (),
+        selection=tuple(corpus.list_trace_ids()) if corpus.selected else (),
         settings=dict(settings or {}),
         unassigned_reasons=unassigned,
         coverage=coverage,
@@ -2037,43 +2023,47 @@ def _coverage(
     counts runs whose evidence a helper actually returned, and
     ``account_complete`` counts accepted accounts, unknowns included.
     """
-    reasons: dict[str, str] = {}
-    attempted = {t for c in chunks for t in c.trace_ids}
-    read = {t for c in chunks if c.status == "success" for t in c.trace_ids}
     latest = latest_by_run(accounts)
-    attempted |= set(latest)
+    in_chunks = {t for c in chunks for t in c.trace_ids}
+    read = {t for c in chunks if c.status == "success" for t in c.trace_ids}
+    quarantined_chunks = {
+        t for c in chunks if c.status == "quarantined" for t in c.trace_ids
+    } - read
+    failed_chunks = in_chunks - read - quarantined_chunks
     accessed: set[str] = set()
     if corpus.view.reads_agent_behavior:
         catalog = corpus.evidence()
-        accessed = {
-            a["run_id"]
-            for a in catalog.accesses
-            if a["tool"] == "get_evidence" and a.get("available")
-        }
+        accessed = {run_id for run_id in readable if catalog.retrieved(run_id)[0]}
+
+    reasons: dict[str, str] = {}
     for trace_id in readable:
         if trace_id in state.assignments:
             continue
-        account = latest.get(trace_id)
-        if accounts_mode and account is not None and account.unassigned_reason():
-            reasons[trace_id] = account.unassigned_reason()
-        elif accounts_mode and account is None:
-            reasons[trace_id] = "processing_failure"
-        elif trace_id in state.ambiguous or trace_id in state.uncovered:
+        if accounts_mode:
+            account = latest.get(trace_id)
+            if account is None:
+                reasons[trace_id] = "not_attempted"
+                continue
+            if account.unassigned_reason():
+                reasons[trace_id] = account.unassigned_reason()
+                continue
+        if trace_id in state.ambiguous or trace_id in state.uncovered:
             reasons[trace_id] = "uncertain_boundary"
-        elif trace_id in attempted and trace_id not in read:
+        elif trace_id in quarantined_chunks:
+            reasons[trace_id] = "quarantined_extract"
+        elif trace_id in failed_chunks:
             reasons[trace_id] = "processing_failure"
-    coverage = {
-        "selected": len(readable),
-        "attempted": len(attempted),
-        "source_accessed": len(accessed),
-        "account_complete": sum(1 for a in latest.values() if a.status == "accepted"),
-        "eligible": sum(1 for a in latest.values() if a.eligible_for_families),
-        "quarantined": sum(1 for a in latest.values() if a.status == "quarantined")
-        + sum(1 for c in chunks if c.status == "quarantined"),
-        "failed": sum(1 for a in latest.values() if a.status in ("failed", "rejected")),
-        "assigned": len(state.assignments),
-        "unresolved": len(state.ambiguous | state.uncovered),
-    }
+        else:
+            # Eligible, but no family invocation reached it (a ceiling fired first).
+            reasons[trace_id] = "not_attempted"
+    coverage = coverage_of(
+        selected=len(readable),
+        chunks=chunks,
+        accounts=accounts,
+        assignments=state.assignments,
+        unresolved=state.ambiguous | state.uncovered,
+        accessed=accessed,
+    )
     return reasons, coverage
 
 
@@ -2092,7 +2082,7 @@ def _completion_of(predict: Any) -> dict[str, Any]:
 
 def _failure_kind(exc: BaseException) -> str:
     if isinstance(exc, BudgetExhausted):
-        return "budget"
+        return f"budget:{exc.reason.value}"
     return "provider_error"
 
 

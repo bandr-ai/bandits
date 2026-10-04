@@ -3328,7 +3328,8 @@ def test_extract_quarantined_chunk_does_not_mutate_the_taxonomy() -> None:
     assert all(c.completion_mode == "extract" and c.raw_reply for c in run.chunks)
     assert not run.contracts and not run.assignments
     assert not run.complete
-    assert run.unassigned_reasons == {"t1": "processing_failure", "t2": "processing_failure"}
+    assert run.unassigned_reasons == {"t1": "quarantined_extract", "t2": "quarantined_extract"}
+    assert run.coverage["quarantined"] == 2 and run.coverage["failed"] == 0
 
 
 def test_fresh_before_retry_failed_batch_waits_for_fresh_traces() -> None:
@@ -3543,3 +3544,51 @@ def test_account_family_rows_omit_results_and_evaluator_claims() -> None:
     ok = family_row(account("supported_complete", ["passed"]), "unseen")
     failed = family_row(account("supported_incomplete", ["failed"]), "unseen")
     assert ok == failed
+
+
+def test_event_refs_follow_the_chronology_when_nodes_and_spans_interleave() -> None:
+    from bandits.traces import WorkflowNode
+
+    trace = _workflow_trace()
+    late_node = WorkflowNode(
+        span_id="node-1",
+        name="step",
+        started_at=trace.spans[1].started_at.replace(microsecond=500),
+        ended_at=trace.spans[1].started_at.replace(microsecond=500),
+        input={"stage": "inspect"},
+    )
+    _, catalog = _catalog(trace.replace(workflow_nodes=(late_node,)))
+    index = catalog.index("w1")
+    assert [e.span_id for e in index.events][:3] == ["step", "m1", "node-1"]
+    for event in index.events:
+        for ref in event.inputs + event.outputs + event.payload_refs:
+            assert ref.startswith(f"e{event.order}."), (ref, event.order)
+
+
+def test_a_ceiling_mid_accounts_stops_with_its_reason_and_leaves_the_rest_not_attempted() -> None:
+    from bandits.analyze.rlm_budget import SessionBudgetGuard
+
+    corpus, catalog = _catalog(_workflow_trace("w1"), _workflow_trace("w2"))
+    guard = SessionBudgetGuard(max_calls=1, max_seconds=60)
+    miner = _AccountMiner(catalog, [("submit", lambda r: _account(r))] * 2)
+
+    def spending(**inputs):
+        guard.settle(guard.admit(prompt="p", messages=None, max_tokens=1), None)
+        return miner(**inputs)
+
+    spending.completion = miner.completion
+    run = mine_taxonomy(
+        corpus,
+        "analysis-1",
+        predict=_family_predict,
+        account_predict=spending,
+        identity_for=_identity,
+        guard=guard,
+        seed=0,
+    )
+    assert run.stop_reason is StopReason.MAX_LLM_CALLS
+    assert len(run.accounts) == 1 and not run.assignments
+    # One run got an accepted account but no family call; the other no call at all.
+    assert run.accounts[0].status == "accepted"
+    assert run.unassigned_reasons == {"w1": "not_attempted", "w2": "not_attempted"}
+    assert run.coverage["attempted"] == 1 and run.coverage["failed"] == 0
