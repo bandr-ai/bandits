@@ -1,0 +1,39 @@
+# Tool config for the step-reward search harness. One action per assistant turn
+# is enforced with actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1.
+tools:
+  - class_name: bandits_jev.verl_glue.tools.BrowserTool
+    config: &cfg {type: native, searcher_factory: "bandits_jev.verl_glue.fake_corpus:searcher", top_k: 10}
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: "Search the corpus. Returns ids and snippets; ids can then be opened."
+        parameters:
+          type: object
+          properties:
+            query: {type: string, description: "Search query."}
+          required: [query]
+  - class_name: bandits_jev.verl_glue.tools.BrowserTool
+    config: *cfg
+    tool_schema:
+      type: function
+      function:
+        name: open
+        description: "Open a document by an id returned from a search."
+        parameters:
+          type: object
+          properties:
+            id: {type: string, description: "Document id from a search result."}
+          required: [id]
+  - class_name: bandits_jev.verl_glue.tools.BrowserTool
+    config: *cfg
+    tool_schema:
+      type: function
+      function:
+        name: find
+        description: "Find a regex pattern in the currently open document."
+        parameters:
+          type: object
+          properties:
+            pattern: {type: string, description: "Regular expression to find."}
+          required: [pattern]
