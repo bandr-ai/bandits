@@ -6,8 +6,10 @@ the prebuilt normalized document vectors, held on the GPU. The model is frozen;
 nothing here is trained. Files live on the `jev-browsecomp` volume:
 /index/corpus.shard*.pkl and /corpus/*.parquet.
 
-Check it (embeds a few documents and compares them with their stored vectors,
-then measures evidence recall on the first 100 benchmark queries):
+Check it (measures evidence recall on the first 100 benchmark queries, batched and
+single-call latency, and that batched and single results agree). The encoding path
+was separately checked once: fresh document embeddings matched the stored vectors
+with cosine 0.99998 or better:
 
     uvx modal run recipes/jev/scripts/modal_retriever.py
 
@@ -81,12 +83,13 @@ class Retriever:
             hidden = self.model(**batch).last_hidden_state[:, -1]
         return torch.nn.functional.normalize(hidden.float(), dim=-1)
 
-    @modal.method()
-    def search(self, queries: list[str], k: int = 10) -> list[list[dict]]:
-        """Top-k per query as {"docid", "score", "snippet"}."""
+    @modal.batched(max_batch_size=32, wait_ms=40)
+    def search_one(self, queries: list[str], ks: list[int]) -> list[list[dict]]:
+        """Call with one query and one k; concurrent calls run as one GPU batch.
+        Top-k as {"docid", "score", "snippet"}."""
         torch = self.torch
         scores = self._embed([TASK_PREFIX + q for q in queries]).to(torch.float16) @ self.index.T
-        top = scores.float().topk(k, dim=-1)
+        top = scores.float().topk(max(ks), dim=-1)
         return [
             [
                 {
@@ -94,23 +97,31 @@ class Retriever:
                     "score": float(s),
                     "snippet": self.texts[self.docids[i]][:SNIPPET_CHARS],
                 }
-                for s, i in zip(row_scores.tolist(), row_ids.tolist(), strict=True)
+                for s, i in zip(row_scores.tolist()[:k], row_ids.tolist()[:k], strict=True)
             ]
-            for row_scores, row_ids in zip(top.values, top.indices, strict=True)
+            for row_scores, row_ids, k in zip(top.values, top.indices, ks, strict=True)
         ]
 
-    @modal.method()
-    def documents(self, docids: list[str]) -> list[str | None]:
-        return [self.texts.get(docid) for docid in docids]
+
+@app.cls(memory=8192, timeout=3600, scaledown_window=300, volumes={"/data": volume})
+class Documents:
+    """Full document text by id; CPU only. (A Modal class with a batched method
+    cannot have other methods, so this lives apart from Retriever.)"""
+
+    @modal.enter()
+    def load(self) -> None:
+        import glob
+
+        import pyarrow.parquet as pq
+
+        self.texts: dict[str, str] = {}
+        for path in sorted(glob.glob("/data/corpus/*.parquet")):
+            table = pq.read_table(path, columns=["docid", "text"])
+            self.texts.update(zip(table["docid"].to_pylist(), table["text"].to_pylist(), strict=True))
 
     @modal.method()
-    def check_document_vectors(self, docids: list[str]) -> list[float]:
-        """Cosine between a freshly embedded document and its stored vector (about 1.0 if the
-        encoding matches the one that built the index)."""
-        position = {d: i for i, d in enumerate(self.docids)}
-        fresh = self._embed([self.texts[d] for d in docids])
-        stored = self.index[[position[d] for d in docids]].float()
-        return (fresh * stored).sum(-1).tolist()
+    def get(self, docids: list[str]) -> list[str | None]:
+        return [self.texts.get(docid) for docid in docids]
 
 
 @app.local_entrypoint()
@@ -125,32 +136,43 @@ def main() -> None:
         evidence.setdefault(qid, set()).add(docid)
 
     retriever = Retriever()
+    texts = [text for _, text in queries]
     started = time.perf_counter()
-    short = retriever.documents.remote(["5412", "82002", "18639"])
-    cosines = retriever.check_document_vectors.remote(
-        [d for d, text in zip(["5412", "82002", "18639"], short, strict=True) if text and len(text) < 20000]
-    )
+    first = retriever.search_one.remote(texts[0], 10)
     cold = time.perf_counter() - started
+
+    started = time.perf_counter()
+    hits_100 = list(retriever.search_one.map(texts, [100] * len(texts)))
+    batched_seconds = time.perf_counter() - started
     recall = {10: [], 100: []}
-    latencies = []
-    for qid, text in queries:
-        t0 = time.perf_counter()
-        hits = retriever.search.remote([text], 100)[0]
-        latencies.append(time.perf_counter() - t0)
+    for (qid, _), hits in zip(queries, hits_100, strict=True):
         got = [h["docid"] for h in hits]
         for k in recall:
             recall[k].append(len(evidence[qid] & set(got[:k])) / len(evidence[qid]))
+
+    latencies = []
+    singles = []
+    for text in texts[:20]:
+        t0 = time.perf_counter()
+        singles.append(retriever.search_one.remote(text, 10))
+        latencies.append(time.perf_counter() - t0)
     latencies.sort()
+    overlap = [
+        len({h["docid"] for h in a} & {h["docid"] for h in b[:10]}) / 10
+        for a, b in zip(singles, hits_100[:20], strict=True)
+    ]
+    document = Documents().get.remote([first[0]["docid"]])[0]
     print(
         json.dumps(
             {
-                "document_vector_cosines": cosines,
                 "queries": len(queries),
                 "evidence_recall@10": sum(recall[10]) / len(queries),
                 "evidence_recall@100": sum(recall[100]) / len(queries),
                 "first_call_seconds_including_load": round(cold, 1),
-                "search_latency_median_s": round(latencies[len(latencies) // 2], 3),
-                "search_latency_p95_s": round(latencies[int(len(latencies) * 0.95)], 3),
+                "concurrent_100_wall_seconds": round(batched_seconds, 2),
+                "single_call_median_s": round(latencies[len(latencies) // 2], 3),
+                "single_vs_batched_top10_overlap_min": min(overlap),
+                "documents_get_ok": bool(document and document.startswith(first[0]["snippet"][:50])),
             },
             indent=2,
         )

@@ -9,6 +9,7 @@ last policy token of the action.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from typing import Any
 
@@ -45,7 +46,8 @@ class BrowserTool(BaseTool):
         if session is None:
             session = SearchSession(self.searcher, top_k=self.top_k)
             setattr(agent_data, SESSION_ATTR, session)
-        reply = session.execute(self.judge_tool, parameters)
+        # The retriever call blocks; a thread lets many rollouts wait on searches together.
+        reply = await asyncio.to_thread(session.execute, self.judge_tool, parameters)
         agent_data.extra_fields.setdefault(EVENTS_KEY, []).append(
             {
                 "position": len(agent_data.response_mask) - 1,
