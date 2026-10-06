@@ -33,3 +33,29 @@ Verdict: directional, not a win. One seed; the next run penalises repeats.
 Engineering failures on the way (fixed): catastrophic regexes in `find` froze
 the trainer; a per-update HTTP client to vLLM left requests hanging until its
 timeout; a laptop suspend ended a non-detached run.
+
+## Step v2 (seed 1)
+
+Same seed, questions and settings. Reward: groups with any correct answer get
+outcome reward only; all-wrong groups are ranked by the mean of
+baseline-centred judge scores (weight 1.0), repeats score -0.5, no search
+scores -1.
+
+| Metric | No RL | Outcome-only | Step v1 | Step v2 | v2 - outcome (95% CI) |
+|---|---|---|---|---|---|
+| Gold evidence seen | 0.218 | 0.200 | 0.224 | 0.209 | +0.009 (-0.040, +0.061) |
+| Gold evidence opened | 0.058 | 0.100 | 0.136 | 0.075 | -0.025 (-0.045, -0.006) |
+| Accuracy (proxy) | 15.6% | 22.9% | 20.6% | 15.8% | -7.1 pts (-14.2, -0.2) |
+| Tool calls | 3.6 | 4.1 | 7.4 | 2.8 | -1.3 |
+| Rollouts repeating an action | 4% | 8% | 26% | 0.2% | -7.7 pts |
+
+Step v2 lost to outcome-only. Averaging step scores rewarded short rollouts
+(the first search usually scores highest), so the policy searched less.
+
+Across both step variants, the reward mostly changed how much the agent
+searched (sum: more, with padding; mean: less), not how well: gold evidence
+found never beat outcome-only. The judge's step signal (AUC 0.68-0.77 against
+gold-evidence steps, generous to topical searches) is too weak to steer search
+quality in 10 updates. Next: a stricter judge rubric (positive only when a step
+surfaces or opens supporting evidence, with padding and repeats as negatives)
+before more RL.
