@@ -8,8 +8,8 @@ training it must reproduce saved judge and retriever outputs.
 Both arms use the same questions per step for a given seed, the same
 hyperparameters and the same evaluation; they differ only in the reward.
 
-    uvx modal run recipes/jev/scripts/modal_grpo.py --arm outcome --seed 1 --steps 10
-    uvx modal run recipes/jev/scripts/modal_grpo.py --arm step --seed 1 --steps 10
+    uvx modal run --detach recipes/jev/scripts/modal_grpo.py --arm outcome --seed 1 --steps 10
+    uvx modal run --detach recipes/jev/scripts/modal_grpo.py --arm step --seed 1 --steps 10
 
 Metrics are appended per step to /runs/step-rl/grpo/<run>/metrics.jsonl on the
 `jev-runs` volume, so an interrupted run keeps what it finished.
@@ -57,7 +57,9 @@ hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
     # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
     # retriever stalled training batches for minutes at a time between updates.
     gpu="H200",
-    timeout=4 * 3600,
+    # Runs are launched detached (they must survive the launching laptop sleeping), so this
+    # is the hard ceiling on what a forgotten run can bill.
+    timeout=2 * 3600,
     scaledown_window=30,
     volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
 )
