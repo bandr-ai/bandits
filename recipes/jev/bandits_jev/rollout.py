@@ -57,7 +57,9 @@ class ContextOverflow(Exception):
     """Raised by ``chat`` when the conversation no longer fits the model."""
 
 
-async def run_rollout(task: dict, chat: Chat, searcher: Searcher, *, max_turns: int = 12, top_k: int = 10) -> dict:
+async def run_rollout(
+    task: dict, chat: Chat, searcher: Searcher, *, max_turns: int = 12, top_k: int = 10, tool_timeout: float = 120.0
+) -> dict:
     session = SearchSession(searcher, top_k=top_k)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -95,7 +97,13 @@ async def run_rollout(task: dict, chat: Chat, searcher: Searcher, *, max_turns: 
             if not isinstance(arguments, dict):
                 raise ValueError("arguments are not an object")
             seen_before, opened_before = set(session.seen), set(session.opened)
-            reply = await asyncio.to_thread(session.execute, "browser." + call["name"], arguments)
+            try:
+                # A hung retriever call must not stall the batch: it becomes an error reply.
+                reply = await asyncio.wait_for(
+                    asyncio.to_thread(session.execute, "browser." + call["name"], arguments), tool_timeout
+                )
+            except TimeoutError:
+                reply = f"Error: the tool did not answer within {tool_timeout:.0f} seconds."
         except (json.JSONDecodeError, ValueError) as exc:
             arguments, reply = {"raw": call["arguments"]}, f"Error: invalid arguments ({exc})"
             seen_before = opened_before = set()

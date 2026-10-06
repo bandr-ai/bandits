@@ -121,7 +121,7 @@ class Trainer:
         from bandits_jev.policy_client import judge_rollout, make_chat
         from bandits_jev.rollout import run_rollout
 
-        client = openai.AsyncOpenAI(base_url=f"http://localhost:{PORT}/v1", api_key="unused", timeout=900)
+        client = openai.AsyncOpenAI(base_url=f"http://localhost:{PORT}/v1", api_key="unused", timeout=300)
         searcher, gate = ModalSearcher(), asyncio.Semaphore(64)
 
         async def judge_async(steps: list[dict]) -> dict:
@@ -134,7 +134,18 @@ class Trainer:
             result["sample"] = sample
             return result
 
-        results = await asyncio.gather(*(one(t, s) for t in tasks for s in range(n)))
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Retriever calls block in threads; the default pool is small enough that a few slow
+        # calls queue every other rollout behind them.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=128))
+        try:
+            # Watchdog: a stalled batch ends the run instead of holding an idle GPU.
+            results = await asyncio.wait_for(
+                asyncio.gather(*(one(t, s) for t in tasks for s in range(n))), 60 * self.batch_minutes
+            )
+        except TimeoutError:
+            raise RuntimeError(f"rollout batch stalled for {self.batch_minutes} minutes; stopping") from None
         # Judge after generation: the judge shares this GPU, so it runs while vLLM is idle.
         by_id = {t["query_id"]: t for t in tasks}
         for result in results:
@@ -172,6 +183,7 @@ class Trainer:
 
         run_dir = Path(f"/runs/step-rl/grpo/{config['run']}")
         run_dir.mkdir(parents=True, exist_ok=True)
+        self.batch_minutes = config["batch_timeout_minutes"]
         check = config.pop("judge_check", [])
         if check:
             got = self._judge_score([c["step"] for c in check])["results"]
@@ -298,6 +310,7 @@ def main(
     arm: str = "outcome", seed: int = 1, steps: int = 10, questions_per_step: int = 16, n: int = 8,
     lr: float = 1e-4, step_weight: float = 0.3, step_cap: float = 1.0, baseline: float = 0.0,
     eval_n: int = 8, eval_limit: int = 60, tag: str = "", max_train_minutes: int = 60,
+    batch_timeout_minutes: int = 12,
 ) -> None:
     work = REPO / "work/step-rl"
     tasks = [json.loads(line) for line in (work / "tasks.jsonl").read_text().splitlines()]
@@ -310,7 +323,8 @@ def main(
         "lr": lr, "step_weight": step_weight, "step_cap": step_cap, "baseline": baseline,
         "eval_n": eval_n, "eval_questions": len(eval_tasks), "policy": POLICY, "policy_revision": POLICY_REVISION,
         "judge_adapter": JUDGE_ADAPTER, "lora_rank": 32, "algorithm": "Dr. GRPO, no KL, one update per batch",
-        "max_train_minutes": max_train_minutes, "judge_check": judge_check(work),
+        "max_train_minutes": max_train_minutes, "batch_timeout_minutes": batch_timeout_minutes,
+        "judge_check": judge_check(work),
     }
     out = Trainer().train.remote(config, train_pool, eval_tasks)
     target = work / "grpo" / f"{run}.json"

@@ -142,3 +142,20 @@ def test_sampled_token_ids_are_kept_per_model_call_when_the_server_returns_them(
 def test_no_token_ids_means_no_model_calls():
     result, _ = run([{"content": "Answer: 1937", "tool_calls": []}])
     assert result["model_calls"] == []
+
+
+def test_a_tool_that_hangs_becomes_an_error_reply_and_the_rollout_continues():
+    import time
+
+    class Hanging(InMemorySearcher):
+        def search(self, query, k=10):
+            time.sleep(0.5)
+            return super().search(query, k)
+
+    chat = policy([
+        {"content": None, "tool_calls": [call("search", query="bridge")]},
+        {"content": "Answer: 1937", "tool_calls": []},
+    ])
+    result = asyncio.run(run_rollout(TASK, chat, Hanging(DOCS), tool_timeout=0.05))
+    assert result["events"][0]["observation"].startswith("Error: the tool did not answer")
+    assert result["correct"]
