@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from bandits_jev.grpo import group_advantages, rollout_reward, training_segments
+from bandits_jev.grpo import (
+    group_advantages,
+    group_rewards,
+    judged_step_quality,
+    rollout_reward,
+    training_segments,
+)
 
 
 def judged(score, action="a", observation="reply"):
@@ -57,3 +63,45 @@ def test_a_re_rendered_prompt_starts_a_new_sequence_instead_of_training_on_it():
         {"prompt_token_ids": [1, 2, 99, 11, 20], "token_ids": [12]},  # template re-rendered token 10 as 99
     ]
     assert training_segments(turns) == [([1, 2, 10, 11], [0, 0, 1, 1]), ([1, 2, 99, 11, 20, 12], [0, 0, 0, 0, 0, 1])]
+
+
+def rollout(correct, *steps):
+    return {"correct": correct, "events": [judged(score, action) for action, score in steps]}
+
+
+V2 = {"step_weight": 0.3, "step_cap": 1.0, "baseline": 0.2, "repeat_penalty": 0.5}
+
+
+def test_step2_uses_outcome_alone_when_any_rollout_is_correct():
+    group = [rollout(True, ("a", -0.9)), rollout(False, ("b", 0.9)), rollout(False)]
+    assert [r["reward"] for r in group_rewards(group, "step2", **V2)] == [1.0, 0.0, 0.0]
+
+
+def test_step2_ranks_an_all_wrong_group_by_mean_step_quality():
+    good, poor = rollout(False, ("a", 0.7)), rollout(False, ("b", 0.0))
+    rewards = [r["reward"] for r in group_rewards([good, poor], "step2", **V2)]
+    assert rewards == pytest.approx([0.3 * 0.5, 0.3 * -0.2])
+    assert group_advantages(rewards)[0] > 0
+
+
+def test_padding_with_baseline_steps_earns_nothing_and_repeats_cost():
+    one = judged_step_quality(rollout(False, ("a", 0.7)), baseline=0.2, repeat_penalty=0.5)
+    padded = judged_step_quality(rollout(False, ("a", 0.7), ("b", 0.2), ("c", 0.2)), baseline=0.2, repeat_penalty=0.5)
+    repeated = judged_step_quality(rollout(False, ("a", 0.7), ("A ", 0.9)), baseline=0.2, repeat_penalty=0.5)
+    assert padded < one
+    assert repeated == pytest.approx((0.5 - 0.5) / 2)
+
+
+def test_not_searching_is_the_worst_in_an_all_wrong_group():
+    assert judged_step_quality(rollout(False), baseline=0.2, repeat_penalty=0.5) == -1.0
+    rewards = [r["reward"] for r in group_rewards([rollout(False), rollout(False, ("a", 0.1))], "step2", **V2)]
+    assert rewards[0] < rewards[1]
+
+
+def test_outcome_and_step_arms_are_unchanged_by_group_rewards():
+    group = [rollout(True, ("a", 0.9)), rollout(False, ("b", 0.4))]
+    for arm in ("outcome", "step"):
+        expected = [rollout_reward(r, arm, step_weight=0.3, step_cap=1.0, baseline=0.2) for r in group]
+        assert group_rewards(group, arm, **V2) == expected
+    with pytest.raises(ValueError):
+        group_rewards(group, "both", **V2)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from bandits_jev.step_shaping import StepEvent, shape_rollout
+from bandits_jev.step_shaping import StepEvent, action_key, shape_rollout
 
 
 def rollout_reward(result: dict, arm: str, *, step_weight: float, step_cap: float, baseline: float) -> dict:
@@ -33,6 +33,57 @@ def rollout_reward(result: dict, arm: str, *, step_weight: float, step_cap: floa
         )
     shaped = shape_rollout([1] * (len(events) + 1), events, outcome, step_weight=step_weight, step_cap=step_cap)
     return {"reward": shaped.total, "outcome": outcome, "step_sum": shaped.step_sum_capped}
+
+
+def judged_step_quality(result: dict, *, baseline: float, repeat_penalty: float) -> float:
+    """Mean of (judge score - baseline) over a rollout's observed steps, in [-1, 1].
+
+    A repeated action scores -repeat_penalty whatever the judge says. A mean, not
+    a sum, so extra searches earn nothing by themselves. A rollout that never
+    searched scores -1: in a group where nobody answered correctly, not looking is
+    the worst thing it could have done.
+    """
+    seen: set[tuple[str, str]] = set()
+    values: list[float] = []
+    for event in result["events"]:
+        key = action_key(event["tool"], event["action"])
+        score = (event.get("judge") or {}).get("score")
+        if key in seen:
+            values.append(-repeat_penalty)
+        elif score is not None and event["observation"].strip():
+            values.append(score - baseline)
+        seen.add(key)
+    if not values:
+        return -1.0
+    return max(-1.0, min(1.0, sum(values) / len(values)))
+
+
+def group_rewards(group: Sequence[dict], arm: str, *, step_weight: float, step_cap: float, baseline: float,
+                  repeat_penalty: float = 0.5) -> list[dict]:
+    """Rewards for one question's rollouts.
+
+    ``step2`` uses the judge only where outcome reward is blind: in a group with
+    any correct answer every rollout gets its outcome alone (exactly the
+    outcome-only reward); in a group where all are wrong, rollouts are ranked by
+    ``judged_step_quality``. ``outcome`` and ``step`` score each rollout alone.
+    """
+    if arm in ("outcome", "step"):
+        return [
+            rollout_reward(r, arm, step_weight=step_weight, step_cap=step_cap, baseline=baseline) for r in group
+        ]
+    if arm != "step2":
+        raise ValueError(f"unknown arm {arm!r}")
+    outcomes = [1.0 if r["correct"] else 0.0 for r in group]
+    if any(outcomes):
+        return [{"reward": o, "outcome": o, "step_sum": 0.0} for o in outcomes]
+    return [
+        {
+            "reward": step_weight * judged_step_quality(r, baseline=baseline, repeat_penalty=repeat_penalty),
+            "outcome": 0.0,
+            "step_sum": step_weight * judged_step_quality(r, baseline=baseline, repeat_penalty=repeat_penalty),
+        }
+        for r in group
+    ]
 
 
 def group_advantages(rewards: Sequence[float]) -> list[float]:

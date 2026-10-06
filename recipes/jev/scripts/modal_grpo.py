@@ -10,6 +10,7 @@ hyperparameters and the same evaluation; they differ only in the reward.
 
     uvx modal run --detach recipes/jev/scripts/modal_grpo.py --arm outcome --seed 1 --steps 10
     uvx modal run --detach recipes/jev/scripts/modal_grpo.py --arm step --seed 1 --steps 10
+    uvx modal run --detach recipes/jev/scripts/modal_grpo.py --arm step2 --seed 1 --steps 10
 
 Metrics are appended per step to /runs/step-rl/grpo/<run>/metrics.jsonl on the
 `jev-runs` volume, so an interrupted run keeps what it finished.
@@ -241,8 +242,8 @@ class Trainer:
 
         from bandits_jev.grpo import (
             group_advantages,
+            group_rewards,
             policy_gradient_step,
-            rollout_reward,
             training_segments,
         )
         from bandits_jev.rollout import summarize
@@ -316,11 +317,14 @@ class Trainer:
 
             groups: dict[str, list[dict]] = {}
             for result in results:
-                result["reward_parts"] = rollout_reward(
-                    result, config["arm"], step_weight=config["step_weight"],
-                    step_cap=config["step_cap"], baseline=config["baseline"],
-                )
                 groups.setdefault(result["query_id"], []).append(result)
+            for group in groups.values():
+                parts = group_rewards(
+                    group, config["arm"], step_weight=config["step_weight"], step_cap=config["step_cap"],
+                    baseline=config["baseline"], repeat_penalty=config["repeat_penalty"],
+                )
+                for result, part in zip(group, parts, strict=True):
+                    result["reward_parts"] = part
             items, sampled_tokens, vllm_logprobs = [], 0, []
             for group in groups.values():
                 for result, advantage in zip(
@@ -411,7 +415,7 @@ def main(
     arm: str = "outcome", seed: int = 1, steps: int = 10, questions_per_step: int = 16, n: int = 8,
     lr: float = 1e-4, step_weight: float = 0.3, step_cap: float = 1.0, baseline: float = 0.0,
     eval_n: int = 8, eval_limit: int = 60, tag: str = "", max_train_minutes: int = 60,
-    batch_timeout_minutes: int = 12,
+    batch_timeout_minutes: int = 12, repeat_penalty: float = 0.5,
 ) -> None:
     work = REPO / "work/step-rl"
     tasks = [json.loads(line) for line in (work / "tasks.jsonl").read_text().splitlines()]
@@ -422,6 +426,7 @@ def main(
     config = {
         "run": run, "arm": arm, "seed": seed, "steps": steps, "questions_per_step": questions_per_step, "n": n,
         "lr": lr, "step_weight": step_weight, "step_cap": step_cap, "baseline": baseline,
+        "repeat_penalty": repeat_penalty,
         "eval_n": eval_n, "eval_questions": len(eval_tasks), "policy": POLICY, "policy_revision": POLICY_REVISION,
         "judge_adapter": JUDGE_ADAPTER, "lora_rank": 32, "algorithm": "Dr. GRPO, no KL, one update per batch",
         "max_train_minutes": max_train_minutes, "batch_timeout_minutes": batch_timeout_minutes,

@@ -40,8 +40,13 @@ class ShapedRollout:
     rejected: Counter = field(default_factory=Counter)
 
 
+def action_key(tool: str, action: str) -> tuple[str, str]:
+    """Two actions are the same when tool and whitespace- and case-normalised text match."""
+    return tool, " ".join(action.split()).lower()
+
+
 def _action_key(event: StepEvent) -> tuple[str, str]:
-    return event.tool, " ".join(event.action.split()).lower()
+    return action_key(event.tool, event.action)
 
 
 def shape_rollout(
