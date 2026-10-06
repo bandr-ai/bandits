@@ -105,3 +105,10 @@ def test_outcome_and_step_arms_are_unchanged_by_group_rewards():
         assert group_rewards(group, arm, **V2) == expected
     with pytest.raises(ValueError):
         group_rewards(group, "both", **V2)
+
+
+def test_oracle_adds_weighted_gold_evidence_recall_to_the_outcome():
+    group = [{"correct": True, "evidence_seen_recall": 0.5, "events": []},
+             {"correct": False, "evidence_seen_recall": 1.0, "events": [judged(0.9)] * 5}]
+    rewards = [r["reward"] for r in group_rewards(group, "oracle", **V2)]
+    assert rewards == pytest.approx([1.0 + 0.3 * 0.5, 0.3 * 1.0])

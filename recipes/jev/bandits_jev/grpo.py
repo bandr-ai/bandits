@@ -67,6 +67,17 @@ def group_rewards(group: Sequence[dict], arm: str, *, step_weight: float, step_c
     outcome-only reward); in a group where all are wrong, rollouts are ranked by
     ``judged_step_quality``. ``outcome`` and ``step`` score each rollout alone.
     """
+    if arm == "oracle":
+        # Upper bound for step-wise reward: the process signal comes from ground truth (the
+        # share of gold evidence documents the rollout saw), so it cannot be padded.
+        return [
+            {
+                "reward": (1.0 if r["correct"] else 0.0) + step_weight * r["evidence_seen_recall"],
+                "outcome": 1.0 if r["correct"] else 0.0,
+                "step_sum": step_weight * r["evidence_seen_recall"],
+            }
+            for r in group
+        ]
     if arm in ("outcome", "step"):
         return [
             rollout_reward(r, arm, step_weight=step_weight, step_cap=step_cap, baseline=baseline) for r in group
