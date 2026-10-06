@@ -39,7 +39,7 @@ app = modal.App("jev-step-judge", image=image)
     gpu=GPU,
     timeout=3600,
     scaledown_window=300,
-    max_containers=4,
+    max_containers=2,
     volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache},
 )
 class JevJudge:
