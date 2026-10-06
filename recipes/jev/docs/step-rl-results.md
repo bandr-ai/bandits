@@ -59,3 +59,23 @@ gold-evidence steps, generous to topical searches) is too weak to steer search
 quality in 10 updates. Next: a stricter judge rubric (positive only when a step
 surfaces or opens supporting evidence, with padding and repeats as negatives)
 before more RL.
+
+## Jev v2: retrained on gold-evidence step labels
+
+Logged training-pool steps (2,986 rollouts, 9,654 steps) were labelled from
+ground truth (positive: surfaced or opened a gold evidence document; negative:
+repeat or tool error; else neutral) and a new judge was trained with the pilot
+recipe (581 rows, 478 train; best dev accuracy 0.79 at the last checkpoint).
+Both judges were scored on 1,172 steps from held-out questions:
+
+| | v1 | v2 |
+|---|---|---|
+| AUC, evidence-finding steps vs rest | 0.781 | 0.786 |
+| Accuracy | 70.6% | 70.6% |
+| Non-evidence steps scored above 0.25 | 33% | 38% |
+
+No meaningful gain. From a step's snippets alone, without the answer, a judge
+cannot reliably tell the right evidence from relevant-looking results; better
+labels do not supply that information. Next proposed test: an oracle arm whose
+step signal comes from gold evidence directly, to learn whether step-wise
+reward helps here at all.
