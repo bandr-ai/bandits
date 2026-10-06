@@ -18,6 +18,7 @@ Metrics are appended per step to /runs/step-rl/grpo/<run>/metrics.jsonl on the
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import modal
@@ -132,8 +133,22 @@ class Trainer:
         from bandits_jev.policy_client import judge_rollout, make_chat
         from bandits_jev.rollout import run_rollout
 
-        client = openai.AsyncOpenAI(base_url=f"http://localhost:{PORT}/v1", api_key="unused", timeout=300)
+        if getattr(self, "client", None) is None:
+            import httpx
+
+            # One client for the whole run, with a short per-request timeout and retries: in the
+            # step arm some requests hung on the client side until the timeout fired (15 min at
+            # 900 s, 2 to 5 min at 300 s) while vLLM itself answered new requests instantly.
+            self.client = openai.AsyncOpenAI(
+                base_url=f"http://localhost:{PORT}/v1", api_key="unused", max_retries=3,
+                http_client=httpx.AsyncClient(
+                    limits=httpx.Limits(max_connections=256, max_keepalive_connections=128),
+                    timeout=httpx.Timeout(90.0, connect=10.0),
+                ),
+            )
+        client = self.client
         searcher, gate = self.retriever, asyncio.Semaphore(64)
+        finished = [0]
 
         async def judge_async(steps: list[dict]) -> dict:
             return self._judge_score(steps)
@@ -143,7 +158,32 @@ class Trainer:
             async with gate:
                 result = await run_rollout(task, make_chat(client, model_name, seed, keep_tokens=keep_tokens), searcher)
             result["sample"] = sample
+            finished[0] += 1
             return result
+
+        def awaiting(task: asyncio.Task) -> str:
+            """The innermost frames of a pending task's await chain."""
+            names, coro = [], task.get_coro()
+            while coro is not None:
+                frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+                if frame is not None:
+                    names.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+                coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+            return " > ".join(names[-4:])
+
+        async def report_stalls() -> None:
+            from collections import Counter
+
+            last, since = 0, time.monotonic()
+            while True:
+                await asyncio.sleep(30)
+                if finished[0] != last:
+                    last, since = finished[0], time.monotonic()
+                elif time.monotonic() - since > 120:
+                    pending = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
+                    where = Counter(awaiting(t) for t in pending).most_common(6)
+                    print(json.dumps({"stall_seconds": round(time.monotonic() - since), "finished": finished[0],
+                                      "pending_tasks": len(pending), "awaiting": where}), flush=True)
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -156,6 +196,7 @@ class Trainer:
         # Diagnosis: if generation runs long, dump every thread's stack each minute. It runs on
         # a C thread, so it shows where Python is stuck even when the interpreter lock is held.
         faulthandler.dump_traceback_later(150, repeat=True, exit=False, file=sys.stderr)
+        reporter = asyncio.create_task(report_stalls())
         try:
             # Watchdog: a stalled batch ends the run instead of holding an idle GPU.
             results = await asyncio.wait_for(
@@ -165,6 +206,7 @@ class Trainer:
             raise RuntimeError(f"rollout batch stalled for {self.batch_minutes} minutes; stopping") from None
         finally:
             faulthandler.cancel_dump_traceback_later()
+            reporter.cancel()
         slow = sorted(
             ((e["seconds"], e["tool"], e["action"][:200]) for r in results for e in r["events"] if e.get("seconds", 0) > 5),
             reverse=True,
