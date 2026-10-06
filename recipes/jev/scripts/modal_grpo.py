@@ -150,6 +150,12 @@ class Trainer:
         # Retriever calls block in threads; the default pool is small enough that a few slow
         # calls queue every other rollout behind them.
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=128))
+        import faulthandler
+        import sys
+
+        # Diagnosis: if generation runs long, dump every thread's stack each minute. It runs on
+        # a C thread, so it shows where Python is stuck even when the interpreter lock is held.
+        faulthandler.dump_traceback_later(150, repeat=True, exit=False, file=sys.stderr)
         try:
             # Watchdog: a stalled batch ends the run instead of holding an idle GPU.
             results = await asyncio.wait_for(
@@ -157,6 +163,13 @@ class Trainer:
             )
         except TimeoutError:
             raise RuntimeError(f"rollout batch stalled for {self.batch_minutes} minutes; stopping") from None
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        slow = sorted(
+            ((e["seconds"], e["tool"], e["action"][:200]) for r in results for e in r["events"] if e.get("seconds", 0) > 5),
+            reverse=True,
+        )
+        print(json.dumps({"slow_tool_calls": len(slow), "slowest": slow[:5]}), flush=True)
         # Judge after generation: the judge shares this GPU, so it runs while vLLM is idle.
         by_id = {t["query_id"]: t for t in tasks}
         for result in results:
@@ -253,7 +266,11 @@ class Trainer:
             rng = random.Random(f"{config['seed']}:{step}")  # same questions per step for both arms
             tasks = rng.sample(train_pool, config["questions_per_step"])
             results = await self._rollouts(tasks, config["n"], model_name, True, f"train:{config['seed']}:{step}")
+            arm_watchdog()
             generated = time.time()
+            (run_dir / f"rollouts-step{step + 1}.json").write_text(
+                json.dumps([{k: v for k, v in r.items() if k != "model_calls"} for r in results])
+            )
 
             groups: dict[str, list[dict]] = {}
             for result in results:
@@ -318,6 +335,7 @@ class Trainer:
 
         arm_watchdog()
         evaluation = await self._rollouts(eval_tasks, config["eval_n"], model_name, False, "eval")
+        arm_watchdog()
         for result in evaluation:
             result.pop("model_calls", None)
         out = {"config": config, "history": history, "eval_summary": summarize(evaluation), "eval": evaluation}

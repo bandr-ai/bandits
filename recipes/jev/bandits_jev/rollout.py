@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -97,6 +98,7 @@ async def run_rollout(
             if not isinstance(arguments, dict):
                 raise ValueError("arguments are not an object")
             seen_before, opened_before = set(session.seen), set(session.opened)
+            tool_started = time.monotonic()
             try:
                 # A hung retriever call must not stall the batch: it becomes an error reply.
                 reply = await asyncio.wait_for(
@@ -104,15 +106,18 @@ async def run_rollout(
                 )
             except TimeoutError:
                 reply = f"Error: the tool did not answer within {tool_timeout:.0f} seconds."
+            tool_seconds = time.monotonic() - tool_started
         except (json.JSONDecodeError, ValueError) as exc:
             arguments, reply = {"raw": call["arguments"]}, f"Error: invalid arguments ({exc})"
             seen_before = opened_before = set()
+            tool_seconds = 0.0
         events.append(
             {
                 "turn": turn,
                 "tool": "browser." + call["name"],
                 "action": SearchSession.action_text(arguments),
                 "observation": reply,
+                "seconds": round(tool_seconds, 3),
                 # Ground truth about the step, for scoring only: never shown to the policy or judge.
                 "new_evidence_seen": len(evidence & (session.seen - seen_before)),
                 "evidence_opened": bool(evidence & (session.opened - opened_before)),
