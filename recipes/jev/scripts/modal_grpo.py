@@ -1,9 +1,10 @@
 """Scoped Dr. GRPO run on one Modal H100: outcome-only or outcome + Jev step reward.
 
-One container holds everything that would otherwise sit idle on its own GPU:
-vLLM serves the policy (LoRA hot-swapped after each update), the policy is
-trained with PEFT on the same GPU, and the frozen Jev judge scores steps
-in-process. Only the retriever stays remote (`jev-retriever` must be deployed).
+One H200 holds everything that would otherwise sit idle on its own GPU or
+stall on the network: vLLM serves the policy (LoRA hot-swapped after each
+update), the policy is trained with PEFT, the frozen Jev judge scores steps,
+and the BrowseComp-Plus retriever answers searches, all in one process. Before
+training it must reproduce saved judge and retriever outputs.
 Both arms use the same questions per step for a given seed, the same
 hyperparameters and the same evaluation; they differ only in the reward.
 
@@ -33,7 +34,9 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     # flash-linear-attention is Triton only; without it the judge's linear-attention layers
     # fall back to slow PyTorch code.
-    .pip_install("vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich", "flash-linear-attention", "regex")
+    .pip_install(
+        "vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich", "flash-linear-attention", "regex", "pyarrow"
+    )
     .env(
         {
             "PYTHONPATH": "/app",
@@ -46,14 +49,17 @@ image = (
 )
 app = modal.App("jev-grpo", image=image)
 runs = modal.Volume.from_name("jev-runs", create_if_missing=True)
+corpus = modal.Volume.from_name("jev-browsecomp")
 hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
 
 
 @app.cls(
-    gpu="H100",
+    # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
+    # retriever stalled training batches for minutes at a time between updates.
+    gpu="H200",
     timeout=4 * 3600,
     scaledown_window=30,
-    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache},
+    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
 )
 class Trainer:
     @modal.enter()
@@ -65,7 +71,7 @@ class Trainer:
         self.server = subprocess.Popen(
             [
                 "vllm", "serve", POLICY, "--revision", POLICY_REVISION, "--served-model-name", "base",
-                "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", "0.5",
+                "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", "0.4",
                 "--enable-lora", "--max-lora-rank", "32", "--max-loras", "2",
                 "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--port", str(PORT),
             ]
@@ -99,6 +105,10 @@ class Trainer:
         self.model = get_peft_model(model, lora)
         self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
 
+        from bandits_jev.dense_retriever import DenseRetriever
+
+        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
+
     def _judge_score(self, steps: list[dict]) -> dict:
         from bandits_jev.step_judge import judge_step
 
@@ -117,12 +127,11 @@ class Trainer:
 
         import openai
 
-        from bandits_jev.modal_searcher import ModalSearcher
         from bandits_jev.policy_client import judge_rollout, make_chat
         from bandits_jev.rollout import run_rollout
 
         client = openai.AsyncOpenAI(base_url=f"http://localhost:{PORT}/v1", api_key="unused", timeout=300)
-        searcher, gate = ModalSearcher(), asyncio.Semaphore(64)
+        searcher, gate = self.retriever, asyncio.Semaphore(64)
 
         async def judge_async(steps: list[dict]) -> dict:
             return self._judge_score(steps)
@@ -184,6 +193,25 @@ class Trainer:
         run_dir = Path(f"/runs/step-rl/grpo/{config['run']}")
         run_dir.mkdir(parents=True, exist_ok=True)
         self.batch_minutes = config["batch_timeout_minutes"]
+        reference = config.pop("retrieval_reference", None)
+        if reference:
+            import hashlib
+
+            got = self.retriever.search_many(reference["queries"], 10)
+            overlaps = [
+                len({h["docid"] for h in g} & {d for d, _, _ in r}) / 10 for g, r in zip(got, reference["top10"], strict=True)
+            ]
+            same_top = sum(g[0]["docid"] == r[0][0] for g, r in zip(got, reference["top10"], strict=True))
+            same_docs = all(
+                hashlib.sha256(self.retriever.texts[d].encode()).hexdigest() == h for d, h in reference["documents"].items()
+            )
+            config["retrieval_check_result"] = {
+                "queries": len(overlaps), "mean_top10_overlap": sum(overlaps) / len(overlaps),
+                "min_top10_overlap": min(overlaps), "same_top1": same_top, "documents_match": same_docs,
+            }
+            print(json.dumps(config["retrieval_check_result"]), flush=True)
+            if min(overlaps) < 0.8 or same_top < len(overlaps) - 1 or not same_docs:
+                raise RuntimeError(f"in-container retriever does not match the service: {config['retrieval_check_result']}")
         check = config.pop("judge_check", [])
         if check:
             got = self._judge_score([c["step"] for c in check])["results"]
@@ -336,6 +364,7 @@ def main(
         "judge_adapter": JUDGE_ADAPTER, "lora_rank": 32, "algorithm": "Dr. GRPO, no KL, one update per batch",
         "max_train_minutes": max_train_minutes, "batch_timeout_minutes": batch_timeout_minutes,
         "judge_check": judge_check(work),
+        "retrieval_reference": json.loads((work / "retrieval_reference.json").read_text()),
     }
     out = Trainer().train.remote(config, train_pool, eval_tasks)
     target = work / "grpo" / f"{run}.json"
