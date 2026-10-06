@@ -33,7 +33,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     # flash-linear-attention is Triton only; without it the judge's linear-attention layers
     # fall back to slow PyTorch code.
-    .pip_install("vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich", "flash-linear-attention")
+    .pip_install("vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich", "flash-linear-attention", "regex")
     .env(
         {
             "PYTHONPATH": "/app",
@@ -205,7 +205,16 @@ class Trainer:
             [p for p in self.model.parameters() if p.requires_grad], lr=config["lr"], betas=(0.9, 0.95), weight_decay=0.0
         )
         model_name, history = "base", []
+        import faulthandler
+        import sys
+
+        def arm_watchdog() -> None:
+            # Runs on a C thread, so it fires even if Python code holds the interpreter lock:
+            # dumps every thread's stack to the log, then exits so the GPU is released.
+            faulthandler.dump_traceback_later(60 * (self.batch_minutes + 8), exit=True, file=sys.stderr)
+
         for step in range(config["steps"]):
+            arm_watchdog()
             if time.time() > deadline:
                 print(json.dumps({"stopped_early": f"time guard after {step} steps"}), flush=True)
                 config["stopped_early_after_steps"] = step
@@ -277,12 +286,14 @@ class Trainer:
             runs.commit()
             print(json.dumps(record), flush=True)
 
+        arm_watchdog()
         evaluation = await self._rollouts(eval_tasks, config["eval_n"], model_name, False, "eval")
         for result in evaluation:
             result.pop("model_calls", None)
         out = {"config": config, "history": history, "eval_summary": summarize(evaluation), "eval": evaluation}
         (run_dir / "eval.json").write_text(json.dumps(out))
         runs.commit()
+        faulthandler.cancel_dump_traceback_later()
         return {k: out[k] for k in ("config", "history", "eval_summary")}
 
 

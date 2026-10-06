@@ -79,3 +79,16 @@ def test_action_text_is_stable_so_repeats_can_be_detected():
     a = SearchSession.action_text({"query": "x", "topn": 3})
     b = SearchSession.action_text({"topn": 3, "query": "x"})
     assert a == b and json.loads(a) == {"query": "x", "topn": 3}
+
+
+def test_a_catastrophic_pattern_times_out_into_an_error_reply():
+    import time
+
+    long_page = {"long": "terra sancta college established students teachers " * 2000}
+    s = SearchSession(InMemorySearcher(long_page), top_k=3)
+    s.execute(SEARCH, {"query": "terra sancta"})
+    s.execute(OPEN, {"id": "long"})
+    started = time.time()
+    reply = s.execute(FIND, {"pattern": "terra.*sancta.*college.*established.*students.*teachers.*zzz"})
+    assert reply.startswith("Error: the pattern took longer than")
+    assert time.time() - started < 10

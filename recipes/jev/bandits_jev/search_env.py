@@ -13,12 +13,17 @@ import json
 import re
 from typing import Any, Protocol
 
+import regex
+
 SEARCH, OPEN, FIND = "browser.search", "browser.open", "browser.find"
 TOOLS = (SEARCH, OPEN, FIND)
 SNIPPET_CHARS = 400
 PAGE_CHARS = 4000
 MAX_FIND_MATCHES = 8
 FIND_CONTEXT_CHARS = 150
+FIND_SECONDS = 2.0
+"""Model-written patterns like 'A.*B.*C.*D' backtrack catastrophically on long pages; the
+standard library holds the interpreter lock while matching, which froze a whole training run."""
 
 
 class Searcher(Protocol):
@@ -105,9 +110,15 @@ class SearchSession:
         if self.open_text is None:
             return "Error: no page is open; use browser.open first."
         try:
-            matches = list(re.finditer(pattern, self.open_text, flags=re.IGNORECASE))
-        except re.error as exc:
+            matches = list(
+                regex.finditer(
+                    pattern, self.open_text, flags=regex.IGNORECASE, timeout=FIND_SECONDS, concurrent=True
+                )
+            )
+        except regex.error as exc:
             return f"Error: invalid pattern ({exc})."
+        except TimeoutError:
+            return f"Error: the pattern took longer than {FIND_SECONDS:.0f} seconds to run; use a simpler pattern."
         if not matches:
             return f"No matches for {pattern!r} in [{self.open_id}]."
         lines = [f"{len(matches)} match(es) for {pattern!r} in [{self.open_id}]:"]
