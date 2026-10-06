@@ -103,7 +103,8 @@ class Retriever:
         ]
 
 
-@app.cls(memory=8192, timeout=3600, scaledown_window=300, volumes={"/data": volume})
+@app.cls(memory=8192, timeout=3600, scaledown_window=120, max_containers=2, volumes={"/data": volume})
+@modal.concurrent(max_inputs=64)
 class Documents:
     """Full document text by id; CPU only. (A Modal class with a batched method
     cannot have other methods, so this lives apart from Retriever.)"""
