@@ -124,3 +124,21 @@ def test_summary_compares_judge_scores_on_evidence_steps_with_the_rest():
     assert out["judge_mean_score_on_other_steps"] == (0.8 - 0.5) / 2
     assert out["rollouts_with_repeated_action"] == 0.5
     assert out["judge_class_share"]["positive"] == 2 / 3
+
+
+def test_sampled_token_ids_are_kept_per_model_call_when_the_server_returns_them():
+    result, _ = run(
+        [
+            {"content": None, "tool_calls": [call("search", query="bridge")], "prompt_token_ids": [1, 2], "token_ids": [7, 8], "logprobs": [-0.1, -0.2]},
+            {"content": "Answer: 1937", "tool_calls": [], "prompt_token_ids": [1, 2, 7, 8, 3], "token_ids": [9], "logprobs": [-0.3]},
+        ]
+    )
+    assert result["model_calls"] == [
+        {"prompt_token_ids": [1, 2], "token_ids": [7, 8], "logprobs": [-0.1, -0.2]},
+        {"prompt_token_ids": [1, 2, 7, 8, 3], "token_ids": [9], "logprobs": [-0.3]},
+    ]
+
+
+def test_no_token_ids_means_no_model_calls():
+    result, _ = run([{"content": "Answer: 1937", "tool_calls": []}])
+    assert result["model_calls"] == []

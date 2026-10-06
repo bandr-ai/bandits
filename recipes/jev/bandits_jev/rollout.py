@@ -65,6 +65,7 @@ async def run_rollout(task: dict, chat: Chat, searcher: Searcher, *, max_turns: 
     ]
     events: list[dict[str, Any]] = []
     assistant_texts: list[str] = []
+    model_calls: list[dict[str, Any]] = []
     evidence = set(task["evidence_ids"])
     final, ended, error, dropped = None, "max_turns", None, 0
     for turn in range(max_turns):
@@ -75,6 +76,14 @@ async def run_rollout(task: dict, chat: Chat, searcher: Searcher, *, max_turns: 
             ended, error = "error", f"context overflow: {exc}"
             break
         calls = message.get("tool_calls") or []
+        if message.get("token_ids") is not None:
+            model_calls.append(
+                {
+                    "prompt_token_ids": message["prompt_token_ids"],
+                    "token_ids": message["token_ids"],
+                    "logprobs": message.get("logprobs"),
+                }
+            )
         if message.get("content"):
             assistant_texts.append(message["content"])
         if not calls or last:
@@ -128,6 +137,8 @@ async def run_rollout(task: dict, chat: Chat, searcher: Searcher, *, max_turns: 
         "evidence_opened_recall": recall(session.opened),
         "events": events,
         "assistant_texts": assistant_texts,
+        # Exact sampled token ids per model call, when the server returned them (training only).
+        "model_calls": model_calls,
     }
 
 
