@@ -59,6 +59,7 @@ class SearchSession:
         self.searcher = searcher
         self.top_k = top_k
         self.seen: set[str] = set()
+        self.opened: set[str] = set()
         self.open_text: str | None = None
         self.open_id: str | None = None
 
@@ -95,6 +96,7 @@ class SearchSession:
         if document is None:
             return f"Error: no document with id {docid!r}."
         self.open_id, self.open_text = docid, document["text"]
+        self.opened.add(docid)
         text = self.open_text
         suffix = f"\n[truncated; {len(text)} characters in all, use browser.find]" if len(text) > PAGE_CHARS else ""
         return f"Opened [{docid}]:\n{text[:PAGE_CHARS]}{suffix}"

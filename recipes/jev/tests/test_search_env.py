@@ -45,7 +45,9 @@ def test_open_only_works_on_ids_already_shown():
     s = session()
     assert s.execute(OPEN, {"id": "d1"}).startswith("Error: id 'd1' was not in any search result")
     s.execute(SEARCH, {"query": "Golden Gate"})
+    assert s.opened == set()
     assert s.execute(OPEN, {"id": "d1"}) == f"Opened [d1]:\n{DOCS['d1']}"
+    assert s.opened == {"d1"}
 
 
 def test_a_long_page_is_cut_and_find_still_reaches_the_rest():
