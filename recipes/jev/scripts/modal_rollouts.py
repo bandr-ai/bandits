@@ -31,8 +31,10 @@ PORT = 8000
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm", "openai", "huggingface_hub")
-    .env({"PYTHONPATH": "/app"})
+    .pip_install("vllm==0.31.0", "openai", "huggingface_hub")
+    # vLLM's FlashInfer sampler builds a CUDA kernel at warmup and needs nvcc, which this
+    # image lacks; the first smoke run crash-looped on it. Off falls back to PyTorch sampling.
+    .env({"PYTHONPATH": "/app", "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_dir(str(REPO / "recipes/jev/bandits_jev"), "/app/bandits_jev")
 )
 app = modal.App("jev-rollouts", image=image)
