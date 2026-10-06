@@ -31,7 +31,9 @@ PORT = 8000
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich")
+    # flash-linear-attention is Triton only; without it the judge's linear-attention layers
+    # fall back to slow PyTorch code.
+    .pip_install("vllm==0.31.0", "openai", "huggingface_hub", "peft", "typer", "rich", "flash-linear-attention")
     .env(
         {
             "PYTHONPATH": "/app",
