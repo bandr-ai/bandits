@@ -55,63 +55,34 @@ corpus = modal.Volume.from_name("jev-browsecomp")
 hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
 
 
-@app.cls(
-    # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
-    # retriever stalled training batches for minutes at a time between updates.
-    gpu="H200",
-    # Runs are launched detached (they must survive the launching laptop sleeping), so this
-    # is the hard ceiling on what a forgotten run can bill.
-    timeout=2 * 3600,
-    scaledown_window=30,
-    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
-)
-class Trainer:
-    @modal.enter()
-    def start(self) -> None:
-        import subprocess
-        import time
-        import urllib.request
+def start_vllm():
+    """Start vLLM for the policy with runtime LoRA loading and wait until it answers."""
+    import subprocess
+    import urllib.request
 
-        self.server = subprocess.Popen(
-            [
-                "vllm", "serve", POLICY, "--revision", POLICY_REVISION, "--served-model-name", "base",
-                "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", "0.4",
-                "--enable-lora", "--max-lora-rank", "32", "--max-loras", "2",
-                "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--port", str(PORT),
-            ]
-        )
-        deadline = time.time() + 20 * 60
-        while True:
-            if self.server.poll() is not None:
-                raise RuntimeError(f"vllm exited with code {self.server.returncode}")
-            try:
-                urllib.request.urlopen(f"http://localhost:{PORT}/v1/models", timeout=2)
-                break
-            except OSError:
-                if time.time() > deadline:
-                    raise RuntimeError("vllm did not become ready in 20 minutes") from None
-                time.sleep(5)
+    server = subprocess.Popen(
+        [
+            "vllm", "serve", POLICY, "--revision", POLICY_REVISION, "--served-model-name", "base",
+            "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", "0.4",
+            "--enable-lora", "--max-lora-rank", "32", "--max-loras", "2",
+            "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--port", str(PORT),
+        ]
+    )
+    deadline = time.time() + 20 * 60
+    while True:
+        if server.poll() is not None:
+            raise RuntimeError(f"vllm exited with code {server.returncode}")
+        try:
+            urllib.request.urlopen(f"http://localhost:{PORT}/v1/models", timeout=2)
+            return server
+        except OSError:
+            if time.time() > deadline:
+                raise RuntimeError("vllm did not become ready in 20 minutes") from None
+            time.sleep(5)
 
-        import torch
-        from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForCausalLM
 
-        from bandits_jev.hf_predictor import HFPredictor
-
-        model = AutoModelForCausalLM.from_pretrained(POLICY, revision=POLICY_REVISION, dtype=torch.bfloat16).to("cuda")
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-        model.config.use_cache = False
-        lora = LoraConfig(
-            r=32, lora_alpha=64, lora_dropout=0.0, task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        )
-        self.model = get_peft_model(model, lora)
-        self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
-
-        from bandits_jev.dense_retriever import DenseRetriever
-
-        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
+class Harness:
+    """Rollout generation, judging and adapter loading shared by Trainer and Evaluator."""
 
     def _judge_score(self, steps: list[dict]) -> dict:
         from bandits_jev.step_judge import judge_step
@@ -125,7 +96,9 @@ class Trainer:
             results.append({"probabilities": judged.probabilities, "score": judged.score, "reason": judged.reason})
         return {"judge": {"model": JUDGE, "revision": JUDGE_REVISION, "adapter": JUDGE_ADAPTER}, "results": results}
 
-    async def _rollouts(self, tasks: list[dict], n: int, model_name: str, keep_tokens: bool, salt: str) -> list[dict]:
+    async def _rollouts(
+        self, tasks: list[dict], n: int, model_name: str, keep_tokens: bool, salt: str, judge: bool = True
+    ) -> list[dict]:
         import asyncio
         import hashlib
 
@@ -213,6 +186,8 @@ class Trainer:
             reverse=True,
         )
         print(json.dumps({"slow_tool_calls": len(slow), "slowest": slow[:5]}), flush=True)
+        if not judge:
+            return results
         # Judge after generation: the judge shares this GPU, so it runs while vLLM is idle.
         by_id = {t["query_id"]: t for t in tasks}
         for result in results:
@@ -232,6 +207,43 @@ class Trainer:
         post("load_lora_adapter", {"lora_name": name, "lora_path": path})
         if previous:
             post("unload_lora_adapter", {"lora_name": previous})
+
+
+@app.cls(
+    # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
+    # retriever stalled training batches for minutes at a time between updates.
+    gpu="H200",
+    # Runs are launched detached (they must survive the launching laptop sleeping), so this
+    # is the hard ceiling on what a forgotten run can bill.
+    timeout=2 * 3600,
+    scaledown_window=30,
+    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
+)
+class Trainer(Harness):
+    @modal.enter()
+    def start(self) -> None:
+        self.server = start_vllm()
+
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        from bandits_jev.hf_predictor import HFPredictor
+
+        model = AutoModelForCausalLM.from_pretrained(POLICY, revision=POLICY_REVISION, dtype=torch.bfloat16).to("cuda")
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+        model.config.use_cache = False
+        lora = LoraConfig(
+            r=32, lora_alpha=64, lora_dropout=0.0, task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        self.model = get_peft_model(model, lora)
+        self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
+
+        from bandits_jev.dense_retriever import DenseRetriever
+
+        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
 
     @modal.method()
     async def train(self, config: dict, train_pool: list[dict], eval_tasks: list[dict]) -> dict:
@@ -389,6 +401,39 @@ class Trainer:
         runs.commit()
         faulthandler.cancel_dump_traceback_later()
         return {k: out[k] for k in ("config", "history", "eval_summary")}
+
+
+@app.cls(
+    gpu="H100",
+    timeout=3600,
+    scaledown_window=30,
+    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
+)
+class Evaluator(Harness):
+    """Held-out evaluation of a saved adapter without training or judging: vLLM and the
+    retriever only. Deploy the app and spawn this so it does not depend on the launching
+    machine staying awake (scripts/spawn_eval.py)."""
+
+    @modal.enter()
+    def start(self) -> None:
+        from bandits_jev.dense_retriever import DenseRetriever
+
+        self.server = start_vllm()
+        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
+
+    @modal.method()
+    async def evaluate(self, run: str, adapter: str, eval_tasks: list[dict], eval_n: int) -> dict:
+        from bandits_jev.rollout import summarize
+
+        self.batch_minutes = 40
+        self._load_adapter("evaluated", adapter, None)
+        evaluation = await self._rollouts(eval_tasks, eval_n, "evaluated", False, "eval", judge=False)
+        out = {"config": {"run": run, "adapter": adapter, "eval_n": eval_n, "judged": False},
+               "eval_summary": summarize(evaluation), "eval": evaluation}
+        path = Path(f"/runs/step-rl/grpo/{run}/eval.json")
+        path.write_text(json.dumps(out))
+        runs.commit()
+        return out["eval_summary"]
 
 
 def judge_check(work: Path, count: int = 20) -> list[dict]:
