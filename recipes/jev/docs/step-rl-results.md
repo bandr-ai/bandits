@@ -79,3 +79,35 @@ cannot reliably tell the right evidence from relevant-looking results; better
 labels do not supply that information. Next proposed test: an oracle arm whose
 step signal comes from gold evidence directly, to learn whether step-wise
 reward helps here at all.
+
+## Oracle step reward (seed 1)
+
+Same seed, questions and settings. Reward: outcome + 0.3 x the share of gold
+evidence documents the rollout saw (ground truth, training questions only).
+Training finished all ten updates; the evaluation was rerun from the saved
+update-10 adapter on the deployed Evaluator after the launching laptop
+suspended (no judge scoring; same rollout code).
+
+| Metric | No RL | Outcome-only | Jev step v1 | Jev step v2 | Oracle step | Oracle - outcome (95% CI) |
+|---|---|---|---|---|---|---|
+| Gold evidence seen | 0.218 | 0.200 | 0.224 | 0.209 | 0.350 | +0.150 (+0.101, +0.201) |
+| Gold evidence opened | 0.058 | 0.100 | 0.136 | 0.075 | 0.049 | -0.050 (-0.083, -0.018) |
+| Accuracy (proxy) | 15.6% | 22.9% | 20.6% | 15.8% | 17.3% | -5.6 pts (-12.1, +1.3) |
+| Tool calls | 3.6 | 4.1 | 7.4 | 2.8 | 7.3 | +3.2 |
+| Rollouts repeating an action | 4% | 8% | 26% | 0.2% | 7% | -0.6 pts |
+
+## Conclusions so far (one seed, ten updates)
+
+- Step-wise reward reshapes search behaviour when its signal is right: a
+  ground-truth step signal raised gold evidence found on held-out questions by
+  about 75% over outcome-only.
+- That did not become accuracy within ten updates; outcome-only RL still has
+  the best accuracy (+7.3 pts over no RL). The agent finds evidence in results
+  but opens less of it and still abstains.
+- The trace-trained Jev is the bottleneck: step v1 recovered about 16% of the
+  oracle's evidence gain (+0.024 of +0.150), and retraining on gold labels did
+  not raise its held-out AUC (0.786 vs 0.781).
+
+Defensible claim: step-wise reward measurably changes agent behaviour, and
+judge quality decides how much of that a learned judge captures. Not yet
+supported: step-wise RL beats outcome-only on accuracy.
