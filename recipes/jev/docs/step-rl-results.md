@@ -148,3 +148,27 @@ evidence than it.
 Claim supported (one seed): where no ground-truth checker exists, a
 judge-only outcome reward gets gamed, and step-wise Jev rewards prevent that
 collapse (+14 pts accuracy here).
+
+## Hosted Jev (TypeSafe System One) as both rewards (seed 1)
+
+Gate on held-out data, zero-shot: step-judge AUC 0.891 (small trained step
+Jev 0.786); final-answer verifier AUC 0.751 from the full trajectory (small
+trained outcome Jev 0.921). Step baseline -0.17, fixed on training-pool steps.
+Runs on an H100 with judging over the API.
+
+| Metric | No RL | Small Jev final | Small Jev final + step | Hosted Jev final | Hosted Jev final + step |
+|---|---|---|---|---|---|
+| Accuracy (proxy) | 15.6% | 5.4% | 19.6% | 0% | 0% |
+| Gold evidence seen | 0.218 | 0.307 | 0.318 | 0.000 | 0.046 |
+| Tool calls | 3.6 | 10.5 | 6.5 | 0.0 | 0.3 |
+
+Both hosted-Jev arms collapsed within about three updates: the policy learned
+to answer at once without searching, with answers the hosted verifier rated
+about 70% likely correct (its AUC against truth on training rollouts fell from
+0.86 to 0.25). The hosted step reward did not prevent it: taking no steps
+avoids step judging entirely.
+
+Lesson: the verifier trained on this agent's own traces (AUC 0.92) held up
+under RL with a step reward; the general zero-shot verifier (AUC 0.75) was
+gamed in a few updates. Next proposed run: the trained outcome Jev as the
+final reward with the hosted Jev, the better step judge, for steps.
