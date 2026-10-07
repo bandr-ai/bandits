@@ -57,7 +57,7 @@ corpus = modal.Volume.from_name("jev-browsecomp")
 hf_cache = modal.Volume.from_name("jev-hf-cache", create_if_missing=True)
 
 
-def start_vllm():
+def start_vllm(memory_share: float = 0.4):
     """Start vLLM for the policy with runtime LoRA loading and wait until it answers."""
     import subprocess
     import urllib.request
@@ -65,7 +65,7 @@ def start_vllm():
     server = subprocess.Popen(
         [
             "vllm", "serve", POLICY, "--revision", POLICY_REVISION, "--served-model-name", "base",
-            "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", "0.4",
+            "--dtype", "bfloat16", "--max-model-len", "32768", "--gpu-memory-utilization", str(memory_share),
             "--enable-lora", "--max-lora-rank", "32", "--max-loras", "2",
             "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--port", str(PORT),
         ]
@@ -196,60 +196,7 @@ class Harness:
             await judge_rollout(judge_async, by_id[result["query_id"]]["query"], result)
         return results
 
-    def _load_adapter(self, name: str, path: str, previous: str | None) -> None:
-        import urllib.request
-
-        def post(endpoint: str, payload: dict) -> None:
-            request = urllib.request.Request(
-                f"http://localhost:{PORT}/v1/{endpoint}", data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(request, timeout=120).read()
-
-        post("load_lora_adapter", {"lora_name": name, "lora_path": path})
-        if previous:
-            post("unload_lora_adapter", {"lora_name": previous})
-
-
-@app.cls(
-    # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
-    # retriever stalled training batches for minutes at a time between updates.
-    gpu="H200",
-    # Runs are launched detached (they must survive the launching laptop sleeping), so this
-    # is the hard ceiling on what a forgotten run can bill.
-    timeout=2 * 3600,
-    scaledown_window=30,
-    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
-)
-class Trainer(Harness):
-    @modal.enter()
-    def start(self) -> None:
-        self.server = start_vllm()
-
-        import torch
-        from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForCausalLM
-
-        from bandits_jev.hf_predictor import HFPredictor
-
-        model = AutoModelForCausalLM.from_pretrained(POLICY, revision=POLICY_REVISION, dtype=torch.bfloat16).to("cuda")
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-        model.config.use_cache = False
-        lora = LoraConfig(
-            r=32, lora_alpha=64, lora_dropout=0.0, task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        )
-        self.model = get_peft_model(model, lora)
-        self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
-        self.outcome_judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=OUTCOME_ADAPTER)
-
-        from bandits_jev.dense_retriever import DenseRetriever
-
-        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
-
-    @modal.method()
-    async def train(self, config: dict, train_pool: list[dict], eval_tasks: list[dict]) -> dict:
+    async def _train(self, config: dict, train_pool: list[dict], eval_tasks: list[dict]) -> dict:
         import random
         import time
 
@@ -292,7 +239,7 @@ class Trainer(Harness):
             if min(overlaps) < 0.8 or same_top < len(overlaps) - 1 or not same_docs:
                 raise RuntimeError(f"in-container retriever does not match the service: {config['retrieval_check_result']}")
         check = config.pop("judge_check", [])
-        if check:
+        if check and config.get("judge_backend", "local") == "local":
             got = self._judge_score([c["step"] for c in check])["results"]
             diffs = [
                 max(abs(g["probabilities"][k] - v) for k, v in c["probabilities"].items())
@@ -336,15 +283,9 @@ class Trainer(Harness):
                 json.dumps([{k: v for k, v in r.items() if k != "model_calls"} for r in results])
             )
 
-            from bandits_jev.outcome_judge import judge_outcome
-
-            by_id = {t["query_id"]: t for t in tasks}
-            for result in results:
-                # Scored in every arm: the reward in the Jev-only arms, and in all arms a check
-                # that the verifier still tracks ground truth as the policy changes.
-                result["jev_outcome"] = judge_outcome(
-                    self.outcome_judge, by_id[result["query_id"]]["query"], result["events"], result["final"]
-                )
+            # Scored in every arm: the reward in the Jev-only arms, and in all arms a check
+            # that the verifier still tracks ground truth as the policy changes.
+            self._score_outcomes(results, {t["query_id"]: t for t in tasks})
             groups: dict[str, list[dict]] = {}
             for result in results:
                 groups.setdefault(result["query_id"], []).append(result)
@@ -426,6 +367,136 @@ class Trainer(Harness):
         return {k: out[k] for k in ("config", "history", "eval_summary")}
 
 
+    def _score_outcomes(self, results: list[dict], by_id: dict[str, dict]) -> None:
+        from bandits_jev.outcome_judge import judge_outcome
+
+        for result in results:
+            result["jev_outcome"] = judge_outcome(
+                self.outcome_judge, by_id[result["query_id"]]["query"], result["events"], result["final"]
+            )
+
+    def _load_adapter(self, name: str, path: str, previous: str | None) -> None:
+        import urllib.request
+
+        def post(endpoint: str, payload: dict) -> None:
+            request = urllib.request.Request(
+                f"http://localhost:{PORT}/v1/{endpoint}", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(request, timeout=120).read()
+
+        post("load_lora_adapter", {"lora_name": name, "lora_path": path})
+        if previous:
+            post("unload_lora_adapter", {"lora_name": previous})
+
+
+@app.cls(
+    # H200 (141 GB) so the retriever fits beside vLLM, the policy and the judge: a remote
+    # retriever stalled training batches for minutes at a time between updates.
+    gpu="H200",
+    # Runs are launched detached (they must survive the launching laptop sleeping), so this
+    # is the hard ceiling on what a forgotten run can bill.
+    timeout=2 * 3600,
+    scaledown_window=30,
+    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
+)
+class Trainer(Harness):
+    @modal.enter()
+    def start(self) -> None:
+        self.server = start_vllm()
+
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        from bandits_jev.hf_predictor import HFPredictor
+
+        model = AutoModelForCausalLM.from_pretrained(POLICY, revision=POLICY_REVISION, dtype=torch.bfloat16).to("cuda")
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+        model.config.use_cache = False
+        lora = LoraConfig(
+            r=32, lora_alpha=64, lora_dropout=0.0, task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        self.model = get_peft_model(model, lora)
+        self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
+        self.outcome_judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=OUTCOME_ADAPTER)
+
+        from bandits_jev.dense_retriever import DenseRetriever
+
+        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
+
+    @modal.method()
+    async def train(self, config: dict, train_pool: list[dict], eval_tasks: list[dict]) -> dict:
+        return await self._train(config, train_pool, eval_tasks)
+
+@app.cls(
+    # The hosted Jev judges over the API, so only vLLM, the policy update and the retriever
+    # share this GPU, which fits an H100.
+    gpu="H100",
+    timeout=2 * 3600,
+    scaledown_window=30,
+    secrets=[modal.Secret.from_name("jev-api")],
+    volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache, "/data": corpus},
+)
+class ApiTrainer(Harness):
+    """Trainer whose step and final-answer judge is the hosted Jev (TypeSafe System One)."""
+
+    @modal.enter()
+    def start(self) -> None:
+        self.server = start_vllm(0.35)
+
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        from bandits_jev.dense_retriever import DenseRetriever
+        from bandits_jev.jev_remote import RemoteJev
+
+        model = AutoModelForCausalLM.from_pretrained(POLICY, revision=POLICY_REVISION, dtype=torch.bfloat16).to("cuda")
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+        model.config.use_cache = False
+        lora = LoraConfig(
+            r=32, lora_alpha=64, lora_dropout=0.0, task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        self.model = get_peft_model(model, lora)
+        self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
+        self.jev = RemoteJev(workers=48)
+
+    def _judge_score(self, steps: list[dict]) -> dict:
+        from bandits_jev.step_judge import OPTIONS, QUESTION, step_state
+
+        items = [
+            (step_state(s["question"], [tuple(p) for p in s["previous"]], s["tool"], s["action"], s["observation"]),
+             QUESTION, OPTIONS)
+            for s in steps
+        ]
+        results = []
+        for probabilities in self.jev.choose_many(items):
+            score = None if probabilities is None else probabilities["positive"] - probabilities["negative"]
+            results.append({"probabilities": probabilities, "score": score,
+                            "reason": None if probabilities else "jev api call failed"})
+        return {"judge": {"model": "jev-latest (hosted)"}, "results": results}
+
+    def _score_outcomes(self, results: list[dict], by_id: dict[str, dict]) -> None:
+        from bandits_jev.jev_remote import full_outcome_state
+        from bandits_jev.outcome_judge import OPTIONS, QUESTION
+
+        items = [
+            (full_outcome_state(by_id[r["query_id"]]["query"], r["events"], r["final"]), QUESTION, OPTIONS)
+            for r in results
+        ]
+        for result, probabilities in zip(results, self.jev.choose_many(items), strict=True):
+            result["jev_outcome"] = None if probabilities is None else probabilities["correct"]
+
+    @modal.method()
+    async def train(self, config: dict, train_pool: list[dict], eval_tasks: list[dict]) -> dict:
+        return await self._train(config, train_pool, eval_tasks)
+
+
 @app.cls(
     gpu="H100",
     timeout=3600,
@@ -482,7 +553,7 @@ def make_job(
     arm: str = "outcome", seed: int = 1, steps: int = 10, questions_per_step: int = 16, n: int = 8,
     lr: float = 1e-4, step_weight: float = 0.3, step_cap: float = 1.0, baseline: float = 0.0,
     eval_n: int = 8, eval_limit: int = 60, tag: str = "", max_train_minutes: int = 60,
-    batch_timeout_minutes: int = 12, repeat_penalty: float = 0.5,
+    batch_timeout_minutes: int = 12, repeat_penalty: float = 0.5, judge_backend: str = "local",
 ) -> tuple[dict, list[dict], list[dict]]:
     """The training config and task lists for one run, shared by the launcher and spawn_train.py."""
     work = REPO / "work/step-rl"
@@ -494,7 +565,7 @@ def make_job(
     config = {
         "run": run, "arm": arm, "seed": seed, "steps": steps, "questions_per_step": questions_per_step, "n": n,
         "lr": lr, "step_weight": step_weight, "step_cap": step_cap, "baseline": baseline,
-        "repeat_penalty": repeat_penalty,
+        "repeat_penalty": repeat_penalty, "judge_backend": judge_backend,
         "eval_n": eval_n, "eval_questions": len(eval_tasks), "policy": POLICY, "policy_revision": POLICY_REVISION,
         "judge_adapter": JUDGE_ADAPTER, "lora_rank": 32, "algorithm": "Dr. GRPO, no KL, one update per batch",
         "max_train_minutes": max_train_minutes, "batch_timeout_minutes": batch_timeout_minutes,
