@@ -111,3 +111,40 @@ suspended (no judge scoring; same rollout code).
 Defensible claim: step-wise reward measurably changes agent behaviour, and
 judge quality decides how much of that a learned judge captures. Not yet
 supported: step-wise RL beats outcome-only on accuracy.
+
+## Jev-only rewards: the unverifiable-domain comparison (seed 1)
+
+No ground truth in any training reward. An outcome Jev (Qwen3.5-4B LoRA) was
+trained from training-pool rollouts labelled correct or incorrect; on 461
+held-out final answers its AUC is 0.92 (accuracy 86.6%; mean P(correct) 0.69
+when right, 0.17 when wrong). Two arms, same seed, questions and settings:
+
+- Jev final: reward = outcome Jev's P(correct).
+- Jev final + Jev step: the same, plus 0.3 x baseline-centred step-Jev scores
+  (summed, capped at +/-1, repeats scored -0.5).
+
+Jev final hit the 60-minute training cap after 8 updates; the other ran 10.
+The outcome Jev tracked ground truth on live training rollouts throughout
+(AUC 0.89 to 1.0 per update).
+
+| Metric | No RL | Ground-truth outcome | Jev final | Jev final + step | Final + step - final (95% CI) |
+|---|---|---|---|---|---|
+| Accuracy (proxy) | 15.6% | 22.9% | 5.4% | 19.6% | +14.2 pts (+8.1, +20.4) |
+| Gold evidence seen | 0.218 | 0.200 | 0.307 | 0.318 | +0.011 (-0.031, +0.054) |
+| Gold evidence opened | 0.058 | 0.100 | 0.066 | 0.137 | +0.072 (+0.042, +0.103) |
+| Tool calls | 3.6 | 4.1 | 10.5 | 6.5 | -4.0 |
+| Rollouts repeating an action | 4% | 8% | 15% | 11% | -3.5 pts (-8.8, +1.9) |
+
+Jev final + step vs no RL: accuracy +4.0 pts (-0.2, +7.9), evidence seen
++0.099 (+0.053, +0.146). Vs the ground-truth outcome arm: accuracy -3.3 pts
+(-8.3, +1.5), evidence seen +0.118 (+0.064, +0.173).
+
+Jev final alone was gamed: the policy padded searches (10.5 calls), its
+training accuracy fell update by update, and held-out accuracy ended below
+the untrained model. Adding step Jev kept search purposeful and ended above
+no RL, within noise of a ground-truth verifier, while finding more gold
+evidence than it.
+
+Claim supported (one seed): where no ground-truth checker exists, a
+judge-only outcome reward gets gamed, and step-wise Jev rewards prevent that
+collapse (+14 pts accuracy here).
