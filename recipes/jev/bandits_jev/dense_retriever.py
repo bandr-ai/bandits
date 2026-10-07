@@ -3,9 +3,9 @@
 Queries are embedded the way the upstream FAISS searcher embeds them (task
 prefix, left padding, last-token pooling, max 8192 tokens), normalised, and
 scored by inner product against the prebuilt normalised document vectors.
-Mirrors scripts/modal_retriever.py, which served the outcome-only run; the
-trainer checks this module against results saved from that service before it
-trains. torch, transformers and pyarrow are imported lazily.
+Before training, the trainer checks this module against 20 saved reference
+searches (work/step-rl/retrieval_reference.json). torch, transformers and
+pyarrow are imported lazily.
 """
 
 from __future__ import annotations

@@ -516,15 +516,20 @@ class Evaluator(Harness):
         self.retriever = DenseRetriever.load("/data/index/corpus.shard*.pkl", "/data/corpus/*.parquet")
 
     @modal.method()
-    async def evaluate(self, run: str, adapter: str, eval_tasks: list[dict], eval_n: int) -> dict:
+    async def evaluate(self, run: str, adapter: str | None, eval_tasks: list[dict], eval_n: int) -> dict:
+        """Evaluate a saved adapter, or the untrained policy when ``adapter`` is None."""
         from bandits_jev.rollout import summarize
 
         self.batch_minutes = 40
-        self._load_adapter("evaluated", adapter, None)
-        evaluation = await self._rollouts(eval_tasks, eval_n, "evaluated", False, "eval", judge=False)
+        model = "base"
+        if adapter is not None:
+            self._load_adapter("evaluated", adapter, None)
+            model = "evaluated"
+        evaluation = await self._rollouts(eval_tasks, eval_n, model, False, "eval", judge=False)
         out = {"config": {"run": run, "adapter": adapter, "eval_n": eval_n, "judged": False},
                "eval_summary": summarize(evaluation), "eval": evaluation}
         path = Path(f"/runs/step-rl/grpo/{run}/eval.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out))
         runs.commit()
         return out["eval_summary"]

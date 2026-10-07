@@ -3,8 +3,7 @@
 ``SearchSession`` runs ``browser.search``, ``browser.open`` and ``browser.find``
 against a ``Searcher`` and returns the real reply text for each call. Replies
 to misuse (an id never shown, nothing open) are ordinary replies, so the
-judge can mark them down. The agent loop pairs each call with the policy
-token that produced it; this module knows nothing about tokens or veRL.
+judge can mark them down. This module knows nothing about tokens or models.
 """
 
 from __future__ import annotations
