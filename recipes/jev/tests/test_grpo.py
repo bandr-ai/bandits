@@ -112,3 +112,16 @@ def test_oracle_adds_weighted_gold_evidence_recall_to_the_outcome():
              {"correct": False, "evidence_seen_recall": 1.0, "events": [judged(0.9)] * 5}]
     rewards = [r["reward"] for r in group_rewards(group, "oracle", **V2)]
     assert rewards == pytest.approx([1.0 + 0.3 * 0.5, 0.3 * 1.0])
+
+
+def test_jev_final_uses_the_outcome_judge_not_ground_truth():
+    group = [{"correct": True, "jev_outcome": 0.2, "events": []}, {"correct": False, "jev_outcome": 0.9, "events": []}]
+    assert [r["reward"] for r in group_rewards(group, "jev_final", **V2)] == [0.2, 0.9]
+
+
+def test_jev_final_step_adds_capped_centred_steps_and_penalises_repeats():
+    clean = {"correct": False, "jev_outcome": 0.5, "events": [judged(0.7, "a"), judged(0.4, "b")]}
+    padded = {"correct": False, "jev_outcome": 0.5, "events": [judged(0.7, "a"), judged(0.4, "b"), judged(0.9, "a")]}
+    rewards = [r["reward"] for r in group_rewards([clean, padded], "jev_final_step", **V2)]
+    assert rewards[0] == pytest.approx(0.5 + 0.3 * (0.5 + 0.2))
+    assert rewards[1] == pytest.approx(rewards[0] - 0.3 * 0.5)

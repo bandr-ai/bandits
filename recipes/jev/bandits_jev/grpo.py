@@ -67,6 +67,25 @@ def group_rewards(group: Sequence[dict], arm: str, *, step_weight: float, step_c
     outcome-only reward); in a group where all are wrong, rollouts are ranked by
     ``judged_step_quality``. ``outcome`` and ``step`` score each rollout alone.
     """
+    if arm in ("jev_final", "jev_final_step"):
+        # No ground truth: the outcome reward is the outcome Jev's P(correct).
+        parts = []
+        for r in group:
+            outcome = float(r.get("jev_outcome") or 0.0)
+            if arm == "jev_final":
+                parts.append({"reward": outcome, "outcome": outcome, "step_sum": 0.0})
+                continue
+            seen: set[tuple[str, str]] = set()
+            events = []
+            for position, event in enumerate(r["events"]):
+                key = action_key(event["tool"], event["action"])
+                score = (event.get("judge") or {}).get("score")
+                centred = -repeat_penalty if key in seen else (None if score is None else score - baseline)
+                seen.add(key)
+                events.append(StepEvent(position, event["tool"], event["action"], event["observation"], centred))
+            shaped = shape_rollout([1] * (len(events) + 1), events, outcome, step_weight=step_weight, step_cap=step_cap)
+            parts.append({"reward": shaped.total, "outcome": outcome, "step_sum": shaped.step_sum_capped})
+        return parts
     if arm == "oracle":
         # Upper bound for step-wise reward: the process signal comes from ground truth (the
         # share of gold evidence documents the rollout saw), so it cannot be padded.

@@ -30,6 +30,8 @@ POLICY_REVISION = "cdbee75f17c01a7cc42f958dc650907174af0554"
 JUDGE = "Qwen/Qwen3.5-4B-Base"
 JUDGE_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 JUDGE_ADAPTER = "/runs/search-judge-pilot/checkpoints/step-50"
+OUTCOME_ADAPTER = "/runs/outcome-judge-v1/checkpoints/step-150"
+"""The outcome Jev (held-out AUC 0.92 on final answers): reward for the Jev-only arms."""
 PORT = 8000
 
 image = (
@@ -240,6 +242,7 @@ class Trainer(Harness):
         )
         self.model = get_peft_model(model, lora)
         self.judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=JUDGE_ADAPTER)
+        self.outcome_judge = HFPredictor(JUDGE, revision=JUDGE_REVISION, adapter_path=OUTCOME_ADAPTER)
 
         from bandits_jev.dense_retriever import DenseRetriever
 
@@ -259,6 +262,12 @@ class Trainer(Harness):
             training_segments,
         )
         from bandits_jev.rollout import summarize
+
+        def auc(positive: list[float], negative: list[float]) -> float | None:
+            if not positive or not negative:
+                return None
+            wins = sum((p > n) + 0.5 * (p == n) for p in positive for n in negative)
+            return wins / (len(positive) * len(negative))
 
         run_dir = Path(f"/runs/step-rl/grpo/{config['run']}")
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +336,15 @@ class Trainer(Harness):
                 json.dumps([{k: v for k, v in r.items() if k != "model_calls"} for r in results])
             )
 
+            from bandits_jev.outcome_judge import judge_outcome
+
+            by_id = {t["query_id"]: t for t in tasks}
+            for result in results:
+                # Scored in every arm: the reward in the Jev-only arms, and in all arms a check
+                # that the verifier still tracks ground truth as the policy changes.
+                result["jev_outcome"] = judge_outcome(
+                    self.outcome_judge, by_id[result["query_id"]]["query"], result["events"], result["final"]
+                )
             groups: dict[str, list[dict]] = {}
             for result in results:
                 groups.setdefault(result["query_id"], []).append(result)
@@ -368,6 +386,11 @@ class Trainer(Harness):
                 "step": step + 1,
                 "questions": [t["query_id"] for t in tasks],
                 "reward_mean": sum(r["reward_parts"]["reward"] for r in results) / len(results),
+                "jev_outcome_mean": sum(r["jev_outcome"] or 0.0 for r in results) / len(results),
+                "jev_outcome_auc_vs_truth": auc(
+                    [r["jev_outcome"] or 0.0 for r in results if r["correct"]],
+                    [r["jev_outcome"] or 0.0 for r in results if not r["correct"]],
+                ),
                 "outcome_mean": sum(r["reward_parts"]["outcome"] for r in results) / len(results),
                 "step_sum_mean": sum(r["reward_parts"]["step_sum"] for r in results) / len(results),
                 "groups_with_signal": sum(any(r["advantage"] != 0 for r in g) for g in groups.values()),
@@ -455,13 +478,13 @@ def judge_check(work: Path, count: int = 20) -> list[dict]:
     ]
 
 
-@app.local_entrypoint()
-def main(
+def make_job(
     arm: str = "outcome", seed: int = 1, steps: int = 10, questions_per_step: int = 16, n: int = 8,
     lr: float = 1e-4, step_weight: float = 0.3, step_cap: float = 1.0, baseline: float = 0.0,
     eval_n: int = 8, eval_limit: int = 60, tag: str = "", max_train_minutes: int = 60,
     batch_timeout_minutes: int = 12, repeat_penalty: float = 0.5,
-) -> None:
+) -> tuple[dict, list[dict], list[dict]]:
+    """The training config and task lists for one run, shared by the launcher and spawn_train.py."""
     work = REPO / "work/step-rl"
     tasks = [json.loads(line) for line in (work / "tasks.jsonl").read_text().splitlines()]
     train_pool = [t for t in tasks if t["split"] == "train_pool"]
@@ -478,6 +501,21 @@ def main(
         "judge_check": judge_check(work),
         "retrieval_reference": json.loads((work / "retrieval_reference.json").read_text()),
     }
+    return config, train_pool, eval_tasks
+
+
+@app.local_entrypoint()
+def main(
+    arm: str = "outcome", seed: int = 1, steps: int = 10, questions_per_step: int = 16, n: int = 8,
+    lr: float = 1e-4, step_weight: float = 0.3, step_cap: float = 1.0, baseline: float = 0.0,
+    eval_n: int = 8, eval_limit: int = 60, tag: str = "", max_train_minutes: int = 60,
+    batch_timeout_minutes: int = 12, repeat_penalty: float = 0.5,
+) -> None:
+    config, train_pool, eval_tasks = make_job(
+        arm, seed, steps, questions_per_step, n, lr, step_weight, step_cap, baseline,
+        eval_n, eval_limit, tag, max_train_minutes, batch_timeout_minutes, repeat_penalty,
+    )
+    run, work = config["run"], REPO / "work/step-rl"
     out = Trainer().train.remote(config, train_pool, eval_tasks)
     target = work / "grpo" / f"{run}.json"
     target.parent.mkdir(exist_ok=True)
