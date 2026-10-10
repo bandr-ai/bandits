@@ -558,6 +558,11 @@ def test_per_turn_judging_needs_every_turn_and_no_hindsight(tmp_path):
     late = [dict(e, relies_on=[e["message"] + 1]) if e["message"] == asst[0] else e for e in ok]
     assert turn_issues(t, late) == [f"turn {asst[0]} cites messages not before it: [{asst[0] + 1}]"]
     assert turn_issues(t, None) == ["turns missing"]
+    first = asst[0]
+    assert turn_issues(t, [dict(e, relies_on=[]) if e["message"] == first else e for e in ok])[0].startswith(f"turn {first} cites nothing")
+    assert turn_issues(t, [dict(e, relies_on=[-1]) if e["message"] == first else e for e in ok]) == [
+        f"turn {first} cites messages not before it: [-1]"]
+    assert turn_issues(t, [dict(e, relies_on=["system"]) if e["message"] == first else e for e in ok]) == []
     cfg = load_config(write_cfg(tmp_path, {"judge": True}, target=1, keep_failures=False))
     ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
     set_llm_factory(_judge_llm())

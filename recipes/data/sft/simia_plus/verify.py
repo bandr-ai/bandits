@@ -208,6 +208,7 @@ def judge(cfg: Config, trace: dict, spec: dict | None) -> dict:
 
 
 EXPANSION_CHECKS = ("only_declared_change", "dependencies_updated", "tool_contracts_respected")
+FULL = 10**7  # judge and blind check see every tool result in full: an audit must not miss truncated evidence
 
 
 def _norm(x) -> str:
@@ -252,11 +253,11 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
                  f"{json.dumps(case, ensure_ascii=False, indent=1)}\n</case>\n" if case else "")
     out = chat_json(get_llm(cfg, "judge"), "You are a strict, precise auditor. Output JSON only.", JUDGE_EXPANSION.format(
         harness=expansion.get("harness") or "(none)", system=trace.get("system", ""),
-        seed=render(expansion["seed"]), variation=json.dumps(expansion["variation"], ensure_ascii=False, indent=1),
-        case=case_text, transcript=render(trace), checklist="\n".join(f"- {c}" for c in checklist)))
+        seed=render(expansion["seed"], max_obs_chars=FULL), variation=json.dumps(expansion["variation"], ensure_ascii=False, indent=1),
+        case=case_text, transcript=render(trace, max_obs_chars=FULL), checklist="\n".join(f"- {c}" for c in checklist)))
     if not isinstance(out, dict):
         raise TypeError("judge returned non-object JSON")
-    corpus = _norm(render(trace, max_obs_chars=10**7)) + "\n" + _norm(render(expansion["seed"], max_obs_chars=10**7))
+    corpus = _norm(render(trace, max_obs_chars=FULL)) + "\n" + _norm(render(expansion["seed"], max_obs_chars=FULL))
     corpus_grams = _trigrams(corpus)
     checks = out.get("checks") if isinstance(out.get("checks"), dict) else {}
     unverified: dict[str, list[str]] = {}
@@ -285,7 +286,8 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
 
 
 def turn_issues(trace: dict, turns) -> list[str]:
-    """Every assistant message needs a "justified" entry whose cited messages all come before it (no hindsight)."""
+    """Every assistant message needs a "justified" entry citing at least one earlier message (0 <= n < its number) or
+    "system" (the system policy alone), and nothing at or after itself (no hindsight)."""
     if not isinstance(turns, list):
         return ["turns missing"]
     by_msg: dict[int, dict] = {}
@@ -304,10 +306,13 @@ def turn_issues(trace: dict, turns) -> list[str]:
             continue
         if e.get("verdict") != "justified":
             issues.append(f"turn {i} {e.get('verdict')}: {e.get('reason', '')}"[:300])
-        refs = e.get("relies_on") if isinstance(e.get("relies_on"), list) else []
-        late = [r for r in refs if not (isinstance(r, int) or str(r).isdigit()) or int(r) >= i]
-        if late:
-            issues.append(f"turn {i} cites messages not before it: {late}")
+        refs = e.get("relies_on")
+        if not isinstance(refs, list) or not refs:
+            issues.append(f"turn {i} cites nothing (relies_on must list earlier messages or \"system\")")
+            continue
+        bad = [r for r in refs if r != "system" and not (str(r).isdigit() and int(r) < i)]
+        if bad:
+            issues.append(f"turn {i} cites messages not before it: {bad}")
     return issues
 
 
@@ -328,7 +333,7 @@ def blind_check(cfg: Config, trace: dict) -> dict:
     final = final_answer(trace)
     msgs = trace["messages"][:-1]
     out = chat_json(get_llm(cfg, "blind"), "You are the agent described in the system prompt. Output JSON only.",
-                    BLIND_ANSWER.format(system=trace.get("system", ""), transcript=render(msgs)))
+                    BLIND_ANSWER.format(system=trace.get("system", ""), transcript=render(msgs, max_obs_chars=FULL)))
     if not isinstance(out, dict):
         return {"agree": False, "insufficient": False, "answer": out, "diffs": ["non-object answer"]}
     if out.get("insufficient_evidence") is True:

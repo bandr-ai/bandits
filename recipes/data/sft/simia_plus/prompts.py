@@ -533,8 +533,9 @@ Construction checks:
   consequence covered by its "dependencies"; nothing else (site, platform, element, story) drifted. When the variation
   combines several changes, each is applied and none removes evidence another needs. A case cannot authorize a change
   the variation does not ask for.
-- dependencies_updated: every later call, tool result and the final answer is consistent with the change; no stale
-  seed observation the change invalidated, no conclusion that still follows the seed's evidence.
+- dependencies_updated: every later call and tool result is consistent with the change; no stale seed observation
+  the change invalidated. The final answer follows the generated observations; keeping the seed's answer is valid
+  when those observations still support it.
 - tool_contracts_respected: every tool result is something that tool can return per the harness description (shape,
   content, no verdict the tool cannot know).
 - observations_consistent: tool results agree with each other and with the failure context.
@@ -542,13 +543,15 @@ Construction checks:
   no case is given.
 Behaviour checks:
 - policy_followed: the agent follows the system policy.
-- task_success: the final answer is correct for the generated evidence under the harness rules and the variation's
-  "correct_when", using only what the conversation shows.
+- task_success: the final answer is correct for the generated evidence, using only what the conversation shows. The
+  system policy and the established harness rules decide what is correct; the variation's "correct_when" is a
+  hypothesis to check against them, never a rule that overrides them.
 Then judge every checklist item the same way.
 
 Turns: one entry for EVERY assistant message in GENERATED, in order: its number, "justified" or "unjustified" (or
-"cannot_determine"), "relies_on": the numbers of the earlier messages that justify it, and a short reason. A call or
-answer that relies on something shown only later, or only in the case or variation, is unjustified.
+"cannot_determine"), "relies_on": the numbers of the earlier messages that justify it (use "system" when the system
+policy alone justifies it), and a short reason. A call or answer that relies on something shown only later, or only
+in the case or variation, is unjustified.
 
 Return JSON only:
 {{"checks": {{"<check name>": {{"verdict": "pass", "evidence": [{{"message": "3", "excerpt": "..."}}], "reason": "..."}}}},
