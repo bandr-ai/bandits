@@ -33,6 +33,8 @@ class Features:
     provenance: bool = False   # drop traces whose ID-like tool arguments come from nowhere
     judge: bool = False        # LLM audit against the spec + checklist
     near_dedup: bool = False   # near-duplicate removal on top of Simia's exact dedup
+    blind_check: bool = False  # seed expansion: a separate call answers from the observations alone; disagreement on the
+                               # contract's categorical fields marks the trace unresolved (not exported, kept for diagnosis)
 
 
 @dataclass
@@ -86,6 +88,8 @@ class Config:
     analyzer_seeds: int = 20   # dev seeds shown to the analyzer
     analyzer_rounds: int = 3   # analyzer versions at most (v1 + revisions from diagnosis)
     pilot_jobs: int = 20       # jobs per round, over dev seeds
+    case_block: bool = False   # analyzer generator writes a "case" (the changed situation, no answer) before the messages
+    combo_share: float = 0.0   # share of analyzer jobs that apply one of the analyzer's variation combinations
     heldout_jobs_per_seed: int = 3  # final comparison on held-out seeds: chosen analyzer prompt vs simia_prompt=fixed
     workers: int = 16
     random_seed: int = 0

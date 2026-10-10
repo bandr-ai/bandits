@@ -79,7 +79,7 @@ def _judge_html(v: dict) -> str:
             verdict = str(c.get("verdict"))
             rows.append(f'<tr><td>{html.escape(name)}</td><td class="v {html.escape(verdict)}">{html.escape(verdict)}</td>'
                         f'<td>{html.escape(str(c.get("reason", "")))}</td></tr>')
-    issues = "".join(f"<li>{html.escape(r)}</li>" for r in v.get("rule_issues", []))
+    issues = "".join(f"<li>{html.escape(r)}</li>" for r in [*v.get("rule_issues", []), *(j.get("turn_issues") or [])])
     unverified = j.get("unverified_excerpts") or {}
     extra = (f'<p class="warn">Unverified excerpts: {html.escape(", ".join(unverified))}</p>' if unverified else "")
     return ((f'<ul class="issues">{issues}</ul>' if issues else "")
@@ -147,6 +147,13 @@ def build_review(root: Path, seeds: list[dict]) -> Path:
                 rows.append(f'<div class="row {status}">{_cell(a)}{_cell(b)}</div>')
         spec = m.get("variation_spec") or {}
         meta = "".join(f"<div><b>{k}:</b> {html.escape(str(spec.get(k, '')))}</div>" for k in ("change", "dependencies", "correct_when"))
+        if m.get("case"):
+            meta += "<div><b>case:</b></div>" + "".join(f"<div>&nbsp;&nbsp;<b>{html.escape(k)}:</b> {html.escape(str(x))}</div>"
+                                                     for k, x in m["case"].items())
+        if v.get("blind"):
+            b = v["blind"]
+            meta += (f"<div><b>blind answer:</b> {'agrees' if b.get('agree') else 'insufficient evidence' if b.get('insufficient') else 'disagrees'}"
+                     f" {html.escape('; '.join(b.get('diffs') or []))}</div>")
         fid = m.get("fidelity") or {}
         blocks.append(
             f'<details class="trace" data-version="{version}" data-variation="{html.escape(variation)}" data-kept="{kept}">'

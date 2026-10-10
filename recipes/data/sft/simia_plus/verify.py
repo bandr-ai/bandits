@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import Config
 from .llm import chat_json, get_llm
-from .prompts import DEFAULT_CHECKLIST, JUDGE, JUDGE_CHECKS, JUDGE_EXPANSION
+from .prompts import BLIND_ANSWER, DEFAULT_CHECKLIST, JUDGE, JUDGE_CHECKS, JUDGE_EXPANSION
 from .schema import render
 from .state import state_match
 
@@ -247,10 +247,13 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
     not occur in the generated trace or the seed does not count as a pass. The result also carries the flat fields
     verify() gates on (task_success, obs_consistent, policy_followed, the fidelity checks, checklist_failed)."""
     checklist = cfg.checklist or DEFAULT_CHECKLIST
+    case = expansion.get("case")
+    case_text = (f'<case note="the generator\'s description of the changed situation; the agent never sees it">\n'
+                 f"{json.dumps(case, ensure_ascii=False, indent=1)}\n</case>\n" if case else "")
     out = chat_json(get_llm(cfg, "judge"), "You are a strict, precise auditor. Output JSON only.", JUDGE_EXPANSION.format(
         harness=expansion.get("harness") or "(none)", system=trace.get("system", ""),
         seed=render(expansion["seed"]), variation=json.dumps(expansion["variation"], ensure_ascii=False, indent=1),
-        transcript=render(trace), checklist="\n".join(f"- {c}" for c in checklist)))
+        case=case_text, transcript=render(trace), checklist="\n".join(f"- {c}" for c in checklist)))
     if not isinstance(out, dict):
         raise TypeError("judge returned non-object JSON")
     corpus = _norm(render(trace, max_obs_chars=10**7)) + "\n" + _norm(render(expansion["seed"], max_obs_chars=10**7))
@@ -266,15 +269,75 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
             unverified[name] = missing or ["(no excerpt)"]
         return ok
 
-    verdicts = {name: passed(name, checks.get(name)) for name in JUDGE_CHECKS}
+    required = [n for n in JUDGE_CHECKS if case or n != "case_consistent"]
+    verdicts = {name: passed(name, checks.get(name)) for name in required}
     out.update({k: verdicts[k] for k in EXPANSION_CHECKS}, task_success=verdicts["task_success"],
-               obs_consistent=verdicts["observations_consistent"], policy_followed=verdicts["policy_followed"])
+               obs_consistent=verdicts["observations_consistent"], policy_followed=verdicts["policy_followed"],
+               case_consistent=verdicts.get("case_consistent", True))
+    out["turn_issues"] = turn_issues(trace, out.get("turns"))
+    out["bad_steps"] = sorted({int(i.split()[1]) for i in out["turn_issues"] if i.startswith("turn ") and i.split()[1].isdigit()})
     out["checklist_failed"] = [str(c.get("item")) for c in out.get("checklist") or [] if isinstance(c, dict)
                                and c.get("verdict") in ("fail", "cannot_determine")]
     if not isinstance(out.get("checklist"), list):
         out["checklist_failed"] = ["(checklist missing)"]
     out["unverified_excerpts"] = unverified
     return out
+
+
+def turn_issues(trace: dict, turns) -> list[str]:
+    """Every assistant message needs a "justified" entry whose cited messages all come before it (no hindsight)."""
+    if not isinstance(turns, list):
+        return ["turns missing"]
+    by_msg: dict[int, dict] = {}
+    for e in turns:
+        try:
+            by_msg[int(e.get("message"))] = e
+        except (AttributeError, TypeError, ValueError):
+            continue
+    issues = []
+    for i, m in enumerate(trace["messages"]):
+        if m["role"] != "assistant":
+            continue
+        e = by_msg.get(i)
+        if e is None:
+            issues.append(f"turn {i} not judged")
+            continue
+        if e.get("verdict") != "justified":
+            issues.append(f"turn {i} {e.get('verdict')}: {e.get('reason', '')}"[:300])
+        refs = e.get("relies_on") if isinstance(e.get("relies_on"), list) else []
+        late = [r for r in refs if not (isinstance(r, int) or str(r).isdigit()) or int(r) >= i]
+        if late:
+            issues.append(f"turn {i} cites messages not before it: {late}")
+    return issues
+
+
+def _categorical_fields(schema: dict | None, fallback: list[str]) -> list[str]:
+    props = (schema or {}).get("properties") or {}
+    picked = [k for k, s in props.items() if isinstance(s, dict) and ("enum" in s or s.get("type") == "boolean")]
+    return picked or list(fallback)
+
+
+def _same(a, b) -> bool:
+    return str(a).strip().lower() == str(b).strip().lower() if a is not None and b is not None else a is None and b is None
+
+
+def blind_check(cfg: Config, trace: dict) -> dict:
+    """A separate call answers from the system prompt and the conversation without its final answer; it never sees the
+    seed, variation, case or verdicts. Compares the contract's categorical fields (enums, booleans), not wording or
+    confidence. Agreement corroborates; it does not prove the observations are valid."""
+    final = final_answer(trace)
+    msgs = trace["messages"][:-1]
+    out = chat_json(get_llm(cfg, "blind"), "You are the agent described in the system prompt. Output JSON only.",
+                    BLIND_ANSWER.format(system=trace.get("system", ""), transcript=render(msgs)))
+    if not isinstance(out, dict):
+        return {"agree": False, "insufficient": False, "answer": out, "diffs": ["non-object answer"]}
+    if out.get("insufficient_evidence") is True:
+        return {"agree": False, "insufficient": True, "answer": out, "diffs": []}
+    schema = load_answer_schemas(cfg.answer_schemas_path).get(system_key(trace.get("system", "")))
+    fields = _categorical_fields(schema, cfg.outcome_fields)
+    final = final if isinstance(final, dict) else {}
+    diffs = [f"{k}: generated {final.get(k)!r} vs blind {out.get(k)!r}" for k in fields if not _same(final.get(k), out.get(k))]
+    return {"agree": not diffs, "insufficient": False, "fields": fields, "answer": out, "diffs": diffs}
 
 
 def ngrams(text: str, n: int = 8) -> set[tuple]:
@@ -309,10 +372,15 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
         # fail closed: a missing field is a failed check, not a pass
         consistent = (j.get("obs_consistent") is True and j.get("policy_followed") is True
                       and j.get("checklist_failed") == [] and j.get("hallucinations") == []
-                      and all(j.get(k) is True for k in (EXPANSION_CHECKS if expansion else ())))
+                      and all(j.get(k) is True for k in (EXPANSION_CHECKS + ("case_consistent",) if expansion else ()))
+                      and (not expansion or j.get("turn_issues") == []))
         success = bool(j.get("task_success"))
         keep = consistent and (success or cfg.keep_failures)
         trace["meta"]["bad_steps"] = j.get("bad_steps", []) if not success else []
+        if keep and expansion and f.blind_check:
+            v["blind"] = blind_check(cfg, trace)
+            if not v["blind"]["agree"]:
+                keep, v["unresolved"] = False, True
     v["kept"] = keep
     trace["meta"]["verify"] = v
     return trace

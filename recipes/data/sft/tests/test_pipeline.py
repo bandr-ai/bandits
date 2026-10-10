@@ -55,6 +55,14 @@ ANALYZER_OUT = json.dumps({"messages": [
     {"role": "assistant", "content": "{\"status\": \"pending\"}"}]})
 
 
+def judged_turns(prompt: str) -> list[dict]:
+    """A "justified" entry for every assistant message in the judge prompt's <generated> block."""
+    import re
+    block = prompt.split("<generated", 1)[1].split("</generated>", 1)[0]
+    nums = sorted({int(n) for n in re.findall(r"^\[(\d+)\] (?:ASSISTANT|TOOL_CALL)", block, re.M)})
+    return [{"message": n, "verdict": "justified", "relies_on": [n - 1], "reason": "r"} for n in nums]
+
+
 class FakeLLM:
     """Answers by role and prompt content."""
 
@@ -116,7 +124,7 @@ class FakeLLM:
         if self.role == "judge" and "<generated" in text:  # seed-expansion judge: grounded verdict per check
             ev = [{"message": "0", "excerpt": "cancel #W2222 please"}]
             checks = {k: {"verdict": "pass", "evidence": ev, "reason": "r"} for k in JUDGE_CHECKS}
-            return {"content": json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "bad_steps": []}),
+            return {"content": json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "turns": judged_turns(text)}),
                     "tool_calls": []}
         if self.role == "judge":
             return {"content": json.dumps({"task_success": True, "final_state": {"orders": {"#W3000": {"status": "cancelled"}}},
@@ -501,8 +509,8 @@ def test_expansion_judge_needs_verifiable_excerpts(tmp_path):
 
     def run(excerpt: str, verdict: str = "pass") -> dict:
         checks = {k: {"verdict": verdict, "evidence": [{"message": "0", "excerpt": excerpt}], "reason": "r"} for k in JUDGE_CHECKS}
-        body = json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "bad_steps": []})
-        set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": body, "tool_calls": []}})())
+        set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, m, *a, **k: {"content": json.dumps(
+            {"checks": checks, "checklist": [], "hallucinations": [], "turns": judged_turns(m[-1]["content"])}), "tool_calls": []}})())
         return verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]
 
     assert run("please cancel   order #W1000")["kept"] is True  # whitespace/case-insensitive match
@@ -525,3 +533,85 @@ def test_judge_excerpts_tolerate_quoting_style_not_invention():
     assert ok('Hi, please cancel ... order #W1000')  # elision
     assert not ok("the HAR shows three pending requests")  # invented
     assert not ok("")
+
+
+def _judge_llm(turns_fn=judged_turns, blind=None):
+    """judge: passes every check with a grounded excerpt; turns from turns_fn. blind: the blind answer (dict)."""
+    def chat(self, messages, *a, **k):
+        text = messages[-1]["content"]
+        if self.role == "blind":
+            return {"content": json.dumps(blind), "tool_calls": []}
+        checks = {c: {"verdict": "pass", "evidence": [{"message": "0", "excerpt": "please cancel order #W1000"}], "reason": "r"}
+                  for c in JUDGE_CHECKS}
+        return {"content": json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "turns": turns_fn(text)}),
+                "tool_calls": []}
+    return lambda c, role: type("J", (), {"role": role, "chat": chat})()
+
+
+def test_per_turn_judging_needs_every_turn_and_no_hindsight(tmp_path):
+    from simia_plus.verify import turn_issues, verify
+    t = from_sharegpt(seed(0), 0)
+    asst = [i for i, m in enumerate(t["messages"]) if m["role"] == "assistant"]
+    ok = [{"message": i, "verdict": "justified", "relies_on": [i - 1]} for i in asst]
+    assert turn_issues(t, ok) == []
+    assert turn_issues(t, ok[1:]) == [f"turn {asst[0]} not judged"]
+    late = [dict(e, relies_on=[e["message"] + 1]) if e["message"] == asst[0] else e for e in ok]
+    assert turn_issues(t, late) == [f"turn {asst[0]} cites messages not before it: [{asst[0] + 1}]"]
+    assert turn_issues(t, None) == ["turns missing"]
+    cfg = load_config(write_cfg(tmp_path, {"judge": True}, target=1, keep_failures=False))
+    ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
+    set_llm_factory(_judge_llm())
+    assert verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]["kept"] is True
+    bad = lambda text: [dict(e, verdict="unjustified") for e in judged_turns(text)]  # noqa: E731
+    set_llm_factory(_judge_llm(bad))
+    v = verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]
+    assert v["kept"] is False and v["judge"]["turn_issues"]
+
+
+def test_blind_answer_disagreement_is_unresolved(tmp_path):
+    from simia_plus.verify import system_key, verify
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][-1]["content"] = '{"status": "cancelled", "note": "done"}'
+    schema = {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "cancelled"]},
+                                                                       "note": {"type": "string"}}}
+    (tmp_path / "schemas.json").write_text(json.dumps({system_key(t["system"]): schema}))
+    cfg = load_config(write_cfg(tmp_path, {"judge": True, "blind_check": True}, target=1, keep_failures=False,
+                                answer_schemas_path=str(tmp_path / "schemas.json")))
+    ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
+    run = lambda blind: verify(cfg, json.loads(json.dumps(t)), set(), ctx)["meta"]["verify"]  # noqa: E731
+    set_llm_factory(_judge_llm(blind={"status": "Cancelled", "note": "other words"}))  # wording and case ignored
+    v = run(None)
+    assert v["kept"] is True and v["blind"]["agree"] and v["blind"]["fields"] == ["status"]
+    set_llm_factory(_judge_llm(blind={"status": "pending"}))
+    v = run(None)
+    assert v["kept"] is False and v["unresolved"] is True and v["blind"]["diffs"]
+    set_llm_factory(_judge_llm(blind={"insufficient_evidence": True, "reason": "r"}))
+    v = run(None)
+    assert v["kept"] is False and v["unresolved"] is True and v["blind"]["insufficient"]
+
+
+def test_case_block_format_and_judge_input(tmp_path):
+    from simia_plus.analyzer import fill, parse_output
+    from simia_plus.prompts import CASE_KEYS
+    case = {k: "x" for k in CASE_KEYS}
+    msgs = json.loads(ANALYZER_OUT)["messages"]
+    c, m, issues = parse_output(json.dumps({"case": case, "messages": msgs}), case=True)
+    assert c == case and m and not issues
+    c, m, issues = parse_output(json.dumps({"case": {"kept": "x"}, "messages": msgs}), case=True)
+    assert c is None and m is None and "case" in issues[0]
+    assert '"case"' in fill("{seed_trace}", {}, case=True) and '"case"' not in fill("{seed_trace}", {})
+
+
+def test_combinations_are_checked_and_planned():
+    from simia_plus.analyzer import check_combinations, plan_jobs
+    from simia_plus.verify import system_key
+    s = from_sharegpt(seed(0), 0)
+    labels = {"S1": system_key(s["system"])}
+    vs = [{"name": n, "applies_to": ["all"], "requires_tools": [], "teaches": n, "change": n, "preserve": "p",
+           "dependencies": "d", "correct_when": "w"} for n in ("a", "b", "c")]
+    assert check_combinations([["a", "b"]], vs) == [] and check_combinations(None, vs) == []
+    assert check_combinations([["a", "a"], ["a", "z"]], vs)
+    jobs = plan_jobs("v1", [s], 4, vs, labels, [], [["a", "b"]], 0.5)
+    combos = [j["variation"] for j in jobs if j["variation"].get("combines")]
+    assert len(combos) == 2 and combos[0]["name"] == "a+b" and "(1) a (2) b" in combos[0]["change"]
+    assert all(not j["variation"].get("combines") for j in plan_jobs("v1", [s], 4, vs, labels, [], [["a", "b"]], 0.0))

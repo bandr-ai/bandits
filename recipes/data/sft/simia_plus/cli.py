@@ -121,6 +121,16 @@ def cmd_heldout(cfg: Config) -> dict:
                            json.loads((root / "chosen_variations.json").read_text()), heldout, _load_seeds(cfg), _eval_ngrams(cfg))
 
 
+def cmd_ab(cfg: Config, version: int, jobs: int) -> dict:
+    """Generator A/B on identical jobs: analyzer version <version> with the plain output format vs with the case block.
+    Paid LLM calls; run only when explicitly asked for."""
+    from .analyzer import run_ab
+
+    out = run_ab(cfg, _load_seeds(cfg), _eval_ngrams(cfg), version, jobs)
+    print(json.dumps({arm: {k: r[k] for k in ("jobs", "kept", "unique_kept", "unresolved", "cost_usd")} for arm, r in out.items()}))
+    return out
+
+
 def _eval_ngrams(cfg: Config) -> set:
     ng: set = set()
     for path in cfg.decontam_paths:
@@ -250,8 +260,11 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="simia-plus", description=__doc__)
-    ap.add_argument("command", choices=["ingest", "analyze", "review", "heldout", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
+    ap.add_argument("command", choices=["ingest", "analyze", "review", "heldout", "ab", "plan", "specs", "generate", "reparse", "verify",
+                                        "select", "run"])
     ap.add_argument("--config", required=True)
+    ap.add_argument("--version", type=int, help="ab: analyzer version whose template both arms use")
+    ap.add_argument("--jobs", type=int, default=20, help="ab: jobs per arm")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     cfg.out.mkdir(parents=True, exist_ok=True)
@@ -262,7 +275,11 @@ def main(argv: list[str] | None = None) -> None:
     calls_before = _call_rows(cfg)
     status = "ok"
     try:
-        if args.command == "run":
+        if args.command == "ab":
+            if not args.version:
+                raise SystemExit("ab needs --version")
+            cmd_ab(cfg, args.version, args.jobs)
+        elif args.command == "run":
             cmd_ingest(cfg)
             cmd_generate(cfg)
             cmd_verify(cfg)

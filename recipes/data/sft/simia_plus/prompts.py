@@ -359,14 +359,20 @@ Produce:
    in its own clearly delimited block first, then the instructions, then a short restatement of the variation's
    change and the rule to change nothing else. Keep the instruction part under about 1,200 words: state principles
    and the exact contracts, not long if-then rule lists. Do not describe the output format: code appends a fixed
-   block requiring one {{"messages": [...]}} JSON object.
+   block that specifies the one JSON object to return.
 
-4. "rationale" (markdown): what you learned and why the harness description, variations and template look the way
-   they do{rationale_extra}.
+4. "combinations": pairs of variation names that can be applied to the same seed together, where the two changes
+   interact in a way the agent must handle (for example one source becomes unavailable while another shows an
+   obstruction). Only pairs whose changes do not remove evidence the other needs and do not contradict each other;
+   [] if none qualify.
 
-Return exactly one JSON object with these four keys, shaped like:
+5. "rationale" (markdown): what you learned and why the harness description, variations, combinations and template
+   look the way they do{rationale_extra}.
+
+Return exactly one JSON object with these five keys, shaped like:
 {{"harness": "## Task\\n...", "variations": [{{"name": "har_unavailable", "applies_to": ["S1"], "requires_tools":
 ["query_har"], "teaches": "...", "change": "...", "preserve": "...", "dependencies": "...", "correct_when": "..."}}],
+"combinations": [["har_unavailable", "overlay_covers_target"]],
 "template": "<seed>\\n{{seed_trace}}\\n</seed>\\n...", "rationale": "..."}}
 </request>"""
 
@@ -387,11 +393,15 @@ ANALYZER_REVISION = """
 {notes}
 </diagnosis>
 
-Revising: write the next version of all three. Fix what the diagnosis found without breaking what worked. Drop or
+Revising: write the next version of all of them. Fix what the diagnosis found without breaking what worked. Drop or
 repair variations that kept failing; keep the ones that worked. Consolidate rather than accumulate: replace rules
 that did not help, merge overlapping ones, and resolve instructions that conflict. In the rationale, list what you
 removed or merged and why.
 """
+
+_FORMAT_RULES = """Rules: roles are only user, assistant, tool. "arguments" is a JSON object. Every tool call gets exactly one tool
+message with its id, right after the assistant message that made the call. Tool "content" is a string. The last
+message is an assistant reply with no tool calls."""
 
 OUTPUT_FORMAT = """
 
@@ -403,9 +413,30 @@ Return ONE JSON object and nothing else (no prose, no markdown fences, no planni
   {"role": "tool", "tool_call_id": "call_1", "content": "<the tool's result as a string>"},
   {"role": "assistant", "content": "<final reply>"}
 ]}
-Rules: roles are only user, assistant, tool. "arguments" is a JSON object. Every tool call gets exactly one tool
-message with its id, right after the assistant message that made the call. Tool "content" is a string. The last
-message is an assistant reply with no tool calls."""
+""" + _FORMAT_RULES
+
+# Case-first variant: the generator settles the changed situation before writing the conversation. The case block is
+# kept in the trace's meta for the judge and for review; it is never part of the training messages.
+CASE_KEYS = ("assigned_change", "kept", "dependent_observations", "unavailable_or_uncertain")
+
+OUTPUT_FORMAT_CASE = """
+
+## Output format (fixed)
+Return ONE JSON object and nothing else (no prose, no markdown fences, no planning text). Write "case" first:
+{"case": {
+   "assigned_change": "<the assigned variation's change, as applied to this seed>",
+   "kept": "<what stays exactly as in the seed: platform, app or site, page, element, failure context, ...>",
+   "dependent_observations": "<which tool calls and results change because of the change, and how>",
+   "unavailable_or_uncertain": "<evidence that is unavailable, missing or ambiguous in the changed situation>"},
+ "messages": [
+  {"role": "user", "content": "..."},
+  {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "<tool>", "arguments": {...}}]},
+  {"role": "tool", "tool_call_id": "call_1", "content": "<the tool's result as a string>"},
+  {"role": "assistant", "content": "<final reply>"}
+]}
+The case describes the situation only: it states no answer, and it cannot widen the assigned change. The agent in
+"messages" never sees the case: every assistant turn must follow from the messages before it.
+""" + _FORMAT_RULES
 
 DIAGNOSE = """<harness_description>
 {harness}
@@ -455,7 +486,7 @@ Return JSON only: {{"notes": "<markdown: concrete failure patterns with trace id
 # Judge for seed-expansion traces: sees the seed, the variation and the harness; gives a grounded verdict per check.
 # Code verifies that every quoted excerpt really occurs in the generated trace or the seed.
 JUDGE_CHECKS = ("only_declared_change", "dependencies_updated", "tool_contracts_respected", "observations_consistent",
-                "policy_followed", "task_success")
+                "case_consistent", "policy_followed", "task_success")
 
 JUDGE_EXPANSION = """<harness_description>
 {harness}
@@ -473,6 +504,7 @@ JUDGE_EXPANSION = """<harness_description>
 {variation}
 </variation>
 
+{case}
 <generated note="the trajectory to judge; messages cited by number">
 {transcript}
 </generated>
@@ -486,27 +518,58 @@ You audit one synthetic training trajectory (GENERATED) made by applying the VAR
 The seed shows the situation before the change; it is not an answer key, because after the variation the correct
 answer may differ. Judge substance only; do not prefer longer answers.
 
+Two kinds of checks. CONSTRUCTION: was the variation applied to the seed correctly? Compare the seed, the variation,
+the case (when given; the generator's own description of the changed situation) and the generated observations.
+BEHAVIOUR: is each assistant action justified by what the agent had seen at that point? The agent never sees the
+variation or the case: for behaviour, only messages before the turn count as evidence.
+
 For each check, give a verdict: "pass", "fail", "cannot_determine" (the trajectory lacks what you need to decide) or
 "not_applicable". Back it with evidence: the message numbers (GENERATED as N, SEED as "seed:N") with short excerpts
 copied exactly from those messages, then a one-sentence reason. When the problem is something missing (an
 unsupported claim), quote the claim and say what support is missing.
 
-Checks:
+Construction checks:
 - only_declared_change: everything that differs from the seed is what the variation's "change" asks for, or a
-  consequence covered by its "dependencies"; nothing else (site, platform, element, story) drifted.
+  consequence covered by its "dependencies"; nothing else (site, platform, element, story) drifted. When the variation
+  combines several changes, each is applied and none removes evidence another needs. A case cannot authorize a change
+  the variation does not ask for.
 - dependencies_updated: every later call, tool result and the final answer is consistent with the change; no stale
   seed observation the change invalidated, no conclusion that still follows the seed's evidence.
 - tool_contracts_respected: every tool result is something that tool can return per the harness description (shape,
   content, no verdict the tool cannot know).
 - observations_consistent: tool results agree with each other and with the failure context.
+- case_consistent: the observations express the case, and the case stays within the variation. "not_applicable" when
+  no case is given.
+Behaviour checks:
 - policy_followed: the agent follows the system policy.
 - task_success: the final answer is correct for the generated evidence under the harness rules and the variation's
-  "correct_when".
+  "correct_when", using only what the conversation shows.
 Then judge every checklist item the same way.
+
+Turns: one entry for EVERY assistant message in GENERATED, in order: its number, "justified" or "unjustified" (or
+"cannot_determine"), "relies_on": the numbers of the earlier messages that justify it, and a short reason. A call or
+answer that relies on something shown only later, or only in the case or variation, is unjustified.
 
 Return JSON only:
 {{"checks": {{"<check name>": {{"verdict": "pass", "evidence": [{{"message": "3", "excerpt": "..."}}], "reason": "..."}}}},
   "checklist": [{{"item": "<exact item text>", "verdict": "...", "evidence": [...], "reason": "..."}}],
-  "hallucinations": ["<claims no source supports>"], "bad_steps": [<numbers of mistaken assistant messages>],
-  "notes": "..."}}
+  "turns": [{{"message": 1, "verdict": "justified", "relies_on": [0], "reason": "..."}}],
+  "hallucinations": ["<claims no source supports>"], "notes": "..."}}
+</request>"""
+
+
+# Blind answer check: a separate call answers from the observations alone (no seed, variation, case or judge verdict).
+# Agreement on the contract's categorical fields corroborates the generated answer; disagreement marks it unresolved.
+BLIND_ANSWER = """<system_prompt>
+{system}
+</system_prompt>
+
+<conversation note="everything the agent has observed; its final answer is withheld">
+{transcript}
+</conversation>
+
+<request>
+You are the agent described in the system prompt. Using only the conversation above, give the final answer the system
+prompt's output contract requires, as that JSON object. If the observations support none of the answers the contract
+allows, return {{"insufficient_evidence": true, "reason": "<one sentence>"}} instead.
 </request>"""

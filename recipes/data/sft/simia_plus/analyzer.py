@@ -36,12 +36,14 @@ from .prompts import (
     ANALYZER_REQUIRED_SLOTS,
     ANALYZER_REVISION,
     ANALYZER_SLOTS,
+    CASE_KEYS,
     DIAGNOSE,
     OUTPUT_FORMAT,
+    OUTPUT_FORMAT_CASE,
     VARIATION_KEYS,
 )
 from .schema import render
-from .select import dedup, diversity_report
+from .select import _shingles, body_text, dedup, diversity_report
 from .simia_text import tools_text
 from .verify import final_answer, system_key, verify
 
@@ -93,6 +95,31 @@ def check_variations(variations, labels: dict[str, str]) -> list[str]:
     return errs
 
 
+def check_combinations(combinations, variations: list[dict]) -> list[str]:
+    if combinations is None:
+        return []
+    if not isinstance(combinations, list):
+        return ["combinations must be a list of [name, name] pairs"]
+    names = {v.get("name") for v in variations if isinstance(v, dict)}
+    errs = []
+    for c in combinations:
+        if not (isinstance(c, list) and len(c) == 2 and c[0] != c[1] and set(c) <= names):
+            errs.append(f"combination {c!r} must be two different known variation names")
+    return errs
+
+
+def combine(a: dict, b: dict) -> dict:
+    """One job spec applying two variations together; the judge checks both are applied and neither undoes the other."""
+    def both(k: str) -> str:
+        return f"(1) {a.get(k, '')} (2) {b.get(k, '')}"
+
+    return {"name": f"{a['name']}+{b['name']}", "combines": [a["name"], b["name"]],
+            "applies_to": a["applies_to"], "requires_tools": sorted(set(a.get("requires_tools") or []) | set(b.get("requires_tools") or [])),
+            "teaches": both("teaches"), "change": both("change") + " Apply both changes together.",
+            "preserve": both("preserve"), "dependencies": both("dependencies"),
+            "correct_when": both("correct_when") + " Both hold at once."}
+
+
 def applicable(variations: list[dict], seed: dict, labels: dict[str, str]) -> list[dict]:
     """Variations for this seed's inspector whose required tools the seed actually calls."""
     label = next((lab for lab, key in labels.items() if key == system_key(seed.get("system", ""))), None)
@@ -101,19 +128,34 @@ def applicable(variations: list[dict], seed: dict, labels: dict[str, str]) -> li
             and set(v.get("requires_tools") or []) <= called]
 
 
-def fill(template: str, slots: dict[str, str]) -> str:
+def fill(template: str, slots: dict[str, str], case: bool = False) -> str:
     out = template
     for name in ANALYZER_SLOTS:
         out = out.replace(f"{{{name}}}", slots.get(name, ""))
-    return out + OUTPUT_FORMAT
+    return out + (OUTPUT_FORMAT_CASE if case else OUTPUT_FORMAT)
 
 
-def parse_output(text: str) -> tuple[list[dict] | None, list[str]]:
-    """Strict check of the fixed output format. Returns (messages, issues); messages is None on any issue."""
+def parse_output(text: str, case: bool = False) -> tuple[list[dict] | None, list[str]] | tuple[dict | None, list[dict] | None, list[str]]:
+    """Strict check of the fixed output format. Returns (messages, issues), or (case, messages, issues) with case=True;
+    messages is None on any issue."""
     try:
         obj = json.loads(text.strip())
     except json.JSONDecodeError as e:
-        return None, [f"format: not a single JSON object ({e.msg})"]
+        issues = [f"format: not a single JSON object ({e.msg})"]
+        return (None, None, issues) if case else (None, issues)
+    case_obj, case_issues = None, []
+    if case:
+        case_obj = obj.get("case") if isinstance(obj, dict) else None
+        if not isinstance(case_obj, dict) or any(not isinstance(case_obj.get(k), str) or not case_obj[k].strip() for k in CASE_KEYS):
+            case_issues = [f"format: \"case\" must be an object with non-empty string fields {list(CASE_KEYS)}"]
+    messages, issues = _parse_messages(obj)
+    issues = case_issues + issues
+    if case:
+        return (case_obj if not issues else None), (messages if not issues else None), issues
+    return messages, issues
+
+
+def _parse_messages(obj) -> tuple[list[dict] | None, list[str]]:
     if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list) or not obj["messages"]:
         return None, ["format: not {\"messages\": [non-empty list]}"]
     issues = []
@@ -164,17 +206,23 @@ def generate_analyzer(cfg: Config, job: dict, seed: dict, template: str, obs: Ob
              "obs_examples": format_obs_examples(obs.examples_for_tools(seed["tools"], cfg.retrieved_obs_per_tool, rng), 800)}
     discarded = []
     attempts = max(1, cfg.generation_attempts)
+    use_case = bool(job.get("case_block"))
+    case = None
     for attempt in range(1, attempts + 1):
-        prompt = fill(template, {**slots, "generation_id": f"{job['job_id']}/{attempt}"})
+        prompt = fill(template, {**slots, "generation_id": f"{job['job_id']}/{attempt}"}, case=use_case)
         out = get_llm(cfg, "generator").chat([{"role": "user", "content": prompt}], json_mode=True)
-        messages, issues = parse_output(out["content"])
+        if use_case:
+            case, messages, issues = parse_output(out["content"], case=True)
+        else:
+            messages, issues = parse_output(out["content"])
         if not issues or attempt == attempts:
             break
         discarded.append({"attempt": attempt, "problem": issues, "raw_output": out["content"]})
     trace = to_trace(job, seed, messages)
     trace["meta"] = {"raw_output": out["content"], "format_issues": issues, "attempts": attempt,
                      "discarded_attempts": discarded, "variation": variation.get("name"), "variation_spec": variation,
-                     **{k: job.get(k) for k in ("job_id", "seed_id", "strategy", "mode", "version")}}
+                     "case_block": use_case, "case": case,
+                     **{k: job.get(k) for k in ("job_id", "seed_id", "strategy", "mode", "version", "arm")}}
     trace["meta"]["fidelity"] = fidelity(trace, seed, cfg.tool_result_prefix)
     return trace
 
@@ -284,8 +332,10 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
     """Ask the analyzer for version <version>; saves harness.md, variations.json, prompt.txt, rationale.md,
     analyzer_raw.json. Returns {"template", "variations", "harness"}."""
     if (vdir / "prompt.txt").exists():
+        combos = vdir / "combinations.json"
         return {"template": (vdir / "prompt.txt").read_text(), "harness": (vdir / "harness.md").read_text(),
-                "variations": json.loads((vdir / "variations.json").read_text())}
+                "variations": json.loads((vdir / "variations.json").read_text()),
+                "combinations": json.loads(combos.read_text()) if combos.exists() else []}
     revision = ANALYZER_REVISION.format(**prev) if prev else ""
     request = ANALYZER.format(**inputs, revision=revision,
                               rationale_extra="; and what you changed in response to the diagnosis" if prev else "")
@@ -298,6 +348,8 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
         template = out.get("template", "")
         errs = (lint(template, holdout_texts) if template else ["no template in output"]) + \
             check_variations(out.get("variations"), labels) + ([] if out.get("harness") else ["no harness description"])
+        if not errs:
+            errs += check_combinations(out.get("combinations"), out["variations"])
         attempts.append({"output": out, "errors": errs})
         if not errs:
             break
@@ -309,7 +361,9 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
     (vdir / "variations.json").write_text(json.dumps(out["variations"], ensure_ascii=False, indent=1))
     (vdir / "prompt.txt").write_text(template)
     (vdir / "rationale.md").write_text(str(out.get("rationale", "")))
-    return {"template": template, "variations": out["variations"], "harness": out["harness"]}
+    combos = out.get("combinations") or []
+    (vdir / "combinations.json").write_text(json.dumps(combos, ensure_ascii=False, indent=1))
+    return {"template": template, "variations": out["variations"], "harness": out["harness"], "combinations": combos}
 
 
 def diagnose(cfg: Config, vdir: Path, version: int, spec: dict, report: dict, verified: list[dict],
@@ -350,15 +404,22 @@ def diagnose(cfg: Config, vdir: Path, version: int, spec: dict, report: dict, ve
 # ---- planning, ledger and reports ----
 
 def plan_jobs(prefix: str, seeds: list[dict], n: int, variations: list[dict], labels: dict[str, str],
-              ledger: list[dict], **extra) -> list[dict]:
+              ledger: list[dict], combinations: list | None = None, combo_share: float = 0.0, **extra) -> list[dict]:
     """Round-robin over seeds; for each, the applicable variation tried least often with that seed so far
-    (ledger across all rounds), ties broken by rotation. Seeds with no applicable variation are skipped."""
+    (ledger across all rounds), ties broken by rotation. Seeds with no applicable variation are skipped.
+    With combo_share > 0, that share of jobs uses a combination of two variations both applicable to the seed
+    (falling back to a single variation when the seed has none)."""
     tried = Counter((r["seed_id"], r["variation"]) for r in ledger)
     eligible = [s for s in seeds if applicable(variations, s, labels)]
+    by_name = {v["name"]: v for v in variations}
     jobs = []
     for j in range(n if eligible else 0):
         seed = eligible[j % len(eligible)]
         pool = applicable(variations, seed, labels)
+        if combo_share > 0 and int((j + 1) * combo_share) > int(j * combo_share):
+            names = {v["name"] for v in pool}
+            combos = [combine(by_name[a], by_name[b]) for a, b in combinations or [] if a in names and b in names]
+            pool = combos or pool
         rot = j // len(eligible)
         v = min(enumerate(pool), key=lambda iv: (tried[(seed["id"], iv[1]["name"])], (iv[0] - rot) % len(pool)))[1]
         tried[(seed["id"], v["name"])] += 1
@@ -404,7 +465,9 @@ def pilot_report(cfg: Config, verified: list[dict], seeds: list[dict]) -> dict:
             reasons["ungrounded_args"] += 1
         j = v.get("judge")
         if j is not None and not v["kept"]:
-            reasons["judge_rejected"] += 1
+            reasons["unresolved_blind_disagrees" if v.get("unresolved") else "judge_rejected"] += 1
+            if (j or {}).get("turn_issues"):
+                reasons["turn_issues"] += 1
         items.update((j or {}).get("checklist_failed") or [])
         b = by_var.setdefault(t["meta"].get("variation") or "-", Counter())
         b["jobs"] += 1
@@ -413,8 +476,16 @@ def pilot_report(cfg: Config, verified: list[dict], seeds: list[dict]) -> dict:
     cells = Counter(c for t in unique for c in decision_cells(t))
     seed_cells = {c for s in seeds for c in decision_cells(s)}
     n = len(verified)
+    by_var_out: dict[str, Counter] = {}
+    for t in unique:
+        ans = final_answer(t)
+        key = " / ".join(f"{f}={ans.get(f)}" for f in cfg.outcome_fields) if isinstance(ans, dict) else "unparsed"
+        by_var_out.setdefault(t["meta"].get("variation") or "-", Counter())[key] += 1
     return {"jobs": n, "format_ok": sum(1 for t in verified if not t["meta"].get("format_issues")),
             "kept": len(kept), "unique_kept": len(unique), "usable_rate": round(len(unique) / n, 3) if n else 0.0,
+            "unresolved": sum(bool(t["meta"]["verify"].get("unresolved")) for t in verified),
+            "outcomes_by_variation": {k: dict(v) for k, v in sorted(by_var_out.items())},
+            "nearest_kept": nearest(unique, seeds),
             "dedup": dup, "reject_reasons": dict(reasons.most_common()), "checklist_failed": dict(items.most_common()),
             "by_variation": {k: dict(v) for k, v in sorted(by_var.items())},
             "outcomes_kept": outcomes(unique, cfg.outcome_fields), "outcomes_seeds": outcomes(seeds, cfg.outcome_fields),
@@ -423,6 +494,21 @@ def pilot_report(cfg: Config, verified: list[dict], seeds: list[dict]) -> dict:
                                     "not_in_seeds": sum(1 for c in cells if c not in seed_cells)},
             "diversity_kept": diversity_report(unique),
             "attempts": dict(Counter(t["meta"].get("attempts", 1) for t in verified))}
+
+
+def nearest(kept: list[dict], seeds: list[dict], top: int = 8) -> dict:
+    """For each kept trace, its most similar other kept trace or seed (word 3-gram Jaccard over non-user text).
+    A diagnostic for meaningful repetition, never a filter: useful minimal pairs are similar by design."""
+    pool = [(t["id"], _shingles(body_text(t))) for t in kept] + [(f"seed:{s['id']}", _shingles(body_text(s))) for s in seeds]
+    rows = []
+    for t in kept:
+        a = _shingles(body_text(t))
+        best = max(((oid, len(a & b) / len(a | b) if a | b else 0.0) for oid, b in pool if oid != t["id"]),
+                   key=lambda x: x[1], default=(None, 0.0))
+        rows.append({"id": t["id"], "variation": t["meta"].get("variation"), "nearest": best[0], "similarity": round(best[1], 3)})
+    rows.sort(key=lambda r: -r["similarity"])
+    sims = [r["similarity"] for r in rows]
+    return {"most_similar": rows[:top], "at_least_0.8": sum(s >= 0.8 for s in sims), "at_least_0.6": sum(s >= 0.6 for s in sims)}
 
 
 def _append_ledger(root: Path, verified: list[dict]) -> None:
@@ -440,7 +526,7 @@ def expansion_context(trace: dict, seeds_by_id: dict[str, dict], harness: str) -
     """What the judge needs to check a seed-expansion trace: its seed, its variation, the harness description."""
     spec = trace["meta"].get("variation_spec")
     seed = seeds_by_id.get(trace["meta"].get("seed_id"))
-    return {"seed": seed, "variation": spec, "harness": harness} if spec and seed else None
+    return {"seed": seed, "variation": spec, "harness": harness, "case": trace["meta"].get("case")} if spec and seed else None
 
 
 def run_arm(cfg: Config, adir: Path, jobs: list[dict], gen_fn, seeds: list[dict], eval_ng: set, harness: str | None = None) -> dict:
@@ -472,7 +558,7 @@ def analyze(cfg: Config, dev: list[dict], heldout: list[dict], eval_ng: set) -> 
         jobs = read_jsonl(vdir / "jobs.jsonl")
         if not jobs:  # planned once per version, so a resumed run keeps the same jobs
             jobs = plan_jobs(f"v{v}", dev, cfg.pilot_jobs, spec["variations"], labels, read_jsonl(root / "ledger.jsonl"),
-                             mode="analyzer", version=v)
+                             spec.get("combinations"), cfg.combo_share, mode="analyzer", version=v, case_block=cfg.case_block)
             (vdir / "jobs.jsonl").write_text("".join(json.dumps(j, ensure_ascii=False) + "\n" for j in jobs))
         report = run_arm(cfg, vdir, jobs, lambda j, t=spec["template"]: generate_analyzer(cfg, j, dev_by_id[j["seed_id"]], t, obs),
                          dev, eval_ng, harness=spec["harness"])
@@ -542,4 +628,42 @@ def compare_heldout(cfg: Config, root: Path, template: str, variations: list[dic
                                        "outcomes_kept", "fidelity_kept")}
                | {"distinct_action_signatures": r["diversity_kept"]["distinct_action_signatures"]} for arm, r in rep.items()}
     (hdir / "comparison.json").write_text(json.dumps(summary, indent=1, default=str))
+    return summary
+
+
+def run_ab(cfg: Config, dev: list[dict], eval_ng: set, version: int, n_jobs: int) -> dict:
+    """Generator A/B on identical jobs: one analyzer version's template with the plain output format ("plain") vs with
+    the case block first ("case"). Both arms get the same checks, including the blind answer check; only the case arm
+    has a case for the judge to check. Run only on request (`simia-plus ab`)."""
+    root = cfg.out / "analyzer"
+    vdir = root / f"v{version}"
+    if not (vdir / "prompt.txt").exists():
+        raise SystemExit(f"no analyzer version {version} under {root}")
+    spec = write_version(cfg, vdir, version, {}, None, [], {})
+    labels = json.loads((root / "system_labels.json").read_text())
+    obs, by_id = ObsBank.from_traces(dev), {s["id"]: s for s in dev}
+    adir = root / f"ab_v{version}"
+    adir.mkdir(parents=True, exist_ok=True)
+    base = read_jsonl(adir / "jobs.jsonl")
+    if not base:  # planned once, so both arms and any resumed run share the same seed/variation assignments
+        base = plan_jobs("ab", dev, n_jobs, spec["variations"], labels, [], spec.get("combinations"), cfg.combo_share,
+                         mode="analyzer", version=version)
+        (adir / "jobs.jsonl").write_text("".join(json.dumps(j, ensure_ascii=False) + "\n" for j in base))
+    abcfg = copy.deepcopy(cfg)
+    abcfg.features.judge = abcfg.features.blind_check = True
+    summary = {}
+    for arm, case in (("plain", False), ("case", True)):
+        prefix = f"ab_v{version}/{arm}/"
+        jobs = [{**j, "job_id": prefix + j["job_id"].split("/", 1)[1], "case_block": case, "arm": arm} for j in base]
+        r = run_arm(abcfg, adir / arm, jobs, lambda j, t=spec["template"]: generate_analyzer(abcfg, j, by_id[j["seed_id"]], t, obs),
+                    dev, eval_ng, harness=spec["harness"])
+        calls = read_jsonl(cfg.out / "llm_calls.jsonl")
+        cost = sum(c.get("cost") or 0 for c in calls if str(c.get("item") or "").startswith(prefix))
+        summary[arm] = {k: r[k] for k in ("jobs", "format_ok", "kept", "unique_kept", "unresolved", "reject_reasons",
+                                          "checklist_failed", "by_variation", "outcomes_kept", "outcomes_by_variation",
+                                          "fidelity_kept")} | {
+            "nearest_kept": {k: r["nearest_kept"][k] for k in ("at_least_0.8", "at_least_0.6")},
+            "decision_cells_kept": r["decision_cells_kept"], "cost_usd": round(cost, 4),
+            "cost_per_unique_kept": round(cost / r["unique_kept"], 4) if r["unique_kept"] else None}
+    (adir / "comparison.json").write_text(json.dumps(summary, indent=1, default=str))
     return summary
