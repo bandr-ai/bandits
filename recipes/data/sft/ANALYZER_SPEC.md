@@ -25,6 +25,8 @@ analyzer → prompt + variations → generator (one seed + one variation per job
 - required slots `{seed_trace}`, `{variation}`, `{system_prompt}`, `{tools}`, `{generation_id}`; optional `{obs_examples}`; no unknown slots; no held-out seed text;
 - at least 3 variations, all keys present, valid labels.
 
+**Prompt layout** (analyzer, diagnosis, judge): material first, each document in its own tag (`<harness_file path>`, `<system_prompt label>`, `<seed id system>`, …), then the request and the JSON output contract last. Output stays JSON (DeepSeek JSON mode). On revision the analyzer must consolidate (replace, merge, resolve conflicts) rather than add rules, and the template's instruction part is capped at about 1,200 words.
+
 ## Jobs
 - Round-robin over dev seeds. A variation is applicable when it matches the seed's inspector (`applies_to`) and the seed actually calls its `requires_tools`. Each job gets the applicable variation tried least often with that seed, counted over all rounds in `ledger.jsonl`.
 - Jobs are planned once per version (`vN/jobs.jsonl`), so a resumed run keeps them.
@@ -39,7 +41,7 @@ analyzer → prompt + variations → generator (one seed + one variation per job
 - **Tool result shape:** each result must be one of that tool's real top-level shapes (`tool_result_shapes`, taken from the harness code) and carry the harness prefix with a running index (`tool_result_prefix`).
 - **Final answer** matches the schema of its system prompt's contract (`answer_schemas_path`).
 - **ID provenance.**
-- **Judge:** sees the seed (as a reference, not an answer key), the variation and the harness description. It quotes the deciding messages for each judgement, then decides `only_declared_change`, `dependencies_updated`, `tool_contracts_respected` and `task_success` (under `correct_when`), plus the fixed checklist from config. Missing fields fail closed.
+- **Judge:** sees the harness description, the seed (a reference, not an answer key), the variation and the generated trace, each in its own tagged block. For each check (`only_declared_change`, `dependencies_updated`, `tool_contracts_respected`, `observations_consistent`, `policy_followed`, `task_success` under `correct_when`) and each config checklist item, it returns a verdict (`pass` / `fail` / `cannot_determine` / `not_applicable`), the message numbers with exact excerpts, and a reason. Code checks every excerpt against the generated trace and the seed: a `pass` without an excerpt that really occurs there does not count. Missing fields and `cannot_determine` fail closed.
 - **Dedup:** exact plus near, within a round and across all rounds (`all_rounds.json`).
 
 ## Diagnostics (reported, never reject on their own)

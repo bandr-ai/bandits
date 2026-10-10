@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import Config
 from .llm import chat_json, get_llm
-from .prompts import DEFAULT_CHECKLIST, JUDGE, JUDGE_EXPANSION
+from .prompts import DEFAULT_CHECKLIST, JUDGE, JUDGE_CHECKS, JUDGE_EXPANSION
 from .schema import render
 from .state import state_match
 
@@ -210,8 +210,24 @@ def judge(cfg: Config, trace: dict, spec: dict | None) -> dict:
 EXPANSION_CHECKS = ("only_declared_change", "dependencies_updated", "tool_contracts_respected")
 
 
+def _norm(x) -> str:
+    return " ".join(str(x).split()).lower()
+
+
+def _grounded(item: dict, corpus: str) -> tuple[bool, list[str]]:
+    """A verdict counts as grounded when it cites at least one excerpt and every excerpt occurs in the corpus."""
+    ev = item.get("evidence") if isinstance(item, dict) else None
+    excerpts = [e.get("excerpt", "") for e in ev or [] if isinstance(e, dict)]
+    missing = [x for x in excerpts if not _norm(x) or _norm(x) not in corpus]
+    return bool(excerpts) and not missing, missing
+
+
 def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
-    """Judge a seed-expansion trace against its seed and assigned variation (the seed is a reference, not an answer key)."""
+    """Judge a seed-expansion trace against its seed and assigned variation (the seed is a reference, not an answer key).
+
+    Each check gets a verdict with quoted evidence. Code verifies the quotes: a "pass" whose excerpts are missing or do
+    not occur in the generated trace or the seed does not count as a pass. The result also carries the flat fields
+    verify() gates on (task_success, obs_consistent, policy_followed, the fidelity checks, checklist_failed)."""
     checklist = cfg.checklist or DEFAULT_CHECKLIST
     out = chat_json(get_llm(cfg, "judge"), "You are a strict, precise auditor. Output JSON only.", JUDGE_EXPANSION.format(
         harness=expansion.get("harness") or "(none)", system=trace.get("system", ""),
@@ -219,6 +235,26 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
         transcript=render(trace), checklist="\n".join(f"- {c}" for c in checklist)))
     if not isinstance(out, dict):
         raise TypeError("judge returned non-object JSON")
+    corpus = _norm(render(trace, max_obs_chars=10**7)) + "\n" + _norm(render(expansion["seed"], max_obs_chars=10**7))
+    checks = out.get("checks") if isinstance(out.get("checks"), dict) else {}
+    unverified: dict[str, list[str]] = {}
+
+    def passed(name: str, item) -> bool:
+        if not isinstance(item, dict) or item.get("verdict") != "pass":
+            return False
+        ok, missing = _grounded(item, corpus)
+        if not ok:
+            unverified[name] = missing or ["(no excerpt)"]
+        return ok
+
+    verdicts = {name: passed(name, checks.get(name)) for name in JUDGE_CHECKS}
+    out.update({k: verdicts[k] for k in EXPANSION_CHECKS}, task_success=verdicts["task_success"],
+               obs_consistent=verdicts["observations_consistent"], policy_followed=verdicts["policy_followed"])
+    out["checklist_failed"] = [str(c.get("item")) for c in out.get("checklist") or [] if isinstance(c, dict)
+                               and c.get("verdict") in ("fail", "cannot_determine")]
+    if not isinstance(out.get("checklist"), list):
+        out["checklist_failed"] = ["(checklist missing)"]
+    out["unverified_excerpts"] = unverified
     return out
 
 

@@ -8,6 +8,7 @@ import pytest
 from simia_plus import cli
 from simia_plus.config import load_config
 from simia_plus.llm import extract_json, set_llm_factory
+from simia_plus.prompts import JUDGE_CHECKS
 from simia_plus.schema import from_sharegpt, load_trace, to_sharegpt
 from simia_plus.simia_text import build_sample_text, parse_simia_text
 from simia_plus.state import apply_ops, state_match
@@ -112,6 +113,11 @@ class FakeLLM:
                                                "ops": [{"op": "set", "path": "orders.#W3000.status", "value": "cancelled"}]}),
                         "tool_calls": []}
             return {"content": json.dumps({"result": {"order_id": "#W3000", "status": "pending"}, "ops": []}), "tool_calls": []}
+        if self.role == "judge" and "<generated" in text:  # seed-expansion judge: grounded verdict per check
+            ev = [{"message": "0", "excerpt": "cancel #W2222 please"}]
+            checks = {k: {"verdict": "pass", "evidence": ev, "reason": "r"} for k in JUDGE_CHECKS}
+            return {"content": json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "bad_steps": []}),
+                    "tool_calls": []}
         if self.role == "judge":
             return {"content": json.dumps({"task_success": True, "final_state": {"orders": {"#W3000": {"status": "cancelled"}}},
                                            "only_declared_change": True, "dependencies_updated": True,
@@ -378,7 +384,7 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
         for f in ("harness.md", "variations.json", "prompt.txt", "rationale.md", "jobs.jsonl", "verified.jsonl", "report.json"):
             assert (a / v / f).exists(), (v, f)
     assert (a / "v1" / "diagnosis.md").exists() and not (a / "v2" / "diagnosis.md").exists()
-    assert "PREVIOUS VERSION (v1)" in json.loads((a / "v2" / "analyzer_raw.json").read_text())["request"]
+    assert '<previous_version number="1">' in json.loads((a / "v2" / "analyzer_raw.json").read_text())["request"]
     assert not (a / "heldout").exists()  # held-out runs only on request
     jobs = [json.loads(line) for line in (a / "v1" / "jobs.jsonl").read_text().splitlines()]
     pairs = [(j["seed_id"], j["variation"]["name"]) for j in jobs]
@@ -395,7 +401,7 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
     seen = " ".join(m["content"] for c in fake_llms["analyzer"].seen for m in c)
     assert all(h not in seen for h in split["heldout"])
     judged = fake_llms["judge"].seen[0][-1]["content"]
-    assert "<seed>" in judged and '"name": "var' in judged and "## tools [established: x]" in judged
+    assert "<seed note=" in judged and '"name": "var' in judged and "## tools [established: x]" in judged
     cli.main(["heldout", "--config", cfg_path])
     cmp = json.loads((a / "heldout" / "comparison.json").read_text())
     assert set(cmp) == {"analyzer", "simia_fixed"} and cmp["simia_fixed"]["jobs"] == 2
@@ -482,3 +488,21 @@ def test_variation_prerequisites_and_expansion_judge_fails_closed(tmp_path):
     assert verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]["kept"] is True
     ctx = {"seed": s, "variation": vs[0], "harness": "h"}
     assert verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]["kept"] is False  # fidelity fields missing
+
+
+def test_expansion_judge_needs_verifiable_excerpts(tmp_path):
+    from simia_plus.verify import verify
+    cfg = load_config(write_cfg(tmp_path, {"judge": True}, target=1, keep_failures=False))
+    s = from_sharegpt(seed(0), 0)
+    ctx = {"seed": s, "variation": {"name": "a"}, "harness": "h"}
+
+    def run(excerpt: str, verdict: str = "pass") -> dict:
+        checks = {k: {"verdict": verdict, "evidence": [{"message": "0", "excerpt": excerpt}], "reason": "r"} for k in JUDGE_CHECKS}
+        body = json.dumps({"checks": checks, "checklist": [], "hallucinations": [], "bad_steps": []})
+        set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": body, "tool_calls": []}})())
+        return verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]
+
+    assert run("please cancel   order #W1000")["kept"] is True  # whitespace/case-insensitive match
+    v = run("the order was refunded")  # quote that occurs nowhere
+    assert v["kept"] is False and "task_success" in v["judge"]["unverified_excerpts"]
+    assert run("please cancel order #W1000", verdict="cannot_determine")["kept"] is False

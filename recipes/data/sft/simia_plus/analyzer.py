@@ -260,7 +260,8 @@ def _harness_text(paths: list[str]) -> str:
     for p in paths:
         path = Path(p)
         files = sorted(f for f in path.rglob("*") if f.is_file()) if path.is_dir() else [path]
-        parts += [f"### FILE {f}\n{f.read_text(errors='replace')}" for f in files if f.suffix in (".py", ".json", ".md", ".yml", ".yaml")]
+        parts += [f'<harness_file path="{f}">\n{f.read_text(errors="replace")}\n</harness_file>'
+                  for f in files if f.suffix in (".py", ".json", ".md", ".yml", ".yaml")]
     return "\n\n".join(parts) or "(none given)"
 
 
@@ -269,12 +270,12 @@ def _analyzer_inputs(cfg: Config, seeds: list[dict], obs: ObsBank, labels: dict[
     shown = seeds if len(seeds) <= cfg.analyzer_seeds else rng.sample(seeds, cfg.analyzer_seeds)
     by_key = {key: label for label, key in labels.items()}
     texts = {system_key(s.get("system", "")): s.get("system", "") for s in seeds}
-    sys_text = "\n\n".join(f"### System prompt {label}\n{texts[key]}" for label, key in labels.items())
-    parts = [f"### Seed {s['id']} (system prompt {by_key[system_key(s.get('system', ''))]})\n{seed_json(s)}" for s in shown]
+    sys_text = "\n".join(f'<system_prompt label="{label}">\n{texts[key]}\n</system_prompt>' for label, key in labels.items())
+    parts = [f'<seed id="{s["id"]}" system="{by_key[system_key(s.get("system", ""))]}">\n{seed_json(s)}\n</seed>' for s in shown]
     tools = {t["name"]: t for s in shown for t in s["tools"]}
     obs_ex = obs.examples_for_tools(list(tools.values()), 2, rng)
     return {"harness": _harness_text(cfg.harness_paths), "n_seeds": len(shown),
-            "seeds": sys_text + "\n\n" + "\n\n".join(parts), "tools": tools_text(list(tools.values())),
+            "system_prompts": sys_text, "seeds": "\n".join(parts), "tools": tools_text(list(tools.values())),
             "obs": format_obs_examples(obs_ex, 800)}
 
 
@@ -323,22 +324,24 @@ def diagnose(cfg: Config, vdir: Path, version: int, spec: dict, report: dict, ve
     def show(t: dict) -> str:
         v = t["meta"]["verify"]
         why = {"rule_issues": v["rule_issues"], "ungrounded_args": v.get("ungrounded_args"),
-               "judge": {k: (v.get("judge") or {}).get(k) for k in ("task_success", "obs_consistent", "policy_followed",
-                                                                    "hallucinations", "checklist_failed", "notes")},
+               "judge": {k: (v.get("judge") or {}).get(k) for k in ("checks", "task_success", "obs_consistent", "policy_followed",
+                                                                    "hallucinations", "checklist_failed", "unverified_excerpts",
+                                                                    "notes")},
                "fidelity": t["meta"].get("fidelity")}
         seed = seeds_by_id.get(t["meta"].get("seed_id"))
         seed_text = render(seed, max_obs_chars=1500)[:7000] if seed else "(seed not found)"
         body = render(t, max_obs_chars=1500) if t["messages"] else f"(unparseable output)\n{t['meta'].get('raw_output', '')[:3000]}"
-        return (f"### {t['id']} (seed {t['meta'].get('seed_id')}, variation {t['meta'].get('variation')})\n"
-                f"SEED:\n{seed_text}\nreasons: {json.dumps(why, ensure_ascii=False)}\nGENERATED:\n{body[:7000]}")
+        return (f'<trace id="{t["id"]}" seed="{t["meta"].get("seed_id")}" variation="{t["meta"].get("variation")}">\n'
+                f"<seed>\n{seed_text}\n</seed>\n<reasons>{json.dumps(why, ensure_ascii=False)}</reasons>\n"
+                f"<generated>\n{body[:7000]}\n</generated>\n</trace>")
 
     out = chat_json(get_llm(cfg, "diagnose"), "You are a rigorous reviewer of agent training data. Output JSON only.",
                     DIAGNOSE.format(version=version, harness=spec["harness"],
                                     variations=json.dumps(spec["variations"], ensure_ascii=False, indent=1),
                                     template=spec["template"], report=json.dumps(report, indent=1, default=str),
                                     n_rejected=len(rej_s), total_rejected=len(rejected), n_kept=len(kept_s),
-                                    total_kept=len(kept), rejected="\n\n".join(map(show, rej_s)) or "(none)",
-                                    kept="\n\n".join(map(show, kept_s)) or "(none)"))
+                                    total_kept=len(kept), rejected="\n".join(map(show, rej_s)) or "(none)",
+                                    kept="\n".join(map(show, kept_s)) or "(none)"))
     notes = str(out.get("notes", "")) if isinstance(out, dict) else str(out)
     (vdir / "diagnosis.md").write_text(notes)
     return notes
