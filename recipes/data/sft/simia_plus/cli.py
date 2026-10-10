@@ -115,6 +115,26 @@ def cmd_generate(cfg: Config) -> list[dict]:
                         done_key=lambda t: t["id"], desc="generate")
 
 
+def cmd_reparse(cfg: Config) -> list[dict]:
+    """Rebuild mode-simia traces from their saved raw outputs (no LLM calls); clears verify/select outputs."""
+    from .generate import trace_from_raw
+
+    seeds = {s["id"]: s for s in _load_seeds(cfg)}
+    rows = []
+    for t in read_jsonl(_p(cfg, "generated.jsonl")):
+        m = t["meta"]
+        if m.get("mode") == "simia" and m.get("raw_output") is not None:
+            new = trace_from_raw({"job_id": t["id"]}, seeds[m["seed_id"]], m["raw_output"])
+            new["meta"] = {**m, **new["meta"]}
+            t = new
+        rows.append(t)
+    write_jsonl(_p(cfg, "generated.jsonl"), rows)
+    for stale in ("verified.jsonl", "verified.errors.jsonl"):
+        _p(cfg, stale).unlink(missing_ok=True)
+    print(f"reparse: {len(rows)} traces rebuilt from raw output")
+    return rows
+
+
 def cmd_verify(cfg: Config) -> list[dict]:
     gen = read_jsonl(_p(cfg, "generated.jsonl"))
     eval_ng = _eval_ngrams(cfg)
@@ -172,7 +192,7 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="simia-plus", description=__doc__)
-    ap.add_argument("command", choices=["ingest", "plan", "specs", "generate", "verify", "select", "run"])
+    ap.add_argument("command", choices=["ingest", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
@@ -191,7 +211,7 @@ def main(argv: list[str] | None = None) -> None:
             cmd_select(cfg)
         else:
             {"ingest": cmd_ingest, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
-             "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
+             "reparse": cmd_reparse, "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
     except BaseException as e:
         status = f"error: {type(e).__name__}: {e}"
         raise

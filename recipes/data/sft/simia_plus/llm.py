@@ -72,6 +72,10 @@ class OpenAILLM:
             kwargs["tools"] = tools
         if json_mode and self.cfg.json_mode and not tools:
             kwargs["response_format"] = {"type": "json_object"}
+        if self.cfg.no_cache:
+            body = dict(kwargs.get("extra_body") or {})
+            body["cache"] = {**body.get("cache", {}), "no-cache": True, "no-store": True}
+            kwargs["extra_body"] = body
         last: Exception | None = None
         for attempt in range(1, self.retries + 1):
             t0 = time.monotonic()
@@ -91,6 +95,7 @@ class OpenAILLM:
                            finish_reason=choice.finish_reason, usage=usage,
                            cost=_float(raw.headers.get("x-litellm-response-cost")),
                            call_id=raw.headers.get("x-litellm-call-id"), provider=extra.get("provider"),
+                           cache_hit=raw.headers.get("x-litellm-cache-hit"),
                            served_model=resp.model, response={"content": msg.content, "tool_calls": calls})
                 if not (msg.content or "").strip() and not calls:
                     raise EmptyResponse(f"empty response (finish_reason={choice.finish_reason})")

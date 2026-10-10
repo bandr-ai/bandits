@@ -283,3 +283,49 @@ def test_gateway_log_appends_final_response():
                      {"content": "Order #W1 is pending.", "tool_calls": None}]}
     t = load_trace(rec, 0)
     assert t["messages"][-1] == {"role": "assistant", "content": "Order #W1 is pending."}
+
+
+def test_parallel_calls_roundtrip_as_consecutive_function_calls():
+    t = load_trace({"id": "p", "tools": TOOLS, "messages": [
+        {"role": "user", "content": "check #W1 and #W2"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "name": "get_order", "arguments": {"order_id": "#W1"}},
+                                                             {"id": "b", "name": "get_order", "arguments": {"order_id": "#W2"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "one"}, {"role": "tool", "tool_call_id": "b", "content": "two"},
+        {"role": "assistant", "content": "done"}]}, 0)
+    sg = to_sharegpt(t)
+    assert [c["from"] for c in sg["conversations"]] == ["human", "function_call", "function_call", "observation", "observation", "gpt"]
+    assert not any("[{" in c["value"] for c in sg["conversations"])
+    back = from_sharegpt(sg, 0)
+    assert len(back["messages"][1]["tool_calls"]) == 2
+    assert [m["content"] for m in back["messages"] if m["role"] == "tool"] == ["one", "two"]
+    assert rule_check(back, 2) == []
+
+
+def test_unusable_generation_is_retried(tmp_path, fake_llms):
+    outputs = iter(["FUNCTION_CALL: {\"name\": \"get_order\", \"arguments\": {}}", SIMIA_OUT])
+
+    class Flaky(FakeLLM):
+        def chat(self, messages, tools=None, json_mode=False):
+            self.calls += 1
+            return {"content": next(outputs), "tool_calls": []}
+
+    set_llm_factory(lambda cfg, role: fake_llms.setdefault(role, Flaky(role)))
+    cfg_path = write_cfg(tmp_path, {}, target=1, n_seeds=1, generation_attempts=3)
+    cli.main(["run", "--config", cfg_path])
+    gen = [json.loads(line) for line in (load_config(cfg_path).out / "generated.jsonl").read_text().splitlines()]
+    assert gen[0]["meta"]["attempts"] == 2 and gen[0]["meta"]["discarded_attempts"][0]["problem"] == "no_leading_user_turn"
+    assert fake_llms["generator"].calls == 2
+
+
+def test_function_call_with_plain_text_reasoning_is_parsed():
+    from simia_plus.schema import parse_function_call
+    calls, why = parse_function_call('I need the order first. I will call get_order.\n{"name": "get_order", "arguments": {"order_id": "#W1"}}')
+    assert calls == [{"name": "get_order", "arguments": {"order_id": "#W1"}}] and why.startswith("I need the order")
+    assert parse_function_call("no json here") == ([], "")
+
+
+def test_orphan_tool_results_are_rejected():
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][1]["tool_calls"] = []  # call lost, result kept
+    issues = rule_check(t, 2)
+    assert any("without a matching call" in i for i in issues) or any("empty assistant turn" in i for i in issues)

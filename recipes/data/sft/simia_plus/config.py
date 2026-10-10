@@ -44,6 +44,7 @@ class ModelCfg:
     max_tokens: int = 16000
     max_tokens_param: str = "max_tokens"  # or "max_completion_tokens"
     json_mode: bool = True  # send response_format=json_object when JSON is expected
+    no_cache: bool = True   # ask a LiteLLM gateway not to serve cached responses (identical prompts must still vary)
     extra: dict = field(default_factory=dict)  # passed through to the API call
 
 
@@ -53,6 +54,9 @@ class Config:
     out_dir: str = "out"
     seed_format: str = "auto"  # auto | canonical (incl. OpenAI/LangChain-style messages) | sharegpt
     tool_defs_path: str | None = None  # JSON with tool schemas, for traces that list tools by name only
+    simia_prompt: str = "fixed"  # "fixed": Simia's prompt + format rules; "original": Simia's prompt only
+    generation_attempts: int = 1  # mode simia: regenerate when the output cannot be used (no user turn,
+                                  # Simia's markup filter, no final reply); Simia itself makes one attempt
     target_count: int = 1000   # traces wanted back (e.g. 100 golden traces -> 1000)
     overgen: float = 1.5       # generate target_count * overgen, then filter and select down (Datology: curate from a bigger pool)
     features: Features = field(default_factory=Features)
@@ -96,6 +100,8 @@ def load_config(path: str | Path) -> Config:
     if unknown:
         raise ValueError(f"unknown config keys: {sorted(unknown)}")
     cfg = Config(**raw, features=feats, models=models)
+    if cfg.simia_prompt not in ("fixed", "original"):
+        raise ValueError("simia_prompt must be 'fixed' or 'original'")
     if cfg.loop_style not in ("split", "simia_env"):
         raise ValueError("loop_style must be 'split' or 'simia_env'")
     if feats.loop and cfg.loop_style == "split" and not feats.spec:

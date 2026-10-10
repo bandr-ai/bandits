@@ -20,6 +20,7 @@ from .llm import chat_json, get_llm
 from .personas import PERSONAS, UNIVERSAL_RULES
 from .prompts import (
     BLOCK_FAILURE,
+    BLOCK_FORMAT,
     BLOCK_PERSONA,
     BLOCK_RETRIEVAL,
     BLOCK_SPEC,
@@ -48,7 +49,7 @@ def _examples(lines: list[str]) -> str:
 
 def simia_prompt(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> str:
     rng = _rng(cfg, job)
-    blocks = []
+    blocks = [BLOCK_FORMAT] if cfg.simia_prompt == "fixed" else []
     if cfg.features.strategies and not job.get("spec"):
         blocks.append(f"\n## Generation Strategy (overrides requirement 1):\n{STRATEGIES[job['strategy']]}\n")
         if job.get("second_seed_id"):
@@ -70,15 +71,43 @@ def simia_prompt(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: Obs
                             extra_blocks="".join(blocks))
 
 
+def _unusable(conv: list[dict], deleted: bool) -> str | None:
+    if deleted:
+        return "simia_markup_filter"
+    if not conv or conv[0]["from"] != "human":
+        return "no_leading_user_turn"
+    if conv[-1]["from"] != "gpt":
+        return "no_final_reply"
+    return None
+
+
 def generate_simia(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> dict:
     prompt = simia_prompt(cfg, job, seed, seeds_by_id, obs, users)
-    out = get_llm(cfg, "generator").chat([{"role": "user", "content": prompt}])
-    conv = parse_simia_text(out["content"])
-    deleted = should_delete_conversation(conv)  # Simia drops conversations with leaked tool markup
-    conv = process_conversation(conv)            # Simia's argument repair (string -> dict, quotes, empty)
+    discarded = []
+    for attempt in range(1, max(1, cfg.generation_attempts) + 1):
+        # a unique tag per job and attempt: identical prompts must not collapse into one cached answer
+        tagged = f"{prompt}\n(Generation id: {job['job_id']}/{attempt})"
+        out = get_llm(cfg, "generator").chat([{"role": "user", "content": tagged}])
+        conv = parse_simia_text(out["content"])
+        deleted = should_delete_conversation(conv)  # Simia drops conversations with leaked tool markup
+        conv = process_conversation(conv)            # Simia's argument repair (string -> dict, quotes, empty)
+        problem = _unusable(conv, deleted)
+        if problem is None or attempt == max(1, cfg.generation_attempts):
+            break
+        discarded.append({"attempt": attempt, "problem": problem, "raw_output": out["content"]})
+    trace = trace_from_raw(job, seed, out["content"])
+    trace["meta"].update(attempts=attempt, discarded_attempts=discarded)
+    return trace
+
+
+def trace_from_raw(job: dict, seed: dict, raw: str) -> dict:
+    """Simia text output -> canonical trace (also used to re-parse saved outputs after parser fixes)."""
+    conv = parse_simia_text(raw)
+    deleted = should_delete_conversation(conv)
+    conv = process_conversation(conv)
     trace = from_sharegpt({"id": job["job_id"], "system": seed.get("system", ""), "tools": seed["tools"],
                            "conversations": conv}, 0)
-    trace["meta"] = {"raw_turns": len(conv), "simia_deleted": deleted, "raw_output": out["content"]}
+    trace["meta"] = {"raw_turns": len(conv), "simia_deleted": deleted, "raw_output": raw}
     return trace
 
 

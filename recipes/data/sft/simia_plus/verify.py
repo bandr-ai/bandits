@@ -34,6 +34,12 @@ def rule_check(trace: dict, min_assistant_turns: int) -> list[str]:
     if not msgs or msgs[-1]["role"] != "assistant" or msgs[-1].get("tool_calls") or not msgs[-1]["content"].strip():
         issues.append("does not end with an assistant reply")
     answered = {m["tool_call_id"] for m in msgs if m["role"] == "tool"}
+    call_ids = {c["id"] for m in msgs for c in m.get("tool_calls", [])}
+    orphans = sum(1 for m in msgs if m["role"] == "tool" and m["tool_call_id"] not in call_ids)
+    if orphans:
+        issues.append(f"{orphans} tool result(s) without a matching call")
+    if any(m["role"] == "assistant" and not m.get("tool_calls") and not (m.get("content") or "").strip() for m in msgs):
+        issues.append("empty assistant turn (no text, no tool call)")
     seen = Counter()
     for m in msgs:
         if "<tool_" in (m.get("content") or "") or "\n[{" in (m.get("content") or ""):
