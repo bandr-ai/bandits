@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import Config
 from .llm import chat_json, get_llm
-from .prompts import DEFAULT_CHECKLIST, JUDGE
+from .prompts import DEFAULT_CHECKLIST, JUDGE, JUDGE_EXPANSION
 from .schema import render
 from .state import state_match
 
@@ -207,6 +207,21 @@ def judge(cfg: Config, trace: dict, spec: dict | None) -> dict:
     return out
 
 
+EXPANSION_CHECKS = ("only_declared_change", "dependencies_updated", "tool_contracts_respected")
+
+
+def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
+    """Judge a seed-expansion trace against its seed and assigned variation (the seed is a reference, not an answer key)."""
+    checklist = cfg.checklist or DEFAULT_CHECKLIST
+    out = chat_json(get_llm(cfg, "judge"), "You are a strict, precise auditor. Output JSON only.", JUDGE_EXPANSION.format(
+        harness=expansion.get("harness") or "(none)", system=trace.get("system", ""),
+        seed=render(expansion["seed"]), variation=json.dumps(expansion["variation"], ensure_ascii=False, indent=1),
+        transcript=render(trace), checklist="\n".join(f"- {c}" for c in checklist)))
+    if not isinstance(out, dict):
+        raise TypeError("judge returned non-object JSON")
+    return out
+
+
 def ngrams(text: str, n: int = 8) -> set[tuple]:
     toks = re.findall(r"\w+", text.lower())
     return {tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)}
@@ -221,7 +236,8 @@ def load_answer_schemas(path: str | None) -> dict[str, dict]:
     return json.loads(Path(path).read_text()) if path else {}
 
 
-def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple]) -> dict:
+def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | None = None) -> dict:
+    """expansion: {"seed", "variation", "harness"} for seed-expansion traces; the judge then checks fidelity too."""
     f = cfg.features
     spec = trace["meta"].get("spec")
     v: dict = {"rule_issues": [*trace["meta"].get("format_issues", []),
@@ -233,11 +249,12 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple]) -> dict:
         v["ungrounded_args"] = provenance_check(trace, spec)
     keep = not v["rule_issues"] and not v["contaminated"] and not v.get("ungrounded_args")
     if f.judge and keep:
-        j = judge(cfg, trace, spec)
+        j = judge_expansion(cfg, trace, expansion) if expansion else judge(cfg, trace, spec)
         v["judge"] = j
         # fail closed: a missing field is a failed check, not a pass
         consistent = (j.get("obs_consistent") is True and j.get("policy_followed") is True
-                      and j.get("checklist_failed") == [] and j.get("hallucinations") == [])
+                      and j.get("checklist_failed") == [] and j.get("hallucinations") == []
+                      and all(j.get(k) is True for k in (EXPANSION_CHECKS if expansion else ())))
         success = bool(j.get("task_success"))
         keep = consistent and (success or cfg.keep_failures)
         trace["meta"]["bad_steps"] = j.get("bad_steps", []) if not success else []

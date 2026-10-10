@@ -287,8 +287,8 @@ Please directly generate the next message without the prefix "User/Tool response
 # Seed expansion, not invention: each job keeps one real seed's situation and applies one assigned variation.
 # Code fills the per-job slots and appends OUTPUT_FORMAT, the one part the analyzer cannot change.
 ANALYZER_SLOTS = ("seed_trace", "variation", "tools", "system_prompt", "obs_examples", "generation_id")
-ANALYZER_REQUIRED_SLOTS = ("seed_trace", "variation", "generation_id")
-VARIATION_KEYS = ("name", "applies_to", "teaches", "change", "preserve", "dependencies", "correct_when")
+ANALYZER_REQUIRED_SLOTS = ("seed_trace", "variation", "system_prompt", "tools", "generation_id")
+VARIATION_KEYS = ("name", "applies_to", "requires_tools", "teaches", "change", "preserve", "dependencies", "correct_when")
 
 ANALYZER = """You design a synthetic-data generator that EXPANDS real, reviewed trajectories (seeds) of one agent into more
 supervised fine-tuning trajectories for that same agent. The fine-tuned model learns each assistant turn: which tool
@@ -297,7 +297,8 @@ call to make given what it has seen, and the final answer given the evidence.
 SEED EXPANSION, NOT INVENTION. Every generated trajectory starts from ONE real seed and keeps the seed's real situation
 (platform, app or site, page, element, failure context, wording style, the real tool results) except what ONE assigned
 variation changes. Everything that depends on that change must be updated consistently: later tool calls, their
-results, the final answer. Tool results the change does not affect stay exactly as in the seed. The outcome follows
+results, the final answer. Reuse a seed tool result only when its call and the evidence behind it remain valid after
+the variation; update or omit results whose dependencies changed. The outcome follows
 from the evidence under the harness rules; never choose the outcome first and fit the evidence to it. A trajectory
 in a made-up world that only resembles the seed is a failure.
 
@@ -313,12 +314,14 @@ Produce three things.
    conclusion/cause, when the answer must stay cautious); and the unknowns. Tag every claim [established: <file>]
    (harness source or schemas), [inferred] (seen in seeds only) or [unknown]. Do not turn unknowns into rules.
 
-2. "variations": 6-12 controlled transformations of a seed. Each one changes what the agent must notice or decide
-   (an evidence source becomes unavailable, an observation now supports a different reading, an obstruction covers
-   or clears the target, two sources disagree, a different element or step on the same page, ...). No cosmetic
+2. "variations": 6-12 controlled transformations of a seed. Each one changes what the agent must recognize, handle
+   or justify (an evidence source becomes unavailable, an observation now supports a different reading, an
+   obstruction covers or clears the target, two sources disagree, a different element or step on the same page,
+   ...). The correct answer may stay the same if the evidence the agent must handle changed. No cosmetic
    variations (renaming, rewording). Mostly ordinary realistic changes, plus a few decision-boundary cases taken from
    rules and incidents the harness source documents; never invent rules. Each variation is an object:
    {{"name": "<short_snake_case>", "applies_to": ["S1", ...] or ["all"] (system prompt labels below),
+     "requires_tools": ["<tool the seed must already call for this variation to make sense>", ...] or [],
      "teaches": "<the behaviour this demonstrates>", "change": "<what changes vs the seed>",
      "preserve": "<what must stay exactly as in the seed>", "dependencies": "<what must be updated to stay consistent>",
      "correct_when": "<the evidence that makes the final answer correct under the harness rules>"}}
@@ -327,8 +330,8 @@ Produce three things.
    - {{seed_trace}} (REQUIRED): the job's seed as {{"messages": [...]}} JSON
    - {{variation}} (REQUIRED): the ONE variation assigned to this job, as JSON
    - {{generation_id}} (REQUIRED): a unique id for the job
-   - {{system_prompt}}: the seed agent's system prompt (defines its question and output contract)
-   - {{tools}}: the seed agent's tool schemas (JSON)
+   - {{system_prompt}} (REQUIRED): the seed agent's system prompt (defines its question and output contract)
+   - {{tools}} (REQUIRED): the seed agent's tool schemas (JSON)
    - {{obs_examples}}: real recorded tool results from other seeds, for exact result formats
    Use no other {{...}} slots. Literal braces are fine as long as they do not form {{word}}. Do NOT describe the
    output format: code appends a fixed block requiring one JSON object {{"messages": [...]}}. The template must make
@@ -389,7 +392,8 @@ what the generator prompt or the variations should change. Look especially for:
 - dependencies not updated (a changed observation whose later calls or final answer still follow the seed);
 - tool results that do not match the tool's real contract or shape (see HARNESS), or state a verdict the tool cannot know;
 - final answers the evidence does not support (especially named causes without their detecting evidence);
-- variations that are cosmetic, keep failing, or never change a decision.
+- variations that are cosmetic (nothing changes in what the agent must recognize, handle or justify) or keep
+  failing. A variation whose correct answer stays the same is fine when the evidence the agent handles changed.
 Do not recommend banning or blacklisting seed content: staying close to the seed is the goal. Judge from the traces.
 
 HARNESS (the analyzer's description):
@@ -404,8 +408,8 @@ GENERATOR TEMPLATE (v{version}):
 PILOT REPORT:
 {report}
 
-REJECTED TRACES ({n_rejected} shown of {total_rejected}), each with its seed's first user message, its variation and
-its rejection reasons:
+REJECTED TRACES ({n_rejected} shown of {total_rejected}), each with its full seed, its variation and its rejection
+reasons:
 {rejected}
 
 KEPT TRACES ({n_kept} shown of {total_kept}):
@@ -413,3 +417,52 @@ KEPT TRACES ({n_kept} shown of {total_kept}):
 
 Return JSON only: {{"notes": "<markdown: concrete failure patterns with trace ids and counts, per-variation verdicts
 (keep / fix / drop), and specific prompt changes; most important first>"}}"""
+
+# Judge for seed-expansion traces: sees the seed, the variation and the harness, and must quote evidence per item.
+JUDGE_EXPANSION = """<harness>
+{harness}
+</harness>
+
+<system_policy>
+{system}
+</system_policy>
+
+<seed>
+{seed}
+</seed>
+
+<variation>
+{variation}
+</variation>
+
+<generated>
+{transcript}
+</generated>
+
+<checklist>
+{checklist}
+</checklist>
+
+You audit a synthetic training trajectory made by applying the VARIATION to the real, reviewed SEED. The seed is a
+reference for what changed, not an answer key: after the variation the correct answer may differ from the seed's.
+Judge substance only; do not prefer longer answers. For every judgement, first quote the exact generated message(s)
+(by [index]) that decide it, then decide. A judgement without a quote counts as failed.
+
+Decide:
+- only_declared_change: everything differing from the seed is what the variation's "change" asks for, or a
+  consequence listed or implied by its "dependencies"; nothing else (site, platform, element, story) drifted.
+- dependencies_updated: every later call, tool result and the final answer is consistent with the change (no stale
+  seed observation that the change invalidated, no conclusion still following the seed's evidence).
+- tool_contracts_respected: every tool result is something that tool can return per the harness (shape, content,
+  no verdict the tool cannot know).
+- task_success: the final answer is correct for the generated evidence under the harness rules and the
+  variation's "correct_when".
+- the checklist items, as before.
+
+Return JSON:
+{{"evidence": {{"only_declared_change": "<quotes>", "dependencies_updated": "<quotes>",
+               "tool_contracts_respected": "<quotes>", "task_success": "<quotes>"}},
+  "only_declared_change": true/false, "dependencies_updated": true/false, "tool_contracts_respected": true/false,
+  "task_success": true/false, "obs_consistent": true/false, "policy_followed": true/false,
+  "hallucinations": ["..."], "checklist_failed": ["<exact text of applicable items not met>"],
+  "bad_steps": [<indices of mistaken assistant messages>], "notes": "..."}}"""

@@ -10,9 +10,12 @@ reads the results and the analyzer revises, for at most `analyzer_rounds` versio
 Fidelity to the seed (which failure-context fields changed, which tool results were reused) and decision-cell
 coverage are measured in code and reported as diagnostics; they never reject a trace on their own.
 
+The judge sees each trace's seed, its variation and the harness description, and checks that only the declared
+change was made and that everything depending on it was updated.
+
 Everything lands under <out_dir>/analyzer/: per version harness.md, variations.json, prompt.txt, rationale.md,
 analyzer_raw.json, generated/verified traces, report.json, diagnosis.md; plus ledger.jsonl, system_labels.json,
-all_rounds.json, chosen.json and heldout/.
+all_rounds.json, chosen.{json,txt}, chosen_variations.json, chosen_harness.md and heldout/.
 """
 from __future__ import annotations
 
@@ -76,7 +79,9 @@ def check_variations(variations, labels: dict[str, str]) -> list[str]:
         if not isinstance(v, dict):
             errs.append(f"variation {i} is not an object")
             continue
-        missing = [k for k in VARIATION_KEYS if not v.get(k)]
+        missing = [k for k in VARIATION_KEYS if k != "requires_tools" and not v.get(k)]
+        if not isinstance(v.get("requires_tools"), list):
+            missing.append("requires_tools (a list, may be empty)")
         if missing:
             errs.append(f"variation {i} ({v.get('name')}) lacks {missing}")
         if v.get("name") in names:
@@ -89,8 +94,11 @@ def check_variations(variations, labels: dict[str, str]) -> list[str]:
 
 
 def applicable(variations: list[dict], seed: dict, labels: dict[str, str]) -> list[dict]:
+    """Variations for this seed's inspector whose required tools the seed actually calls."""
     label = next((lab for lab, key in labels.items() if key == system_key(seed.get("system", ""))), None)
-    return [v for v in variations if "all" in v["applies_to"] or label in v["applies_to"]]
+    called = {c["name"] for m in seed["messages"] for c in m.get("tool_calls", [])}
+    return [v for v in variations if ("all" in v["applies_to"] or label in v["applies_to"])
+            and set(v.get("requires_tools") or []) <= called]
 
 
 def fill(template: str, slots: dict[str, str]) -> str:
@@ -165,7 +173,7 @@ def generate_analyzer(cfg: Config, job: dict, seed: dict, template: str, obs: Ob
         discarded.append({"attempt": attempt, "problem": issues, "raw_output": out["content"]})
     trace = to_trace(job, seed, messages)
     trace["meta"] = {"raw_output": out["content"], "format_issues": issues, "attempts": attempt,
-                     "discarded_attempts": discarded, "variation": variation.get("name"),
+                     "discarded_attempts": discarded, "variation": variation.get("name"), "variation_spec": variation,
                      **{k: job.get(k) for k in ("job_id", "seed_id", "strategy", "mode", "version")}}
     trace["meta"]["fidelity"] = fidelity(trace, seed, cfg.tool_result_prefix)
     return trace
@@ -319,10 +327,10 @@ def diagnose(cfg: Config, vdir: Path, version: int, spec: dict, report: dict, ve
                                                                     "hallucinations", "checklist_failed", "notes")},
                "fidelity": t["meta"].get("fidelity")}
         seed = seeds_by_id.get(t["meta"].get("seed_id"))
-        seed_user = next((m["content"] for m in seed["messages"] if m["role"] == "user"), "") if seed else ""
+        seed_text = render(seed, max_obs_chars=1500)[:7000] if seed else "(seed not found)"
         body = render(t, max_obs_chars=1500) if t["messages"] else f"(unparseable output)\n{t['meta'].get('raw_output', '')[:3000]}"
         return (f"### {t['id']} (seed {t['meta'].get('seed_id')}, variation {t['meta'].get('variation')})\n"
-                f"seed first user message: {seed_user[:1500]}\nreasons: {json.dumps(why, ensure_ascii=False)}\n{body[:7000]}")
+                f"SEED:\n{seed_text}\nreasons: {json.dumps(why, ensure_ascii=False)}\nGENERATED:\n{body[:7000]}")
 
     out = chat_json(get_llm(cfg, "diagnose"), "You are a rigorous reviewer of agent training data. Output JSON only.",
                     DIAGNOSE.format(version=version, harness=spec["harness"],
@@ -425,11 +433,21 @@ def _append_ledger(root: Path, verified: list[dict]) -> None:
                                 "reasons": t["meta"]["verify"]["rule_issues"][:5]}, ensure_ascii=False) + "\n")
 
 
-def run_arm(cfg: Config, adir: Path, jobs: list[dict], gen_fn, seeds: list[dict], eval_ng: set) -> dict:
+def expansion_context(trace: dict, seeds_by_id: dict[str, dict], harness: str) -> dict | None:
+    """What the judge needs to check a seed-expansion trace: its seed, its variation, the harness description."""
+    spec = trace["meta"].get("variation_spec")
+    seed = seeds_by_id.get(trace["meta"].get("seed_id"))
+    return {"seed": seed, "variation": spec, "harness": harness} if spec and seed else None
+
+
+def run_arm(cfg: Config, adir: Path, jobs: list[dict], gen_fn, seeds: list[dict], eval_ng: set, harness: str | None = None) -> dict:
+    """harness=None judges without seed context (the Simia baseline arm, which has no seed variation)."""
+    by_id = {s["id"]: s for s in seeds}
     gen = parallel_map(gen_fn, jobs, key=lambda j: j["job_id"], out_path=adir / "generated.jsonl", workers=cfg.workers,
                        done_key=lambda t: t["id"], desc=f"generate {adir.name}")
-    ver = parallel_map(lambda t: verify(cfg, t, eval_ng), gen, key=lambda t: t["id"], out_path=adir / "verified.jsonl",
-                       workers=cfg.workers, desc=f"verify {adir.name}")
+    ver = parallel_map(lambda t: verify(cfg, t, eval_ng, expansion_context(t, by_id, harness) if harness is not None else None),
+                       gen, key=lambda t: t["id"], out_path=adir / "verified.jsonl", workers=cfg.workers,
+                       desc=f"verify {adir.name}")
     report = pilot_report(cfg, ver, seeds)
     (adir / "report.json").write_text(json.dumps(report, indent=1, default=str))
     return report
@@ -454,7 +472,7 @@ def analyze(cfg: Config, dev: list[dict], heldout: list[dict], eval_ng: set) -> 
                              mode="analyzer", version=v)
             (vdir / "jobs.jsonl").write_text("".join(json.dumps(j, ensure_ascii=False) + "\n" for j in jobs))
         report = run_arm(cfg, vdir, jobs, lambda j, t=spec["template"]: generate_analyzer(cfg, j, dev_by_id[j["seed_id"]], t, obs),
-                         dev, eval_ng)
+                         dev, eval_ng, harness=spec["harness"])
         _append_ledger(root, read_jsonl(vdir / "verified.jsonl"))
         versions.append({"version": v, "usable_rate": report["usable_rate"]})
         print(f"analyzer v{v}: usable {report['unique_kept']}/{report['jobs']}, format_ok {report['format_ok']}")
@@ -470,6 +488,7 @@ def analyze(cfg: Config, dev: list[dict], heldout: list[dict], eval_ng: set) -> 
     bdir = root / f"v{best['version']}"
     (root / "chosen.txt").write_text((bdir / "prompt.txt").read_text())
     (root / "chosen_variations.json").write_text((bdir / "variations.json").read_text())
+    (root / "chosen_harness.md").write_text((bdir / "harness.md").read_text())
     (root / "chosen.json").write_text(json.dumps(chosen, indent=1))
     return chosen
 
@@ -501,7 +520,8 @@ def compare_heldout(cfg: Config, root: Path, template: str, variations: list[dic
     hdir = root / "heldout"
     jobs = plan_jobs("heldout-analyzer", heldout, n, variations, labels, [], mode="analyzer")
     rep = {"analyzer": run_arm(cfg, hdir / "analyzer", jobs,
-                               lambda j: generate_analyzer(cfg, j, by_id[j["seed_id"]], template, obs), heldout, eval_ng)}
+                               lambda j: generate_analyzer(cfg, j, by_id[j["seed_id"]], template, obs), heldout, eval_ng,
+                               harness=(root / "chosen_harness.md").read_text())}
     base = copy.deepcopy(cfg)
     base.simia_prompt, base.prompt_source = "fixed", "simia"
     base.features.strategies = base.features.retrieval = False

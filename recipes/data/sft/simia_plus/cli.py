@@ -181,6 +181,13 @@ def cmd_reparse(cfg: Config) -> list[dict]:
 def cmd_verify(cfg: Config) -> list[dict]:
     gen = read_jsonl(_p(cfg, "generated.jsonl"))
     eval_ng = _eval_ngrams(cfg)
+    if cfg.prompt_source == "analyzer":  # seed-expansion traces are judged against their seed and variation
+        from .analyzer import expansion_context
+
+        seeds = {s["id"]: s for s in _load_seeds(cfg)}
+        harness = _p(cfg, "analyzer/chosen_harness.md").read_text()
+        return parallel_map(lambda t: verify(cfg, t, eval_ng, expansion_context(t, seeds, harness)), gen,
+                            key=lambda t: t["id"], out_path=_p(cfg, "verified.jsonl"), workers=cfg.workers, desc="verify")
     return parallel_map(lambda t: verify(cfg, t, eval_ng), gen, key=lambda t: t["id"],
                         out_path=_p(cfg, "verified.jsonl"), workers=cfg.workers, desc="verify")
 

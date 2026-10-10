@@ -45,8 +45,8 @@
 Total spend ≈ $0.75. Run outputs are in the session scratchpad (not durable). Rerun via `configs/` and the gateway settings above.
 
 **Open issues**
-- Seed-expansion pilot not run yet (needs the user's go-ahead); config to write: `harness_paths` (agentic-test `failure_analyzer/tools`, `catalog/cause_catalog.json`, `check_specs.py`, `shaping.py`, `fde-ft/tool_defs.json`), `tool_arg_defaults`, `tool_result_shapes`, `tool_result_prefix: "^\\[obs:(\\d+)\\] "`, a fidelity item in the checklist.
-- Judge is lenient (passes ~all); usable rate does not separate versions.
+- Seed-expansion pilot not run yet (needs the user's go-ahead). Config ready: `fde-work/sft-analyzer-pilot/pilot_expand.json` (fresh `out_expand/`, same split copied in; harness = agentic-test `failure_analyzer/tools`, `cause_catalog.json`, `check_specs.py`, `shaping.py`, `fde-ft/tool_defs.json`, ~114k chars). With its arg defaults, result shapes and prefix, all 17 seeds pass every code check. Run: `ingest` then `analyze`.
+- Judge was lenient (passed ~all) when it could not see the seed; now it gets seed + variation + harness. Still uncalibrated against known-bad traces.
 - 17 reviewed seeds bound how many distinct situations exist; measure coverage (decision cells) before scaling.
 - No held-out evaluation and no training test yet.
 

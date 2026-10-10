@@ -17,16 +17,16 @@ analyzer → prompt + variations → generator (one seed + one variation per job
 
 **Output per version:**
 - `harness.md`: task, contracts, tool contracts with exact result shapes, evidence→answer rules, unknowns. Every claim is tagged `[established: file]`, `[inferred]` or `[unknown]`.
-- `variations.json`: 6–12 objects with `name, applies_to, teaches, change, preserve, dependencies, correct_when`. Each changes what the agent must notice or decide; none are cosmetic. The analyzer proposes them, so no human labelling is needed.
+- `variations.json`: 6–12 objects with `name, applies_to, requires_tools, teaches, change, preserve, dependencies, correct_when`. Each changes what the agent must recognize, handle or justify; the correct answer may stay the same. None are cosmetic. The analyzer proposes them, so no human labelling is needed.
 - `prompt.txt`: the template.
 - `rationale.md` and `analyzer_raw.json`.
 
 **Checks on the analyzer's output** (up to 3 tries, with errors fed back):
-- required slots `{seed_trace}`, `{variation}`, `{generation_id}`; optional `{tools}`, `{system_prompt}`, `{obs_examples}`; no unknown slots; no held-out seed text;
+- required slots `{seed_trace}`, `{variation}`, `{system_prompt}`, `{tools}`, `{generation_id}`; optional `{obs_examples}`; no unknown slots; no held-out seed text;
 - at least 3 variations, all keys present, valid labels.
 
 ## Jobs
-- Round-robin over dev seeds. Each job gets the applicable variation tried least often with that seed, counted over all rounds in `ledger.jsonl`.
+- Round-robin over dev seeds. A variation is applicable when it matches the seed's inspector (`applies_to`) and the seed actually calls its `requires_tools`. Each job gets the applicable variation tried least often with that seed, counted over all rounds in `ledger.jsonl`.
 - Jobs are planned once per version (`vN/jobs.jsonl`), so a resumed run keeps them.
 
 ## Output format (fixed)
@@ -39,10 +39,11 @@ analyzer → prompt + variations → generator (one seed + one variation per job
 - **Tool result shape:** each result must be one of that tool's real top-level shapes (`tool_result_shapes`, taken from the harness code) and carry the harness prefix with a running index (`tool_result_prefix`).
 - **Final answer** matches the schema of its system prompt's contract (`answer_schemas_path`).
 - **ID provenance.**
-- **Judge:** fixed checklist from config. Missing fields fail closed.
+- **Judge:** sees the seed (as a reference, not an answer key), the variation and the harness description. It quotes the deciding messages for each judgement, then decides `only_declared_change`, `dependencies_updated`, `tool_contracts_respected` and `task_success` (under `correct_when`), plus the fixed checklist from config. Missing fields fail closed.
 - **Dedup:** exact plus near, within a round and across all rounds (`all_rounds.json`).
 
 ## Diagnostics (reported, never reject on their own)
+- **Diagnosis** reads each sampled trace next to its full seed.
 - **Fidelity to the seed:** which failure-context fields changed, platform changes, the share of seed tool results reused, no-op outputs.
 - **Per-variation results:** jobs, kept, no-op.
 - **Decision cells:** evidence seen so far → action, per assistant turn. Reports the distinct count, max repeats, and how many cells are not in the seeds.

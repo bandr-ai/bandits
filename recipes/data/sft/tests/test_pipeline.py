@@ -72,10 +72,10 @@ class FakeLLM:
         if self.role == "generator":
             return {"content": SIMIA_OUT, "tool_calls": []}
         if self.role == "analyzer":
-            vs = [{"name": f"var{k}", "applies_to": ["all"] if k else ["S1"], "teaches": "t", "change": "c", "preserve": "p",
-                   "dependencies": "d", "correct_when": "w"} for k in range(3)]
+            vs = [{"name": f"var{k}", "applies_to": ["all"] if k else ["S1"], "requires_tools": ["get_order"] if k == 2 else [],
+                   "teaches": "t", "change": "c", "preserve": "p", "dependencies": "d", "correct_when": "w"} for k in range(3)]
             return {"content": json.dumps({"harness": "## tools [established: x]", "variations": vs,
-                                           "template": "Seed:\n{seed_trace}\nApply: {variation}\nTools: {tools}\n{generation_id}",
+                                           "template": "Seed:\n{seed_trace}\nApply: {variation}\nPolicy: {system_prompt}\nTools: {tools}\n{generation_id}",
                                            "rationale": "seeds are order-support chats"}), "tool_calls": []}
         if self.role == "diagnose":
             return {"content": json.dumps({"notes": "- all fine"}), "tool_calls": []}
@@ -114,6 +114,8 @@ class FakeLLM:
             return {"content": json.dumps({"result": {"order_id": "#W3000", "status": "pending"}, "ops": []}), "tool_calls": []}
         if self.role == "judge":
             return {"content": json.dumps({"task_success": True, "final_state": {"orders": {"#W3000": {"status": "cancelled"}}},
+                                           "only_declared_change": True, "dependencies_updated": True,
+                                           "tool_contracts_respected": True,
                                            "obs_consistent": True, "user_realistic": True, "policy_followed": True,
                                            "hallucinations": [], "checklist_failed": [], "bad_steps": []}), "tool_calls": []}
         if self.role == "seed_check":
@@ -392,6 +394,8 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
     assert json.loads((a / "all_rounds.json").read_text())["kept_all_rounds"] == 12
     seen = " ".join(m["content"] for c in fake_llms["analyzer"].seen for m in c)
     assert all(h not in seen for h in split["heldout"])
+    judged = fake_llms["judge"].seen[0][-1]["content"]
+    assert "<seed>" in judged and '"name": "var' in judged and "## tools [established: x]" in judged
     cli.main(["heldout", "--config", cfg_path])
     cmp = json.loads((a / "heldout" / "comparison.json").read_text())
     assert set(cmp) == {"analyzer", "simia_fixed"} and cmp["simia_fixed"]["jobs"] == 2
@@ -435,8 +439,9 @@ def test_fidelity_reports_changed_context_and_reuse():
 
 def test_analyzer_lint_and_strict_format():
     from simia_plus.analyzer import lint, parse_output
-    assert lint("x {seed_trace} {variation} {generation_id}") == []
-    assert lint("x {seed_trace} {variation} {foo}") == ["missing required slot {generation_id}", "unknown slot {foo}"]
+    full = "x {seed_trace} {variation} {system_prompt} {tools} {generation_id}"
+    assert lint(full) == []
+    assert lint(full.replace("{generation_id}", "{foo}")) == ["missing required slot {generation_id}", "unknown slot {foo}"]
     assert parse_output('Plan: ...\n{"messages": []}')[1][0].startswith("format: not a single JSON")
     msgs, issues = parse_output(json.dumps({"messages": [{"role": "tool", "tool_call_id": "c1", "content": {"a": 1}}]}))
     assert msgs is None and "string content" in issues[0]
@@ -459,3 +464,21 @@ def test_answer_schema_and_judge_fail_closed(tmp_path, fake_llms):
     set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps({"task_success": True}),
                                                                                   "tool_calls": []}})())
     assert verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]["kept"] is False
+
+
+def test_variation_prerequisites_and_expansion_judge_fails_closed(tmp_path):
+    from simia_plus.analyzer import applicable
+    from simia_plus.verify import system_key, verify
+    s = from_sharegpt(seed(0), 0)
+    labels = {"S1": system_key(s["system"])}
+    vs = [{"name": "a", "applies_to": ["all"], "requires_tools": []},
+          {"name": "b", "applies_to": ["S1"], "requires_tools": ["get_order"]},
+          {"name": "c", "applies_to": ["all"], "requires_tools": ["refund_order"]},
+          {"name": "d", "applies_to": ["S2"], "requires_tools": []}]
+    assert [v["name"] for v in applicable(vs, s, labels)] == ["a", "b"]
+    cfg = load_config(write_cfg(tmp_path, {"judge": True}, target=1, keep_failures=False))
+    old = {"task_success": True, "obs_consistent": True, "policy_followed": True, "hallucinations": [], "checklist_failed": []}
+    set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps(old), "tool_calls": []}})())
+    assert verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]["kept"] is True
+    ctx = {"seed": s, "variation": vs[0], "harness": "h"}
+    assert verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]["kept"] is False  # fidelity fields missing
