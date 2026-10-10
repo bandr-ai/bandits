@@ -402,6 +402,9 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
     assert all(h not in seen for h in split["heldout"])
     judged = fake_llms["judge"].seen[0][-1]["content"]
     assert "<seed note=" in judged and '"name": "var' in judged and "## tools [established: x]" in judged
+    cli.main(["review", "--config", cfg_path])
+    page = (a / "review.html").read_text()
+    assert page.count('<details class="trace"') == 12 and "<ins>" in page
     cli.main(["heldout", "--config", cfg_path])
     cmp = json.loads((a / "heldout" / "comparison.json").read_text())
     assert set(cmp) == {"analyzer", "simia_fixed"} and cmp["simia_fixed"]["jobs"] == 2

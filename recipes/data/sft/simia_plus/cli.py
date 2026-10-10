@@ -98,6 +98,14 @@ def cmd_analyze(cfg: Config) -> dict:
     return analyze(cfg, _load_seeds(cfg), read_jsonl(_p(cfg, "heldout.jsonl")), _eval_ngrams(cfg))
 
 
+def cmd_review(cfg: Config) -> None:
+    """Local HTML: every analyzer trace next to its seed, aligned, with changes highlighted and the judge's verdicts."""
+    from .review import build_review
+
+    out = build_review(_p(cfg, "analyzer"), _load_seeds(cfg))
+    print(f"review: {out}")
+
+
 def cmd_heldout(cfg: Config) -> dict:
     """Chosen analyzer version vs simia_prompt=fixed on the held-out seeds. Separate on purpose: looking at held-out
     results turns those seeds into dev data, so this runs only when explicitly asked for."""
@@ -242,7 +250,7 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="simia-plus", description=__doc__)
-    ap.add_argument("command", choices=["ingest", "analyze", "heldout", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
+    ap.add_argument("command", choices=["ingest", "analyze", "review", "heldout", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
@@ -260,7 +268,7 @@ def main(argv: list[str] | None = None) -> None:
             cmd_verify(cfg)
             cmd_select(cfg)
         else:
-            {"ingest": cmd_ingest, "analyze": cmd_analyze, "heldout": cmd_heldout, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
+            {"ingest": cmd_ingest, "analyze": cmd_analyze, "review": cmd_review, "heldout": cmd_heldout, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
              "reparse": cmd_reparse, "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
     except BaseException as e:
         status = f"error: {type(e).__name__}: {e}"
