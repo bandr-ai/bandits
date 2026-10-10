@@ -9,7 +9,7 @@ from simia_plus import cli
 from simia_plus.config import load_config
 from simia_plus.llm import extract_json, set_llm_factory
 from simia_plus.prompts import JUDGE_CHECKS
-from simia_plus.schema import from_sharegpt, load_trace, to_sharegpt
+from simia_plus.schema import from_sharegpt, load_trace, render, to_sharegpt
 from simia_plus.simia_text import build_sample_text, parse_simia_text
 from simia_plus.state import apply_ops, state_match
 from simia_plus.verify import provenance_check, rule_check
@@ -506,3 +506,19 @@ def test_expansion_judge_needs_verifiable_excerpts(tmp_path):
     v = run("the order was refunded")  # quote that occurs nowhere
     assert v["kept"] is False and "task_success" in v["judge"]["unverified_excerpts"]
     assert run("please cancel order #W1000", verdict="cannot_determine")["kept"] is False
+
+
+def test_judge_excerpts_tolerate_quoting_style_not_invention():
+    from simia_plus.verify import _grounded, _norm, _trigrams
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][2]["content"] = '[obs:1] {"status": "success", "read": "{\\"answer\\": \\"No keyboard visible; field fully shown\\"}"}'
+    corpus = _norm(render(t, max_obs_chars=10**6))
+    grams = _trigrams(corpus)
+
+    def ok(x):
+        return _grounded({"evidence": [{"excerpt": x}]}, corpus, grams)[0]
+
+    assert ok('"answer": "No keyboard visible; field fully shown"')  # unescaped JSON, wrapping quotes
+    assert ok('Hi, please cancel ... order #W1000')  # elision
+    assert not ok("the HAR shows three pending requests")  # invented
+    assert not ok("")

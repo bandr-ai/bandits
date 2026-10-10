@@ -1,0 +1,183 @@
+{
+ "seeds_path": "<projects>/fde-work/sft-analyzer-pilot/seeds_golden.jsonl",
+ "tool_defs_path": "<projects>/fde-ft/tool_defs.json",
+ "out_dir": "<projects>/fde-work/sft-analyzer-pilot/out_expand",
+ "prompt_source": "analyzer",
+ "simia_prompt": "fixed",
+ "generation_attempts": 3,
+ "holdout_frac": 0.3,
+ "analyzer_seeds": 20,
+ "analyzer_rounds": 3,
+ "pilot_jobs": 20,
+ "heldout_jobs_per_seed": 3,
+ "answer_schemas_path": "<projects>/fde-work/sft-analyzer-pilot/answer_schemas.json",
+ "outcome_fields": [
+  "conclusion",
+  "root_cause"
+ ],
+ "keep_failures": false,
+ "workers": 8,
+ "features": {
+  "provenance": true,
+  "judge": true,
+  "near_dedup": true
+ },
+ "checklist": [
+  "Every tool call argument uses values from the task context, the system prompt, or earlier tool results; nothing is invented.",
+  "Each tool result contains only what that tool could actually return (a HAR query returns requests; history returns recorded steps; a screenshot comparison returns a visual read of the screenshot). A result does not state the inspector's verdict, root cause, or confidence unless that tool is designed to answer that exact question.",
+  "Tool results are consistent with each other and with the failure context in the user message.",
+  "The final JSON conclusion, root_cause and confidence are supported by evidence visible in earlier tool results or the context; a weak or contradictory evidence base gives a low confidence or the cautious conclusion the system prompt prescribes.",
+  "The assistant follows the system prompt's investigation guidance (uses the tools it names when they are relevant) and answers only its own question."
+ ],
+ "models": {
+  "default": {
+   "model": "openrouter/deepseek/deepseek-v4.1-flash",
+   "base_url": "https://ai-gateway-staging.testsigma.com/v1",
+   "api_key_env": "LITE_LLM_KEY",
+   "temperature": 1.0,
+   "max_tokens": 32000,
+   "extra": {
+    "extra_body": {
+     "provider": {
+      "only": [
+       "relace"
+      ],
+      "allow_fallbacks": false
+     }
+    }
+   }
+  },
+  "judge": {
+   "model": "openrouter/deepseek/deepseek-v4.1-flash",
+   "base_url": "https://ai-gateway-staging.testsigma.com/v1",
+   "api_key_env": "LITE_LLM_KEY",
+   "temperature": 0,
+   "max_tokens": 32000,
+   "extra": {
+    "extra_body": {
+     "provider": {
+      "only": [
+       "relace"
+      ],
+      "allow_fallbacks": false
+     }
+    }
+   }
+  }
+ },
+ "harness_paths": [
+  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/tools",
+  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/catalog/cause_catalog.json",
+  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/check_specs.py",
+  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/shaping.py",
+  "<projects>/fde-ft/tool_defs.json"
+ ],
+ "tool_arg_defaults": {
+  "a11y_search": {
+   "side": "runtime",
+   "role": "",
+   "name": ""
+  },
+  "locator_probe": {
+   "side": "runtime"
+  },
+  "query_har": {
+   "query": "summary"
+  },
+  "walk_history": {
+   "source": "test_steps"
+  },
+  "compare_screenshots": {
+   "question": ""
+  }
+ },
+ "tool_result_shapes": {
+  "*": [
+   [
+    "status",
+    "message"
+   ]
+  ],
+  "a11y_search": [
+   [
+    "status",
+    "available",
+    "count",
+    "nodes"
+   ],
+   [
+    "status",
+    "available",
+    "count",
+    "nodes",
+    "reason"
+   ]
+  ],
+  "compare_screenshots": [
+   [
+    "status",
+    "available",
+    "read"
+   ],
+   [
+    "status",
+    "available",
+    "message"
+   ]
+  ],
+  "locator_probe": [
+   [
+    "status",
+    "side",
+    "result",
+    "count",
+    "available"
+   ],
+   [
+    "status",
+    "side",
+    "result",
+    "count",
+    "available",
+    "reason"
+   ]
+  ],
+  "query_har": [
+   [
+    "status",
+    "available"
+   ],
+   [
+    "status",
+    "available",
+    "engine_counts"
+   ],
+   [
+    "status",
+    "available",
+    "pending"
+   ],
+   [
+    "status",
+    "available",
+    "failures"
+   ],
+   [
+    "status",
+    "available",
+    "total_entries",
+    "pending_count",
+    "oldest_pending_ms",
+    "failure_count"
+   ]
+  ],
+  "walk_history": [
+   [
+    "status",
+    "available",
+    "items"
+   ]
+  ]
+ },
+ "tool_result_prefix": "^\\[obs:(\\d+)\\] "
+}

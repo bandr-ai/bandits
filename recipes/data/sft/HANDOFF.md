@@ -45,8 +45,8 @@
 Total spend ≈ $0.75. Run outputs are in the session scratchpad (not durable). Rerun via `configs/` and the gateway settings above.
 
 **Open issues**
-- Seed-expansion pilot not run yet (needs the user's go-ahead). Config ready: `fde-work/sft-analyzer-pilot/pilot_expand.json` (fresh `out_expand/`, same split copied in; harness = agentic-test `failure_analyzer/tools`, `cause_catalog.json`, `check_specs.py`, `shaping.py`, `fde-ft/tool_defs.json`, ~114k chars). With its arg defaults, result shapes and prefix, all 17 seeds pass every code check. Run: `ingest` then `analyze`.
-- Judge was lenient (passed ~all) when it could not see the seed; now it gets seed + variation + harness. Still uncalibrated against known-bad traces.
+- Seed-expansion pilot not run yet (needs the user's go-ahead). Config ready: `fde-work/sft-analyzer-pilot/pilot_expand.json` (copy with scrubbed paths in `pilots/next-seed-expansion/`) (fresh `out_expand/`, same split copied in; harness = agentic-test `failure_analyzer/tools`, `cause_catalog.json`, `check_specs.py`, `shaping.py`, `fde-ft/tool_defs.json`, ~114k chars). With its arg defaults, result shapes and prefix, all 17 seeds pass every code check. Run: `ingest` then `analyze`.
+- Judge was lenient (passed ~all) when it could not see the seed; now it gets seed + variation + harness. Smoke test (`fde-work/sft-analyzer-pilot/judge_smoke.py`, 5 hand-built cases from 2 dev seeds x 2 runs, $0.03): 10/10 as expected after fixing excerpt matching (judge quotes unescape JSON and use "..."; matching now tolerates that, invented quotes still fail). Unchanged seed and a legit evidence change pass; fake tool shape (code), unsupported cause and undeclared platform drift fail. Tiny sample, not a calibration.
 - 17 reviewed seeds bound how many distinct situations exist; measure coverage (decision cells) before scaling.
 - No held-out evaluation and no training test yet.
 

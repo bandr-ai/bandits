@@ -211,14 +211,32 @@ EXPANSION_CHECKS = ("only_declared_change", "dependencies_updated", "tool_contra
 
 
 def _norm(x) -> str:
-    return " ".join(str(x).split()).lower()
+    """Lowercase, no backslashes (JSON inside tool results is quoted with escapes the judge drops), single spaces."""
+    return " ".join(str(x).replace("\\", "").split()).lower()
 
 
-def _grounded(item: dict, corpus: str) -> tuple[bool, list[str]]:
-    """A verdict counts as grounded when it cites at least one excerpt and every excerpt occurs in the corpus."""
+def _trigrams(text: str) -> set[tuple]:
+    words = re.findall(r"\w+", text)
+    return {tuple(words[i:i + 3]) for i in range(len(words) - 2)}
+
+
+def _grounded(item: dict, corpus: str, corpus_grams: set[tuple]) -> tuple[bool, list[str]]:
+    """A verdict counts as grounded when it cites at least one excerpt and every excerpt is found in the corpus:
+    each piece between "..." elisions verbatim, or with at least 80% of its word trigrams present (tolerates wrapping
+    quotes and a skipped key, not invented content). Pieces under 3 words only count when nothing longer is quoted."""
     ev = item.get("evidence") if isinstance(item, dict) else None
     excerpts = [e.get("excerpt", "") for e in ev or [] if isinstance(e, dict)]
-    missing = [x for x in excerpts if not _norm(x) or _norm(x) not in corpus]
+    missing = []
+    def piece_found(text: str) -> bool:
+        grams = _trigrams(text)
+        return text in corpus or bool(grams) and len(grams & corpus_grams) / len(grams) >= 0.8
+
+    for x in excerpts:
+        pieces = [p for p in (_norm(q) for q in str(x).replace("…", "...").split("...")) if re.search(r"\w", p)]
+        # "..." marks an elision: each piece must be found; one-word scraps between elisions carry no evidence
+        checked = [p for p in pieces if len(re.findall(r"\w+", p)) >= 3] or pieces
+        if not checked or not all(piece_found(p) for p in checked):
+            missing.append(x)
     return bool(excerpts) and not missing, missing
 
 
@@ -236,13 +254,14 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
     if not isinstance(out, dict):
         raise TypeError("judge returned non-object JSON")
     corpus = _norm(render(trace, max_obs_chars=10**7)) + "\n" + _norm(render(expansion["seed"], max_obs_chars=10**7))
+    corpus_grams = _trigrams(corpus)
     checks = out.get("checks") if isinstance(out.get("checks"), dict) else {}
     unverified: dict[str, list[str]] = {}
 
     def passed(name: str, item) -> bool:
         if not isinstance(item, dict) or item.get("verdict") != "pass":
             return False
-        ok, missing = _grounded(item, corpus)
+        ok, missing = _grounded(item, corpus, corpus_grams)
         if not ok:
             unverified[name] = missing or ["(no excerpt)"]
         return ok
