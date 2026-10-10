@@ -66,10 +66,10 @@
   }
  },
  "harness_paths": [
-  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/tools",
-  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/catalog/cause_catalog.json",
-  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/check_specs.py",
-  "<projects>/fde-work/references/agentic-test/src/failure_analyzer/shaping.py",
+  "<projects>/fde-work/references/agentic-test-e2b674d/src/failure_analyzer/tools",
+  "<projects>/fde-work/references/agentic-test-e2b674d/src/failure_analyzer/catalog/cause_catalog.json",
+  "<projects>/fde-work/references/agentic-test-e2b674d/src/failure_analyzer/check_specs.py",
+  "<projects>/fde-work/references/agentic-test-e2b674d/src/failure_analyzer/shaping.py",
   "<projects>/fde-ft/tool_defs.json"
  ],
  "tool_arg_defaults": {

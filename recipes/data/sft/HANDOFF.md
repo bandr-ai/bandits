@@ -20,6 +20,7 @@
 **fde seeds**
 - Stored in gateway-log format (`final_messages` + `turns`). Tools are names only, so set `tool_defs_path` to `fde-ft/tool_defs.json`.
 - 4/17 seeds call `a11y_search` without `role`/`name`: valid, the harness fills them from `arg_defaults` (`tools/_base.py`). Set `tool_arg_defaults`.
+- Harness version must match the seeds. Seeds were recorded 2026-09-26..28 (UUIDv7 ids); their system prompts match agentic-test prompts.py from 02f9400e (09-25), and failure_analyzer is unchanged from there to e2b674d (09-28). `harness_paths` point at a detached worktree `fde-work/references/agentic-test-e2b674d`, not the live checkout: main later changed the blocker rule (modal / `blocks_interaction`, b615e3bb 09-29) and identity confirmation (RFC-043, 10-07). The v1-v3 expansion pilot used main @ 3fd5e445; no new-rule fields leaked into its outputs.
 - `query_har` / `walk_history` only ever return `available:false` in the seeds; generators invent their success shapes unless given `tool_result_shapes` and the harness source.
 
 **Release 1 checks**
