@@ -329,3 +329,14 @@ def test_orphan_tool_results_are_rejected():
     t["messages"][1]["tool_calls"] = []  # call lost, result kept
     issues = rule_check(t, 2)
     assert any("without a matching call" in i for i in issues) or any("empty assistant turn" in i for i in issues)
+
+
+def test_inserted_prompt_blocks_have_no_template_escapes(tmp_path, fake_llms):
+    from simia_plus.banks import ObsBank, UserBank
+    from simia_plus.config import load_config
+    from simia_plus.generate import simia_prompt
+    cfg = load_config(write_cfg(tmp_path, {"retrieval": True, "failure": True}, target=1))
+    s = load_trace(seed(0), 0)
+    p = simia_prompt(cfg, {"job_id": "j", "seed_id": "s0", "strategy": "new_scenario", "failure": {"at_call": 1, "type": "timeout"}},
+                     s, {"s0": s}, ObsBank.from_traces([s]), UserBank.from_traces([s]))
+    assert "{{" not in p and "}}" not in p

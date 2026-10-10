@@ -79,7 +79,7 @@ OBSERVATION: [tool result]
 BLOCK_FORMAT = """
 ## Format Rules (common errors to avoid):
 1. The conversation MUST start with a HUMAN turn. It is the task input: write it in exactly the same form as the example's first HUMAN turn (same structure and fields), with NEW values for a NEW case.
-2. One tool call per FUNCTION_CALL turn, as one JSON object {{"name": ..., "arguments": {{...}}}}. For calls made in parallel, write consecutive FUNCTION_CALL turns, then their OBSERVATION turns in the same order.
+2. One tool call per FUNCTION_CALL turn, as one JSON object {"name": ..., "arguments": {...}}. For calls made in parallel, write consecutive FUNCTION_CALL turns, then their OBSERVATION turns in the same order.
 3. Never write <tool_call>, <tool_response> or similar tags, and never put a JSON list in a FUNCTION_CALL turn.
 4. Every OBSERVATION must match the format of the example's results exactly (same prefixes, field names and JSON shape); only the values change.
 5. The final ASSISTANT turn must follow the output format the system prompt requires (if it requires a JSON object, output only that object).
