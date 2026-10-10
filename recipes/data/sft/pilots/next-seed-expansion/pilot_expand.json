@@ -63,6 +63,23 @@
      }
     }
    }
+  },
+  "blind": {
+   "model": "openrouter/deepseek/deepseek-v4.1-flash",
+   "base_url": "https://ai-gateway-staging.testsigma.com/v1",
+   "api_key_env": "LITE_LLM_KEY",
+   "temperature": 0,
+   "max_tokens": 32000,
+   "extra": {
+    "extra_body": {
+     "provider": {
+      "only": [
+       "relace"
+      ],
+      "allow_fallbacks": false
+     }
+    }
+   }
   }
  },
  "harness_paths": [

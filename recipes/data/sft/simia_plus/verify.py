@@ -310,10 +310,19 @@ def turn_issues(trace: dict, turns) -> list[str]:
         if not isinstance(refs, list) or not refs:
             issues.append(f"turn {i} cites nothing (relies_on must list earlier messages or \"system\")")
             continue
-        bad = [r for r in refs if r != "system" and not (str(r).isdigit() and int(r) < i)]
+        bad = [r for r in refs if r != "system" and not (_msg_no(r) is not None and 0 <= _msg_no(r) < i)]
         if bad:
             issues.append(f"turn {i} cites messages not before it: {bad}")
     return issues
+
+
+def _msg_no(r) -> int | None:
+    """A cited message number: an int (or integral float) or a digit string; anything else is not a message."""
+    if isinstance(r, bool):
+        return None
+    if isinstance(r, int) or (isinstance(r, float) and r.is_integer()):
+        return int(r)
+    return int(r) if isinstance(r, str) and r.strip().isdigit() else None
 
 
 def _categorical_fields(schema: dict | None, fallback: list[str]) -> list[str]:
