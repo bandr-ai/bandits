@@ -281,3 +281,135 @@ Output format:
 - If should end, output "[TERMINATE]"
 
 Please directly generate the next message without the prefix "User/Tool response":"""
+
+
+# ---- Analyzer (ANALYZER_SPEC.md): an agent writes the whole generation prompt from the seeds ----
+# Seed expansion, not invention: each job keeps one real seed's situation and applies one assigned variation.
+# Code fills the per-job slots and appends OUTPUT_FORMAT, the one part the analyzer cannot change.
+ANALYZER_SLOTS = ("seed_trace", "variation", "tools", "system_prompt", "obs_examples", "generation_id")
+ANALYZER_REQUIRED_SLOTS = ("seed_trace", "variation", "generation_id")
+VARIATION_KEYS = ("name", "applies_to", "teaches", "change", "preserve", "dependencies", "correct_when")
+
+ANALYZER = """You design a synthetic-data generator that EXPANDS real, reviewed trajectories (seeds) of one agent into more
+supervised fine-tuning trajectories for that same agent. The fine-tuned model learns each assistant turn: which tool
+call to make given what it has seen, and the final answer given the evidence.
+
+SEED EXPANSION, NOT INVENTION. Every generated trajectory starts from ONE real seed and keeps the seed's real situation
+(platform, app or site, page, element, failure context, wording style, the real tool results) except what ONE assigned
+variation changes. Everything that depends on that change must be updated consistently: later tool calls, their
+results, the final answer. Tool results the change does not affect stay exactly as in the seed. The outcome follows
+from the evidence under the harness rules; never choose the outcome first and fit the evidence to it. A trajectory
+in a made-up world that only resembles the seed is a failure.
+
+Study, in this order: the HARNESS SOURCE (the agent's real implementation: tool code with its exact output shapes,
+answer contracts, answer-shaping rules, cause catalog), then the SEEDS (reviewed good behaviour), then the real tool
+results. The harness source is established fact; what you only infer from the seeds is a hypothesis.
+
+Produce three things.
+
+1. "harness": markdown that makes your understanding inspectable: the agent's task; its input and output contracts;
+   for EVERY tool, what it can and cannot observe and its exact result shape for every outcome (success, empty,
+   unavailable, error), including the "[obs:N] " prefix; the evidence-to-answer rules (what supports each
+   conclusion/cause, when the answer must stay cautious); and the unknowns. Tag every claim [established: <file>]
+   (harness source or schemas), [inferred] (seen in seeds only) or [unknown]. Do not turn unknowns into rules.
+
+2. "variations": 6-12 controlled transformations of a seed. Each one changes what the agent must notice or decide
+   (an evidence source becomes unavailable, an observation now supports a different reading, an obstruction covers
+   or clears the target, two sources disagree, a different element or step on the same page, ...). No cosmetic
+   variations (renaming, rewording). Mostly ordinary realistic changes, plus a few decision-boundary cases taken from
+   rules and incidents the harness source documents; never invent rules. Each variation is an object:
+   {{"name": "<short_snake_case>", "applies_to": ["S1", ...] or ["all"] (system prompt labels below),
+     "teaches": "<the behaviour this demonstrates>", "change": "<what changes vs the seed>",
+     "preserve": "<what must stay exactly as in the seed>", "dependencies": "<what must be updated to stay consistent>",
+     "correct_when": "<the evidence that makes the final answer correct under the harness rules>"}}
+
+3. "template": the ENTIRE instruction the generator sees for one job. Code fills these slots; write each as {{name}}:
+   - {{seed_trace}} (REQUIRED): the job's seed as {{"messages": [...]}} JSON
+   - {{variation}} (REQUIRED): the ONE variation assigned to this job, as JSON
+   - {{generation_id}} (REQUIRED): a unique id for the job
+   - {{system_prompt}}: the seed agent's system prompt (defines its question and output contract)
+   - {{tools}}: the seed agent's tool schemas (JSON)
+   - {{obs_examples}}: real recorded tool results from other seeds, for exact result formats
+   Use no other {{...}} slots. Literal braces are fine as long as they do not form {{word}}. Do NOT describe the
+   output format: code appends a fixed block requiring one JSON object {{"messages": [...]}}. The template must make
+   the generator apply exactly the assigned variation to the seed and nothing else.
+
+HARNESS SOURCE:
+{harness}
+
+SEEDS ({n_seeds} reviewed trajectories; system prompts shown once, labelled S1..Sn):
+{seeds}
+
+TOOL SCHEMAS:
+{tools}
+
+REAL TOOL RESULTS (sample):
+{obs}
+{revision}
+Return JSON only: {{"harness": "<markdown>", "variations": [...], "template": "<the full template>",
+"rationale": "<markdown: what you learned and why the template and variations look as they do{rationale_extra}>"}}"""
+
+ANALYZER_REVISION = """
+PREVIOUS VERSION (v{version}):
+harness:
+{harness}
+
+variations:
+{variations}
+
+template:
+{template}
+
+DIAGNOSIS OF ITS PILOT (from a separate reviewer):
+{notes}
+
+Write the next version of all three: fix what the diagnosis found without breaking what worked. Drop or repair
+variations that kept failing; keep the ones that worked.
+"""
+
+OUTPUT_FORMAT = """
+
+## Output format (fixed)
+Return ONE JSON object and nothing else (no prose, no markdown fences, no planning text):
+{"messages": [
+  {"role": "user", "content": "..."},
+  {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "<tool>", "arguments": {...}}]},
+  {"role": "tool", "tool_call_id": "call_1", "content": "<the tool's result as a string>"},
+  {"role": "assistant", "content": "<final reply>"}
+]}
+Rules: roles are only user, assistant, tool. "arguments" is a JSON object. Every tool call gets exactly one tool
+message with its id, right after the assistant message that made the call. Tool "content" is a string. The last
+message is an assistant reply with no tool calls."""
+
+DIAGNOSE = """You review a pilot of a seed-expansion generator. Each job took ONE real reviewed seed and ONE assigned
+variation; the output should be the seed's real situation with exactly that change, every dependent detail updated,
+and the answer following from the evidence. Find what makes outputs rejected, wrong, or weak as training data, and
+what the generator prompt or the variations should change. Look especially for:
+- drift: changes the variation did not ask for (new site, platform, element, story), or a made-up world;
+- dependencies not updated (a changed observation whose later calls or final answer still follow the seed);
+- tool results that do not match the tool's real contract or shape (see HARNESS), or state a verdict the tool cannot know;
+- final answers the evidence does not support (especially named causes without their detecting evidence);
+- variations that are cosmetic, keep failing, or never change a decision.
+Do not recommend banning or blacklisting seed content: staying close to the seed is the goal. Judge from the traces.
+
+HARNESS (the analyzer's description):
+{harness}
+
+VARIATIONS:
+{variations}
+
+GENERATOR TEMPLATE (v{version}):
+{template}
+
+PILOT REPORT:
+{report}
+
+REJECTED TRACES ({n_rejected} shown of {total_rejected}), each with its seed's first user message, its variation and
+its rejection reasons:
+{rejected}
+
+KEPT TRACES ({n_kept} shown of {total_kept}):
+{kept}
+
+Return JSON only: {{"notes": "<markdown: concrete failure patterns with trace ids and counts, per-variation verdicts
+(keep / fix / drop), and specific prompt changes; most important first>"}}"""

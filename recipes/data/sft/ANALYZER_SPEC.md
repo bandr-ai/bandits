@@ -1,55 +1,60 @@
-# Analyzer-written generation prompt (spec)
+# Analyzer-written generation prompt: seed expansion (spec)
 
 ## Why
-Simia's prompt is domain-tuned (hand-written retail/airline blocks) and failed on new domains. Instead, an analyzer agent writes the entire generation prompt from the seeds.
+Simia's prompt is domain-tuned (hand-written retail/airline blocks) and failed on new domains. Instead, an analyzer agent writes the generation prompt from the seeds and the harness.
 
-## Contract
-**Analyzer**
-- Input: a sample of seeds (≤20, never the held-out ones), their tool schemas and system prompts, real tool-result examples, and, on later rounds, the diagnosis notes.
-- Output: `prompt_vN.txt` (a template), `checklist_vN.json` (yes/no requirements, tagged by inspector/tool), `notes_vN.md` (rationale).
+The first pilot (`pilots/2026-10-10-fde-invent/`) showed that asking for "new, different" trajectories makes the generator invent worlds. So generation is now **seed expansion**: keep one reviewed seed's real situation and apply one controlled variation. Only approved, reviewed seeds are used as starting points.
 
-**Template**
-- The analyzer writes all of the text.
-- Slots that code fills per job: `{seed_trace}`, `{tools}`, `{system_prompt}`, `{obs_examples}`, `{generation_id}`. A template may use any subset, but it must include `{seed_trace}` and `{generation_id}`.
+## Loop
+analyzer → prompt + variations → generator (one seed + one variation per job) → checks + judge → diagnosis → same analyzer revises. At most `analyzer_rounds` versions.
 
-**Output format (fixed; the only rule the analyzer cannot change)**
-- One JSON object: `{"messages": [...]}`.
-- Roles: user / assistant / tool. Assistant turns may carry `tool_calls` `[{id, name, arguments}]`; tool turns carry `tool_call_id`.
-- Validated against a JSON schema. A failure is rejected and logged, never silently fixed.
+## Analyzer (`simia-plus analyze`, after `ingest`)
+**Input:**
+- the harness source (`harness_paths`), treated as established facts;
+- up to `analyzer_seeds` dev seeds, with system prompts labelled S1..Sn (`system_labels.json`);
+- the tool schemas and real tool results;
+- on later rounds: the previous version and its diagnosis.
 
-**Lint before use**
-- Required slots present; no unknown slots.
-- Output-format instruction present.
-- No held-out seed text in the template.
+**Output per version:**
+- `harness.md`: task, contracts, tool contracts with exact result shapes, evidence→answer rules, unknowns. Every claim is tagged `[established: file]`, `[inferred]` or `[unknown]`.
+- `variations.json`: 6–12 objects with `name, applies_to, teaches, change, preserve, dependencies, correct_when`. Each changes what the agent must notice or decide; none are cosmetic. The analyzer proposes them, so no human labelling is needed.
+- `prompt.txt`: the template.
+- `rationale.md` and `analyzer_raw.json`.
 
-## Loop (≤3 rounds)
-1. The analyzer writes v1.
-2. Pilot: about 20 jobs. Run schema validation, `rule_check`, the checklist judge (reasoning mode; any applicable miss means reject), and diversity.
-3. A diagnosis agent reads the rejected and weak traces and writes notes. The analyzer then writes vN+1.
-4. Every version, with its pilot report, is logged as a node in `runs.jsonl`.
+**Checks on the analyzer's output** (up to 3 tries, with errors fed back):
+- required slots `{seed_trace}`, `{variation}`, `{generation_id}`; optional `{tools}`, `{system_prompt}`, `{obs_examples}`; no unknown slots; no held-out seed text;
+- at least 3 variations, all keys present, valid labels.
 
-## Independence
-- The judge's checklist is frozen within a round, and the analyzer never scores its own prompt.
-- Acceptance uses held-out seeds only.
+## Jobs
+- Round-robin over dev seeds. Each job gets the applicable variation tried least often with that seed, counted over all rounds in `ledger.jsonl`.
+- Jobs are planned once per version (`vN/jobs.jsonl`), so a resumed run keeps them.
 
-## Acceptance (held-out seeds, matched count, cache off, same model)
-**Compare against:**
-- `simia_prompt=original`
-- `simia_prompt=fixed`
-- the previous analyzer version
+## Output format (fixed)
+- Code appends `OUTPUT_FORMAT`: one JSON object `{"messages": [...]}`.
+- Parsed strictly. A failure is rejected and logged, never repaired.
 
-**Metrics:**
-- usable rate
-- checklist pass rate
-- distinct tool sequences and verdicts
-- answer-leak rate: tool results that state the conclusion outright (judged)
-- expert review on a sample
+## Acceptance (the same for every version)
+- **Pairing:** calls and results paired in order, no duplicate ids.
+- **Argument schemas,** after the harness's `tool_arg_defaults`.
+- **Tool result shape:** each result must be one of that tool's real top-level shapes (`tool_result_shapes`, taken from the harness code) and carry the harness prefix with a running index (`tool_result_prefix`).
+- **Final answer** matches the schema of its system prompt's contract (`answer_schemas_path`).
+- **ID provenance.**
+- **Judge:** fixed checklist from config. Missing fields fail closed.
+- **Dedup:** exact plus near, within a round and across all rounds (`all_rounds.json`).
 
-**Keep a version only if** it beats `fixed` on usable rate and leak rate without lower diversity.
+## Diagnostics (reported, never reject on their own)
+- **Fidelity to the seed:** which failure-context fields changed, platform changes, the share of seed tool results reused, no-op outputs.
+- **Per-variation results:** jobs, kept, no-op.
+- **Decision cells:** evidence seen so far → action, per assistant turn. Reports the distinct count, max repeats, and how many cells are not in the seeds.
+- Outcome counts vs the seeds.
+
+## Held-out (`simia-plus heldout`, only on request)
+- The split is by seed id at ingest (`holdout_frac`, `split.json`). Held-out seeds are kept out of `seeds.jsonl`, the banks and the analyzer.
+- The chosen version and `simia_prompt=fixed` run on the same held-out seeds, with matched counts, under the same acceptance.
+- With about 5 seeds this is a sanity check. Once results influence a revision, those seeds count as dev.
+
+## Out of scope for now
+Evaluator calibration sets; raw (unreviewed) traces as anchors; promoting synthetic traces to seeds; a reasoning-rewrite stage (training drops thinking, so there is no reasoning text to rewrite); the student-model training test, which is the real gate for scaling.
 
 ## Config
-- `prompt_source: simia | analyzer`
-- `analyzer_seeds: 20`
-- `analyzer_rounds: 3`
-- `holdout_frac: 0.3`
-- New stage: `simia-plus analyze`, run before `plan`.
+`prompt_source`, `analyzer_seeds`, `analyzer_rounds`, `pilot_jobs`, `heldout_jobs_per_seed`, `holdout_frac`, `harness_paths`, `tool_arg_defaults`, `tool_result_shapes`, `tool_result_prefix`, `answer_schemas_path`, `outcome_fields`.

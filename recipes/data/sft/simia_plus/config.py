@@ -55,6 +55,7 @@ class Config:
     seed_format: str = "auto"  # auto | canonical (incl. OpenAI/LangChain-style messages) | sharegpt
     tool_defs_path: str | None = None  # JSON with tool schemas, for traces that list tools by name only
     simia_prompt: str = "fixed"  # "fixed": Simia's prompt + format rules; "original": Simia's prompt only
+    prompt_source: str = "simia"  # "simia": Simia's prompt; "analyzer": the prompt written by `analyze` (ANALYZER_SPEC.md)
     generation_attempts: int = 1  # mode simia: regenerate when the output cannot be used (no user turn,
                                   # Simia's markup filter, no final reply); Simia itself makes one attempt
     target_count: int = 1000   # traces wanted back (e.g. 100 golden traces -> 1000)
@@ -75,6 +76,17 @@ class Config:
     min_assistant_turns: int = 2
     keep_failures: bool = True  # keep judged failures (with bad_steps) for loss masking
     decontam_paths: list[str] = field(default_factory=list)  # eval traces; seeds and outputs overlapping them are dropped
+    holdout_frac: float = 0.0  # share of seeds (by id) held out at ingest: kept out of seeds.jsonl, banks and the analyzer
+    answer_schemas_path: str | None = None  # JSON {sha256(system prompt): JSON schema}; the final reply must be JSON matching it
+    outcome_fields: list[str] = field(default_factory=list)  # final-answer keys whose values the report counts
+    harness_paths: list[str] = field(default_factory=list)  # harness source files given to the analyzer as established facts
+    tool_arg_defaults: dict = field(default_factory=dict)  # {tool: {arg: default}}: the harness fills these before validation
+    tool_result_shapes: dict = field(default_factory=dict)  # {tool or "*": [[top-level keys], ...]}: allowed real result shapes
+    tool_result_prefix: str | None = None  # regex every tool result starts with; group 1 = 1-based result index (e.g. "[obs:N] ")
+    analyzer_seeds: int = 20   # dev seeds shown to the analyzer
+    analyzer_rounds: int = 3   # analyzer versions at most (v1 + revisions from diagnosis)
+    pilot_jobs: int = 20       # jobs per round, over dev seeds
+    heldout_jobs_per_seed: int = 3  # final comparison on held-out seeds: chosen analyzer prompt vs simia_prompt=fixed
     workers: int = 16
     random_seed: int = 0
     models: dict[str, ModelCfg] = field(default_factory=dict)
@@ -102,6 +114,8 @@ def load_config(path: str | Path) -> Config:
     cfg = Config(**raw, features=feats, models=models)
     if cfg.simia_prompt not in ("fixed", "original"):
         raise ValueError("simia_prompt must be 'fixed' or 'original'")
+    if cfg.prompt_source not in ("simia", "analyzer"):
+        raise ValueError("prompt_source must be 'simia' or 'analyzer'")
     if cfg.loop_style not in ("split", "simia_env"):
         raise ValueError("loop_style must be 'split' or 'simia_env'")
     if feats.loop and cfg.loop_style == "split" and not feats.spec:

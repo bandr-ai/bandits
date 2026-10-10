@@ -1,4 +1,4 @@
-"""simia-plus CLI: ingest -> plan -> specs -> generate -> verify -> select (or `run` for all).
+"""simia-plus CLI: ingest -> [analyze -> (heldout)] -> plan -> specs -> generate -> verify -> select (or `run` for all).
 
 Every stage reads and writes JSONL under out_dir and resumes: re-running skips work already done.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import random
 import subprocess
 import sys
 import uuid
@@ -62,12 +63,54 @@ def cmd_ingest(cfg: Config) -> list[dict]:
         ok = [s for s in seeds if all(res.get(s["id"], {}).get(k) for k in ("complete", "logical", "well_formatted"))]
         print(f"seed check: kept {len(ok)}/{len(seeds)}")
         seeds = ok
+    seeds = _split(cfg, seeds)
     write_jsonl(_p(cfg, "seeds.jsonl"), seeds)
     obs, users = ObsBank.from_traces(seeds), UserBank.from_traces(seeds)
     write_jsonl(_p(cfg, "obs_bank.jsonl"), obs.entries)
     write_jsonl(_p(cfg, "user_bank.jsonl"), users.entries)
     print(f"ingest: {len(seeds)} seeds, {len(obs.entries)} real tool results, {len(users.entries)} real user turns")
     return seeds
+
+
+def _split(cfg: Config, seeds: list[dict]) -> list[dict]:
+    """Hold out a share of seeds by id (persisted in split.json); returns the dev seeds. Held-out seeds go to
+    heldout.jsonl only, so they never reach the banks, the analyzer or generation."""
+    if cfg.holdout_frac <= 0:
+        return seeds
+    path = _p(cfg, "split.json")
+    if path.exists():  # a persisted split wins: re-running ingest must not reshuffle
+        test = set(json.loads(path.read_text())["heldout"])
+    else:
+        ids = sorted(s["id"] for s in seeds)
+        random.Random(cfg.random_seed).shuffle(ids)
+        test = set(ids[:max(1, round(len(ids) * cfg.holdout_frac))])
+        path.write_text(json.dumps({"by": "seed id", "random_seed": cfg.random_seed, "holdout_frac": cfg.holdout_frac,
+                                    "dev": sorted(set(ids) - test), "heldout": sorted(test)}, indent=1))
+    write_jsonl(_p(cfg, "heldout.jsonl"), [s for s in seeds if s["id"] in test])
+    dev = [s for s in seeds if s["id"] not in test]
+    print(f"split: {len(dev)} dev, {len(seeds) - len(dev)} held out")
+    return dev
+
+
+def cmd_analyze(cfg: Config) -> dict:
+    from .analyzer import analyze
+
+    return analyze(cfg, _load_seeds(cfg), read_jsonl(_p(cfg, "heldout.jsonl")), _eval_ngrams(cfg))
+
+
+def cmd_heldout(cfg: Config) -> dict:
+    """Chosen analyzer version vs simia_prompt=fixed on the held-out seeds. Separate on purpose: looking at held-out
+    results turns those seeds into dev data, so this runs only when explicitly asked for."""
+    from .analyzer import compare_heldout
+
+    root = _p(cfg, "analyzer")
+    if not (root / "chosen.txt").exists():
+        raise SystemExit("run `analyze` first")
+    heldout = read_jsonl(_p(cfg, "heldout.jsonl"))
+    if not heldout:
+        raise SystemExit("no held-out seeds (holdout_frac is 0)")
+    return compare_heldout(cfg, root, (root / "chosen.txt").read_text(),
+                           json.loads((root / "chosen_variations.json").read_text()), heldout, _load_seeds(cfg), _eval_ngrams(cfg))
 
 
 def _eval_ngrams(cfg: Config) -> set:
@@ -192,7 +235,7 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="simia-plus", description=__doc__)
-    ap.add_argument("command", choices=["ingest", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
+    ap.add_argument("command", choices=["ingest", "analyze", "heldout", "plan", "specs", "generate", "reparse", "verify", "select", "run"])
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
@@ -210,7 +253,7 @@ def main(argv: list[str] | None = None) -> None:
             cmd_verify(cfg)
             cmd_select(cfg)
         else:
-            {"ingest": cmd_ingest, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
+            {"ingest": cmd_ingest, "analyze": cmd_analyze, "heldout": cmd_heldout, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
              "reparse": cmd_reparse, "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
     except BaseException as e:
         status = f"error: {type(e).__name__}: {e}"

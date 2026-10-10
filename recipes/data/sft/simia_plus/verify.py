@@ -9,9 +9,12 @@ judge          Proxy-State Eval (2602.16246) + Adaption checklists: LLM audit ag
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
+from functools import lru_cache
+from pathlib import Path
 
 from .config import Config
 from .llm import chat_json, get_llm
@@ -23,7 +26,7 @@ _TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool
 _IDLIKE = re.compile(r"^(?=.*\d)[\w\-#.@:/]{3,}$|^[^@\s]+@[^@\s]+\.\w+$")
 
 
-def rule_check(trace: dict, min_assistant_turns: int) -> list[str]:
+def rule_check(trace: dict, min_assistant_turns: int, arg_defaults: dict | None = None) -> list[str]:
     issues = []
     if trace.get("meta", {}).get("simia_deleted"):
         issues.append("leaked tool markup (Simia should_delete_conversation)")
@@ -33,9 +36,20 @@ def rule_check(trace: dict, min_assistant_turns: int) -> list[str]:
         issues.append("does not start with a user message")
     if not msgs or msgs[-1]["role"] != "assistant" or msgs[-1].get("tool_calls") or not msgs[-1]["content"].strip():
         issues.append("does not end with an assistant reply")
-    answered = {m["tool_call_id"] for m in msgs if m["role"] == "tool"}
-    call_ids = {c["id"] for m in msgs for c in m.get("tool_calls", [])}
-    orphans = sum(1 for m in msgs if m["role"] == "tool" and m["tool_call_id"] not in call_ids)
+    call_ids = [c["id"] for m in msgs for c in m.get("tool_calls", [])]
+    if len(call_ids) != len(set(call_ids)):
+        issues.append("duplicate tool call id")
+    # each result must answer a call of the latest assistant turn, before the next user/assistant turn
+    answered, open_ids, orphans = set(), set(), 0
+    for m in msgs:
+        if m["role"] == "tool":
+            if m["tool_call_id"] in open_ids:
+                open_ids.discard(m["tool_call_id"])
+                answered.add(m["tool_call_id"])
+            else:
+                orphans += 1
+        else:
+            open_ids = {c["id"] for c in m.get("tool_calls", [])} if m["role"] == "assistant" else set()
     if orphans:
         issues.append(f"{orphans} tool result(s) without a matching call")
     if any(m["role"] == "assistant" and not m.get("tool_calls") and not (m.get("content") or "").strip() for m in msgs):
@@ -55,25 +69,105 @@ def rule_check(trace: dict, min_assistant_turns: int) -> list[str]:
             if spec is None:
                 issues.append(f"unknown tool {c['name']}")
                 continue
-            params = spec.get("parameters", {})
-            props = params.get("properties", {})
-            for req in params.get("required", []):
-                if req not in c["arguments"]:
-                    issues.append(f"{c['name']} missing required argument {req}")
-            for k, v in c["arguments"].items():
-                if k not in props:
-                    if params.get("additionalProperties") is False:
-                        issues.append(f"{c['name']} unknown argument {k}")
-                    continue
-                t = props[k].get("type")
-                py = _TYPES.get(t) if isinstance(t, str) else None
-                if (py and not isinstance(v, py)) or (t in ("integer", "number") and isinstance(v, bool)):
-                    issues.append(f"{c['name']}.{k} should be {t}")
+            args = {**(arg_defaults or {}).get(c["name"], {}), **c["arguments"]}  # the harness fills defaults first
+            issues += [f"{c['name']}{e}" for e in schema_errors(args, spec.get("parameters", {}))]
     if sum(1 for m in msgs if m["role"] == "assistant") < min_assistant_turns:
         issues.append("too few assistant turns")
     if any(n >= 3 for n in seen.values()):
         issues.append("same call repeated 3+ times (loop)")
     return issues
+
+
+def schema_errors(value, schema: dict, path: str = "") -> list[str]:
+    """The JSON Schema subset tool and answer schemas use: type, enum, required, properties,
+    additionalProperties: false, items, minimum, maximum."""
+    errs = []
+    t = schema.get("type")
+    types = t if isinstance(t, list) else [t] if t else []
+    if types:
+        ok = any(value is None if x == "null" else
+                 isinstance(value, _TYPES[x]) and not (x in ("integer", "number") and isinstance(value, bool))
+                 for x in types if x == "null" or x in _TYPES)
+        if not ok:
+            return [f"{path or ' value'} should be {'/'.join(types)}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path or ' value'}={value!r} not in {schema['enum']}")
+    if isinstance(value, dict):
+        props = schema.get("properties", {})
+        errs += [f"{path} missing required argument {k}" if not path else f"{path} missing {k}"
+                 for k in schema.get("required", []) if k not in value]
+        for k, v in value.items():
+            if k in props:
+                errs += schema_errors(v, props[k], f"{path}.{k}")
+            elif schema.get("additionalProperties") is False:
+                errs.append(f"{path} unknown argument {k}")
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for i, v in enumerate(value):
+            errs += schema_errors(v, schema["items"], f"{path}[{i}]")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errs.append(f"{path} below {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            errs.append(f"{path} above {schema['maximum']}")
+    return errs
+
+
+def system_key(system: str) -> str:
+    return hashlib.sha256((system or "").encode()).hexdigest()
+
+
+def final_answer(trace: dict):
+    """The final assistant reply parsed as JSON, or None when it is not exactly one JSON value."""
+    last = trace["messages"][-1] if trace["messages"] else {}
+    if last.get("role") != "assistant":
+        return None
+    try:
+        return json.loads((last.get("content") or "").strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def tool_result_check(trace: dict, shapes: dict, prefix: str | None) -> list[str]:
+    """Tool results must look like the real tool's output: the harness prefix with a running index, then a JSON
+    object whose top-level keys are one of that tool's real shapes (from the harness code)."""
+    if not shapes and not prefix:
+        return []
+    issues, n = [], 0
+    for m in trace["messages"]:
+        if m["role"] != "tool":
+            continue
+        n += 1
+        body = m["content"]
+        if prefix:
+            mt = re.match(prefix, body)
+            if not mt:
+                issues.append(f"tool result {n} ({m.get('name')}) lacks the harness prefix")
+            elif mt.groups() and mt.group(1) != str(n):
+                issues.append(f"tool result {n} ({m.get('name')}) has index {mt.group(1)}")
+            body = body[mt.end():] if mt else body
+        if m.get("name") not in shapes:  # unlisted tools are not checked; "*" adds shapes (e.g. errors) to listed ones
+            continue
+        allowed = [set(k) for k in shapes[m.get("name")] + shapes.get("*", [])]
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            issues.append(f"tool result {n} ({m.get('name')}) is not JSON")
+            continue
+        if not isinstance(obj, dict) or set(obj) not in allowed:
+            issues.append(f"tool result {n} ({m.get('name')}) has a shape the real tool never returns: "
+                          f"{sorted(obj) if isinstance(obj, dict) else type(obj).__name__}")
+    return issues
+
+
+def answer_check(trace: dict, schemas: dict[str, dict]) -> list[str]:
+    """The final reply must be exactly the JSON object the system prompt's output contract asks for."""
+    schema = schemas.get(system_key(trace.get("system", "")))
+    if schema is None:
+        return []
+    ans = final_answer(trace)
+    if ans is None:
+        return ["final answer is not a bare JSON value"]
+    return [f"answer{e}" for e in schema_errors(ans, schema)]
 
 
 def _values(x) -> list:
@@ -122,10 +216,18 @@ def user_text(trace: dict) -> str:
     return " ".join(m["content"] for m in trace["messages"] if m["role"] == "user")
 
 
+@lru_cache(maxsize=4)
+def load_answer_schemas(path: str | None) -> dict[str, dict]:
+    return json.loads(Path(path).read_text()) if path else {}
+
+
 def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple]) -> dict:
     f = cfg.features
     spec = trace["meta"].get("spec")
-    v: dict = {"rule_issues": rule_check(trace, cfg.min_assistant_turns)}
+    v: dict = {"rule_issues": [*trace["meta"].get("format_issues", []),
+                               *rule_check(trace, cfg.min_assistant_turns, cfg.tool_arg_defaults),
+                               *tool_result_check(trace, cfg.tool_result_shapes, cfg.tool_result_prefix),
+                               *answer_check(trace, load_answer_schemas(cfg.answer_schemas_path))]}
     v["contaminated"] = bool(eval_ngrams and ngrams(user_text(trace)) & eval_ngrams)
     if f.provenance:
         v["ungrounded_args"] = provenance_check(trace, spec)
@@ -133,7 +235,9 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple]) -> dict:
     if f.judge and keep:
         j = judge(cfg, trace, spec)
         v["judge"] = j
-        consistent = bool(j.get("obs_consistent", True)) and not j.get("checklist_failed") and not j.get("hallucinations")
+        # fail closed: a missing field is a failed check, not a pass
+        consistent = (j.get("obs_consistent") is True and j.get("policy_followed") is True
+                      and j.get("checklist_failed") == [] and j.get("hallucinations") == [])
         success = bool(j.get("task_success"))
         keep = consistent and (success or cfg.keep_failures)
         trace["meta"]["bad_steps"] = j.get("bad_steps", []) if not success else []

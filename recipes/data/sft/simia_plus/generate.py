@@ -238,6 +238,12 @@ def generate(cfg: Config, job: dict, seeds_by_id: dict, obs: ObsBank, users: Use
         trace = generate_loop(cfg, job, seed, obs, users)
     elif job["mode"] == "simia_env":
         trace = generate_simia_env(cfg, job, seed)
+    elif cfg.prompt_source == "analyzer":
+        from .analyzer import generate_analyzer, variation_for
+        root = cfg.out / "analyzer"
+        variation = variation_for(job["job_id"], seed, json.loads((root / "chosen_variations.json").read_text()),
+                                  json.loads((root / "system_labels.json").read_text()))
+        trace = generate_analyzer(cfg, {**job, "variation": variation}, seed, (root / "chosen.txt").read_text(), obs)
     else:
         trace = generate_simia(cfg, job, seed, seeds_by_id, obs, users)
     trace["meta"].update({k: job.get(k) for k in ("job_id", "seed_id", "second_seed_id", "strategy", "mode",

@@ -47,19 +47,38 @@ OBSERVATION: {"order_id": "#W2222", "status": "cancelled"}
 ASSISTANT: Cancelled #W2222."""
 
 
+ANALYZER_OUT = json.dumps({"messages": [
+    {"role": "user", "content": "cancel #W2222 please"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "get_order", "arguments": {"order_id": "#W2222"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "{\"order_id\": \"#W2222\", \"status\": \"pending\"}"},
+    {"role": "assistant", "content": "{\"status\": \"pending\"}"}]})
+
+
 class FakeLLM:
     """Answers by role and prompt content."""
 
     def __init__(self, role: str):
         self.role = role
         self.calls = 0
+        self.seen = []
 
     def chat(self, messages, tools=None, json_mode=False):
         self.calls += 1
+        self.seen.append(messages)
         text = messages[-1]["content"] if messages else ""
         sys = messages[0]["content"] if messages else ""
+        if self.role == "generator" and "Output format (fixed)" in text:
+            return {"content": ANALYZER_OUT, "tool_calls": []}
         if self.role == "generator":
             return {"content": SIMIA_OUT, "tool_calls": []}
+        if self.role == "analyzer":
+            vs = [{"name": f"var{k}", "applies_to": ["all"] if k else ["S1"], "teaches": "t", "change": "c", "preserve": "p",
+                   "dependencies": "d", "correct_when": "w"} for k in range(3)]
+            return {"content": json.dumps({"harness": "## tools [established: x]", "variations": vs,
+                                           "template": "Seed:\n{seed_trace}\nApply: {variation}\nTools: {tools}\n{generation_id}",
+                                           "rationale": "seeds are order-support chats"}), "tool_calls": []}
+        if self.role == "diagnose":
+            return {"content": json.dumps({"notes": "- all fine"}), "tool_calls": []}
         if self.role == "spec":
             n = int(text.split("Write ")[1].split(" scenario")[0])
             specs = [{"strategy": "x", "goal": f"cancel order #W3{k:03d}", "user_facts": {"order_id": f"#W3{k:03d}"},
@@ -118,7 +137,7 @@ def fake_llms():
 def write_cfg(tmp_path, features: dict, target: int, n_seeds: int = 3, **extra) -> str:
     seeds_path = tmp_path / "seeds.jsonl"
     seeds_path.write_text("\n".join(json.dumps(seed(i)) for i in range(n_seeds)) + "\n")
-    roles = ["default", "spec", "generator", "agent", "user_sim", "tool_sim", "judge", "seed_check"]
+    roles = ["default", "spec", "generator", "agent", "user_sim", "tool_sim", "judge", "seed_check", "analyzer", "diagnose"]
     cfg = {"seeds_path": str(seeds_path), "out_dir": str(tmp_path / "out"), "target_count": target,
            "overgen": 1.0, "workers": 2, "features": features, "models": {r: {"model": "fake"} for r in roles}, **extra}
     p = tmp_path / "cfg.json"
@@ -340,3 +359,103 @@ def test_inserted_prompt_blocks_have_no_template_escapes(tmp_path, fake_llms):
     p = simia_prompt(cfg, {"job_id": "j", "seed_id": "s0", "strategy": "new_scenario", "failure": {"at_call": 1, "type": "timeout"}},
                      s, {"s0": s}, ObsBank.from_traces([s]), UserBank.from_traces([s]))
     assert '{{"' not in p and "{{..." not in p  # template escapes (nested JSON may legitimately end in "}}")
+
+
+def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
+    cfg_path = write_cfg(tmp_path, {"judge": True, "provenance": True}, target=2, n_seeds=5, holdout_frac=0.4,
+                         analyzer_rounds=2, pilot_jobs=6, heldout_jobs_per_seed=1, outcome_fields=["status"])
+    cli.main(["ingest", "--config", cfg_path])
+    cfg = load_config(cfg_path)
+    split = json.loads((cfg.out / "split.json").read_text())
+    assert len(split["heldout"]) == 2 and len(split["dev"]) == 3
+    banked = {e["seed_id"] for e in map(json.loads, (cfg.out / "obs_bank.jsonl").read_text().splitlines())}
+    assert banked == set(split["dev"])  # held-out seeds stay out of the banks
+    cli.main(["analyze", "--config", cfg_path])
+    a = cfg.out / "analyzer"
+    for v in ("v1", "v2"):
+        for f in ("harness.md", "variations.json", "prompt.txt", "rationale.md", "jobs.jsonl", "verified.jsonl", "report.json"):
+            assert (a / v / f).exists(), (v, f)
+    assert (a / "v1" / "diagnosis.md").exists() and not (a / "v2" / "diagnosis.md").exists()
+    assert "PREVIOUS VERSION (v1)" in json.loads((a / "v2" / "analyzer_raw.json").read_text())["request"]
+    assert not (a / "heldout").exists()  # held-out runs only on request
+    jobs = [json.loads(line) for line in (a / "v1" / "jobs.jsonl").read_text().splitlines()]
+    pairs = [(j["seed_id"], j["variation"]["name"]) for j in jobs]
+    assert len(set(pairs)) == len(pairs)  # 6 jobs over 3 seeds x 3 variations: no pair repeats
+    ledger = [json.loads(line) for line in (a / "ledger.jsonl").read_text().splitlines()]
+    assert len(ledger) == 12 and {r["version"] for r in ledger} == {1, 2}
+    v2_pairs = {(j["seed_id"], j["variation"]["name"]) for j in map(json.loads, (a / "v2" / "jobs.jsonl").read_text().splitlines())}
+    untried = {(sid, v) for sid in {p[0] for p in pairs} for v in ("var0", "var1", "var2")} - set(pairs)
+    assert untried and untried <= v2_pairs  # the ledger steers v2 to the pairs v1 did not try first
+    rep = json.loads((a / "v1" / "report.json").read_text())
+    assert rep["format_ok"] == 6 and rep["kept"] == 6 and rep["outcomes_kept"] == {"status=pending": 1}
+    assert rep["fidelity_all"]["context_parsed"] == "0/6" and set(rep["by_variation"]) == {"var0", "var1"}
+    assert json.loads((a / "all_rounds.json").read_text())["kept_all_rounds"] == 12
+    seen = " ".join(m["content"] for c in fake_llms["analyzer"].seen for m in c)
+    assert all(h not in seen for h in split["heldout"])
+    cli.main(["heldout", "--config", cfg_path])
+    cmp = json.loads((a / "heldout" / "comparison.json").read_text())
+    assert set(cmp) == {"analyzer", "simia_fixed"} and cmp["simia_fixed"]["jobs"] == 2
+
+
+def test_tool_results_must_have_real_shapes_and_prefix():
+    from simia_plus.verify import tool_result_check
+    t = from_sharegpt(seed(0), 0)
+    shapes = {"get_order": [["order_id", "status"]], "*": [["status", "message"]]}
+    assert tool_result_check(t, shapes, None) == []
+    t["messages"][2]["content"] = json.dumps({"status": "success", "read": "{}"})
+    assert "never returns" in tool_result_check(t, shapes, None)[0]
+    t2 = from_sharegpt(seed(0), 0)
+    for k, m in enumerate(m for m in t2["messages"] if m["role"] == "tool"):
+        m["content"] = f"[obs:{k + 1}] {m['content']}"
+    assert tool_result_check(t2, shapes, r"^\[obs:(\d+)\]\s*") == []
+    t2["messages"][6]["content"] = t2["messages"][6]["content"].replace("[obs:2]", "[obs:7]")
+    assert tool_result_check(t2, shapes, r"^\[obs:(\d+)\]\s*") == ["tool result 2 (cancel_order) has index 7"]
+
+
+def test_harness_arg_defaults_satisfy_required_args():
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][1]["tool_calls"][0]["arguments"] = {}
+    assert any("missing required argument order_id" in i for i in rule_check(t, 2))
+    assert rule_check(t, 2, {"get_order": {"order_id": ""}}) == []
+
+
+def test_fidelity_reports_changed_context_and_reuse():
+    from simia_plus.analyzer import decision_cells, fidelity
+    s = from_sharegpt(seed(0), 0)
+    s["messages"][0]["content"] = 'Failure context: {"platform": "WEB", "element": {"name": "Buy", "role": "button"}}'
+    same = json.loads(json.dumps(s))
+    assert fidelity(same, s, None)["no_op"] is True
+    t = json.loads(json.dumps(s))
+    t["messages"][0]["content"] = 'Failure context: {"platform": "WEB", "element": {"name": "Pay", "role": "button"}} hint'
+    t["messages"][2]["content"] = '{"order_id": "#W1000", "status": "on_hold"}'
+    f = fidelity(t, s, None)
+    assert f["context_fields_changed"] == ["element.name"] and f["tool_results_reused_from_seed"] == 1 and not f["no_op"]
+    assert len(decision_cells(t)) == 4
+
+
+def test_analyzer_lint_and_strict_format():
+    from simia_plus.analyzer import lint, parse_output
+    assert lint("x {seed_trace} {variation} {generation_id}") == []
+    assert lint("x {seed_trace} {variation} {foo}") == ["missing required slot {generation_id}", "unknown slot {foo}"]
+    assert parse_output('Plan: ...\n{"messages": []}')[1][0].startswith("format: not a single JSON")
+    msgs, issues = parse_output(json.dumps({"messages": [{"role": "tool", "tool_call_id": "c1", "content": {"a": 1}}]}))
+    assert msgs is None and "string content" in issues[0]
+
+
+def test_result_before_its_call_is_rejected():
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][1], t["messages"][2] = t["messages"][2], t["messages"][1]
+    assert any("without a matching call" in i for i in rule_check(t, 2))
+
+
+def test_answer_schema_and_judge_fail_closed(tmp_path, fake_llms):
+    from simia_plus.verify import answer_check, system_key, verify
+    t = from_sharegpt(seed(0), 0)
+    schema = {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "cancelled"]}}}
+    assert answer_check(t, {system_key(t["system"]): schema}) == ["final answer is not a bare JSON value"]
+    t["messages"][-1]["content"] = '{"status": "gone"}'
+    assert answer_check(t, {system_key(t["system"]): schema}) == ["answer.status='gone' not in ['pending', 'cancelled']"]
+    cfg = load_config(write_cfg(tmp_path, {"judge": True}, target=1, keep_failures=False))
+    set_llm_factory(lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps({"task_success": True}),
+                                                                                  "tool_calls": []}})())
+    assert verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]["kept"] is False

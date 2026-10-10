@@ -2,7 +2,9 @@
 
 ## State
 - PR bandr-ai/bandits#143, branch `feat/recipe-sft-synth`.
-- Next: build `ANALYZER_SPEC.md`.
+- Analyzer built for seed expansion (`simia_plus/analyzer.py`, `simia-plus analyze`; see `ANALYZER_SPEC.md`). Not piloted yet: **no pilot runs without the user's go-ahead.**
+- First ("invent") pilot recorded in `pilots/2026-10-10-fde-invent/` (prompts, rationales, diagnoses, reports; traces stay in fde-work).
+- Student model for training: `Qwen/Qwen3.8-27B` (fde-ft, uncommitted on its `main`); its GPU settings are still sized for 4B.
 
 ## Gotchas
 **LiteLLM gateway (`ai-gateway-staging.testsigma.com/v1`)**
@@ -17,11 +19,18 @@
 
 **fde seeds**
 - Stored in gateway-log format (`final_messages` + `turns`). Tools are names only, so set `tool_defs_path` to `fde-ft/tool_defs.json`.
-- 20% of seeds call `a11y_search` without args that the schema marks required (a schema mismatch, not a recipe bug).
+- 4/17 seeds call `a11y_search` without `role`/`name`: valid, the harness fills them from `arg_defaults` (`tools/_base.py`). Set `tool_arg_defaults`.
+- `query_har` / `walk_history` only ever return `available:false` in the seeds; generators invent their success shapes unless given `tool_result_shapes` and the harness source.
 
 **Release 1 checks**
 - Plain-Simia stats from before `c2ead2e` are invalid: that parser dropped most tool calls, and `rule_check` did not catch orphan tool results.
 - Bundles for app.bandr.ai: check every step and history entry before upload; the first batch rendered empty.
+
+## Analyzer pilot (durable: `fde-work/sft-analyzer-pilot/`)
+- `pilot.json` config; `seeds_golden.jsonl` (the 17); `out/` all outputs (layout in ANALYZER_SPEC); `analyze.log`.
+- `answer_schemas.json` from `derive_answer_schemas.py`: parses each seed system prompt's output contract (source of truth: agentic-test `failure_analyzer/prompts.py` @ 3fd5e445). 14 distinct prompts (sweep/escalation prompts embed run-specific cause rows). All 17 seeds pass.
+- Split by seed id, `random_seed` 0: 12 dev / 5 held out (`out/split.json`).
+- Rerun: `set -a; . fde-work/.env; set +a; simia-plus ingest|analyze --config fde-work/sft-analyzer-pilot/pilot.json` (resumes; delete `out/analyzer/vN` to redo a version).
 
 ## Data
 - Seeds: the 30 traces in `fde-work/eval-labeling/traces`, with reviewer verdicts in `outcome-check/binary-audit.json` (`expected_binary`). Used: the 17 marked `success`, all `faa.reason`.
@@ -36,11 +45,10 @@
 Total spend ≈ $0.75. Run outputs are in the session scratchpad (not durable). Rerun via `configs/` and the gateway settings above.
 
 **Open issues**
-- Tool results state the conclusion outright.
-- Narrow diversity: the same consent-modal and promo stories keep recurring.
-- No answer-schema check yet.
-- No held-out evaluation yet.
-- No training test yet.
+- Seed-expansion pilot not run yet (needs the user's go-ahead); config to write: `harness_paths` (agentic-test `failure_analyzer/tools`, `catalog/cause_catalog.json`, `check_specs.py`, `shaping.py`, `fde-ft/tool_defs.json`), `tool_arg_defaults`, `tool_result_shapes`, `tool_result_prefix: "^\\[obs:(\\d+)\\] "`, a fidelity item in the checklist.
+- Judge is lenient (passes ~all); usable rate does not separate versions.
+- 17 reviewed seeds bound how many distinct situations exist; measure coverage (decision cells) before scaling.
+- No held-out evaluation and no training test yet.
 
 ## app.bandr.ai
 Workspace `eae26b28…` (the FAA expert workspace). Import goes through S3 `bandr-data-478499050241-aps1/expert-review/<key>/` plus SSM on `i-0128e67c5081e82c2`; see `fde-work/eval-labeling/expert-global-30-20261009/upload.py`.
