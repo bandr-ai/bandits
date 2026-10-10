@@ -1,0 +1,57 @@
+<seed_trace>
+{seed_trace}
+</seed_trace>
+
+<agent_system_prompt>
+{system_prompt}
+</agent_system_prompt>
+
+<tool_schemas>
+{tools}
+</tool_schemas>
+
+<assigned_variation>
+{variation}
+</assigned_variation>
+
+<generation_id>
+{generation_id}
+</generation_id>
+
+<obs_examples>
+{obs_examples}
+</obs_examples>
+
+## Job
+
+Expand the seed into one new trajectory: the same micro-agent, the same situation, ONE assigned change. The seed is a real reviewed run — a user message carrying the failure context, assistant turns that call tools, tool turns that return observations, and a final assistant message that is the verdict JSON. Reproduce that shape with the change applied.
+
+## Ground rules
+
+1. Keep the world. Same platform, app or site, page, element, locator value, step ids, failure wording and the agent's voice. Never invent pages, elements, apps, causes or evidence sources. Every tool call uses a schema from <tool_schemas> and passes the arguments the agent actually knows at that step — an argument the agent does not constrain may be left out or sent as "" (the harness fills an omitted argument from the tool's defaults before validation).
+
+2. Evidence drives the run. After each observation ask: this agent has this question and this prompt — what does it do next, and what can it legitimately conclude from what it has seen so far? Never choose a conclusion and then invent evidence for it. If the seed's original answer no longer follows from the new evidence, the answer changes.
+
+3. `evidence_available` is part of the evidence world. The assigned change may drop or add slots on it; when it does, update the list, and make every call whose slot is now absent return that tool's unavailable payload with the tool's own reason sentence. Conversely, an `available: true` payload is only possible for a slot the list advertises — never manufacture nodes, counts or a visual read for a slot this run does not have.
+
+4. Re-evaluate reused seed calls. A seed call and its observation may be reused only when both still hold after the change. When the variation changes what is on screen — a different live page, a different dialog, an element now present or now covered — re-run every call that targeted the old screen (especially an a11y_search for a landmark on it): update the result to what that tool returns for the new screen, or drop the call. Never leave a stale observation beside contradicting evidence. Call count may change freely; evidence consistency beats call count.
+
+5. Stay inside the harness contracts. A tool result is exactly the JSON that tool returns for that outcome: no invented fields, no missing field the tool always emits, no reason sentence the tool would not write. A source that was not captured returns its unavailable shape with the reason, never an empty list pretending to be an answer. a11y_search's no-match and no-tree-captured are different payloads. locator_probe's `unverifiable` and `unavailable` are not `no_match`. query_har's `available: false` means no log was captured, not that nothing was pending. compare_screenshots returns the vision model's read as a STRING holding its own answer / confidence / observations JSON.
+
+6. Read evidence the way <agent_system_prompt> reads it: programmatic before visual; a record-side probe says nothing about the live page; absence is heal-blocking and needs a screenshot that affirms the element's region is visible and the element is not in it; covered-with-no-source is occluded, not absent; an identity-family heal-enabling read and a blocker are hypotheses until the confirming check runs; a low confidence is honest, a guess is not.
+
+7. Trajectory shape. Assistant turns carry tool_calls (a tool name plus an arguments object); tool turns carry that call's observation; the final assistant message is the answer JSON with no tool_calls. Never leave a tool call without its observation, or an observation without its call.
+
+8. Every tool-turn content begins with an observation marker: `[obs:N] ` followed by the tool's JSON, where N starts at 1 and increments by one for each tool result in order — including error, unavailable and empty payloads. Never emit the raw JSON without the marker, and never reuse or skip an N.
+
+9. Vocabulary is closed. The final message's conclusion and root_cause values may come only from <agent_system_prompt>; <assigned_variation> and <obs_examples> are not vocabulary sources. If a variation names a term the prompt does not define, answer with the prompt's closest valid term (the presence check's covered-target term is `occluded`, not a keyboard-specific conclusion). A key the prompt requires alongside a conclusion (page_kind when the conclusion is different_page) must appear in the JSON itself, not only in the detail sentence.
+
+10. Cause naming. Name a specific root cause only when the evidence you generated positively supports that cause; when the run produced no positive evidence for one, or the change does not bear on causes, use root_cause null. The conclusion's contract comes from <agent_system_prompt>, never from a variation's prose.
+
+11. Comparison reads. When a compare_screenshots kind compares two sides, the read's observations must describe each side present in the image set (recorded and live) or state that a side is missing — never collapse a comparison into a live-only description.
+
+12. The final JSON has exactly the keys <agent_system_prompt> names, an honest confidence, and one short, non-hedged detail sentence naming evidence this run actually saw. No prose outside the JSON.
+
+## Only this changes
+
+The assigned change in <assigned_variation>, and nothing else. Everything else stays as in the seed: platform, app or site, page, element, locator, step ids and failure wording; the agent's question and its tool surface; the seed's wording style. Do not add a second change and do not soften the assigned one. When the assigned change drops or adds an evidence slot, updating `evidence_available` and every payload that depends on it is part of that one change, not drift. Do not let the seed's original outcome survive if the new evidence does not support it.

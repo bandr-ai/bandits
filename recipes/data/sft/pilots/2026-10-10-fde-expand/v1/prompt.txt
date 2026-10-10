@@ -1,0 +1,49 @@
+<seed_trace>
+{seed_trace}
+</seed_trace>
+
+<system_prompt>
+{system_prompt}
+</system_prompt>
+
+<tools>
+{tools}
+</tools>
+
+<variation>
+{variation}
+</variation>
+
+<generation_id>
+{generation_id}
+</generation_id>
+
+<obs_examples>
+{obs_examples}
+</obs_examples>
+
+## Job
+
+Expand the seed trajectory into one new trajectory: the same micro-agent, the same situation, ONE assigned change. The seed is a real reviewed run — a user message carrying the failure context, assistant turns that call tools, tool turns that return observations, and a final assistant message that is the verdict JSON. Reproduce that shape.
+
+## Ground rules
+
+1. Keep the world. Same platform, app or site, page, element, locator value, step ids, failure wording and the agent's own voice. Do not invent pages, elements, apps, causes, tools or evidence sources. Every tool call must be one of the schemas in <tools>, using that schema's required keys, with arguments that describe the seed's actual element or page — updated by the variation only if the variation changes what is on screen.
+
+2. Evidence drives the run. After each observation ask: this agent has this system prompt and this question — what does it do next, and what can it legitimately conclude from what it has seen so far? Never choose a conclusion first and invent evidence for it. If the seed's original conclusion no longer follows from the new evidence, the outcome changes.
+
+3. Reuse a seed tool call only when the call and its result both remain valid. If the variation invalidates the call (its arguments no longer match what is on screen) or its result (the observation it reported no longer holds), update it, replace it or drop it — and update every later call, observation and the final answer that depended on it. Never let a stale observation sit next to contradicting evidence.
+
+4. Stay inside the harness contracts. A tool result is the JSON string that tool actually returns for that outcome: no invented fields, no missing field the tool always emits, no reason sentence the tool would not write. A source that was not captured returns available false with a reason — never an empty list pretending to be an answer. compare_screenshots returns the vision model's read as a STRING containing its own answer / confidence / observations JSON. a11y_search finding nothing and a tree never captured are different payloads. locator_probe's unverifiable and unavailable are not no_match. query_har's available false means no log was captured, not that nothing was pending.
+
+5. Read the evidence the way the system prompt reads it: programmatic before visual; a record-side probe says nothing about the live page; absence is heal-blocking and needs the screenshot to affirm the region is visible without the element; covered-with-no-source is occluded, not absent; identity-family heal-enabling reads and blockers are hypotheses until the confirming check runs; a low confidence is honest, a guessed conclusion is not.
+
+6. Final assistant message: exactly the answer contract in <system_prompt> — the same keys, a conclusion or root cause drawn only from that prompt's own vocabulary, an honest confidence, and one short, non-hedged detail sentence naming evidence this run actually saw. No prose outside the JSON.
+
+7. Keep the turn structure: assistant turns carrying tool calls (a tool name plus an arguments object), tool turns carrying the observation for that call, and the final JSON as the last assistant message with no tool calls. Keep the seed's call count roughly — one more or one fewer if the variation forces it — and never leave a tool call without its observation, or an observation without its call.
+
+## Only this changes
+
+Restatement of the assigned change: the variation's change, and nothing else.
+
+Everything else stays as in the seed: platform, app or site, page, element, locator, step ids and failure wording; the agent's question and its tool surface; the seed's wording style. Do not add a second change, do not soften or inflate the assigned one, and do not let the seed's original outcome survive if the new evidence does not support it.

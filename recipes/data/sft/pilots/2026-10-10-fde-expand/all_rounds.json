@@ -1,0 +1,31 @@
+{
+ "kept_all_rounds": 49,
+ "unique_after_cross_round_dedup": 49,
+ "dedup": {},
+ "by_version": {
+  "1": 14,
+  "2": 18,
+  "3": 17
+ },
+ "seed_variation_pairs": 17,
+ "max_per_pair": 8,
+ "decision_cells": {
+  "distinct": 40,
+  "max_repeats": 11
+ },
+ "outcomes": {
+  "conclusion=different_page": 4,
+  "conclusion=diverged": 4,
+  "conclusion=found_in_place": 4,
+  "conclusion=locale_variance": 4,
+  "conclusion=no_blocker": 6,
+  "conclusion=not_occluded": 11,
+  "conclusion=occluded": 2,
+  "conclusion=same_page": 4,
+  "conclusion=still_loading": 8,
+  "root_cause=NSE_LOCALE_VARIANCE": 4,
+  "root_cause=NSE_SAME_PAGE_LOCATOR": 1,
+  "root_cause=NSE_STILL_LOADING": 8,
+  "root_cause=None": 36
+ }
+}
