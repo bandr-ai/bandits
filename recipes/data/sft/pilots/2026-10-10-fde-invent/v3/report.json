@@ -1,0 +1,53 @@
+{
+ "jobs": 20,
+ "format_ok": 20,
+ "kept": 20,
+ "unique_kept": 20,
+ "usable_rate": 1.0,
+ "dedup": {},
+ "reject_reasons": {},
+ "checklist_failed": {},
+ "outcomes_kept": {
+  "conclusion=different_page": 2,
+  "conclusion=no_blocker": 2,
+  "conclusion=not_occluded": 3,
+  "conclusion=occluded": 2,
+  "conclusion=page_ready": 2,
+  "conclusion=same_page": 2,
+  "conclusion=same_page_scrolled": 1,
+  "root_cause=None": 20
+ },
+ "outcomes_seeds": {
+  "conclusion=different_page": 1,
+  "conclusion=diverged": 2,
+  "conclusion=found_in_place": 1,
+  "conclusion=not_occluded": 2,
+  "conclusion=page_ready": 1,
+  "conclusion=system_dialog": 1,
+  "root_cause=NSE_SYSTEM_DIALOG": 1,
+  "root_cause=None": 11
+ },
+ "diversity_kept": {
+  "n": 20,
+  "distinct_action_signatures": 10,
+  "action_signature_entropy_bits": 3.184,
+  "first_user_distinct_3gram_ratio": 0.74,
+  "by_strategy": {
+   "analyzer": 20
+  },
+  "by_persona": {
+   "null": 20
+  },
+  "by_mode": {
+   "analyzer": 20
+  },
+  "with_failure": 0,
+  "per_seed_min_max": [
+   1,
+   2
+  ]
+ },
+ "attempts": {
+  "1": 20
+ }
+}

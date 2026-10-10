@@ -1,0 +1,20 @@
+## What the seeds show
+
+The twelve seeds are one inspector family (page-readiness, cause-sweep, element-presence web and mobile, page-identity web and mobile, native-overlay, escalation, keyboard-occlusion) over a shared evidence surface: failure-context JSON in, a handful of tool calls, one small JSON verdict out. Two things dominate the seed batch and must be reproduced:
+
+- **Honest no-cause endings dominate.** Of twelve seeds, only one names a positive root cause (NSE_SYSTEM_DIALOG); the rest are root_cause null, page_ready, not_occluded, found_in_place, different_page or diverged. Several are literally 'no evidence for any catalogue cause'. An inspector that over-diagnoses is worse than useless to the downstream heal walk, so the generator must be biased hard toward no-cause.
+- **Tool contracts are narrow and truthfully unimplemented.** Sources routinely return `available:false` with a reason string; a11y hits on the record side prove nothing about the live page; a probe miss is never absence; screenshots return only rendered facts. The seeds show agents correctly concluding *null* when the tool whose input would expose a cause was simply never captured — that is the most important behaviour to train.
+
+## Why the template says what it says
+
+Section 0 fixes the batch-level outcome distribution *before* the case is invented, keyed off the last character of the generation id (the only per-job varying handle available): 14/16 PLAN-NO-CAUSE, 2/16 PLAN-CAUSE, with a mandatory fallback to PLAN-NO-CAUSE when the required artefact cannot be written truthfully. This makes the balance a property of the sampling plan rather than a hope. Sections 2–4 reproduce the domain's real evidence budget, the five tools' exact contracts, and the catalogue's detecting-evidence matrix, including the seed-visible edge cases (unavailable runtime source, no HAR on mobile, record side proving nothing live, absence needing a visual witness).
+
+## Changes in response to the diagnosis
+
+1. **Outcome skew.** Replaced prose exhortation with a deterministic plan: mode chosen from the last hex character of the generation id, 87.5% no-cause / 12.5% single positive cause, and within PLAN-NO-CAUSE two-thirds plainest-cautious versus about a third divergence-style no-cause verdicts. A positive cause also requires a transcript artefact that literally matches its catalogue row, plus the mode fallback.
+2. **Per-seed duplication.** Section 7 now requires differing from the seed's failure family, page kind and *final verdict*, and varies the opening tool family.
+3. **Ungrounded arguments.** Added an explicit GROUNDING RULE: arguments may only come from the failure context, the system prompt or an earlier [obs:N]; no guessed labels or translated names; recorded_name/role or schema-allowed empty strings otherwise. It is also self-check item 3.
+4. **Hint leaking the verdict.** The hint line is now optional and restricted to raw signals (URL, title, readyState, status code, keyboard flag, context handle, process flag), explicitly barring conclusion labels, root_cause values, page_kind values and 'confirm X' instructions.
+5. **Under-investigation.** Added the EXCLUSION RULE: for element-not-found failures at least one call must target the failed element itself before any no-cause verdict, and a narrow role query may never stand in for a broad blocker conclusion.
+6. **System-dialog / occlusion confusion.** Added the mapping rule: an OS-owned surface must take the catalogue dialog/overlay cause; a null-cause occlusion verdict is only for app-owned obstructions.
+7. **Final-key inconsistency.** Section 5 pins the exact key sets per contract shape (four keys for conclusion-bearing inspectors, three for root-cause-only ones), allows page_kind only with the different-page verdict, and forbids extra or missing keys; self-check item 6 enforces it.

@@ -1,0 +1,65 @@
+{
+ "jobs": 20,
+ "format_ok": 20,
+ "kept": 18,
+ "unique_kept": 18,
+ "usable_rate": 0.9,
+ "dedup": {},
+ "reject_reasons": {
+  "judge_rejected": 2
+ },
+ "checklist_failed": {
+  "The final JSON conclusion, root_cause and confidence are supported by evidence visible in earlier tool results or the context; a weak or contradictory evidence base gives a low confidence or the cautious conclusion the system prompt prescribes.": 1,
+  "The assistant follows the system prompt's investigation guidance (uses the tools it names when they are relevant) and answers only its own question.": 1
+ },
+ "outcomes_kept": {
+  "conclusion=different_page": 2,
+  "conclusion=found_in_place": 1,
+  "conclusion=keyboard_occluded": 3,
+  "conclusion=locale_variance": 3,
+  "conclusion=no_blocker": 1,
+  "conclusion=still_loading": 2,
+  "conclusion=system_overlay": 1,
+  "root_cause=NSEM_SYSTEM_OVERLAY": 1,
+  "root_cause=NSE_KEYBOARD_OCCLUSION": 3,
+  "root_cause=NSE_LOCALE_VARIANCE": 3,
+  "root_cause=NSE_SAME_PAGE_LOCATOR": 1,
+  "root_cause=NSE_SESSION_EXPIRED": 1,
+  "root_cause=NSE_SESSION_INTERSTITIAL": 1,
+  "root_cause=NSE_STILL_LOADING": 3,
+  "root_cause=None": 5
+ },
+ "outcomes_seeds": {
+  "conclusion=different_page": 1,
+  "conclusion=diverged": 2,
+  "conclusion=found_in_place": 1,
+  "conclusion=not_occluded": 2,
+  "conclusion=page_ready": 1,
+  "conclusion=system_dialog": 1,
+  "root_cause=NSE_SYSTEM_DIALOG": 1,
+  "root_cause=None": 11
+ },
+ "diversity_kept": {
+  "n": 18,
+  "distinct_action_signatures": 14,
+  "action_signature_entropy_bits": 3.684,
+  "first_user_distinct_3gram_ratio": 0.755,
+  "by_strategy": {
+   "analyzer": 18
+  },
+  "by_persona": {
+   "null": 18
+  },
+  "by_mode": {
+   "analyzer": 18
+  },
+  "with_failure": 0,
+  "per_seed_min_max": [
+   1,
+   2
+  ]
+ },
+ "attempts": {
+  "1": 20
+ }
+}

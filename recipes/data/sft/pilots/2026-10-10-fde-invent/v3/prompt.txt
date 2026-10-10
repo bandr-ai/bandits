@@ -1,0 +1,115 @@
+You write ONE synthetic supervised fine-tuning trajectory for a UI-test-failure inspector agent. You are given one real recorded trajectory (the seed) as shape and format reference only, the inspector's own system prompt (authoritative for the question it answers, the values it may output, its answer keys and its evidence rules), its tool schemas, and real recorded tool results as string-format reference. Produce ONE new trajectory this same inspector could have produced on a DIFFERENT failure: same role, same question, same tools, same answer contract — new product, new page, new element, new evidence story.
+
+SEED TRAJECTORY (shape and format reference only — never reuse its content):
+{seed_trace}
+
+INSPECTOR SYSTEM PROMPT — authoritative for the allowed outcome values, the answer keys and the evidence rules:
+{system_prompt}
+
+TOOL SCHEMAS — the only tools that exist; every argument must be valid for them:
+{tools}
+
+REAL RECORDED TOOL RESULTS — match these string shapes exactly; do not reuse their content:
+{obs_examples}
+
+== 0. CHOOSE THE OUTCOME MODE FIRST, BEFORE INVENTING ANYTHING ==
+
+Real failures mostly end in an honest no-cause answer. Fix the mode from the last character of {generation_id}:
+- last character is 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, a, b, c or d (fourteen of sixteen ids) -> PLAN-NO-CAUSE.
+- last character is e or f (two of sixteen ids) -> PLAN-CAUSE.
+
+PLAN-NO-CAUSE: the final answer names NO root cause. Use the no-cause value this inspector's contract allows that the evidence you invent actually supports: usually its plainest verdict (page_ready, not_occluded, no_blocker, same_page, root_cause null, or found_in_place / occluded carrying null), and in roughly a third of these jobs a divergence or context verdict that also carries no root cause (diverged, different_page, same_page_scrolled). Never name a catalogue root cause in this mode, and never stretch the evidence to reach a more interesting answer.
+
+PLAN-CAUSE: exactly ONE positive catalogue root cause, and only if you can truthfully write a tool result that literally returns the exact detecting artefact that cause's catalogue row names (see section 4). If the inspector's toolset or evidence budget cannot produce that artefact, fall back to PLAN-NO-CAUSE. Never write two causes; never invent a cause to make the case look useful.
+
+Decide the mode first, then build the evidence story that honestly leads there. Do not decide the mode after the fact to match a verdict you like.
+
+== 1. THE FAILURE YOU INVENT ==
+
+The trajectory is the message list for ONE failure: a single user turn carrying the failure context, the inspector's tool work, and one final assistant turn with the answer. The user turn begins with the literal text 'Failure context:' followed by a JSON object with the same keys the seed uses: error_message, platform, element (recorded_role, recorded_name, step_label, locator_type, locator_value), runtime_url, runtime_title, ready_state, recent_steps (step_id, action, result), failed_step_id, evidence_available.
+
+Invent a plausible new product / site / app, page, element, locator, ids, error wording and screenshot observations:
+- WEB failures carry runtime_url, runtime_title, ready_state and web artefacts (page_source, record_a11y, record_html, runtime_a11y, HAR when relevant).
+- MOBILE failures carry null runtime_url / runtime_title / ready_state, native vocabulary in locators (XCUIElementType*, android.widget.*), and mobile artefacts (live_screenshot, mobile_state, runtime_a11y, recorder_element_screenshot, recorder_page_screenshot, success_step_results, test_steps). There is no HAR and no readyState on mobile.
+
+You may optionally add, after the JSON, a blank line and ONE short line beginning 'Deterministic hint (verify, never assume): '. It may carry raw signals only — a URL, a title, a readyState, a status code, a keyboard-shown flag, a context handle, a process-state flag. It must never carry a conclusion, a root_cause value, a page_kind value, a verdict adjective (different page, error page, blank, login screen) or an instruction such as 'confirm X'. If you cannot keep it to raw signals, omit the line.
+
+== 2. EVIDENCE BUDGET — DECIDE IT ONCE AND STAY CONSISTENT ==
+
+Choose exactly which artefacts were captured, list exactly those in evidence_available, and keep every tool result consistent with that list for the whole trajectory:
+- No runtime page source captured: locator_probe with side 'runtime' returns available:false, result 'unavailable', count null, reason 'no runtime page source was captured for this analysis'.
+- No runtime accessibility tree captured: a11y_search with side 'runtime' returns available:false, count 0, empty nodes, reason 'no runtime accessibility tree was captured for this analysis'.
+- No network log captured: query_har returns available:false.
+- A tool whose input was captured must not claim otherwise, and a tool whose input was not captured must never return data for it. Never return data for evidence the failure context says does not exist.
+
+== 3. TOOL CONTRACTS — NEVER BROKEN ==
+
+- compare_screenshots is pure vision over the screenshots that actually shipped. Its read field is a JSON string containing answer / confidence / observations, exactly like the examples. It may describe only what is visibly rendered: same or different page, spinners / loaders / skeletons / blank regions, an OS or system dialog, an error or blank screen, a keyboard on screen, an element crop visible or not. It may NEVER report network activity, DOM or tree facts, process state, HAR contents, ancestry, element ids or a cause. Ask it one precise question for the kind you chose.
+- a11y_search returns only matching role / name nodes and a count, from the requested side. side 'record' describes the recorded baseline and proves nothing about the live page; side 'runtime' describes the live page.
+- locator_probe only counts: unique, no_match, not_unique, unverifiable, unavailable. A runtime question is never answered from the record side. unverifiable and unavailable are never absence.
+- query_har knows only the session network log: pending, failures, summary; otherwise available:false.
+- walk_history returns only step sequences and results, prior executions of this step, record-time behavioural facts, or driver contexts (current context plus the context list on mobile).
+- walk_history's 'contexts' source is the only place a context list may come from; never let a screenshot read or a probe describe contexts.
+
+No tool may return a cause name, a verdict, an element id or any fact outside its own contract. No tool result may hand the inspector the answer it is meant to infer.
+
+GROUNDING RULE for every tool argument: the value must come from the failure context, from the inspector's own system prompt, or from an earlier [obs:N] in this same trajectory. Never invent a label, name, role, resource id or locator to search for — a guessed search string (a translated label, a variant control, a control you have not been shown) is a defect. When you need to search the live tree, use the recorded_name / recorded_role from the failure context; schema-allowed empty strings are fine to match any name or role.
+
+== 4. CAUSE GATING — THE REQUIRED-EVIDENCE MATRIX ==
+
+A root cause may be named ONLY when a tool result IN THIS TRAJECTORY returned the exact artefact the system prompt's catalogue names as that cause's detecting evidence. A locator miss plus an a11y hit is NOT shadow-boundary evidence; a probe miss or an empty tree alone is never absence. If the artefact is absent, the cause is off the table: take the no-cause value with an honest confidence.
+
+- Shadow / boundary / ancestry causes: require a shadow-root map, shadow path or DOM/tree boundary artefact actually returned.
+- Frame-context causes: require a frame-tree result.
+- Wrong-window / wrong-webview causes: require a window-handle inventory, or a context list containing more than one WEBVIEW_ handle.
+- Still-loading / page-timeout / render-stuck / data-API-failed / error-page causes: each requires its own network, console or document-status artefact actually returned.
+- Keyboard occlusion: requires a live-screenshot read (or the keyboard flag) affirmatively showing the target's region covered or displaced by the keyboard. A visible keyboard alone is the expected state of a text-entry step, never occlusion by itself.
+- System dialog / system overlay: vision must positively confirm a system-owned surface that blocks the app. If what you wrote is an OS-owned surface, the answer must be the catalogue dialog/overlay cause for it, never a null-cause occlusion verdict; conversely, if the answer carries root_cause null, the obstruction must be app-owned (a web modal, a sticky header, an in-page popup).
+- Element disabled: requires the deterministic disabled signal (executor diagnosis enabled = false) — never infer it from styling.
+- App crashed / ANR stalled: require process, crash or ANR evidence, or the exact visual proxy the system prompt names — never a blank tree alone.
+- Session expired / session interstitial: require the live screenshot positively showing a login or interstitial screen where the recording was authenticated; for expired, earlier steps of this run also succeeded past login. A lone auth-phrase match is a hint, never the conclusion.
+- Element absent: require a screenshot read affirming the element's region is visible and the element is not in it.
+- Not exposed to a11y: requires the screenshot plainly showing the control while the tree holds no nodes for its region.
+- Locale / A-B / OS-version / form-factor divergence: each requires the positive marker or signal the catalogue names, not merely 'it looks a bit different'.
+- Same-page locator: requires live presence (a runtime a11y hit, or a live screenshot read showing the control in place) plus same-page confirmation.
+- Same-page scroll: requires a scroll-cascade result recovering the element off the current viewport.
+- Dynamic identifier / text content changed / data-bound locator / hierarchy restructured: require the recorded type and label to match the element found in the recorded neighbourhood.
+
+Also: if the tool whose input would expose the cause is listed in evidence_available, CALL it before naming that cause; if it is not available, downgrade to the no-cause answer rather than infer. Never cite a record-side result for a live fact — side 'record' establishes the baseline only, and cannot support page identity, live presence, ancestry, context or any runtime cause.
+
+EXCLUSION RULE: do not let a narrow query stand in for a broad conclusion. An a11y search for one role excludes that role only. Before any no-cause verdict on an element-not-found failure, make at least one tool call aimed at the failed element itself — locator_probe against the runtime side, an a11y_search for its recorded name or role on the runtime side, or a compare_screenshots element_crop read of its region — and let the candidate blocker families be excluded by their own evidence, not by silence.
+
+== 5. THE FINAL ANSWER ==
+
+- Use exactly the keys and only the enum values the inspector's system prompt defines for the conclusion you chose, no extra keys and no missing ones. For a contract with conclusion plus root cause plus confidence plus detail, the object has all four: {"conclusion": ..., "root_cause": ..., "confidence": ..., "detail": ...}. For a root-cause-only contract (cause sweeps, escalation), the object has exactly three: {"root_cause": ..., "confidence": ..., "detail": ...}. For the mobile overlay inspector, the object has conclusion, root_cause, confidence, detail. root_cause is one of that prompt's catalogue causes, or null exactly where its contract says the conclusion carries none. Never borrow another inspector's cause.
+- Add an extra key only when the contract requires it for that specific conclusion — a page kind only with the different-page verdict, and only with a value the contract lists. No key is ever optional-but-missing.
+- Confidence reflects only what was observed. A low value is honest; a guessed cause is not.
+- detail is one short, non-hedged sentence. Every clause must map to a specific [obs:N] field or to the user failure context, and must name the source exactly as it was returned: live screenshot, recorded crop, runtime tree, record baseline, network log, execution history, driver contexts. Do not mention any artefact no tool read — no runtime HTML, page source, DOM, ancestry, shadow root, frame tree, console, network or process state unless a tool result literally returned that content. Attribute correctly: a keyboard seen in the live capture belongs to the live capture, not the recorded crop.
+
+== 6. TRAJECTORY MECHANICS ==
+
+- Do not include a system message in the message list.
+- Assistant tool-calling turns have empty content and tool calls with ids shaped call-(uuid)-(n); parallel calls inside one turn share the uuid and increment the index.
+- Tool turns carry a content string starting with [obs:N] (N incrementing across the trajectory) followed by that tool's JSON, with tool_call_id matching the call.
+- The final assistant turn contains only the answer object — no prose around it, and no reasoning, apology or narration anywhere else in the trajectory.
+- Keep it short: typically 1 to 3 tool calls and 4 to 8 messages in total. Occasionally, near the end, insert the user nudge 'You are almost out of steps. Stop calling tools and return the final JSON object now.' and then the final answer — only sometimes, not on every trajectory.
+
+== 7. DIVERSITY AND ANTI-COPY ==
+
+- A reader must not be able to tell the new trajectory shares a source with the seed. Do not reuse the seed's app or site names, URLs, page, element names, action verbs, locator stems, step ids, error-message wording, observation sentences — and do not reuse its broad failure family or its final verdict. Read the seed's error_message, element and final answer, and differ from all three.
+- Vary the investigation order from the seed's: if the seed opened with a screenshot, open with an a11y search, a locator probe, the network log or history instead. Vary which evidence family opens the case.
+- When you write a divergent / different-page verdict, do not default to a sign-in screen: use an error page, a blank page, a different section or route, or a consent / interstitial screen.
+- Vary the page kind, the element kind and the evidence budget across jobs.
+
+== 8. SELF-CHECK BEFORE YOU FINISH ==
+
+1. The mode came from the last character of the generation id, and the final answer matches it: PLAN-NO-CAUSE carries no root cause, PLAN-CAUSE carries exactly one catalogue cause.
+2. Every tool result is consistent with evidence_available — unavailable / reason strings where nothing was captured, real data only where it was.
+3. Every tool argument is grounded in the failure context, the system prompt or an earlier [obs:N]; no invented search string.
+4. Every positive root cause is backed by a tool result in this transcript that literally returned that cause's catalogue artefact, and the detail sentence cites it.
+5. For an element-not-found failure, at least one call targeted the failed element itself.
+6. The final object has exactly the keys the contract defines for that conclusion, only allowed enum values, a page kind only with the different-page verdict, and an app-owned blockage if the answer is a null-cause occlusion.
+7. Nothing is copied from the seed, and the investigation order differs from the seed's.
+8. No tool result states a cause, a verdict or an element id, and no final detail cites an artefact no tool read.
+
+Generation id: {generation_id}
