@@ -1,12 +1,14 @@
 """Dedup, select down to target_count, and report diversity.
 
-Exact dedup is Simia's (hash of human + assistant text). Near-dedup and balanced selection follow
+Exact dedup hashes every message (Simia's hashed human + assistant text only); near-dedup compares calls, results
+and answers, since seed expansions share their user context. Near-dedup and balanced selection follow
 Datology's curation: generate a bigger pool, remove redundancy, and keep coverage across seeds and
 strategies rather than the highest-scoring head (rare-but-useful examples survive).
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter, defaultdict
@@ -14,9 +16,21 @@ from collections import Counter, defaultdict
 _W = re.compile(r"\w+")
 
 
+def _calls(m: dict) -> str:
+    return json.dumps([[c["name"], c["arguments"]] for c in m.get("tool_calls", [])], sort_keys=True, ensure_ascii=False)
+
+
 def exact_key(trace: dict) -> str:
-    parts = [f"{m['role'][0]}:{m['content']}" for m in trace["messages"] if m["role"] in ("user", "assistant")]
+    """Hash of every message: text, tool calls and tool results. (Simia hashed human + assistant text only; with seed
+    expansion the context is shared by design and the differences live in calls and results.)"""
+    parts = [f"{m['role'][0]}:{m.get('content') or ''}:{_calls(m)}" for m in trace["messages"]]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def body_text(trace: dict) -> str:
+    """Everything but the user turns: tool calls, tool results, assistant text. Near-dedup compares this, because
+    expansions of one seed share their user context on purpose."""
+    return "\n".join(f"{m.get('content') or ''} {_calls(m)}" for m in trace["messages"] if m["role"] != "user")
 
 
 def action_signature(trace: dict) -> tuple:
@@ -42,7 +56,7 @@ def dedup(traces: list[dict], near: bool, threshold: float = 0.8) -> tuple[list[
             continue
         seen.add(k)
         if near:
-            sh = _shingles(first_user(t))
+            sh = _shingles(body_text(t))
             bucket = buckets[action_signature(t)]
             if any(len(sh & o) / max(1, len(sh | o)) >= threshold for o in bucket):
                 stats["near_dup"] += 1
