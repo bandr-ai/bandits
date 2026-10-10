@@ -5,14 +5,19 @@ Every stage reads and writes JSONL under out_dir and resumes: re-running skips w
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import subprocess
+import sys
+import uuid
+from collections import Counter
 from pathlib import Path
 
 from .banks import ObsBank, UserBank
 from .config import Config, load_config
 from .generate import generate
 from .io import parallel_map, read_jsonl, write_jsonl
-from .llm import chat_json, get_llm
+from .llm import chat_json, configure_call_log, get_llm
 from .plan import plan_jobs, write_specs
 from .prompts import SEED_CHECK
 from .schema import load_trace, render, to_sharegpt
@@ -145,11 +150,24 @@ def cmd_select(cfg: Config) -> dict:
               "short_of_target": max(0, cfg.target_count - len(final)), "dedup": dup_stats,
               "reject_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
               "features": vars(cfg.features), "diversity": diversity_report(final),
+              "llm": _llm_summary(cfg),
               "seed_diversity": diversity_report([{**s, "meta": {"seed_id": s["id"]}} for s in seeds])}
     _p(cfg, "final").mkdir(parents=True, exist_ok=True)
     _p(cfg, "final/report.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps({k: report[k] for k in ("target", "generated", "kept", "final", "short_of_target")}))
     return report
+
+
+def _llm_summary(cfg: Config) -> dict:
+    calls = _call_rows(cfg)
+    by_role: dict[str, dict] = {}
+    for c in calls:
+        r = by_role.setdefault(c.get("role") or "?", {"ok": 0, "failed_attempts": 0, "cost_usd": 0.0, "completion_tokens": 0})
+        r["ok" if c.get("ok") else "failed_attempts"] += 1
+        r["cost_usd"] = round(r["cost_usd"] + (c.get("cost") or 0), 6)
+        r["completion_tokens"] += ((c.get("usage") or {}).get("completion_tokens") or 0)
+    return {"calls": len(calls), "cost_usd": round(sum(c.get("cost") or 0 for c in calls), 6), "by_role": by_role,
+            "providers": dict(Counter(str(c.get("provider")) for c in calls if c.get("ok")))}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -159,14 +177,54 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     cfg.out.mkdir(parents=True, exist_ok=True)
-    if args.command == "run":
-        cmd_ingest(cfg)
-        cmd_generate(cfg)
-        cmd_verify(cfg)
-        cmd_select(cfg)
-    else:
-        {"ingest": cmd_ingest, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
-         "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
+    configure_call_log(_p(cfg, "llm_calls.jsonl"))
+    run = {"run_id": datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6],
+           "command": args.command, "config_path": str(Path(args.config).resolve()),
+           "config": json.loads(Path(args.config).read_text()), "started": _now(), **_provenance()}
+    calls_before = _call_rows(cfg)
+    status = "ok"
+    try:
+        if args.command == "run":
+            cmd_ingest(cfg)
+            cmd_generate(cfg)
+            cmd_verify(cfg)
+            cmd_select(cfg)
+        else:
+            {"ingest": cmd_ingest, "plan": cmd_plan, "specs": cmd_specs, "generate": cmd_generate,
+             "verify": cmd_verify, "select": cmd_select}[args.command](cfg)
+    except BaseException as e:
+        status = f"error: {type(e).__name__}: {e}"
+        raise
+    finally:
+        calls = _call_rows(cfg)[len(calls_before):]
+        run.update(finished=_now(), status=status, llm_calls=len(calls), llm_failed_attempts=sum(not c.get("ok") for c in calls),
+                   cost_usd=round(sum(c.get("cost") or 0 for c in calls), 6),
+                   providers=dict(Counter(str(c.get("provider")) for c in calls if c.get("ok"))),
+                   files={p.name: sum(1 for _ in p.open()) for p in sorted(cfg.out.glob("*.jsonl"))})
+        with _p(cfg, "runs.jsonl").open("a") as f:
+            f.write(json.dumps(run, default=str) + "\n")
+        print(f"run {run['run_id']}: {status}, {run['llm_calls']} LLM calls, ${run['cost_usd']}")
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.UTC).isoformat()
+
+
+def _call_rows(cfg: Config) -> list[dict]:
+    return read_jsonl(_p(cfg, "llm_calls.jsonl"))
+
+
+def _provenance() -> dict:
+    """Code version for the run manifest (git commit + dirty flag when available)."""
+    here = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], check=False, cwd=here, capture_output=True, text=True, timeout=10).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain", "--", str(here)], check=False, cwd=here, capture_output=True,
+                                    text=True, timeout=10).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        commit, dirty = None, None
+    import openai
+    return {"git_commit": commit or None, "git_dirty": dirty, "python": sys.version.split()[0], "openai": openai.__version__}
 
 
 if __name__ == "__main__":

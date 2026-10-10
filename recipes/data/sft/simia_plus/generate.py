@@ -78,7 +78,7 @@ def generate_simia(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: O
     conv = process_conversation(conv)            # Simia's argument repair (string -> dict, quotes, empty)
     trace = from_sharegpt({"id": job["job_id"], "system": seed.get("system", ""), "tools": seed["tools"],
                            "conversations": conv}, 0)
-    trace["meta"] = {"raw_turns": len(conv), "simia_deleted": deleted}
+    trace["meta"] = {"raw_turns": len(conv), "simia_deleted": deleted, "raw_output": out["content"]}
     return trace
 
 

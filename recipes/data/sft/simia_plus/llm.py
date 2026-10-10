@@ -1,13 +1,45 @@
-"""Thin OpenAI-compatible chat client with retries, JSON extraction and a swappable factory (for tests)."""
+"""Thin OpenAI-compatible chat client with retries, per-call logging, JSON extraction and a swappable
+factory (for tests).
+
+Every attempt (success or failure) is appended to the call log configured with configure_call_log():
+role, model, work item, attempt, latency, HTTP status, finish reason, token usage, gateway cost header,
+the provider that actually served it, the full request messages and the full response.
+"""
 from __future__ import annotations
 
+import contextvars
+import datetime
 import json
 import os
 import re
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol
+
+current_item: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_item", default=None)
+_log_path: Path | None = None
+_log_lock = threading.Lock()
+
+
+def configure_call_log(path: str | Path | None) -> None:
+    global _log_path
+    _log_path = Path(path) if path else None
+    if _log_path:
+        _log_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def log_call(row: dict) -> None:
+    if _log_path is None:
+        return
+    row = {"ts": datetime.datetime.now(datetime.UTC).isoformat(), "item": current_item.get(), **row}
+    with _log_lock, _log_path.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+
+class EmptyResponse(RuntimeError):
+    """The model returned neither text nor tool calls (e.g. reasoning ran out of tokens)."""
 
 from .config import Config, ModelCfg
 
@@ -20,12 +52,16 @@ class ChatLLM(Protocol):
 class OpenAILLM:
     """Returns {"content": str, "tool_calls": [{"id", "name", "arguments": dict}]}."""
 
-    def __init__(self, cfg: ModelCfg, retries: int = 4):
+    def __init__(self, cfg: ModelCfg, role: str = "", retries: int = 4):
         from openai import OpenAI
 
         self.cfg = cfg
+        self.role = role
         self.retries = retries
-        self.client = OpenAI(base_url=cfg.base_url, api_key=os.environ.get(cfg.api_key_env, "EMPTY"))
+        key = os.environ.get(cfg.api_key_env)
+        if not key and cfg.base_url is None:
+            raise RuntimeError(f"environment variable {cfg.api_key_env} is not set")
+        self.client = OpenAI(base_url=cfg.base_url, api_key=key or "EMPTY", timeout=600, max_retries=0)
 
     def chat(self, messages, tools=None, json_mode=False):
         kwargs: dict[str, Any] = {"model": self.cfg.model, "messages": messages,
@@ -37,21 +73,47 @@ class OpenAILLM:
         if json_mode and self.cfg.json_mode and not tools:
             kwargs["response_format"] = {"type": "json_object"}
         last: Exception | None = None
-        for attempt in range(self.retries):
+        for attempt in range(1, self.retries + 1):
+            t0 = time.monotonic()
+            row: dict[str, Any] = {"role": self.role, "model": self.cfg.model, "attempt": attempt,
+                                   "request": {"messages": messages, "tools": [t["function"]["name"] for t in tools or []],
+                                               "json_mode": bool(kwargs.get("response_format"))}}
             try:
-                msg = self.client.chat.completions.create(**kwargs).choices[0].message
-                calls = []
-                for tc in msg.tool_calls or []:
-                    calls.append({"id": tc.id, "name": tc.function.name,
-                                  "arguments": parse_args(tc.function.arguments)})
+                raw = self.client.chat.completions.with_raw_response.create(**kwargs)
+                resp = raw.parse()
+                choice = resp.choices[0]
+                msg = choice.message
+                calls = [{"id": tc.id, "name": tc.function.name, "arguments": parse_args(tc.function.arguments)}
+                         for tc in msg.tool_calls or []]
+                usage = resp.usage.model_dump() if resp.usage else None
+                extra = resp.model_extra or {}
+                row.update(ok=True, status=raw.status_code, latency_s=round(time.monotonic() - t0, 3),
+                           finish_reason=choice.finish_reason, usage=usage,
+                           cost=_float(raw.headers.get("x-litellm-response-cost")),
+                           call_id=raw.headers.get("x-litellm-call-id"), provider=extra.get("provider"),
+                           served_model=resp.model, response={"content": msg.content, "tool_calls": calls})
+                if not (msg.content or "").strip() and not calls:
+                    raise EmptyResponse(f"empty response (finish_reason={choice.finish_reason})")
+                log_call(row)
                 return {"content": msg.content or "", "tool_calls": calls}
-            except Exception as e:  # noqa: BLE001 - provider SDKs raise many types; retried, then re-raised
+            except Exception as e:  # noqa: BLE001 - provider SDKs raise many types; logged, retried, then re-raised
                 last = e
-                time.sleep(min(30, 2 ** attempt))
+                row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
+                           status=row.get("status") or getattr(e, "status_code", None))
+                log_call(row)
+                if attempt < self.retries:
+                    time.sleep(min(60, 2 ** attempt))
         raise RuntimeError(f"LLM call failed after {self.retries} attempts: {last}")
 
 
-_factory: Callable[[ModelCfg, str], ChatLLM] = lambda cfg, role: OpenAILLM(cfg)
+def _float(x: Any) -> float | None:
+    try:
+        return float(x) if x is not None else None
+    except ValueError:
+        return None
+
+
+_factory: Callable[[ModelCfg, str], ChatLLM] = lambda cfg, role: OpenAILLM(cfg, role)
 _cache: dict[str, ChatLLM] = {}
 _lock = threading.Lock()
 

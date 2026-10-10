@@ -44,7 +44,13 @@ def parallel_map(fn: Callable[[dict], dict | list[dict] | None], items: list[dic
     lock = threading.Lock()
     ok = failed = 0
     with out_path.open("a") as out, ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(fn, it): it for it in todo}
+        from .llm import current_item
+
+        def run(it: dict):
+            current_item.set(key(it))
+            return fn(it)
+
+        futures = {pool.submit(run, it): it for it in todo}
         for fut in as_completed(futures):
             it = futures[fut]
             try:
