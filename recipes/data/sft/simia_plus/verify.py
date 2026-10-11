@@ -285,6 +285,22 @@ def judge_expansion(cfg: Config, trace: dict, expansion: dict) -> dict:
     return out
 
 
+def malformed(j, expansion: dict | None) -> list[str]:
+    """Required parts missing from a judge response: an evaluation error (retried once), not a verdict."""
+    if not isinstance(j, dict):
+        return ["not an object"]
+    if not expansion:
+        return []  # the plain judge has no required structure beyond its flat fields, which fail closed
+    checks = j.get("checks") if isinstance(j.get("checks"), dict) else {}
+    required = [k for k in JUDGE_CHECKS if expansion.get("case") or k != "case_consistent"]
+    out = [f"check {k}" for k in required if not isinstance(checks.get(k), dict)]
+    if not isinstance(j.get("turns"), list):
+        out.append("turns")
+    if not isinstance(j.get("checklist"), list):
+        out.append("checklist")
+    return out
+
+
 def turn_issues(trace: dict, turns) -> list[str]:
     """Every assistant message needs a "justified" entry citing at least one earlier message (0 <= n < its number) or
     "system" (the system policy alone), and nothing at or after itself (no hindsight)."""
@@ -381,7 +397,23 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
         v["ungrounded_args"] = provenance_check(trace, spec)
     keep = not v["rule_issues"] and not v["contaminated"] and not v.get("ungrounded_args")
     if f.judge and keep:
-        j = judge_expansion(cfg, trace, expansion) if expansion else judge(cfg, trace, spec)
+        j, v["judge_attempts"] = None, 0
+        for _ in range(2):  # a malformed response gets one retry; a failed call (incl. token limit) gets none
+            v["judge_attempts"] += 1
+            try:
+                j = judge_expansion(cfg, trace, expansion) if expansion else judge(cfg, trace, spec)
+            except Exception as e:  # noqa: BLE001 - an evaluator failure is recorded, never read as a verdict on the trace
+                v["eval_error"] = f"{type(e).__name__}: {e}"[:300]
+                break
+            missing = malformed(j, expansion)
+            v["eval_error"] = f"malformed judge output: {', '.join(missing)}" if missing else None
+            if not missing:
+                break
+        if v.get("eval_error"):
+            v["judge"], v["kept"] = j, False
+            trace["meta"]["verify"] = v
+            return trace
+        v.pop("eval_error", None)
         v["judge"] = j
         # fail closed: a missing field is a failed check, not a pass
         consistent = (j.get("obs_consistent") is True and j.get("policy_followed") is True
@@ -392,9 +424,13 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
         keep = consistent and (success or cfg.keep_failures)
         trace["meta"]["bad_steps"] = j.get("bad_steps", []) if not success else []
         if keep and expansion and f.blind_check:
-            v["blind"] = blind_check(cfg, trace)
-            if not v["blind"]["agree"]:
-                keep, v["unresolved"] = False, True
+            try:
+                v["blind"] = blind_check(cfg, trace)
+            except Exception as e:  # noqa: BLE001 - a failed blind call is recorded, not a disagreement
+                v["blind"] = {"agree": None, "error": f"{type(e).__name__}: {e}"[:300]}
+            if v["blind"].get("agree") is False:
+                v["unresolved"] = True  # always recorded; it only blocks the trace when blind_gate is on
+                keep = keep and not f.blind_gate
     v["kept"] = keep
     trace["meta"]["verify"] = v
     return trace

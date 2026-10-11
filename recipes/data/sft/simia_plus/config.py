@@ -35,6 +35,7 @@ class Features:
     near_dedup: bool = False   # near-duplicate removal on top of Simia's exact dedup
     blind_check: bool = False  # seed expansion: a separate call answers from the observations alone; disagreement on the
                                # contract's categorical fields marks the trace unresolved (not exported, kept for diagnosis)
+    blind_gate: bool = True    # False: blind disagreement is recorded (unresolved) but does not block the trace (diagnostic only)
 
 
 @dataclass
@@ -90,6 +91,7 @@ class Config:
     pilot_jobs: int = 20       # jobs per round, over dev seeds
     case_block: bool = False   # analyzer generator writes a "case" (the changed situation, no answer) before the messages
     combo_share: float = 0.0   # share of analyzer jobs that apply one of the analyzer's variation combinations
+    quarantine_seeds: dict[str, str] = field(default_factory=dict)  # seed id (or unique prefix) -> reason; kept on disk, never used as a seed
     heldout_jobs_per_seed: int = 3  # final comparison on held-out seeds: chosen analyzer prompt vs simia_prompt=fixed
     workers: int = 16
     random_seed: int = 0

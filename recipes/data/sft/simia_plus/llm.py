@@ -41,6 +41,10 @@ def log_call(row: dict) -> None:
 class EmptyResponse(RuntimeError):
     """The model returned neither text nor tool calls (e.g. reasoning ran out of tokens)."""
 
+
+class Truncated(RuntimeError):
+    """The response hit the token limit (finish_reason=length); an identical retry would hit it again, so not retried."""
+
 from .config import Config, ModelCfg
 
 
@@ -97,6 +101,8 @@ class OpenAILLM:
                            call_id=raw.headers.get("x-litellm-call-id"), provider=extra.get("provider"),
                            cache_hit=raw.headers.get("x-litellm-cache-hit"),
                            served_model=resp.model, response={"content": msg.content, "tool_calls": calls})
+                if choice.finish_reason == "length":
+                    raise Truncated(f"response hit the token limit ({self.cfg.max_tokens})")
                 if not (msg.content or "").strip() and not calls:
                     raise EmptyResponse(f"empty response (finish_reason={choice.finish_reason})")
                 log_call(row)
@@ -106,6 +112,8 @@ class OpenAILLM:
                 row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
                            status=row.get("status") or getattr(e, "status_code", None))
                 log_call(row)
+                if isinstance(e, Truncated):
+                    raise
                 if attempt < self.retries:
                     time.sleep(min(60, 2 ** attempt))
         raise RuntimeError(f"LLM call failed after {self.retries} attempts: {last}")

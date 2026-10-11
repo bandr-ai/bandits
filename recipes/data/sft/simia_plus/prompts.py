@@ -518,6 +518,10 @@ You audit one synthetic training trajectory (GENERATED) made by applying the VAR
 The seed shows the situation before the change; it is not an answer key, because after the variation the correct
 answer may differ. Judge substance only; do not prefer longer answers.
 
+Distinguish failed execution, unavailable evidence, an observed negative result, and positive evidence. State exactly
+what the operation tested. Do not infer broader absence or inactivity than the result supports. Attribute arguments
+to the call and observations to the returned result.
+
 Two kinds of checks. CONSTRUCTION: was the variation applied to the seed correctly? Compare the seed, the variation,
 the case (when given; the generator's own description of the changed situation) and the generated observations.
 BEHAVIOUR: is each assistant action justified by what the agent had seen at that point? The agent never sees the
@@ -525,7 +529,8 @@ variation or the case: for behaviour, only messages before the turn count as evi
 
 For each check, give a verdict: "pass", "fail", "cannot_determine" (the trajectory lacks what you need to decide) or
 "not_applicable". Back it with evidence: the message numbers (GENERATED as N, SEED as "seed:N") with short excerpts
-copied exactly from those messages, then a one-sentence reason. When the problem is something missing (an
+copied exactly from those messages (each excerpt one contiguous span of at most about 20 words from the one message
+it cites; inside JSON, quote a single key and its value), then a one-sentence reason. When the problem is something missing (an
 unsupported claim), quote the claim and say what support is missing.
 
 Construction checks:
@@ -553,7 +558,9 @@ Turns: one entry for EVERY assistant message in GENERATED, in order: its number,
 policy alone justifies it), and a short reason. A call or answer that relies on something shown only later, or only
 in the case or variation, is unjustified.
 
-Return JSON only:
+Return JSON only. "checks" must contain exactly these seven keys, each with a verdict: only_declared_change,
+dependencies_updated, tool_contracts_respected, observations_consistent, case_consistent, policy_followed,
+task_success.
 {{"checks": {{"<check name>": {{"verdict": "pass", "evidence": [{{"message": "3", "excerpt": "..."}}], "reason": "..."}}}},
   "checklist": [{{"item": "<exact item text>", "verdict": "...", "evidence": [...], "reason": "..."}}],
   "turns": [{{"message": 1, "verdict": "justified", "relies_on": [0], "reason": "..."}}],
@@ -573,6 +580,11 @@ BLIND_ANSWER = """<system_prompt>
 
 <request>
 You are the agent described in the system prompt. Using only the conversation above, give the final answer the system
-prompt's output contract requires, as that JSON object. If the observations support none of the answers the contract
-allows, return {{"insufficient_evidence": true, "reason": "<one sentence>"}} instead.
+prompt's output contract requires, as that JSON object. Follow the system prompt's own rules for what the evidence
+supports, including the cautious answers it allows (for example no root cause when none is positively supported).
+Distinguish failed execution, unavailable evidence, an observed negative result, and positive evidence. State exactly
+what the operation tested. Do not infer broader absence or inactivity than the result supports. Attribute arguments
+to the call and observations to the returned result.
+Return {{"insufficient_evidence": true, "reason": "<one sentence>"}} only when, under those rules, the observations
+leave the answer genuinely undecided.
 </request>"""

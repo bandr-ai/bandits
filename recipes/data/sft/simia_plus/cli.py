@@ -143,7 +143,10 @@ def _load_seeds(cfg: Config) -> list[dict]:
     seeds = read_jsonl(_p(cfg, "seeds.jsonl"))
     if not seeds:
         raise SystemExit("run `ingest` first")
-    return seeds
+    held = [s["id"] for s in seeds if any(s["id"].startswith(q) for q in cfg.quarantine_seeds)]
+    if held:
+        print(f"quarantined seeds (not used): {held}")
+    return [s for s in seeds if s["id"] not in held]
 
 
 def cmd_plan(cfg: Config) -> list[dict]:

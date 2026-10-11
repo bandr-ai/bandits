@@ -595,6 +595,51 @@ def test_blind_answer_disagreement_is_unresolved(tmp_path):
     assert v["kept"] is False and v["unresolved"] is True and v["blind"]["insufficient"]
 
 
+def test_blind_diagnostic_only_and_evaluator_errors(tmp_path):
+    from simia_plus.llm import Truncated
+    from simia_plus.verify import system_key, verify
+    t = from_sharegpt(seed(0), 0)
+    t["messages"][-1]["content"] = '{"status": "cancelled"}'
+    schema = {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "cancelled"]}}}
+    (tmp_path / "schemas.json").write_text(json.dumps({system_key(t["system"]): schema}))
+    cfg = load_config(write_cfg(tmp_path, {"judge": True, "blind_check": True}, target=1, keep_failures=False,
+                                answer_schemas_path=str(tmp_path / "schemas.json")))
+    ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
+    run = lambda: verify(cfg, json.loads(json.dumps(t)), set(), ctx)["meta"]["verify"]  # noqa: E731
+    cfg.features.blind_gate = False  # disagreement recorded, trace not blocked
+    set_llm_factory(_judge_llm(blind={"status": "pending"}))
+    v = run()
+    assert v["kept"] is True and v["unresolved"] is True
+    cfg.features.blind_gate = True
+    calls = []
+    good = _judge_llm(blind={"status": "cancelled"})
+    def flaky(c, role):  # first judge response lacks turns (malformed), the retry is complete
+        inner = good(c, role)
+        def chat(self, messages, *a, **k):
+            out = inner.chat(messages)
+            if role == "judge" and not calls:
+                calls.append(1)
+                body = json.loads(out["content"]); body.pop("turns")
+                return {"content": json.dumps(body), "tool_calls": []}
+            return out
+        return type("J", (), {"role": role, "chat": chat})()
+    set_llm_factory(flaky)
+    v = run()
+    assert v["kept"] is True and v["judge_attempts"] == 2 and not v.get("eval_error")
+    always_bad = lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps({"checks": {}}),  # noqa: E731
+                                                                                "tool_calls": []}})()
+    set_llm_factory(always_bad)
+    v = run()
+    assert v["kept"] is False and v["judge_attempts"] == 2 and v["eval_error"].startswith("malformed judge output")
+    def truncated(c, role):
+        def chat(self, *a, **k):
+            raise Truncated("response hit the token limit (1)")
+        return type("J", (), {"chat": chat})()
+    set_llm_factory(truncated)
+    v = run()
+    assert v["kept"] is False and v["judge_attempts"] == 1 and "Truncated" in v["eval_error"]
+
+
 def test_case_block_format_and_judge_input(tmp_path):
     from simia_plus.analyzer import fill, parse_output
     from simia_plus.prompts import CASE_KEYS

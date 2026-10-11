@@ -464,7 +464,9 @@ def pilot_report(cfg: Config, verified: list[dict], seeds: list[dict]) -> dict:
         if v.get("ungrounded_args"):
             reasons["ungrounded_args"] += 1
         j = v.get("judge")
-        if j is not None and not v["kept"]:
+        if v.get("eval_error"):
+            reasons["eval_error"] += 1
+        elif j is not None and not v["kept"]:
             reasons["unresolved_blind_disagrees" if v.get("unresolved") else "judge_rejected"] += 1
             if (j or {}).get("turn_issues"):
                 reasons["turn_issues"] += 1
@@ -484,6 +486,9 @@ def pilot_report(cfg: Config, verified: list[dict], seeds: list[dict]) -> dict:
     return {"jobs": n, "format_ok": sum(1 for t in verified if not t["meta"].get("format_issues")),
             "kept": len(kept), "unique_kept": len(unique), "usable_rate": round(len(unique) / n, 3) if n else 0.0,
             "unresolved": sum(bool(t["meta"]["verify"].get("unresolved")) for t in verified),
+            "kept_unresolved": sum(bool(t["meta"]["verify"].get("unresolved")) for t in kept),
+            "eval_errors": sum(bool(t["meta"]["verify"].get("eval_error")) for t in verified),
+            "judge_retried": sum(t["meta"]["verify"].get("judge_attempts", 1) > 1 for t in verified),
             "outcomes_by_variation": {k: dict(v) for k, v in sorted(by_var_out.items())},
             "nearest_kept": nearest(unique, seeds),
             "dedup": dup, "reject_reasons": dict(reasons.most_common()), "checklist_failed": dict(items.most_common()),
@@ -651,6 +656,7 @@ def run_ab(cfg: Config, dev: list[dict], eval_ng: set, version: int, n_jobs: int
         (adir / "jobs.jsonl").write_text("".join(json.dumps(j, ensure_ascii=False) + "\n" for j in base))
     abcfg = copy.deepcopy(cfg)
     abcfg.features.judge = abcfg.features.blind_check = True
+    abcfg.features.blind_gate = False  # blind check is diagnostic in the A/B: recorded and reported, never blocks (both arms)
     summary = {}
     for arm, case in (("plain", False), ("case", True)):
         prefix = f"ab_v{version}/{arm}/"
@@ -659,7 +665,8 @@ def run_ab(cfg: Config, dev: list[dict], eval_ng: set, version: int, n_jobs: int
                     dev, eval_ng, harness=spec["harness"])
         calls = read_jsonl(cfg.out / "llm_calls.jsonl")
         cost = sum(c.get("cost") or 0 for c in calls if str(c.get("item") or "").startswith(prefix))
-        summary[arm] = {k: r[k] for k in ("jobs", "format_ok", "kept", "unique_kept", "unresolved", "reject_reasons",
+        summary[arm] = {k: r[k] for k in ("jobs", "format_ok", "kept", "unique_kept", "unresolved", "kept_unresolved",
+                                          "eval_errors", "judge_retried", "reject_reasons",
                                           "checklist_failed", "by_variation", "outcomes_kept", "outcomes_by_variation",
                                           "fidelity_kept")} | {
             "nearest_kept": {k: r["nearest_kept"][k] for k in ("at_least_0.8", "at_least_0.6")},
