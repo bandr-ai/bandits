@@ -170,5 +170,40 @@ def dspy_lm(model: str, *, api_key: str | None = None, **kwargs: Any) -> Any:
     """A ``dspy.LM`` for ``model``. The caller has already imported DSPy."""
     import dspy
 
+    from bandits import ledger
+    from bandits.analyze.rlm_history import record_history
+
+    class RecordedLM(dspy.LM):
+        def __call__(self, *args, **call_kwargs):
+            before = len(self.history)
+            ledger.record(
+                {
+                    "event_type": "model_call_start",
+                    "model": model,
+                    "request": {
+                        "prompt": call_kwargs.get("prompt", args[0] if args else None),
+                        "messages": call_kwargs.get("messages"),
+                        "temperature": call_kwargs.get(
+                            "temperature", self.kwargs.get("temperature")
+                        ),
+                        "max_tokens": call_kwargs.get("max_tokens", self.kwargs.get("max_tokens")),
+                    },
+                }
+            )
+            try:
+                return super().__call__(*args, **call_kwargs)
+            except BaseException as exc:
+                ledger.record(
+                    {
+                        "event_type": "model_call_error",
+                        "model": model,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                raise
+            finally:
+                record_history(self.history[before:], language_model=self)
+
     ref = resolve(model)
-    return dspy.LM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)
+    return RecordedLM(ref.litellm_id, **credentials(ref, api_key=api_key), **kwargs)
