@@ -37,3 +37,18 @@ jobs:
       - run: uv pip install "transformers>=5.2" "peft>=0.12"
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync pytest
+
+  sft-data:
+    # The SFT data recipe (recipes/data/sft): standalone, offline tests with a fake LLM.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: recipes/data/sft
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest

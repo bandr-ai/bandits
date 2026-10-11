@@ -1,0 +1,39 @@
+Most important failure patterns:
+
+1. **Tool availability lies about `evidence_available` (1 rejection, 1 weak kept).** In rejected `v2/01a0de28-d969-7ab0-9d94-02ed01d772ec__0` (locale_shift_same_page), the failure context preserved `evidence_available` without `runtime_a11y`, yet the generated `a11y_search({'side':'runtime'})` returned `available:true` with German navigation nodes. The seed with the same `evidence_available` had returned `available:false` with `no runtime accessibility tree was captured`. This is a direct harness-contract break and invents an evidence source. In kept `v2/01a0de25-9668-71b2-9866-e44fcd3ead6d__0` (same variation), `runtime_a11y` was advertised and the live page now shows the German permission dialog, but the generated `a11y_search({'role':'alertdialog','name':''})` still returns `count:0` from the seed (where the live page was a verification screen). The final answer ignores it; the judge tolerates it because a11y_search cannot witness absence, but it is a stale observation contradicting the changed live page. Fix: enforce `available:true` only for advertised slots; when the live page changes, re-evaluate every a11y_search for a landmark on it, or drop the call.
+
+2. **Cause-sweep checks can be rejected for a missing checklist (1 rejection).** `v2/01a0e008-9fbb-7af0-95f4-ab6b76735db5__1` (probe_unverifiable_record_alias) is contract-shaped: runtime probe `no_match`, record probe `unverifiable` with reason, final `root_cause:null, confidence:0.0, detail` citing the runtime no_match and no frame/shadow/window diff. The judge returned `checks:null`, `checklist_failed:['(checklist missing)']`, and all task/obs/policy flags false. Additionally, the variation's `correct_when` says `no_match` should send the agent on to visual and tree evidence, but this seed is a cause-sweep check whose only required tool is `locator_probe`. The generator could not follow that clause. Fix: generate the checklist for cause-sweep outputs or exempt them; restrict `probe_unverifiable_record_alias` to S1/S10 or rewrite its S6 expected behavior.
+
+3. **Reused seed observations after the world changed (1 weak kept).** See the locale_shift a11y_search case above. The generator currently reuses 27.3% of tool results from seeds in kept traces; that reuse must be conditioned on the observation still holding. In `v2/01a0de25-9668-71b2-9866-e44fcd3ead6d__0`, the a11y_search result did not survive the live-page change.
+
+4. **Near-duplicate rate is high (8 near-duplicates among 18 kept, pilot report).** Likely driven by over-sampling `keyboard_shown_target_above` (4 jobs, 4 kept) and repeated seed families. The variations themselves are not cosmetic, but the pilot allocation wastes capacity. Fix: cap per-variation jobs and diversify seeds/variations.
+
+5. **No drift or unsupported named causes in the six kept traces.** Context parsed 10/10, mean context fields changed 0.0, platform changed 0. The only world-invention is the unadvertised runtime a11y tree in pattern 1. Named causes in kept traces: `NSE_LOCALE_VARIANCE` (locale_shift) and `NSE_STILL_LOADING` (spinner), both with positive visual evidence; the rest use `root_cause:null`. Good.
+
+Variation verdicts:
+
+- `live_screenshot_missing_tree_only`: **fix** (not exercised; it requires dropping `live_screenshot`/recorder screenshot slots from `evidence_available`, but the pilot's `mean_context_fields_changed` is 0.0, so the generator never mutates that field. Add explicit permission/enforcement for `evidence_available` changes).
+- `a11y_tree_captured_empty_visual_affirms`: **keep** (1/1 kept).
+- `a11y_tree_not_captured`: **fix** (not exercised; same `evidence_available` mutation problem as above).
+- `probe_unverifiable_record_alias`: **fix** (2/3 kept; rejection is the missing-checklist/judge path plus the S6 `correct_when` that assumes visual/tree follow-up).
+- `spinner_affirms_loading_no_har`: **keep** (3/3 kept; the shown trace correctly flips to `still_loading`/`NSE_STILL_LOADING` and does not read `query_har available:false` as 'nothing pending').
+- `keyboard_shown_target_above`: **keep** (4/4 kept) but over-sampled; near-dup risk.
+- `target_covered_presence_occluded`: **keep** (2/2 kept); minor wording fix: preserve says 'the step that entered text' while the seed step is a click. Change to 'the interacting step'.
+- `app_dialog_not_system_owned`: **keep** (2/2 kept).
+- `generic_control_on_signin_page`: **keep** (1/1 kept; shown trace correctly refutes the same-page hint with `different_page` + `page_kind:'sign_in'`).
+- `same_page_promo_overlay_not_variant`: **keep** (2/2 kept; shown traces correctly return `same_page` with `root_cause:null`).
+- `locale_shift_same_page`: **fix** (1/2 kept; the rejected trace invents an unadvertised runtime a11y tree, and the kept trace reuses a stale `alertdialog count:0` after the live page changed. Make `a11y_search` conditional on advertised `runtime_a11y`; update or drop stale tree searches).
+- `fresh_session_interstitial_history`: **fix** (not exercised; verify `NSE_SESSION_INTERSTITIAL` is in the S7 closed vocabulary and that `walk_history` is actually called before naming the cause; otherwise drop/rewrite).
+
+Template changes (add/remove/fix):
+
+- **Add:** a hard precondition/validator: every tool result with `available:true` must have its corresponding slot in `evidence_available`; if a side's tree/source is not advertised, the tool returns the exact unavailable payload. This directly prevents the top rejection.
+- **Add:** 'When the variation changes the live page, re-evaluate every seed call that targeted the old live page (especially `a11y_search` for a landmark on it). Update the result to match the new page or drop the call. Never keep a stale seed observation beside contradicting evidence.' This is already in Ground rule 3, but needs to be a mandatory per-call check.
+- **Add/clarify:** `evidence_available` is part of the evidence world and must be updated when the variation adds or drops a slot. 'Only this changes' must explicitly permit that as part of the assigned change, not drift. Otherwise variations like `live_screenshot_missing_tree_only` and `a11y_tree_not_captured` cannot be applied correctly.
+- **Remove or soften:** 'Keep the seed's call count, roughly — one more or one fewer if the change forces it.' It can pressure the generator to retain invalidated calls to preserve count. Replace with: 'Drop any seed call whose observation no longer holds; call count may change more if needed. Evidence consistency over call count.'
+- **Remove or relax:** the instruction that every tool call must include every declared field. The harness fills omitted fields from `arg_defaults` before validation, and the generated traces sometimes omit `a11y_search` role/name (e.g. rejected locale_shift `a11y_search({'side':'runtime'})`). Either enforce it consistently or delete it as low-value.
+- **Fix in variations:** make `locale_shift_same_page`'s `a11y_search` optional/conditional on `runtime_a11y`; do not list it as required for seeds lacking that slot.
+- **Fix in variations:** restrict `probe_unverifiable_record_alias` to S1/S10 or give it an S6-specific `correct_when` that does not demand visual/tree evidence.
+- **Fix in variations:** for `target_covered_presence_occluded`, change preserve wording from 'the step that entered text' to the actual interacting step.
+- **Fix in variations:** for `fresh_session_interstitial_history`, verify the named cause exists in S7's closed vocabulary; if not, rewrite to the closest valid cause or drop the variation.
+- **Pilot config:** cap per-variation jobs and diversify seeds to reduce the 8/18 near-duplicate rate; over-sampling `keyboard_shown_target_above` (4/20) is not paying for itself.

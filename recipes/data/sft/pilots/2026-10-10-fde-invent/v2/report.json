@@ -1,0 +1,62 @@
+{
+ "jobs": 20,
+ "format_ok": 20,
+ "kept": 19,
+ "unique_kept": 19,
+ "usable_rate": 0.95,
+ "dedup": {},
+ "reject_reasons": {
+  "judge_rejected": 1
+ },
+ "checklist_failed": {
+  "Every tool call argument uses values from the task context, the system prompt, or earlier tool results; nothing is invented.": 1
+ },
+ "outcomes_kept": {
+  "conclusion=different_page": 2,
+  "conclusion=keyboard_occluded": 3,
+  "conclusion=locale_variance": 2,
+  "conclusion=no_blocker": 1,
+  "conclusion=occluded": 2,
+  "conclusion=still_loading": 2,
+  "conclusion=system_overlay": 1,
+  "root_cause=NSEM_SYSTEM_OVERLAY": 1,
+  "root_cause=NSE_ERROR_PAGE_RENDERED": 2,
+  "root_cause=NSE_KEYBOARD_OCCLUSION": 3,
+  "root_cause=NSE_LOCALE_VARIANCE": 2,
+  "root_cause=NSE_STILL_LOADING": 3,
+  "root_cause=None": 8
+ },
+ "outcomes_seeds": {
+  "conclusion=different_page": 1,
+  "conclusion=diverged": 2,
+  "conclusion=found_in_place": 1,
+  "conclusion=not_occluded": 2,
+  "conclusion=page_ready": 1,
+  "conclusion=system_dialog": 1,
+  "root_cause=NSE_SYSTEM_DIALOG": 1,
+  "root_cause=None": 11
+ },
+ "diversity_kept": {
+  "n": 19,
+  "distinct_action_signatures": 11,
+  "action_signature_entropy_bits": 3.216,
+  "first_user_distinct_3gram_ratio": 0.767,
+  "by_strategy": {
+   "analyzer": 19
+  },
+  "by_persona": {
+   "null": 19
+  },
+  "by_mode": {
+   "analyzer": 19
+  },
+  "with_failure": 0,
+  "per_seed_min_max": [
+   1,
+   2
+  ]
+ },
+ "attempts": {
+  "1": 20
+ }
+}

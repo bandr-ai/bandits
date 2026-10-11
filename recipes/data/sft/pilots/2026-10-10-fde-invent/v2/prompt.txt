@@ -1,0 +1,98 @@
+You are writing ONE synthetic supervised fine-tuning trajectory for a UI-test-failure inspector agent. You receive one real recorded trajectory (the seed) for shape and format reference, that agent's own system prompt (authoritative for the question it answers, the values it may output, and what evidence may support what), its tool schemas, and real recorded tool results as string-format reference. Write ONE new trajectory this same agent could have produced on a DIFFERENT failure: same role, same question, same tools, same final-answer contract, new case. Nothing about the new trajectory may be copied from the seed's scenario.
+
+SEED TRAJECTORY (shape and format reference only — never reuse its content):
+{seed_trace}
+
+AGENT SYSTEM PROMPT — authoritative for the question asked, the allowed conclusion / root_cause values, and the evidence rules:
+{system_prompt}
+
+TOOL SCHEMAS — the only tools that exist; every argument must be valid for them:
+{tools}
+
+REAL RECORDED TOOL RESULTS — match these string shapes exactly; do not reuse their content:
+{obs_examples}
+
+== 1. THE FAILURE YOU INVENT ==
+
+The trajectory is the message list for ONE failure: a single user turn carrying the failure context, the agent's tool work, and one final assistant turn with the answer. The user turn begins with the literal text 'Failure context:' and then a JSON object with the same keys the seed uses: error_message, platform, element (recorded_role, recorded_name, step_label, locator_type, locator_value), runtime_url, runtime_title, ready_state, recent_steps (step_id, action, result), failed_step_id, evidence_available. It may optionally be followed by a blank line and one short line beginning 'Deterministic hint (verify, never assume): ...'.
+
+Invent a plausible, different product / site / app, page, element, locator, ids, error wording and screenshot observations:
+- WEB failures carry runtime_url, runtime_title, ready_state, and web artefacts (page_source, record_a11y, record_html, runtime_a11y, HAR when relevant).
+- MOBILE failures carry null runtime_url / runtime_title / ready_state, native vocabulary in locators (XCUIElementType*, android.widget.*), and mobile artefacts (live_screenshot, mobile_state, runtime_a11y, recorder_element_screenshot, recorder_page_screenshot, success_step_results, test_steps). There is no HAR and no readyState on mobile.
+
+== 2. EVIDENCE BUDGET — DECIDE IT ONCE, STAY CONSISTENT ==
+
+Choose exactly which artefacts were captured, list exactly those in evidence_available, and keep every tool result consistent with that list for the whole trajectory:
+- No runtime page source captured: locator_probe with side 'runtime' returns available:false, result unavailable, count null, reason 'no runtime page source was captured for this analysis'.
+- No runtime accessibility tree captured: a11y_search with side 'runtime' returns available:false, count 0, empty nodes, reason 'no runtime accessibility tree was captured for this analysis'.
+- No network log captured: query_har returns available:false.
+- A tool whose input was captured must not claim otherwise; a tool whose input was not captured must never return data for it. Never return data for evidence the failure context says does not exist.
+
+== 3. TOOL CONTRACTS — NEVER BROKEN ==
+
+- compare_screenshots is pure vision over the screenshots that actually shipped. Its read field is a JSON string containing answer / confidence / observations, exactly like the examples. It may describe only what is visibly rendered: same or different page, spinners / loaders / skeletons / blank regions, an OS or system dialog, an error or blank screen, a keyboard on screen, an element crop visible or not. It may NEVER report network activity, DOM or tree facts, process state, HAR contents, ancestry, element ids, or a cause. Ask it a precise question for the kind you chose.
+- a11y_search returns only matching role / name nodes and a count from the requested tree side. side 'record' describes the recorded baseline and proves nothing about the live page. side 'runtime' describes the live page.
+- locator_probe only counts: unique, no_match, not_unique, unverifiable, unavailable. A runtime question is never answered from the record side. unverifiable and unavailable are never absence.
+- query_har knows only the session network log: pending, failures, summary; otherwise available:false.
+- walk_history returns only step sequences and results, prior executions of this step, record-time behavioural facts, or driver contexts (current context plus context list on mobile).
+No tool may return a cause name, a verdict, an element id, or any fact outside its own contract. No tool result may hand the agent the answer it is meant to infer.
+
+== 4. CAUSE GATING — THE REQUIRED-EVIDENCE MATRIX ==
+
+A root cause may be named ONLY when a tool result in your own trajectory returned the exact artefact the system prompt's catalog names as that cause's detecting evidence (or that artefact was shipped and a tool read it). A locator miss plus an a11y hit is NOT shadow-boundary evidence. If the artefact is absent, the cause is off the table: return null (or the inspector's carry-no-cause value) with an honest confidence.
+
+Apply this per family:
+- Shadow / boundary / ancestry causes: require a shadow-root map, shadow path, or DOM / tree boundary artefact actually returned.
+- Frame-context causes: require a frame-tree result.
+- Wrong-window / wrong-webview causes: require a window-handle inventory or a context list containing more than one WEBVIEW_ handle.
+- Still-loading / timeout / render-stuck / data-API-failed / error-page causes: each requires its own network, console, or document-status artefact actually returned (HAR read, readyState, error-page fingerprint).
+- Keyboard occlusion: requires a live-screenshot read (or the keyboard flag) affirmatively showing the target's region covered or displaced by the keyboard. A visible keyboard alone is the expected state of a text-entry step, never occlusion by itself.
+- System dialog / system overlay: vision must positively confirm a system-owned surface blocking the app.
+- Element disabled: requires the deterministic disabled signal (executor diagnosis enabled = false).
+- App crashed / ANR stalled: require process, crash, or ANR evidence, or the exact visual proxy the system prompt names — never a blank tree alone.
+- Session expired / session interstitial: require the live screenshot positively showing a login or interstitial screen where the recording was authenticated; for expired, earlier steps of this run also succeeded past login. A lone auth-phrase match is a hint, never the conclusion.
+- Element absent: requires a screenshot read that affirms the element's region is visible and the element is not in it. A probe miss or an empty tree alone is never a witness.
+- Not exposed to a11y: requires the screenshot plainly showing the control while the tree holds no nodes for its region.
+- Locale / A-B / OS-version / form-factor divergence: each requires the positive marker or signal the catalog names, not merely 'it looks a bit different'.
+- Same-page locator: requires live presence (runtime a11y hit, or a live screenshot read showing the control in place) plus same-page confirmation.
+- Same-page scroll: requires a scroll-cascade result recovering the element off the current viewport.
+- Dynamic identifier / text content changed / data-bound locator: require the recorded type and label to match the element found in the recorded neighbourhood.
+
+Also: if the tool whose input would expose the cause is listed in evidence_available, CALL it before naming the cause. If it is not available, downgrade to null rather than infer.
+
+Never cite a record-side result for a live fact. side 'record' establishes the baseline only; it cannot support page identity, live presence, ancestry, context, or a runtime cause.
+
+== 5. THE FINAL ANSWER ==
+
+- Use exactly the keys the system prompt defines, and only the enum values it lists. root_cause must be one of its catalog causes, or null where the contract says the conclusion carries none. Never borrow another inspector's cause.
+- Include an extra key only when the contract requires it for that specific conclusion (for example a page kind only with the different-page verdict), with an allowed value.
+- Confidence reflects only what was observed. A low value is honest; a guessed cause is not.
+- detail is one short, non-hedged sentence. Every clause must map to a specific [obs:N] field or to the user failure context. Name the source of each observation exactly as it was returned: live screenshot, recorded crop, runtime tree, record baseline, network log. Do not mention any artefact no tool read — no runtime HTML, page source, DOM, ancestry, shadow root, frame tree, console, network, or process state unless a tool result literally returned that content. Attribute correctly: a keyboard seen in the live capture is the live capture, not the recorded crop.
+
+== 6. TRAJECTORY MECHANICS ==
+
+- Do not include a system message in the message list.
+- Assistant tool-calling turns have empty content and tool calls with ids shaped call-(uuid)-(n); parallel calls inside a turn share the uuid and increment the index.
+- Tool turns carry a content string that starts with [obs:N] (N incrementing across the trajectory) followed by that tool's JSON, with tool_call_id matching the call.
+- The final assistant turn contains only the answer JSON — no prose around it, no reasoning, no apology, no narration anywhere else either.
+- Keep it short: typically 1 to 3 tool calls and 4 to 8 messages total. Occasionally, near the end, insert the user nudge 'You are almost out of steps. Stop calling tools and return the final JSON object now.' and then the final answer — only sometimes, not on every trajectory.
+
+== 7. DIVERSITY AND ANTI-COPY ==
+
+- A reader must not be able to tell the new trajectory shares a source with the seed. Do not reuse the seed's app or site names, URLs, page, element names, action verbs, locator stems, step ids, error-message wording, or observation sentences. Change the failure family too: if the seed is an element-absence case, do not write another element-absence case with the same shape unless the evidence genuinely leads there.
+- Vary the investigation order from the seed's: if the seed opened with a screenshot, open with a11y search, a locator probe, the network log, or history instead. Vary which evidence family opens the case.
+- When concluding a divergent / different-page verdict, do not default to a sign-in screen. Use an error page, a blank page, a different section or route, or a consent / interstitial screen. Vary the page kind across jobs.
+- Vary the failure family and the page kind: element absence, page identity, page readiness, occlusion, wrong context, data-driven absence, permission gating, transient element, and so on.
+
+== 8. OUTCOME BALANCE — DO NOT OVER-DIAGNOSE ==
+
+The real seed batch is dominated by honest carry-no-cause outcomes (null root cause, page ready, not occluded, no blocker) and by divergent / different-page verdicts. Keep that balance:
+- Prefer the cautious outcome whenever the invented evidence is ambiguous.
+- At most one positive root cause per trajectory, and only when its required-evidence row above is satisfied by a tool result you actually wrote. A positive cause invented to make the case look useful is a defect.
+- If the honest answer is that nothing is supported, say so: the inspector's no-cause outcome with an honest low-to-mid confidence.
+- If the seed's verdict is a positive cause, prefer a different verdict unless the invented evidence clearly forces the same one. Never copy the seed's verdict to match its shape.
+- Include occasional genuinely ambiguous cases whose honest answer is null.
+
+Write only the new trajectory.
+
+Generation id: {generation_id}

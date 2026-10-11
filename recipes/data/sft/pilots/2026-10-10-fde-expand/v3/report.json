@@ -1,0 +1,129 @@
+{
+ "jobs": 20,
+ "format_ok": 20,
+ "kept": 17,
+ "unique_kept": 17,
+ "usable_rate": 0.85,
+ "dedup": {},
+ "reject_reasons": {
+  "judge_rejected": 3
+ },
+ "checklist_failed": {
+  "Every tool call argument uses values from the task context, the system prompt, or earlier tool results; nothing is invented.": 1
+ },
+ "by_variation": {
+  "a11y_tree_captured_empty_visual_affirms": {
+   "jobs": 1,
+   "kept": 1,
+   "no_op": 0
+  },
+  "a11y_tree_not_captured": {
+   "jobs": 3,
+   "kept": 3,
+   "no_op": 0
+  },
+  "app_dialog_not_system_owned": {
+   "jobs": 3,
+   "kept": 2,
+   "no_op": 0
+  },
+  "generic_control_on_signin_page": {
+   "jobs": 2,
+   "kept": 1,
+   "no_op": 0
+  },
+  "keyboard_shown_target_above": {
+   "jobs": 4,
+   "kept": 3,
+   "no_op": 0
+  },
+  "locale_shift_same_page": {
+   "jobs": 3,
+   "kept": 3,
+   "no_op": 0
+  },
+  "probe_unverifiable_record_alias": {
+   "jobs": 1,
+   "kept": 1,
+   "no_op": 0
+  },
+  "spinner_affirms_loading_no_har": {
+   "jobs": 3,
+   "kept": 3,
+   "no_op": 0
+  }
+ },
+ "outcomes_kept": {
+  "conclusion=different_page": 2,
+  "conclusion=diverged": 2,
+  "conclusion=found_in_place": 2,
+  "conclusion=locale_variance": 3,
+  "conclusion=no_blocker": 2,
+  "conclusion=not_occluded": 3,
+  "conclusion=still_loading": 3,
+  "root_cause=NSE_LOCALE_VARIANCE": 3,
+  "root_cause=NSE_SAME_PAGE_LOCATOR": 1,
+  "root_cause=NSE_STILL_LOADING": 3,
+  "root_cause=None": 10
+ },
+ "outcomes_seeds": {
+  "conclusion=different_page": 1,
+  "conclusion=diverged": 2,
+  "conclusion=found_in_place": 1,
+  "conclusion=not_occluded": 2,
+  "conclusion=page_ready": 1,
+  "conclusion=system_dialog": 1,
+  "root_cause=NSE_SYSTEM_DIALOG": 1,
+  "root_cause=None": 11
+ },
+ "fidelity_all": {
+  "context_parsed": "20/20",
+  "mean_context_fields_changed": 0.3,
+  "platform_changed": 0,
+  "no_op": 0,
+  "tool_results_reused_from_seed_share": 0.356,
+  "most_changed_fields": {
+   "evidence_available": 4,
+   "runtime_title": 1,
+   "runtime_url": 1
+  }
+ },
+ "fidelity_kept": {
+  "context_parsed": "17/17",
+  "mean_context_fields_changed": 0.235,
+  "platform_changed": 0,
+  "no_op": 0,
+  "tool_results_reused_from_seed_share": 0.375,
+  "most_changed_fields": {
+   "evidence_available": 4
+  }
+ },
+ "decision_cells_kept": {
+  "distinct": 31,
+  "max_repeats": 3,
+  "not_in_seeds": 15
+ },
+ "diversity_kept": {
+  "n": 17,
+  "distinct_action_signatures": 9,
+  "action_signature_entropy_bits": 2.984,
+  "first_user_distinct_3gram_ratio": 0.322,
+  "by_strategy": {
+   "analyzer": 17
+  },
+  "by_persona": {
+   "null": 17
+  },
+  "by_mode": {
+   "analyzer": 17
+  },
+  "with_failure": 0,
+  "per_seed_min_max": [
+   1,
+   3
+  ]
+ },
+ "attempts": {
+  "1": 20
+ }
+}

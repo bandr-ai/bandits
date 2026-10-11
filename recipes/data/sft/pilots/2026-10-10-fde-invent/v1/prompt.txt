@@ -1,0 +1,43 @@
+You are generating ONE synthetic supervised fine-tuning trajectory for a UI-test-failure inspector agent. The job gives you one real recorded trajectory (the seed) plus that agent's own system prompt and tool schemas. Write ONE new trajectory this same agent could have produced on a DIFFERENT failure — same role, same question, same tools, same output contract, new case.
+
+SEED TRAJECTORY (shape reference only — study its structure, never copy its content):
+{seed_trace}
+
+AGENT SYSTEM PROMPT — authoritative for the question it answers, the exact allowed conclusion / root_cause values, the evidence rules, and the contract of its final message:
+{system_prompt}
+
+TOOL SCHEMAS — the only tools that exist; arguments must be valid for them:
+{tools}
+
+REAL RECORDED TOOL RESULTS — format reference for the tool-result strings only (match their shape exactly, not their content):
+{obs_examples}
+
+WHAT TO PRODUCE
+The trajectory is the message list for this one failure: a single user turn carrying the failure context, then the agent's tool work, ending with the agent's one final answer message. The user turn begins with "Failure context:" and then a JSON object using the same keys the seed uses: error_message, platform, element (with recorded_role, recorded_name, step_label, locator_type, locator_value), runtime_url, runtime_title, ready_state, recent_steps (step_id, action, result), failed_step_id, evidence_available. Invent a plausible, different product / site / app, page, element, locator value, ids, error wording and screenshot observations. The agent probes the case with a few tool calls and stops with its final answer.
+
+HARD RULES
+1. Invent everything. Never reuse the seed's URLs, app or site names, element names, locator values, step ids, error-message wording, or observation sentences. A reader must not be able to tell the two trajectories share a source.
+2. Stay inside the agent's lane. The final answer uses exactly the keys, and only the enum values, the system prompt above defines; root_cause must be one of the catalog causes that system prompt lists, or null where it says the conclusion carries none. If the contract adds an extra key only for a particular conclusion (a page_kind, for instance), include it only in that case. Never invent a cause, never borrow a cause from another inspector's catalog, never answer a different question than the one asked.
+3. Evidence must support the answer, never exceed it. Name a catalog cause only when the evidence positively shows that entry's detecting evidence; otherwise null with an honest low confidence. Confidence is a function of what was actually observed — a low value is honest, a guessed cause is not.
+4. Each tool result must be true to that tool's contract, and no tool may hand over the answer the agent is supposed to infer:
+   - compare_screenshots is pure vision over the shipped screenshots: it may only describe what is visibly rendered (including "different page", "no", "OS/system dialog …"). It can never report network activity, DOM or tree facts, process state, HAR data or a root cause. Its read field is a JSON string (escaped, inside the outer JSON) with answer / confidence / observations, exactly like the examples.
+   - a11y_search returns only matching role/name nodes from an accessibility tree plus a count. side='record' describes the recorded baseline and proves nothing about the live page.
+   - locator_probe only counts: unique / no_match / not_unique / unverifiable / unavailable. A runtime question is never answered from the record side.
+   - query_har only knows the network log: pending, failures or summary; otherwise available:false.
+   - walk_history only returns execution history, step results, record-time behavioural facts, or driver contexts.
+   Never let a tool return an element id, a cause name, or any fact outside its own contract.
+5. Availability must be consistent with the failure context. A tool whose input was not captured returns unavailable / available:false with a reason (no runtime page source captured, no runtime accessibility tree captured, no network log for this failure); never return data for evidence the context says does not exist. Decide per trajectory what was captured, put exactly that in evidence_available, and keep every tool result consistent with it across the whole trajectory.
+6. Respect the platform. For MOBILE failures use native vocabulary (XCUIElementType*, android.widget.*, ActivityIndicator / Alert / RecyclerView / UITableView, no URLs, no ready_state, no HAR); for WEB use web artefacts (runtime_url, runtime_title, ready_state, page_source, HAR).
+7. Trajectory mechanics, matching the seed's shape:
+   - do not include a system message in the message list;
+   - the user failure context may optionally be followed by a blank line and one short line beginning "Deterministic hint (verify, never assume): …", as some seeds have;
+   - assistant tool-calling turns have empty content and one or more tool calls with ids shaped like call-<uuid>-<n>; parallel calls inside a turn share the uuid and increment the index;
+   - tool turns carry a content string that starts with "[obs:N] " (N incrementing across the trajectory) followed by the tool's JSON, with tool_call_id matching the call;
+   - the final assistant turn contains only the answer JSON — no prose around it, one short non-hedged detail sentence naming evidence the agent actually saw;
+   - keep it short: typically 1–3 tool calls and 4–8 messages total. Occasionally, near the end, insert the user nudge "You are almost out of steps. Stop calling tools and return the final JSON object now." and then the final answer — but only sometimes, not on every trajectory.
+8. Vary the outcome between jobs, not within one. A resolved positive diagnosis, an honest null (page_ready, not_occluded, no_blocker, root_cause null), and a diverged / different_page verdict are all valid — pick whichever the invented evidence genuinely leads to, and let some cases be genuinely ambiguous. Never force a positive cause to look useful.
+9. No narration anywhere. No commentary, no reasoning out loud, no apology, no meta text in any assistant message other than the required tool calls and the single final answer.
+
+Write only the new trajectory.
+
+Generation id: {generation_id}

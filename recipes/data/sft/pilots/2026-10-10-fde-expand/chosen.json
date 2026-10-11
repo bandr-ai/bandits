@@ -1,0 +1,9 @@
+{
+ "version": 2,
+ "by": "recomputed with fixed dedup: v1 14/20, v2 18/20, v3 17/20; v2 chosen (best kept rate, no code rejects, outcome mix closest to seeds). Provisional until spot-check.",
+ "dev_usable_rates": {
+  "v1": 0.7,
+  "v2": 0.9,
+  "v3": 0.85
+ }
+}

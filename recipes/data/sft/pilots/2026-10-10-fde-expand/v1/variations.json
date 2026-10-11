@@ -1,0 +1,190 @@
+[
+ {
+  "name": "live_screenshot_missing_tree_only",
+  "applies_to": [
+   "S1",
+   "S10"
+  ],
+  "requires_tools": [
+   "a11y_search",
+   "locator_probe",
+   "compare_screenshots"
+  ],
+  "teaches": "When no live screenshot was captured, every comparison kind returns available=false with a reason; presence must be decided from the tree and the probe alone, and absence can never be concluded without the visual witness.",
+  "change": "evidence_available no longer contains live_screenshot (nor the recorded page/element screenshots): compare_screenshots full_page and element_crop come back available=false with the 'no live screenshot captured — nothing to compare the recorded references against' message; the runtime accessibility tree IS captured and contains the recorded role+name node.",
+  "preserve": "platform, app or site, page, recorded element and locator value, failed_step_id, the failure wording, and the agent's question.",
+  "dependencies": "replace or drop the screenshot calls and their reads (they now return the unavailable payload and must not be cited as a visual read); keep the a11y_search call with a real nodes payload; if a probe is made, give it a real result; the final answer must rest on the programmatic evidence only.",
+  "correct_when": "a11y_search on side='runtime' returns the recorded role+name node(s) with count ≥ 1 (or the runtime probe resolves it) while every screenshot kind is unavailable — presence is affirmed programmatically, and `absent` is excluded because no screenshot affirmed the region is visible without the element."
+ },
+ {
+  "name": "a11y_tree_not_captured",
+  "applies_to": [
+   "S1",
+   "S10",
+   "S3",
+   "S5"
+  ],
+  "requires_tools": [
+   "a11y_search"
+  ],
+  "teaches": "available=false with the missing-tree reason names a missing TREE, not a missing element — it must never be converted into absence, and the run falls through to the tools that still hold evidence.",
+  "change": "Every a11y_search call comes back {\"status\": \"success\", \"available\": false, \"count\": 0, \"nodes\": [], \"reason\": \"no runtime accessibility tree was captured for this analysis\"} (and the record tree is uncaptured too, with the side='record' wording), while the screenshots remain captured.",
+  "preserve": "the seed's element, locator, page, platform and its non-a11y evidence calls and reads.",
+  "dependencies": "any call whose result depended on tree nodes is replaced by the unavailable payload; the conclusion must rest on what is left (the screenshot read, a probe), and the detail sentence must not claim to have searched a tree.",
+  "correct_when": "the remaining evidence is the screenshot read and/or a probe: if the crop read affirms the recorded control is visible the answer is `found_in_place`; if the only tree evidence is the unavailable payload, no absence may be claimed and no conclusion may cite node counts."
+ },
+ {
+  "name": "probe_unverifiable_record_alias",
+  "applies_to": [
+   "S1",
+   "S10",
+   "S6"
+  ],
+  "requires_tools": [
+   "locator_probe"
+  ],
+  "teaches": "`unverifiable` is not `no_match`: a dialect that cannot be evaluated against that side says nothing about the element's presence, and the runtime side is the only side that answers a runtime question.",
+  "change": "The record-side probe returns result 'unverifiable', count null, available true, reason 'the recorded capture predates recorder alias attributes'; a runtime probe of the same locator is also run and returns a real count (no_match, or unique, or not_unique).",
+  "preserve": "the recorded locator type and value, the page, the element, the platform.",
+  "dependencies": "the runtime probe must be made before any presence reading; the final detail must attribute the reading to side='runtime' and never cite the unverifiable record result as absence or as a match.",
+  "correct_when": "the runtime probe carries the presence reading (unique → found_in_place; no_match → the search continues to the visual/tree evidence); the record-side unverifiable result is treated as no information, and the answer never says the element was absent because the record probe matched nothing."
+ },
+ {
+  "name": "spinner_affirms_loading_no_har",
+  "applies_to": [
+   "S9",
+   "S4"
+  ],
+  "requires_tools": [
+   "compare_screenshots",
+   "query_har"
+  ],
+  "teaches": "Positive spinner evidence suffices for still_loading; and HAR available=false means no network log was captured, not that nothing was pending.",
+  "change": "compare_screenshots spinner_check now reads a spinner/skeleton covering the missing element's region (answer yes, confidence around 0.9); query_har still returns available=false as in the seed.",
+  "preserve": "the element, platform, recent steps, the fact that no network log exists for this failure, and the seed's call order.",
+  "dependencies": "the spinner question must ask about the missing element's region specifically; the final answer flips to still_loading with NSE_STILL_LOADING and the spinner named as the evidence; no sentence may assert anything about in-flight requests.",
+  "correct_when": "the visual read affirms a loader over the element's region while the network log is uncaptured — pending work plausibly explains the absence, so still_loading / NSE_STILL_LOADING, cited from the spinner alone."
+ },
+ {
+  "name": "keyboard_shown_target_above",
+  "applies_to": [
+   "S2"
+  ],
+  "requires_tools": [
+   "compare_screenshots"
+  ],
+  "teaches": "A visible soft keyboard is the expected state of a text-entry step; occlusion requires the target's region actually covered or displaced.",
+  "change": "The live screenshot shows the soft keyboard open, but the recorded field is fully visible above it (overlay_check read: keyboard present, no blocking overlay, target clear of it).",
+  "preserve": "the text-entry step, the recorded field and its locator, the platform.",
+  "dependencies": "the overlay_check question must ask exactly whether the target's region is covered or displaced by the keyboard; the answer becomes not_occluded with root_cause null; no occlusion cause may be named.",
+  "correct_when": "the read affirms the target sits clear of the keyboard — not_occluded; a wrong occlusion call blocks a heal, so doubt resolves to not_occluded."
+ },
+ {
+  "name": "keyboard_covers_target_tree_sees_it",
+  "applies_to": [
+   "S2",
+   "S1"
+  ],
+  "requires_tools": [
+   "compare_screenshots",
+   "a11y_search"
+  ],
+  "teaches": "Present-but-covered is the positive occlusion shape: tree nodes exist for the element while the keyboard covers its region.",
+  "change": "a11y_search on the runtime tree returns the recorded field with count ≥ 1, and the overlay_check read affirms the keyboard covers the element's expected region.",
+  "preserve": "the element, the platform, the step that entered text, the recorded locator.",
+  "dependencies": "the final answer becomes keyboard_occluded with NSE_KEYBOARD_OCCLUSION, citing both facts; a presence reading of `absent` is excluded because the element is in the tree.",
+  "correct_when": "nodes_nonempty plus a keyboard covering the element's region is present-but-occluded — never absence, and never a claim that the element fails to exist."
+ },
+ {
+  "name": "app_dialog_not_system_owned",
+  "applies_to": [
+   "S8"
+  ],
+  "requires_tools": [
+   "compare_screenshots"
+  ],
+  "teaches": "A native dialog node is not automatically a system-owned blocker: an in-flow app dialog the flow itself produces is no_blocker.",
+  "change": "The overlay_check read describes an app-rendered in-flow dialog (the app's own chrome and buttons, part of the expected flow) rather than an OS permission/update prompt or a system shade; the app underneath is reachable once the flow's dialog is handled.",
+  "preserve": "the platform, the recorded element, the step, the permission-flavoured wording of the failure.",
+  "dependencies": "the question must ask whether the dialog is OS/system-owned and genuinely blocking the app under it; the answer becomes no_blocker with root_cause null; any system_dialog / system_overlay cause is dropped.",
+  "correct_when": "the read names app chrome and an in-flow dialog the flow itself produces — no_blocker; the prompt's test is system ownership plus genuine blocking, and a fingerprint or a dialog node alone never decides."
+ },
+ {
+  "name": "overlay_covers_region_no_source",
+  "applies_to": [
+   "S1",
+   "S10"
+  ],
+  "requires_tools": [
+   "compare_screenshots",
+   "locator_probe",
+   "a11y_search"
+  ],
+  "teaches": "Without a page source or tree, covered and gone cannot be told apart — occluded is the hand-off, never absent.",
+  "change": "No page source and no accessibility tree were captured; the live screenshot shows a modal/promo whose box sits over the region where the recorded element belongs, and the recorded element is not visible in it.",
+  "preserve": "the element, its locator, the page kind, the failure wording.",
+  "dependencies": "locator_probe on side='runtime' returns unavailable with its 'no runtime page source was captured for this analysis' reason; a11y_search returns the missing-tree payload; the answer becomes occluded with root_cause null (a hand-off), and the detail must not claim the element is gone.",
+  "correct_when": "an overlay sits over the element's expected region while no source or tree shipped — occluded; absence would require a screenshot read affirming the region is visible and the element is not in it."
+ },
+ {
+  "name": "generic_control_on_signin_page",
+  "applies_to": [
+   "S1",
+   "S10"
+  ],
+  "requires_tools": [
+   "compare_screenshots"
+  ],
+  "teaches": "A crop of a generic control resembles that control on any page; presence must refute its own premise instead of forcing found_in_place.",
+  "change": "The live screenshot is a sign-in page that carries a generic Submit / Cancel / password control visually similar to the recorded element's crop.",
+  "preserve": "the recorded element, its locator value, the platform, the failure wording.",
+  "dependencies": "the element_crop read must state that the live page is a login screen; the answer becomes different_page with page_kind 'sign_in' and root_cause null; found_in_place and found_other_context are both excluded.",
+  "correct_when": "the live page is plainly a sign-in page rather than the recorded page — different_page with page_kind sign_in; a lookalike generic control does not make it found_in_place, and found_other_context means another frame/window/webview of the SAME page."
+ },
+ {
+  "name": "same_page_promo_overlay_not_variant",
+  "applies_to": [
+   "S3",
+   "S5"
+  ],
+  "requires_tools": [
+   "compare_screenshots"
+  ],
+  "teaches": "A modal that merely appeared at runtime is neither divergence nor an A/B variant — dynamic content and overlays do not change the page's identity.",
+  "change": "The live page shows the same chrome, navigation and page kind as the recorded page, with the same URL/title, plus a cookie-consent or promo modal over it.",
+  "preserve": "the page, the route, the title, the layout family.",
+  "dependencies": "a11y_search may corroborate a shared landmark; the answer becomes same_page (or same_page_scrolled), and neither diverged nor ab_variant may be named since no variant marker exists.",
+  "correct_when": "structure, chrome and route match and only an overlay differs — same_page; ab_variant needs a positive variant signal (build/version/flag marker or known variant fingerprint) and diverged needs a structurally different screen."
+ },
+ {
+  "name": "locale_shift_same_page",
+  "applies_to": [
+   "S3",
+   "S5"
+  ],
+  "requires_tools": [
+   "compare_screenshots",
+   "a11y_search"
+  ],
+  "teaches": "Same page in another language is locale_variance — not divergence, and distinct from a single element's label change.",
+  "change": "The live page is the same screen in another language (e.g. German): same chrome, navigation, page kind and route, with all copy translated.",
+  "preserve": "page kind, route, layout family, the recorded element's role and position.",
+  "dependencies": "the full_page read must state the language difference; a11y_search may corroborate the same landmark in the other language; the answer becomes locale_variance with NSE_LOCALE_VARIANCE (the cause its own prompt lists for that conclusion).",
+  "correct_when": "structure and route match while the copy is translated throughout — locale_variance; a different screen structure would be diverged, and a single relabelled control on an otherwise unchanged page is the element-presence reading text_changed, not locale variance."
+ },
+ {
+  "name": "fresh_session_interstitial_history",
+  "applies_to": [
+   "S7"
+  ],
+  "requires_tools": [
+   "compare_screenshots",
+   "walk_history"
+  ],
+  "teaches": "A session-scoped screen appears only on fresh sessions — the run's history is what separates a session interstitial from a permanent change or an ordinary promo.",
+  "change": "The live screen shows a first-run / consent / 'what's new' interstitial; walk_history execution_history shows this step passing in recent prior runs and success_steps show the earlier steps of this run green on a fresh session.",
+  "preserve": "the element, the platform, the step ids and the failure wording.",
+  "dependencies": "the walk_history call must actually be made before the cause is named (a history claim reached without consulting history is unwitnessed); the final answer names NSE_SESSION_INTERSTITIAL and cites the overlay plus the fresh-session / prior-pass pattern.",
+  "correct_when": "the overlay read plus the fresh-session history with prior passes is the catalog's detecting evidence for NSE_SESSION_INTERSTITIAL; the same overlay without that history would not support it, and no flow-change cause may be named without positive divergence evidence."
+ }
+]
