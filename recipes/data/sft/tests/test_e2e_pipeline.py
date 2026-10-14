@@ -356,3 +356,67 @@ def test_failed_production_is_never_complete_and_resumes(tmp_path, fake, breaker
     assert run(cfg, target=40) == 0
     rep = json.loads((out / "final" / "report.json").read_text())
     assert rep["status"] == "complete" and rep["from_production"] > 0
+
+
+def _sdk_client(replies, sent):
+    """An OpenAI SDK stand-in: each create() returns the next (content, completion_tokens) as a raw response."""
+    from types import SimpleNamespace as NS
+
+    def create(**kw):
+        content, out_tokens = replies[len(sent)]
+        sent.append(kw)
+        msg = NS(content=content, tool_calls=None, model_extra={})
+        resp = NS(choices=[NS(message=msg, finish_reason="stop")], model="m", model_extra={},
+                  usage=NS(model_dump=lambda t=out_tokens: {"prompt_tokens": 0, "completion_tokens": t}))
+        return NS(parse=lambda r=resp: r, headers={}, status_code=200)
+    raw = NS(create=create)
+    return NS(chat=NS(completions=NS(with_raw_response=raw)))
+
+
+def test_every_billed_retry_is_reserved_before_it_is_sent(monkeypatch):
+    """Review repro: one reservation covered all retries, so a billed empty reply plus a retry passed the cap."""
+    from simia_plus import llm
+    from simia_plus.config import ModelCfg
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    cfg = ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY", max_tokens=10,
+                   price_input_per_mtok=1, price_output_per_mtok=1)
+    msgs = [{"role": "user", "content": "x"}]
+    seen = []
+    real = llm.max_call_cost
+    monkeypatch.setattr(llm, "max_call_cost", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    probe = llm.OpenAILLM(cfg, "r", retries=1)
+    probe.client = _sdk_client([("ok", 0)], [])
+    llm.set_budget(llm.Budget(1.0))
+    probe.chat(msgs)
+    bound = seen[0]  # exactly what the client reserves per attempt for this request
+    assert bound > 10 / 1e6
+    try:
+        for limit, expect_requests in ((0.000011, 0), (bound + 0.000001, 1), (2 * bound + 0.00002, 2)):
+            sent = []
+            c = llm.OpenAILLM(cfg, "r", retries=3)
+            c.client = _sdk_client([("", 10), ("ok", 10)], sent)  # empty reply billed 10 tokens, then a real one
+            b = llm.Budget(limit)
+            llm.set_budget(b)
+            try:
+                c.chat(msgs)
+            except llm.BudgetExhausted:
+                pass
+            assert len(sent) == expect_requests, (limit, len(sent))
+            assert b.spent <= limit and b.reserved == 0  # never past the cap, nothing left held
+            assert b.spent == pytest.approx(len(sent) * 10 / 1e6)  # each attempt settled to what it was billed
+    finally:
+        llm.set_budget(None)
+
+
+def test_call_cost_bound_is_a_real_upper_bound():
+    from simia_plus.config import ModelCfg
+    from simia_plus.llm import max_call_cost, token_cost
+    cfg = ModelCfg(model="m", max_tokens=100, price_input_per_mtok=1, price_output_per_mtok=1)
+    text = "日本語のテキスト" * 200  # 3 bytes per character: more tokens than characters/3 could allow for
+    msgs = [{"role": "user", "content": text}]
+    assert max_call_cost(cfg, msgs) >= token_cost(cfg, {"prompt_tokens": len(text.encode()), "completion_tokens": 100})
+    tools = [{"type": "function", "function": {"name": "t", "description": "d" * 5000, "parameters": {}}}]
+    assert max_call_cost(cfg, msgs, tools=tools) - max_call_cost(cfg, msgs) >= 5000 / 1e6  # tool schemas count
+    over = ModelCfg(model="m", max_tokens=100, price_input_per_mtok=1, price_output_per_mtok=1,
+                    extra={"max_completion_tokens": 50000})
+    assert max_call_cost(over, msgs) - max_call_cost(cfg, msgs) >= (50000 - 100) / 1e6  # the larger output limit wins

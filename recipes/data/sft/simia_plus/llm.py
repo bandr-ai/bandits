@@ -100,7 +100,10 @@ class ChatLLM(Protocol):
 
 
 class OpenAILLM:
-    """Returns {"content": str, "tool_calls": [{"id", "name", "arguments": dict}]}."""
+    """Returns {"content": str, "tool_calls": [{"id", "name", "arguments": dict}]}. Meters the process budget itself,
+    per provider attempt (each retry reserves before it starts and settles to what it was billed)."""
+
+    meters_itself = True
 
     def __init__(self, cfg: ModelCfg, role: str = "", retries: int = 10):
         from openai import OpenAI
@@ -130,7 +133,10 @@ class OpenAILLM:
             kwargs["extra_body"] = body
         last: Exception | None = None
         billed = 0.0  # what the provider charged across attempts (failed calls that returned usage are billed)
+        budget = _budget
+        bound = max_call_cost(self.cfg, messages, tools=tools, extra_params=kwargs) if budget is not None else 0.0
         for attempt in range(1, self.retries + 1):
+            held = budget.reserve(bound) if budget is not None else 0.0  # BudgetExhausted: no request is sent
             t0 = time.monotonic()
             row: dict[str, Any] = {"role": self.role, "model": self.cfg.model, "attempt": attempt,
                                    "request": {"messages": messages, "tools": [t["function"]["name"] for t in tools or []],
@@ -162,13 +168,18 @@ class OpenAILLM:
                            cache_hit=raw.headers.get("x-litellm-cache-hit"),
                            served_model=model, response={"content": content, "tool_calls": calls, "reasoning": reasoning})
                 billed += cost or 0.0
+                if budget is not None:
+                    budget.settle(held, cost or 0.0)
+                    held = 0.0
                 if finish == "length":
                     raise Truncated(f"response hit the token limit ({self.cfg.max_tokens})")
                 if not (content or "").strip() and not calls:
                     raise EmptyResponse(f"empty response (finish_reason={finish})")
                 log_call(row)
                 return {"content": content or "", "tool_calls": calls, "cost": billed}
-            except Exception as e:
+            except Exception as e:  # provider SDKs raise many types; logged, retried, then re-raised
+                if budget is not None and held:  # no response came back: nothing billed for this attempt
+                    budget.settle(held, 0.0)
                 last = e
                 row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
                            status=row.get("status") or getattr(e, "status_code", None))
@@ -255,12 +266,22 @@ def get_llm(cfg: Config, role: str) -> ChatLLM:
         return _Metered(_cache[key], m)
 
 
-def max_call_cost(cfg: ModelCfg, messages: list[dict]) -> float:
-    """Upper bound of one call's cost: prompt at ~3 characters per token (an overestimate) plus max_tokens of output.
-    0 when the model has no configured prices (preflight refuses a budgeted run without them)."""
-    prompt = len(json.dumps(messages, ensure_ascii=False)) // 3 + 1
-    return token_cost(cfg, {"prompt_tokens": prompt, "completion_tokens": cfg.max_tokens}) or 0.0 \
-        if isinstance(cfg, ModelCfg) else 0.0
+OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def max_call_cost(cfg: ModelCfg, messages: list[dict], tools: list | None = None, extra_params: dict | None = None) -> float:
+    """Upper bound of one request's cost. Prompt: the UTF-8 byte length of everything sent (messages, tools, extra
+    params); a token is never shorter than one byte, so bytes bound tokens from above. Output: the largest output
+    limit the request carries (the config's, or an override in `extra`). 0 when the model has no configured prices
+    (preflight refuses a budgeted run without them)."""
+    if not isinstance(cfg, ModelCfg):
+        return 0.0
+    sent = {"messages": messages, "tools": tools,
+            "params": {k: v for k, v in (extra_params or {}).items() if k != "messages"}}
+    prompt = len(json.dumps(sent, ensure_ascii=False, default=str).encode("utf-8"))
+    limits = [cfg.max_tokens, *(v for src in (cfg.extra, extra_params or {}) for k, v in src.items()
+                                if k in OUTPUT_LIMIT_KEYS and isinstance(v, int))]
+    return token_cost(cfg, {"prompt_tokens": prompt, "completion_tokens": max(limits)}) or 0.0
 
 
 class _Metered:
@@ -271,9 +292,10 @@ class _Metered:
 
     def chat(self, messages, *args, **kwargs):
         budget = _budget
-        if budget is None:
+        if budget is None or getattr(self.inner, "meters_itself", False):  # the real client meters each attempt
             return self.inner.chat(messages, *args, **kwargs)
-        held = budget.reserve(max_call_cost(self.cfg, messages))
+        tools = kwargs.get("tools") if "tools" in kwargs else (args[0] if args else None)
+        held = budget.reserve(max_call_cost(self.cfg, messages, tools=tools))
         try:
             out = self.inner.chat(messages, *args, **kwargs)
         except Exception as e:
