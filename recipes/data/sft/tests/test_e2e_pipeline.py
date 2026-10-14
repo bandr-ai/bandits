@@ -49,7 +49,7 @@ class E2EFake(FakeLLM):
         if self.role == "judge":  # rubric judge
             if o.get("judge_down") and "prod/" in text:
                 raise RuntimeError("provider down")
-            return {"content": json.dumps({"integrity": {"I1_consistent": "pass"}, "answer_correct": True}), "tool_calls": []}
+            return {"content": json.dumps({"integrity": {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}, "answer_correct": True}), "tool_calls": []}
         if self.role == "analyzer" and text.startswith("<observed_contracts>"):  # per-seed proposals (old and wide)
             n = int(text.rsplit("Propose ", 1)[-1].split()[0]) if "Propose " in text else 3
             vs = [{"name": f"p{next(_n)}", "kind": ("task", "evidence")[k % 2], "requires_tools": [], "basis": "seed",
@@ -262,7 +262,7 @@ def test_input_json_flag_is_soft_and_reaches_both_judges(tmp_path):
         def chat(self, messages, tools=None, json_mode=False, tool_choice=None):
             seen.append(messages[-1]["content"])
             sys_ = messages[0]["content"]
-            out = CLEAN if "internal consistency" in sys_ else {"integrity": {}, "answer_correct": True}
+            out = CLEAN if "internal consistency" in sys_ else {"integrity": {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}, "answer_correct": True}
             return {"content": json.dumps(out), "tool_calls": []}
         return type("F", (), {"chat": chat})()
     set_llm_factory(factory)

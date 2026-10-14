@@ -13,10 +13,16 @@ from simia_plus.schema import from_sharegpt
 from simia_plus.verify import verify
 
 
+CLEAN = {"facts": [], "contradictions": [], "impossible_results": [], "unsupported_claims": []}
+
+
 def judge_says(payload):
+    """The rubric judge answers `payload`; the consistency check (same judge model) finds nothing wrong."""
     def chat(self, messages, tools=None, json_mode=False):
         if isinstance(payload, Exception):
             raise payload
+        if "internal consistency" in messages[0]["content"]:
+            return {"content": json.dumps(CLEAN), "tool_calls": []}
         return {"content": json.dumps(payload), "tool_calls": []}
     set_llm_factory(lambda cfg, role: type("J", (), {"chat": chat})())
 
@@ -31,7 +37,8 @@ def cfg(tmp_path):
     set_llm_factory(lambda cfg, role: (_ for _ in ()).throw(RuntimeError("no real LLM in tests")))
 
 
-GOOD = {"agent": "x", "situation": "READY", "integrity": {"I1_consistent": "pass"}, "answer_correct": True,
+CHECKS = {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}
+GOOD = {"agent": "x", "situation": "READY", "integrity": CHECKS, "answer_correct": True,
         "label": "good", "minor_issues": [], "reason": "r"}
 
 
@@ -42,7 +49,7 @@ def test_good_is_kept(cfg):
 
 
 def test_integrity_failure_is_dropped_even_if_labelled_good(cfg):
-    judge_says({**GOOD, "integrity": {"I1_consistent": "fail"}})
+    judge_says({**GOOD, "integrity": {**CHECKS, "I1_consistent": "fail"}})
     v = verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]
     assert v["kept"] is False and v["rubric"]["integrity_failed"] == ["I1_consistent"]
 
@@ -67,7 +74,26 @@ def test_rule_failure_skips_the_judge(cfg):
 
 
 def test_unclear_is_not_kept():
-    assert normalize({**GOOD, "label": "unclear", "answer_correct": None})["label"] == "unclear"
+    assert normalize({**GOOD, "label": "unclear"})["label"] == "unclear"
+
+
+def test_incomplete_verdicts_are_errors_not_passes():
+    """Review repro: {"label": "good"} without integrity checks or answer_correct used to pass."""
+    for bad in ({"label": "good"}, {**GOOD, "integrity": {"I1_consistent": "pass"}}, {**GOOD, "answer_correct": None},
+                {**GOOD, "integrity": {**CHECKS, "I3_decisive_kept": "maybe"}}):
+        with pytest.raises(ValueError):
+            normalize(json.loads(json.dumps(bad)))
+    assert normalize({**GOOD, "integrity": {**CHECKS, "I2_possible": None, "I2_possible_results": "pass"}})["label"] == "good"
+
+
+def test_wrong_answer_is_bad_even_if_labelled_unclear():
+    assert normalize({**GOOD, "label": "unclear", "answer_correct": False})["label"] == "bad"
+
+
+def test_incomplete_verdict_fails_closed_in_verify(cfg):
+    judge_says({"label": "good"})
+    v = verify(cfg, from_sharegpt(seed(0), 0), set())["meta"]["verify"]
+    assert v["kept"] is False and v["rubric"]["label"] == "error"
 
 
 def test_describe_change_keeps_only_the_change():
@@ -101,8 +127,7 @@ def test_change_gate_drops_noops_cosmetic_edits_and_copies():
 
 def test_v2_label_follows_parts_not_the_judge():
     """v2 judges write no label: code derives it, so a right answer cannot excuse a failed integrity check."""
-    v2 = {"integrity": {"I2_possible": "fail"}, "answer_correct": True, "integrity_critique": "a", "answer_critique": "b"}
+    v2 = {"integrity": {**CHECKS, "I2_possible": "fail"}, "answer_correct": True, "integrity_critique": "a", "answer_critique": "b"}
     out = normalize(v2)
     assert out["label"] == "bad" and out["integrity_failed"] == ["I2_possible"] and out["critique"] == "a\nb"
-    assert normalize({"integrity": {"I1_consistent": "pass"}, "answer_correct": True})["label"] == "good"
-    assert normalize({"integrity": {"I1_consistent": "pass"}, "answer_correct": None})["label"] == "unclear"
+    assert normalize({"integrity": CHECKS, "answer_correct": True})["label"] == "good"

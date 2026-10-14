@@ -76,17 +76,32 @@ def build_prompt(trace: dict, rubric: str, seed: dict | None = None, change: str
     return system, "\n\n".join(parts)
 
 
+VERDICTS = ("pass", "fail", "n/a")
+REQUIRED_CHECKS = ("I1_consistent", "I3_decisive_kept", "I4_same_situation")  # plus I2 under its v1 or v2 name
+
+
 def normalize(out) -> dict:
+    """Fail closed: a verdict missing a required part is an evaluator error (ValueError), never a pass. "good" needs
+    answer_correct true and every integrity check present with pass or n/a."""
     if not isinstance(out, dict):
         raise TypeError("rubric judge returned non-object JSON")
-    integ = out.get("integrity") if isinstance(out.get("integrity"), dict) else {}
+    integ = out.get("integrity")
+    if not isinstance(integ, dict):
+        raise ValueError("rubric judge: no integrity object")
+    missing = [k for k in REQUIRED_CHECKS if integ.get(k) not in VERDICTS]
+    if not any(integ.get(k) in VERDICTS for k in ("I2_possible", "I2_possible_results")):
+        missing.append("I2_possible")
+    if missing:
+        raise ValueError(f"rubric judge: integrity checks missing or invalid: {missing}")
+    if not isinstance(out.get("answer_correct"), bool):
+        raise ValueError("rubric judge: answer_correct must be true or false")
     failed = [k for k in INTEGRITY if integ.get(k) == "fail"]
     label = out.get("label") if out.get("label") in LABELS else None
-    # The label must agree with its own parts: an integrity failure or a wrong answer is bad.
-    if failed or out.get("answer_correct") is False:
-        label = "bad" if label != "unclear" or failed else label
-    if label is None:  # v2 judges write no label: it follows from integrity and answer_correct, decided here
-        label = "good" if out.get("answer_correct") is True else "unclear"
+    # The label must agree with its own parts: an integrity failure or a wrong answer is bad, whatever the label says.
+    if failed or out["answer_correct"] is False:
+        label = "bad"
+    elif label is None:  # v2 judges write no label: it follows from integrity and answer_correct, decided here
+        label = "good"
     if "critique" not in out and ("integrity_critique" in out or "answer_critique" in out):
         out["critique"] = f"{out.get('integrity_critique', '')}\n{out.get('answer_critique', '')}".strip()
     out.update(label=label, integrity_failed=failed)

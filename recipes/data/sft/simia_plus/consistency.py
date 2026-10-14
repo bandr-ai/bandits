@@ -34,13 +34,18 @@ def check(cfg, trace: dict, seed: dict | None = None, notes: list[str] | None = 
     if notes:
         from .rubric_judge import notes_block
         reference += "\n" + notes_block(notes) + "\n"
-    out = chat_json(get_llm(cfg, "judge"), "You check agent conversations for internal consistency. Output JSON only.",
-                    CONSISTENCY_CHECK.format(system=trace.get("system", ""), reference=reference,
-                                             tools=tools_text(trace.get("tools") or []) or "(none)",
-                                             conversation=render(trace, max_obs_chars=FULL)))
-    if not isinstance(out, dict):
-        raise ValueError("consistency check returned no JSON object")
-    problems = {k: [p for p in out.get(k) or [] if p] for k in PROBLEMS}
+    prompt = CONSISTENCY_CHECK.format(system=trace.get("system", ""), reference=reference,
+                                      tools=tools_text(trace.get("tools") or []) or "(none)",
+                                      conversation=render(trace, max_obs_chars=FULL))
+    for attempt in (1, 2):  # an incomplete answer gets one retry, then fails closed (an error, never "good")
+        out = chat_json(get_llm(cfg, "judge"), "You check agent conversations for internal consistency. Output JSON only.",
+                        prompt)
+        missing = [k for k in PROBLEMS if not isinstance(out, dict) or not isinstance(out.get(k), list)]
+        if not missing:
+            break
+        if attempt == 2:
+            raise ValueError(f"consistency check answer lacks lists: {missing}")
+    problems = {k: [p for p in out[k] if p] for k in PROBLEMS}
     return {"label": "bad" if any(problems.values()) else "good", "problems": problems, "facts": out.get("facts") or []}
 
 

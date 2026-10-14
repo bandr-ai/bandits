@@ -45,9 +45,9 @@ def test_verify_runs_judge_and_consistency_and_either_rejects(tmp_path):
     rubric.write_text("rubric\n## Output\n{}")
     t = from_sharegpt(seed(0), 0)
     for judge_out, cons_out, kept in ((
-            {"answer_correct": True, "integrity": {}}, {"contradictions": [], "impossible_results": [], "unsupported_claims": []}, True),
-            ({"answer_correct": True, "integrity": {}}, {"contradictions": [{"msgs": [1, 2], "why": "x"}]}, False),
-            ({"answer_correct": False, "integrity": {}}, {"contradictions": [], "impossible_results": [], "unsupported_claims": []}, False)):
+            {"answer_correct": True, "integrity": {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}}, {"contradictions": [], "impossible_results": [], "unsupported_claims": []}, True),
+            ({"answer_correct": True, "integrity": {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}}, {"contradictions": [{"msgs": [1, 2], "why": "x"}]}, False),
+            ({"answer_correct": False, "integrity": {"I1_consistent": "pass", "I2_possible": "pass", "I3_decisive_kept": "n/a", "I4_same_situation": "n/a"}}, {"contradictions": [], "impossible_results": [], "unsupported_claims": []}, False)):
         cfg = load_config(write_cfg(tmp_path, {"rubric_judge": True, "consistency_check": True, "change_gate": False}, target=1,
                                     rubric_path=str(rubric)))
 
@@ -57,4 +57,20 @@ def test_verify_runs_judge_and_consistency_and_either_rejects(tmp_path):
         set_llm_factory(lambda c, role, chat=chat: type("F", (), {"chat": chat})())
         v = verify(cfg, json.loads(json.dumps(t)), set())["meta"]["verify"]
         assert v["kept"] is kept and "consistency" in v and "rubric" in v
+    set_llm_factory(lambda cfg, role: (_ for _ in ()).throw(RuntimeError("no real LLM in tests")))
+
+
+def test_incomplete_answer_is_an_error_not_good(tmp_path):
+    """Review repro: {} used to become label good. Now one retry, then an error (fail closed)."""
+    import pytest
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"seeds_path": "x", "out_dir": str(tmp_path), "models": {"default": {"model": "fake"}}}))
+    cfg = load_config(p)
+    prompts = []
+    for reply in ({}, {"contradictions": []}, {"contradictions": None, "impossible_results": [], "unsupported_claims": []}):
+        prompts.clear()
+        fake(reply, prompts)
+        with pytest.raises(ValueError):
+            check(cfg, from_sharegpt(seed(0), 0))
+        assert len(prompts) == 2  # retried once
     set_llm_factory(lambda cfg, role: (_ for _ in ()).throw(RuntimeError("no real LLM in tests")))
