@@ -162,6 +162,8 @@ class OpenAILLM:
                     cost = _float(usage.get("cost"))  # gateways that stream often report cost in usage only
                 if cost is None:
                     cost = token_cost(self.cfg, usage)  # direct providers: price x tokens from the config
+                if cost is None and budget is not None:  # served but unpriced: charge the reservation, never zero
+                    cost, row["cost_estimated"] = held, True
                 row.update(ok=True, status=raw.status_code, latency_s=round(time.monotonic() - t0, 3),
                            finish_reason=finish, usage=usage, cost=cost,
                            call_id=raw.headers.get("x-litellm-call-id"), provider=extra.get("provider"),
@@ -178,8 +180,17 @@ class OpenAILLM:
                 log_call(row)
                 return {"content": content or "", "tool_calls": calls, "cost": billed}
             except Exception as e:  # provider SDKs raise many types; logged, retried, then re-raised
-                if budget is not None and held:  # no response came back: nothing billed for this attempt
-                    budget.settle(held, 0.0)
+                if budget is not None and held:
+                    # Unsettled attempt: billing unknown. If the provider may have done the work (a timeout, a broken
+                    # stream, an unreadable 200 reply) charge the reservation; if the request was refused or never
+                    # connected (error status, connection failure) nothing was served.
+                    status = row.get("status") or getattr(e, "status_code", None)
+                    maybe_served = (status is None and ("Timeout" in type(e).__name__ or self.cfg.stream)) or status == 200
+                    charge = held if maybe_served else 0.0
+                    budget.settle(held, charge)
+                    if charge:
+                        billed += charge
+                        row.update(cost=charge, cost_estimated=True)  # persisted, so a resumed run counts it
                 last = e
                 row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
                            status=row.get("status") or getattr(e, "status_code", None))

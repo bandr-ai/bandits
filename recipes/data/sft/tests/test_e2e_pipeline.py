@@ -420,3 +420,53 @@ def test_call_cost_bound_is_a_real_upper_bound():
     over = ModelCfg(model="m", max_tokens=100, price_input_per_mtok=1, price_output_per_mtok=1,
                     extra={"max_completion_tokens": 50000})
     assert max_call_cost(over, msgs) - max_call_cost(cfg, msgs) >= (50000 - 100) / 1e6  # the larger output limit wins
+
+
+def test_unknown_cost_is_charged_not_free(monkeypatch, tmp_path):
+    """Review repro: replies with no usage and no cost header were settled at $0, so 5 calls fit a 1-call budget."""
+    from types import SimpleNamespace as NS
+
+    from simia_plus import llm
+    from simia_plus import pipeline as pl
+    from simia_plus.config import ModelCfg
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    cfg = ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY", max_tokens=10,
+                   price_input_per_mtok=1, price_output_per_mtok=1)
+    msgs = [{"role": "user", "content": "x"}]
+    log = tmp_path / "calls.jsonl"
+    llm.configure_call_log(log)
+
+    def unpriced(**kw):
+        msg = NS(content="ok", tool_calls=None, model_extra={})
+        resp = NS(choices=[NS(message=msg, finish_reason="stop")], model="m", model_extra={}, usage=None)
+        return NS(parse=lambda: resp, headers={}, status_code=200)
+    c = llm.OpenAILLM(cfg, "r", retries=1)
+    c.client = NS(chat=NS(completions=NS(with_raw_response=NS(create=unpriced))))
+    bound = llm.max_call_cost(cfg, msgs, extra_params={"model": "m", "messages": msgs, "max_tokens": 10, "temperature": 1.0,
+                                                       "extra_body": {"cache": {"no-cache": True, "no-store": True}}})
+    b = llm.Budget(bound * 1.5)
+    llm.set_budget(b)
+    try:
+        c.chat(msgs)
+        with pytest.raises(llm.BudgetExhausted):
+            c.chat(msgs)  # the first call used the whole reservation: no room for a second
+        assert b.spent == pytest.approx(bound) and b.reserved == 0
+        # resume: the conservative charge is in the call log, so a new process starts from it
+        spent = pl.Spend(log).update()
+        assert spent == pytest.approx(bound)
+        with pytest.raises(llm.BudgetExhausted):
+            llm.Budget(bound * 1.5, spent).reserve(bound)
+        # a timeout may have been served: charged; a refused connection was not
+        for exc_name, charged in (("APITimeoutError", True), ("APIConnectionError", False)):
+            def failing(*a, _n=exc_name, **kw):
+                raise type(_n, (Exception,), {})("x")
+            c2 = llm.OpenAILLM(cfg, "r", retries=1)
+            c2.client = NS(chat=NS(completions=NS(with_raw_response=NS(create=failing))))
+            b2 = llm.Budget(1.0)
+            llm.set_budget(b2)
+            with pytest.raises(RuntimeError):
+                c2.chat(msgs)
+            assert (b2.spent > 0) is charged and b2.reserved == 0, exc_name
+    finally:
+        llm.set_budget(None)
+        llm.configure_call_log(None)
