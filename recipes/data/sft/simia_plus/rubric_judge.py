@@ -87,14 +87,14 @@ def normalize(out) -> dict:
         raise TypeError("rubric judge returned non-object JSON")
     integ = out.get("integrity")
     if not isinstance(integ, dict):
-        raise ValueError("rubric judge: no integrity object")
+        raise ValueError("rubric judge: no integrity object")  # noqa: TRY004 - a bad model answer, handled as an evaluator error
     missing = [k for k in REQUIRED_CHECKS if integ.get(k) not in VERDICTS]
     if not any(integ.get(k) in VERDICTS for k in ("I2_possible", "I2_possible_results")):
         missing.append("I2_possible")
     if missing:
         raise ValueError(f"rubric judge: integrity checks missing or invalid: {missing}")
     if not isinstance(out.get("answer_correct"), bool):
-        raise ValueError("rubric judge: answer_correct must be true or false")
+        raise ValueError("rubric judge: answer_correct must be true or false")  # noqa: TRY004 - a bad model answer
     failed = [k for k in INTEGRITY if integ.get(k) == "fail"]
     label = out.get("label") if out.get("label") in LABELS else None
     # The label must agree with its own parts: an integrity failure or a wrong answer is bad, whatever the label says.

@@ -94,6 +94,7 @@ def test_tools_the_seed_lacks_are_rejected(cfg):
 
 def test_llm_client_per_model_settings(tmp_path):
     import dataclasses
+
     from simia_plus.llm import get_llm, set_llm_factory
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"seeds_path": "x", "out_dir": str(tmp_path), "models": {"default": {"model": "fake"}}}))

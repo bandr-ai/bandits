@@ -337,7 +337,7 @@ def test_permanent_client_errors_are_not_retried(monkeypatch):
         calls.clear()
         c = llm.OpenAILLM(ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY"), "r", retries=3)
         c.client = client(status)
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError):
             c.chat([{"role": "user", "content": "x"}])
         assert len(calls) == attempts, (status, calls)
 

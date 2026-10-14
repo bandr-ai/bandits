@@ -13,27 +13,27 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from .rollout import agent_rollout
 from .banks import ObsBank, ResultFormat, UserBank, format_input_examples, format_obs_examples
 from .config import Config
 from .io import parallel_map, read_jsonl, write_jsonl
 from .llm import BudgetExhausted, chat_json, get_llm
 from .prompts import (
-    SEED_VARIATIONS,
-    SEED_VARIATIONS_WIDE,
     ANALYZER,
     ANALYZER_REQUIRED_SLOTS,
     ANALYZER_REVISION,
     ANALYZER_SLOTS,
     CASE_KEYS,
     DIAGNOSE,
-    TASK_NOTE,
     ENV_ONLY,
     OUTPUT_FORMAT,
     OUTPUT_FORMAT_CASE,
+    SEED_VARIATIONS,
+    SEED_VARIATIONS_WIDE,
+    TASK_NOTE,
     VARIATION_KEYS,
     VARIATION_KINDS,
 )
+from .rollout import agent_rollout
 from .schema import render
 from .select import _shingles, action_signature, body_text, dedup, diversity_report
 from .simia_text import tools_text
@@ -904,7 +904,7 @@ def _lesson_chunk(cfg: Config, multi: dict[str, list[dict]]) -> None:
                         LESSON_PROMPT.format(items="\n".join(lines)))
         groups = out.get("duplicate_groups") if isinstance(out, dict) else None
         if not isinstance(groups, list):
-            raise ValueError("no duplicate_groups list")
+            raise TypeError("no duplicate_groups list")
     except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
         raise
     except Exception as e:  # noqa: BLE001 - advisory step: never fail the run, record why nothing was grouped
@@ -944,7 +944,6 @@ def coverage_text(cfg: Config, root: Path, spec: dict, dev: list[dict], labels: 
     """What earlier rounds already covered, for the next revision: finished (seed, variation) cells with their outcome,
     and how many untried cells the current variations still leave. Those cells are never rerun, so a revision that
     keeps the same variations on the same seeds produces nothing new."""
-    by_id = {s["id"]: s for s in dev}
     by_name = {v["name"]: v for v in spec["variations"]}
     rows = []
     ledger = read_jsonl(root / "ledger.jsonl")

@@ -10,7 +10,6 @@ import argparse
 import collections
 import json
 import os
-import re
 
 # USD per 1M tokens, Fireworks list prices (checked 2026-10-13): input, cached input, output
 LIST = {"deepseek-v4p1-flash": (0.22, 0.22, 0.66), "glm-5p3-flash": (0.15, 0.029, 0.50)}
@@ -48,7 +47,9 @@ def main(argv=None):
             if "llm_calls.jsonl" not in fn:
                 continue
             p = os.path.join(dp, "llm_calls.jsonl")
-            for line in open(p, errors="ignore"):
+            with open(p, errors="ignore") as fh:
+                lines = fh.readlines()
+            for line in lines:
                 try:
                     r = json.loads(line)
                 except json.JSONDecodeError:
@@ -78,7 +79,8 @@ def main(argv=None):
         for name, (n, lg, ls, i, o) in out[k].items():
             print(f"  {str(name)[:60]:60} {n:6d}  {lg:8.2f}  {ls:8.2f}  {i/1e6:7.2f}  {o/1e6:6.2f}")
     if a.json:
-        json.dump(out, open(a.json, "w"), indent=1)
+        with open(a.json, "w") as fh:
+            json.dump(out, fh, indent=1)
 
 
 if __name__ == "__main__":

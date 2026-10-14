@@ -21,7 +21,7 @@ from .io import read_jsonl
 from .llm import chat_json, get_llm
 from .schema import render
 
-ORDER_HINT = re.compile(r"\b(first|before|then|after)\b[^.\n]{0,60}\b[a-z]+_[a-z_]+\b", re.I)
+ORDER_HINT = re.compile(r"\b(first|before|then|after)\b[^.\n]{0,60}\b[a-z]+_[a-z_]+\b", re.IGNORECASE)
 
 
 def _calls(trace: dict) -> list[dict]:
@@ -60,7 +60,7 @@ def reorder_trace(trace: dict, perm: list[int]) -> dict:
             out.append(copy.deepcopy(m))
         if m["role"] == "assistant" and m.get("tool_calls"):
             for p in range(pos - len(m["tool_calls"]), pos):
-                call, res = pairs[perm[p]]
+                _call, res = pairs[perm[p]]
                 body = re.sub(r"^\[([a-z]+):\d+\]", lambda m, n=p + 1: f"[{m.group(1)}:{n}]", res["content"])
                 out.append({**res, "content": body})
     return {**trace, "messages": out}
@@ -94,7 +94,7 @@ def mechanical_ok(trace: dict) -> list[str]:
     return issues
 
 
-UNAVAILABLE = re.compile(r"unavailable|not captured|was not captured|available[=:]? ?false|no .{0,30}captured", re.I)
+UNAVAILABLE = re.compile(r"unavailable|not captured|was not captured|available[=:]? ?false|no .{0,30}captured", re.IGNORECASE)
 
 
 def tool_signature(variation: dict, trace: dict) -> tuple[set[str], set[str]]:
@@ -225,7 +225,6 @@ def run_experiment(cfg: Config, dev: list[dict], name: str, version: int, n: int
         good = json.loads(Path(good_path).read_text()) if good_path else []
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(max_workers=max(1, cfg.workers))
-        cache: dict = {}
 
         def screen(seed, a, b):
             return pool.submit(screen_pair, cfg, seed, a, b).result()

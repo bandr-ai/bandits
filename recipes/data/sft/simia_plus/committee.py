@@ -6,7 +6,6 @@ reported so the stricter rule can be compared. This module only judges; regenera
 Like APIGen it votes without executing anything (we have no tool replay), so it can only be as good as the reviewers' reading."""
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
@@ -60,7 +59,7 @@ def _one(cfg: Config, name: str, seed: dict, trace: dict) -> dict:
                                       generated=render(trace, max_obs_chars=2500)[:14000], aspect=ASPECTS[name]))
     except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
         raise
-    except Exception as e:  # truncated or failed call: recorded as "error", never a pass
+    except Exception as e:  # noqa: BLE001 - truncated or failed call: recorded as "error", never a pass
         out = {"error": str(e)[:120]}
     ok = isinstance(out, dict) and out.get("verdict") in ("pass", "fail")
     return {"aspect": name, "verdict": out["verdict"] if ok else "error",

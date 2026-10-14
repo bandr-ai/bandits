@@ -203,7 +203,7 @@ def answer_check(trace: dict, schemas: dict[str, dict]) -> list[str]:
     return [f"answer{e}" for e in schema_errors(ans, schema)]
 
 
-_JSON_DEMAND = re.compile(r"\b(return|respond|reply|output|answer|emit|produce|write)\b[^.\n]{0,80}\bJSON\b|\bJSON\b[^.\n]{0,40}\b(only|object)\b", re.I)
+_JSON_DEMAND = re.compile(r"\b(return|respond|reply|output|answer|emit|produce|write)\b[^.\n]{0,80}\bJSON\b|\bJSON\b[^.\n]{0,40}\b(only|object)\b", re.IGNORECASE)
 
 
 def requires_json_answer(system: str) -> bool:
@@ -563,6 +563,7 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
     if f.rubric_judge and keep:
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
+
         from .consistency import check as consistency_check
         from .rubric_judge import describe_change, judge_rubric, load_rubric
         seed = (expansion or {}).get("seed")
@@ -575,7 +576,7 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
             except Exception as e:  # noqa: BLE001
                 return {"label": "error", "error": f"{type(e).__name__}: {e}"[:300]}
         notes = v.get("soft_flags") or None  # code-found differences from the seed: the judges weigh them, code never gates on them
-        run_judge = lambda: guarded(lambda: judge_rubric(cfg, trace, seed=seed, rubric=load_rubric(cfg.rubric_path),  # noqa: E731
+        run_judge = lambda: guarded(lambda: judge_rubric(cfg, trace, seed=seed, rubric=load_rubric(cfg.rubric_path),
                                                      change=describe_change((expansion or {}).get("variation")), notes=notes))
         if f.consistency_check:  # two independent calls at once: latency of one, either can reject
             with ThreadPoolExecutor(2) as ex:

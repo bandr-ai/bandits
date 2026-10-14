@@ -60,7 +60,7 @@ def judged_turns(prompt: str) -> list[dict]:
     """A "justified" entry for every assistant message in the judge prompt's <generated> block."""
     import re
     block = prompt.split("<generated", 1)[1].split("</generated>", 1)[0]
-    nums = sorted({int(n) for n in re.findall(r"^\[(\d+)\] (?:ASSISTANT|TOOL_CALL)", block, re.M)})
+    nums = sorted({int(n) for n in re.findall(r"^\[(\d+)\] (?:ASSISTANT|TOOL_CALL)", block, re.MULTILINE)})
     return [{"message": n, "verdict": "justified", "relies_on": [n - 1], "reason": "r"} for n in nums]
 
 
@@ -608,7 +608,7 @@ def test_per_turn_judging_needs_every_turn_and_no_hindsight(tmp_path):
     ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
     set_llm_factory(_judge_llm())
     assert verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]["kept"] is True
-    bad = lambda text: [dict(e, verdict="unjustified") for e in judged_turns(text)]  # noqa: E731
+    bad = lambda text: [dict(e, verdict="unjustified") for e in judged_turns(text)]
     set_llm_factory(_judge_llm(bad))
     v = verify(cfg, from_sharegpt(seed(0), 0), set(), ctx)["meta"]["verify"]
     assert v["kept"] is False and v["judge"]["turn_issues"]
@@ -624,7 +624,7 @@ def test_judge_evaluator_errors(tmp_path):
     cfg = load_config(write_cfg(tmp_path, {"change_gate": False, "judge": True, "judge_gate": True}, target=1, keep_failures=False,
                                 answer_schemas_path=str(tmp_path / "schemas.json")))
     ctx = {"seed": t, "variation": {"name": "a"}, "harness": "h"}
-    run = lambda: verify(cfg, json.loads(json.dumps(t)), set(), ctx)["meta"]["verify"]  # noqa: E731
+    run = lambda: verify(cfg, json.loads(json.dumps(t)), set(), ctx)["meta"]["verify"]
     calls = []
     good = _judge_llm()
     def flaky(c, role):  # first judge response lacks turns (malformed), the retry is complete
@@ -640,7 +640,7 @@ def test_judge_evaluator_errors(tmp_path):
     set_llm_factory(flaky)
     v = run()
     assert v["kept"] is True and v["judge_attempts"] == 2 and not v.get("eval_error")
-    always_bad = lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps({"checks": {}}),  # noqa: E731
+    always_bad = lambda c, role: type("J", (), {"chat": lambda self, *a, **k: {"content": json.dumps({"checks": {}}),
                                                                                 "tool_calls": []}})()
     set_llm_factory(always_bad)
     v = run()

@@ -168,7 +168,7 @@ class OpenAILLM:
                     raise EmptyResponse(f"empty response (finish_reason={finish})")
                 log_call(row)
                 return {"content": content or "", "tool_calls": calls, "cost": billed}
-            except Exception as e:  # noqa: BLE001 - provider SDKs raise many types; logged, retried, then re-raised
+            except Exception as e:
                 last = e
                 row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
                            status=row.get("status") or getattr(e, "status_code", None))

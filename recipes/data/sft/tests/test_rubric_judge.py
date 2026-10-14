@@ -12,7 +12,6 @@ from simia_plus.rubric_judge import describe_change, normalize
 from simia_plus.schema import from_sharegpt
 from simia_plus.verify import verify
 
-
 CLEAN = {"facts": [], "contradictions": [], "impossible_results": [], "unsupported_claims": []}
 
 

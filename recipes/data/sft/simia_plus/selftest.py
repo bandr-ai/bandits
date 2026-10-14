@@ -153,7 +153,7 @@ def revise(cfg, slots: dict, failures: str) -> tuple[dict, str]:
 
 
 def loop(cfg, slots: dict, dev: list[dict], test: list[dict], seeds: dict, out: Path, rounds: int) -> dict:
-    devc, testc = {c["id"]: c for c in dev}, {c["id"]: c for c in test}
+    devc = {c["id"]: c for c in dev}
     history = []
     best = slots
     best_v = judge_cases(cfg, dev, seeds, assemble_v2(best))

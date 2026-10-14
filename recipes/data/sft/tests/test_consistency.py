@@ -40,6 +40,7 @@ def test_label_follows_the_lists(tmp_path):
 
 def test_verify_runs_judge_and_consistency_and_either_rejects(tmp_path):
     from test_pipeline import write_cfg
+
     from simia_plus.verify import verify
     rubric = tmp_path / "r.md"
     rubric.write_text("rubric\n## Output\n{}")

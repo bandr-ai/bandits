@@ -7,7 +7,6 @@ import json
 from .llm import chat_json, get_llm
 from .schema import to_openai_messages, to_openai_tools
 
-
 FINAL_NOW = "Write your final reply now, based on what you have observed so far."
 
 
