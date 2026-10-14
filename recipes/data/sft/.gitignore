@@ -1,0 +1,10 @@
+# local research notes and private data: never commit
+/IDEAS.md
+/SPEND.md
+/COST.md
+/HANDOFF*.md
+/PROMPT_CHANGES.md
+/plan.md
+/pilots/
+/rubric_eval/
+/work/

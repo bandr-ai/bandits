@@ -37,3 +37,24 @@ jobs:
       - run: uv pip install "transformers>=5.2" "peft>=0.12"
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync pytest
+
+  sft-data:
+    # The SFT data recipe (recipes/data/sft): standalone, offline tests with a fake LLM.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: recipes/data/sft
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest
+      - name: Wheel smoke test (resources load from an installed wheel, outside the checkout)
+        run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/sft-dist"
+          uv venv "$RUNNER_TEMP/sft-wheel"
+          uv pip install --python "$RUNNER_TEMP/sft-wheel/bin/python" "$RUNNER_TEMP"/sft-dist/*.whl
+          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/sft-wheel/bin/python" -c "import importlib.resources as ir, simia_plus.pipeline as p, simia_plus.rubric_loop as r, simia_plus.config as c; c.load_config(p.DEFAULT_CONFIG); r.generic_v2(); r.prompt_section('INDUCE', 'induce_rubric_prompt_v2.md'); assert ir.files('simia_plus').joinpath('LICENSE-SIMIA').is_file()"

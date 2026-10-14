@@ -16,3 +16,4 @@ work/
 datasets/
 handoffs/
 scripts/swebench_traj_to_chat_json.py
+*.swp
