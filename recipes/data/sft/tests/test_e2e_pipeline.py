@@ -340,3 +340,19 @@ def test_permanent_client_errors_are_not_retried(monkeypatch):
         with pytest.raises(Exception):
             c.chat([{"role": "user", "content": "x"}])
         assert len(calls) == attempts, (status, calls)
+
+
+@pytest.mark.parametrize("breaker", [{"breaker_window": 100}, {"breaker_max_bad": 1.0}])
+def test_failed_production_is_never_complete_and_resumes(tmp_path, fake, breaker):
+    """Review repro: a failed batch smaller than the breaker window reported `complete` with 0 jobs verified and was
+    skipped on resume."""
+    cfg, out = make(tmp_path, **breaker)
+    fake["gen_fail"] = "prod/"
+    assert run(cfg, target=40) == 1
+    rep = json.loads((out / "final" / "report.json").read_text())
+    assert rep["status"] != "complete" and rep["steps"]["production"]["status"] == "stopped"
+    assert ("incomplete" in rep["status"]) or ("circuit breaker" in rep["status"])
+    fake.pop("gen_fail")  # provider recovers
+    assert run(cfg, target=40) == 0
+    rep = json.loads((out / "final" / "report.json").read_text())
+    assert rep["status"] == "complete" and rep["from_production"] > 0

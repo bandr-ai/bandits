@@ -400,7 +400,8 @@ class Pipeline:
             write_jsonl(ver_path, [t for t in ver if t not in errored])
             print(f"production: re-judging {len(errored)} traces whose judge/check call failed earlier")
         wave_size = max(4, 2 * cfg.workers)
-        recent: deque = deque(maxlen=cfg.breaker_window)
+        window = max(1, min(cfg.breaker_window, len(jobs)))  # a batch smaller than the window can still trip it
+        recent: deque = deque(maxlen=window)
         attempted: set = set()
         stop = None
         while True:
@@ -428,7 +429,7 @@ class Pipeline:
             bad = [r for r in recent if r]
             print(f"production: {len(done) + len(ver_by.keys() & ids)}/{len(jobs)} jobs, spent ${self.spend.update():.3f}, "
                   f"failures in last {len(recent)}: {len(bad)}")
-            if len(recent) >= cfg.breaker_window and len(bad) > cfg.breaker_max_bad * len(recent):
+            if len(recent) >= window and len(bad) > cfg.breaker_max_bad * len(recent):
                 top = Counter(bad).most_common(3)
                 stop = Stop(f"circuit breaker: {len(bad)} of the last {len(recent)} jobs failed ({top}); something is "
                             "systemic (provider, key, model). Fix and re-run the same command to resume")
@@ -445,6 +446,16 @@ class Pipeline:
             self.save()
         if stop:
             raise stop
+        # done only when every job has a final outcome; failures stay resumable (the step is not marked done)
+        ids = {t["id"] for t in ver}
+        missing = [j["job_id"] for j in jobs if j["job_id"] not in ids]
+        evaluator = [t["id"] for t in ver if _job_failure(t) in ("judge call error", "consistency call error")]
+        if missing or evaluator:
+            errs = Counter(str(e.get("error", "?")).split("(")[0][:60] for e in read_jsonl(gen_path.with_suffix(".errors.jsonl"))
+                           if e.get("key") in set(missing))
+            raise Stop(f"production incomplete: {len(missing)} of {len(jobs)} jobs without a result "
+                       f"({dict(errs.most_common(3)) or 'no error logged'}), {len(evaluator)} with judge/check call errors; "
+                       "re-run the same command to retry them")
         return f"{len(ver)}/{len(jobs)} jobs verified, {len(sig)} kept before dedup"
 
     # ---- report ----
