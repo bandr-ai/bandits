@@ -1,0 +1,10 @@
+{
+  "seeds_path": "seeds.jsonl",
+  "out_dir": "out/simia",
+  "target_count": 1000,
+  "overgen": 1.5,
+  "features": {},
+  "models": {
+    "default": {"model": "gpt-5", "temperature": null, "max_tokens": 60000, "max_tokens_param": "max_completion_tokens"}
+  }
+}

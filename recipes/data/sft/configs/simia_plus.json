@@ -1,0 +1,18 @@
+{
+  "seeds_path": "seeds.jsonl",
+  "out_dir": "out/simia_plus",
+  "target_count": 1000,
+  "overgen": 1.5,
+  "features": {
+    "check_seeds": true, "strategies": true, "spec": true, "persona": true, "failure": true,
+    "retrieval": true, "loop": true, "provenance": true, "judge": true, "near_dedup": true
+  },
+  "loop_style": "split",
+  "loop_frac": 0.3,
+  "failure_rate": 0.25,
+  "models": {
+    "default": {"model": "gpt-5", "temperature": null, "max_tokens": 60000, "max_tokens_param": "max_completion_tokens"},
+    "user_sim": {"model": "gpt-5-mini", "temperature": null, "max_tokens": 4000, "max_tokens_param": "max_completion_tokens"},
+    "tool_sim": {"model": "gpt-5-mini", "temperature": null, "max_tokens": 8000, "max_tokens_param": "max_completion_tokens"}
+  }
+}
