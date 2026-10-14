@@ -23,12 +23,12 @@ Each version stores `signals.json`, `observed_contracts.md`, `variations.json`, 
 
 ## Run after reviewing config
 
-Use `simia_plus/defaults/pipeline_fireworks.json` and set `seeds_path` to reviewed seed data supported by the existing ingest. If seed tool definitions are already embedded, no external registry is needed. Otherwise provide only the customer's actual tool definitions, never inferred implementation source. Export the API key the config names (`api_key_env`).
+Use `bandits_sft/defaults/pipeline_fireworks.json` and set `seeds_path` to reviewed seed data supported by the existing ingest. If seed tool definitions are already embedded, no external registry is needed. Otherwise provide only the customer's actual tool definitions, never inferred implementation source. Export the API key the config names (`api_key_env`).
 
 ```bash
-.venv/bin/python -m simia_plus ingest --config simia_plus/defaults/pipeline_fireworks.json
-.venv/bin/python -m simia_plus analyze --config simia_plus/defaults/pipeline_fireworks.json
-.venv/bin/python -m simia_plus review --config simia_plus/defaults/pipeline_fireworks.json
+.venv/bin/python -m bandits_sft ingest --config bandits_sft/defaults/pipeline_fireworks.json
+.venv/bin/python -m bandits_sft analyze --config bandits_sft/defaults/pipeline_fireworks.json
+.venv/bin/python -m bandits_sft review --config bandits_sft/defaults/pipeline_fireworks.json
 ```
 
 `ingest` makes no model calls with this config. `analyze` makes paid calls. No calls are needed to run `.venv/bin/python -m pytest -q`.

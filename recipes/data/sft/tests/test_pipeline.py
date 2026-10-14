@@ -5,15 +5,15 @@ import json
 
 import pytest
 
-from simia_plus import cli
-from simia_plus.config import load_config
-from simia_plus.llm import extract_json, set_llm_factory
-from simia_plus.prompts import JUDGE_CHECKS
-from simia_plus.schema import from_sharegpt, load_trace, render, to_sharegpt
-from simia_plus.simia_text import build_sample_text, parse_simia_text
-from simia_plus.state import apply_ops, state_match
-from simia_plus.verify import provenance_check, rule_check
-from simia_plus.verify import verify as verify_fn
+from bandits_sft import cli
+from bandits_sft.config import load_config
+from bandits_sft.llm import extract_json, set_llm_factory
+from bandits_sft.prompts import JUDGE_CHECKS
+from bandits_sft.schema import from_sharegpt, load_trace, render, to_sharegpt
+from bandits_sft.state import apply_ops, state_match
+from bandits_sft.trace_text import build_sample_text, parse_trace_text
+from bandits_sft.verify import provenance_check, rule_check
+from bandits_sft.verify import verify as verify_fn
 
 TOOLS = [{"name": "get_order", "description": "Look up an order",
           "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}},
@@ -36,7 +36,7 @@ def seed(i: int, conversational: bool = True) -> dict:
             "conversations": conv}
 
 
-SIMIA_OUT = """HUMAN: hey can u cancel #W2222
+BASELINE_OUT = """HUMAN: hey can u cancel #W2222
 FUNCTION_CALL: <think>
 Need the order first. I will call the function get_order.
 </think>
@@ -80,7 +80,7 @@ class FakeLLM:
         if self.role == "generator" and "Output format (fixed)" in text:
             return {"content": ANALYZER_OUT, "tool_calls": []}
         if self.role == "generator":
-            return {"content": SIMIA_OUT, "tool_calls": []}
+            return {"content": BASELINE_OUT, "tool_calls": []}
         if self.role == "analyzer":
             vs = [{"name": f"var{k}", "applies_to": ["all"] if k else ["S1"], "requires_tools": ["get_order"] if k == 2 else [],
                    "teaches": "t", "change": "c", "preserve": "p", "dependencies": "d", "correct_when": "w"} for k in range(3)]
@@ -118,7 +118,7 @@ class FakeLLM:
             if convo[-1]["role"] == "tool" and n_tools == 1:
                 return {"content": "#W3000 is pending. Cancel it?", "tool_calls": []}
             return {"content": "Cancelled #W3000.", "tool_calls": []}
-        if self.role == "tool_sim" and "You are a simulation environment" in text:  # Simia-RL env
+        if self.role == "tool_sim" and "You are a simulation environment" in text:  # reference simulation env
             latest = text.split("RL model's latest response:")[1].split("Requirements:")[0]
             if "<tool_call>" in latest:
                 status = "cancelled" if "cancel_order" in latest else "pending"
@@ -179,8 +179,8 @@ def test_sharegpt_roundtrip():
     assert back["messages"] == t["messages"]
 
 
-def test_parse_simia_text_matches_simia_roles():
-    conv = parse_simia_text(SIMIA_OUT)
+def test_parse_trace_text_matches_baseline_roles():
+    conv = parse_trace_text(BASELINE_OUT)
     assert [c["from"] for c in conv] == ["human", "function_call", "observation", "gpt",
                                          "human", "function_call", "observation", "gpt"]
     t = from_sharegpt({"id": "g", "tools": TOOLS, "conversations": conv}, 0)
@@ -188,7 +188,7 @@ def test_parse_simia_text_matches_simia_roles():
     assert rule_check(t, 2) == []
 
 
-def test_sample_text_is_simia_format():
+def test_sample_text_is_baseline_format():
     txt = build_sample_text(load_trace(seed(0), 0))
     assert txt.startswith("SYSTEM: ") and "\n\nFUNCTION_CALL: " in txt and "\n\nOBSERVATION: " in txt
 
@@ -223,7 +223,7 @@ def test_extract_json_handles_fences_and_prose():
     assert extract_json('result {"a": [1, 2]} trailing') == {"a": [1, 2]}
 
 
-def test_baseline_is_plain_simia(tmp_path, fake_llms):
+def test_baseline_is_plain_baseline(tmp_path, fake_llms):
     """All features off: one generator call per job, no spec/persona/judge, every seed used, target met."""
     cfg_path = write_cfg(tmp_path, {}, target=6)
     cli.main(["run", "--config", cfg_path])
@@ -233,7 +233,7 @@ def test_baseline_is_plain_simia(tmp_path, fake_llms):
     gen = [json.loads(l) for l in (cfg.out / "generated.jsonl").read_text().splitlines()]
     assert {g["meta"]["seed_id"] for g in gen} == {"s0", "s1", "s2"}
     assert all(g["meta"]["strategy"] == "new_scenario" and g["meta"]["persona"] is None for g in gen)
-    # identical fake outputs: Simia's exact dedup collapses them to one
+    # identical fake outputs: baseline's exact dedup collapses them to one
     assert report["final"] == 1 and report["dedup"]["exact_dup"] == 5
 
 
@@ -280,17 +280,17 @@ def test_loop_requires_spec(tmp_path):
         load_config(cfg_path)
 
 
-def test_simia_env_mode(tmp_path, fake_llms):
-    """Simia-RL's simulator (user + tools in one model, seed as reference) driving a teacher agent."""
-    cfg_path = write_cfg(tmp_path, {"loop": True}, target=3, loop_frac=1.0, loop_style="simia_env")
+def test_reference_env_mode(tmp_path, fake_llms):
+    """reference simulation's simulator (user + tools in one model, seed as reference) driving a teacher agent."""
+    cfg_path = write_cfg(tmp_path, {"loop": True}, target=3, loop_frac=1.0, loop_style="reference_env")
     cli.main(["run", "--config", cfg_path])
     cfg = load_config(cfg_path)
     gen = [json.loads(line) for line in (cfg.out / "generated.jsonl").read_text().splitlines()]
     t = next(g for g in gen if g["meta"]["seed_id"] == "s0")
-    assert t["meta"]["mode"] == "simia_env" and t["meta"]["ended"] == "terminate"
+    assert t["meta"]["mode"] == "reference_env" and t["meta"]["ended"] == "terminate"
     assert [m["role"] for m in t["messages"]] == ["user", "assistant", "tool", "assistant", "user",
                                                   "assistant", "tool", "assistant"]
-    assert t["messages"][0]["content"] == "Hi, please cancel order #W1000."  # Simia-RL: seed's first message
+    assert t["messages"][0]["content"] == "Hi, please cancel order #W1000."  # reference simulation: seed's first message
     assert "spec" not in fake_llms and "user_sim" not in fake_llms
 
 
@@ -311,9 +311,9 @@ def test_langchain_style_messages_and_named_tools():
         load_trace(rec, 0, "auto")
 
 
-def test_simia_code_is_used():
-    """Simia's own argument repair and markup filter run on generated FUNCTION_CALL turns."""
-    from simia_plus.simia import fix_arguments_format, should_delete_conversation
+def test_baseline_code_is_used():
+    """baseline's own argument repair and markup filter run on generated FUNCTION_CALL turns."""
+    from bandits_sft.upstream import fix_arguments_format, should_delete_conversation
     ok, fixed, _ = fix_arguments_format('{"name": "get_order", "arguments": "{\\"order_id\\": \\"#W1\\"}"}')
     assert ok and json.loads(fixed)["arguments"] == {"order_id": "#W1"}
     assert should_delete_conversation([{"from": "gpt", "value": "<tool_call>x"}])
@@ -347,7 +347,7 @@ def test_parallel_calls_roundtrip_as_consecutive_function_calls():
 
 
 def test_unusable_generation_is_retried(tmp_path, fake_llms):
-    outputs = iter(["FUNCTION_CALL: {\"name\": \"get_order\", \"arguments\": {}}", SIMIA_OUT])
+    outputs = iter(["FUNCTION_CALL: {\"name\": \"get_order\", \"arguments\": {}}", BASELINE_OUT])
 
     class Flaky(FakeLLM):
         def chat(self, messages, tools=None, json_mode=False):
@@ -363,7 +363,7 @@ def test_unusable_generation_is_retried(tmp_path, fake_llms):
 
 
 def test_function_call_with_plain_text_reasoning_is_parsed():
-    from simia_plus.schema import parse_function_call
+    from bandits_sft.schema import parse_function_call
     calls, why = parse_function_call('I need the order first. I will call get_order.\n{"name": "get_order", "arguments": {"order_id": "#W1"}}')
     assert calls == [{"name": "get_order", "arguments": {"order_id": "#W1"}}] and why.startswith("I need the order")
     assert parse_function_call("no json here") == ([], "")
@@ -377,12 +377,12 @@ def test_orphan_tool_results_are_rejected():
 
 
 def test_inserted_prompt_blocks_have_no_template_escapes(tmp_path, fake_llms):
-    from simia_plus.banks import ObsBank, UserBank
-    from simia_plus.config import load_config
-    from simia_plus.generate import simia_prompt
+    from bandits_sft.banks import ObsBank, UserBank
+    from bandits_sft.config import load_config
+    from bandits_sft.generate import baseline_prompt
     cfg = load_config(write_cfg(tmp_path, {"retrieval": True, "failure": True}, target=1))
     s = load_trace(seed(0), 0)
-    p = simia_prompt(cfg, {"job_id": "j", "seed_id": "s0", "strategy": "new_scenario", "failure": {"at_call": 1, "type": "timeout"}},
+    p = baseline_prompt(cfg, {"job_id": "j", "seed_id": "s0", "strategy": "new_scenario", "failure": {"at_call": 1, "type": "timeout"}},
                      s, {"s0": s}, ObsBank.from_traces([s]), UserBank.from_traces([s]))
     assert '{{"' not in p and "{{..." not in p  # template escapes (nested JSON may legitimately end in "}}")
 
@@ -427,11 +427,11 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
     assert page.count('<details class="trace"') == 9 and "<ins>" in page
     cli.main(["heldout", "--config", cfg_path])
     cmp = json.loads((a / "heldout" / "comparison.json").read_text())
-    assert set(cmp) == {"analyzer", "simia_fixed"} and cmp["simia_fixed"]["jobs"] == 2
+    assert set(cmp) == {"analyzer", "baseline_fixed"} and cmp["baseline_fixed"]["jobs"] == 2
 
 
 def test_tool_results_must_have_real_shapes_and_prefix():
-    from simia_plus.verify import tool_result_check
+    from bandits_sft.verify import tool_result_check
     t = from_sharegpt(seed(0), 0)
     shapes = {"get_order": [["order_id", "status"]], "*": [["status", "message"]]}
     assert tool_result_check(t, shapes, None) == []
@@ -453,7 +453,7 @@ def test_harness_arg_defaults_satisfy_required_args():
 
 
 def test_fidelity_reports_changed_context_and_reuse():
-    from simia_plus.analyzer import decision_cells, fidelity
+    from bandits_sft.analyzer import decision_cells, fidelity
     s = from_sharegpt(seed(0), 0)
     s["messages"][0]["content"] = 'Failure context: {"platform": "WEB", "element": {"name": "Buy", "role": "button"}}'
     same = json.loads(json.dumps(s))
@@ -467,7 +467,7 @@ def test_fidelity_reports_changed_context_and_reuse():
 
 
 def test_analyzer_lint_and_strict_format():
-    from simia_plus.analyzer import lint, parse_output
+    from bandits_sft.analyzer import lint, parse_output
     full = "x {seed_trace} {variation} {system_prompt} {tools} {generation_id}"
     assert lint(full) == []
     assert lint(full.replace("{generation_id}", "{foo}")) == ["missing required slot {generation_id}", "unknown slot {foo}"]
@@ -483,7 +483,7 @@ def test_result_before_its_call_is_rejected():
 
 
 def test_answer_schema_and_judge_fail_closed(tmp_path, fake_llms):
-    from simia_plus.verify import answer_check, system_key, verify
+    from bandits_sft.verify import answer_check, system_key, verify
     t = from_sharegpt(seed(0), 0)
     schema = {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "cancelled"]}}}
     assert answer_check(t, {system_key(t["system"]): schema}) == ["final answer is not a bare JSON value"]
@@ -496,7 +496,7 @@ def test_answer_schema_and_judge_fail_closed(tmp_path, fake_llms):
 
 
 def test_judge_flags_are_critique_not_noise():
-    from simia_plus.verify import judge_flags
+    from bandits_sft.verify import judge_flags
     assert judge_flags(None) == [] and judge_flags({"error": "token limit"}) == []
     ok = {"checks": {"a": {"verdict": "pass"}, "tool_contracts_respected": {"verdict": "not_applicable"},
                      "case_consistent": {"verdict": "not_applicable"}, "c": {"verdict": "cannot_determine"}},
@@ -525,8 +525,8 @@ def test_judge_critique_only_never_gates(tmp_path, fake_llms):
 
 
 def test_variation_prerequisites_and_expansion_judge_fails_closed(tmp_path):
-    from simia_plus.analyzer import applicable
-    from simia_plus.verify import system_key, verify
+    from bandits_sft.analyzer import applicable
+    from bandits_sft.verify import system_key, verify
     s = from_sharegpt(seed(0), 0)
     labels = {"S1": system_key(s["system"])}
     vs = [{"name": "a", "applies_to": ["all"], "requires_tools": []},
@@ -543,7 +543,7 @@ def test_variation_prerequisites_and_expansion_judge_fails_closed(tmp_path):
 
 
 def test_expansion_judge_needs_verifiable_excerpts(tmp_path):
-    from simia_plus.verify import verify
+    from bandits_sft.verify import verify
     cfg = load_config(write_cfg(tmp_path, {"change_gate": False, "judge": True, "judge_gate": True}, target=1, keep_failures=False))
     s = from_sharegpt(seed(0), 0)
     ctx = {"seed": s, "variation": {"name": "a"}, "harness": "h"}
@@ -561,7 +561,7 @@ def test_expansion_judge_needs_verifiable_excerpts(tmp_path):
 
 
 def test_judge_excerpts_tolerate_quoting_style_not_invention():
-    from simia_plus.verify import _grounded, _norm, _trigrams
+    from bandits_sft.verify import _grounded, _norm, _trigrams
     t = from_sharegpt(seed(0), 0)
     t["messages"][2]["content"] = '[r:1] {"status": "success", "read": "{\\"answer\\": \\"Item visible; value fully shown\\"}"}'
     corpus = _norm(render(t, max_obs_chars=10**6))
@@ -590,7 +590,7 @@ def _judge_llm(turns_fn=judged_turns, blind=None):
 
 
 def test_per_turn_judging_needs_every_turn_and_no_hindsight(tmp_path):
-    from simia_plus.verify import turn_issues, verify
+    from bandits_sft.verify import turn_issues, verify
     t = from_sharegpt(seed(0), 0)
     asst = [i for i, m in enumerate(t["messages"]) if m["role"] == "assistant"]
     ok = [{"message": i, "verdict": "justified", "relies_on": [i - 1]} for i in asst]
@@ -615,8 +615,8 @@ def test_per_turn_judging_needs_every_turn_and_no_hindsight(tmp_path):
 
 
 def test_judge_evaluator_errors(tmp_path):
-    from simia_plus.llm import Truncated
-    from simia_plus.verify import system_key, verify
+    from bandits_sft.llm import Truncated
+    from bandits_sft.verify import system_key, verify
     t = from_sharegpt(seed(0), 0)
     t["messages"][-1]["content"] = '{"status": "cancelled"}'
     schema = {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "cancelled"]}}}
@@ -655,8 +655,8 @@ def test_judge_evaluator_errors(tmp_path):
 
 
 def test_case_block_format_and_judge_input(tmp_path):
-    from simia_plus.analyzer import fill, parse_output
-    from simia_plus.prompts import CASE_KEYS
+    from bandits_sft.analyzer import fill, parse_output
+    from bandits_sft.prompts import CASE_KEYS
     case = {k: "x" for k in CASE_KEYS}
     msgs = json.loads(ANALYZER_OUT)["messages"]
     c, m, issues = parse_output(json.dumps({"case": case, "messages": msgs}), case=True)
@@ -667,8 +667,8 @@ def test_case_block_format_and_judge_input(tmp_path):
 
 
 def test_combinations_are_checked_and_planned():
-    from simia_plus.analyzer import check_combinations, plan_jobs
-    from simia_plus.verify import system_key
+    from bandits_sft.analyzer import check_combinations, plan_jobs
+    from bandits_sft.verify import system_key
     s = from_sharegpt(seed(0), 0)
     labels = {"S1": system_key(s["system"])}
     vs = [{"name": n, "applies_to": ["all"], "requires_tools": [], "teaches": n, "change": n, "preserve": "p",
@@ -683,10 +683,10 @@ def test_combinations_are_checked_and_planned():
 
 
 def test_seed_only_analysis_reads_all_dev_seeds_and_rejects_external_sources():
-    from simia_plus.analyzer import _analyzer_inputs, check_signals, system_labels
-    from simia_plus.banks import ObsBank
+    from bandits_sft.analyzer import _analyzer_inputs, check_signals, system_labels
+    from bandits_sft.banks import ObsBank
     traces = [from_sharegpt(seed(i), i) for i in range(4)]
-    from simia_plus.config import Config
+    from bandits_sft.config import Config
     cfg = Config(seeds_path='unused', analyzer_seeds=1)
     inputs = _analyzer_inputs(cfg, traces, ObsBank.from_traces(traces), system_labels(traces))
     assert inputs['n_seeds'] == 4
@@ -722,7 +722,7 @@ def _vars():
 
 
 def test_eligible_seeds_restrict_assignment_and_are_validated():
-    from simia_plus.analyzer import applicable, check_variations
+    from bandits_sft.analyzer import applicable, check_variations
     sd = lambda i: {"id": i, "system": "S", "messages": []}
     assert [v["name"] for v in applicable(_vars(), sd("s1"), {})] == ["a", "c"]
     assert [v["name"] for v in applicable(_vars(), sd("s2"), {})] == ["b", "c"]
@@ -733,7 +733,7 @@ def test_eligible_seeds_restrict_assignment_and_are_validated():
 
 
 def test_scheduler_covers_least_used_seeds_first():
-    from simia_plus.analyzer import plan_jobs
+    from bandits_sft.analyzer import plan_jobs
     seeds = [{"id": f"s{i}", "system": "S", "messages": []} for i in range(1, 6)]
     vs = [{**_vars()[2], "name": f"v{k}"} for k in range(3)]
     r1 = plan_jobs("v1", seeds, 3, vs, {}, [])
@@ -743,7 +743,7 @@ def test_scheduler_covers_least_used_seeds_first():
 
 
 def test_refusal_is_its_own_outcome_not_a_format_failure():
-    from simia_plus.analyzer import parse_refusal, pilot_report
+    from bandits_sft.analyzer import parse_refusal, pilot_report
     assert parse_refusal('{"invalid_pairing": true, "reason": "needs a loader seed"}') == "needs a loader seed"
     assert parse_refusal('{"invalid_pairing": true, "messages": [{"role": "user", "content": "x"}]}') is None
     assert parse_refusal("not json") is None
@@ -764,7 +764,7 @@ def load_config_for_tests():
 
 
 def test_explicit_json_requirement_is_a_hard_check_only_when_the_prompt_says_so():
-    from simia_plus.verify import answer_soft_flags, explicit_answer_check, requires_json_answer
+    from bandits_sft.verify import answer_soft_flags, explicit_answer_check, requires_json_answer
     assert requires_json_answer("Return a single JSON object with keys a and b.")
     assert requires_json_answer("Respond with JSON only.")
     assert not requires_json_answer("You may quote JSON snippets from the page. Answer politely.")
@@ -781,7 +781,7 @@ def test_explicit_json_requirement_is_a_hard_check_only_when_the_prompt_says_so(
 
 
 def test_not_applicable_is_accepted_only_for_structurally_empty_checks(monkeypatch):
-    import simia_plus.verify as vf
+    import bandits_sft.verify as vf
     cfg = load_config_for_tests()
     trace = {"system": "s", "tools": [], "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], "meta": {}}
     na = {"verdict": "not_applicable", "evidence": [], "reason": "no tools"}
@@ -809,7 +809,7 @@ def _two_call_trace():
 
 
 def test_reorder_keeps_pairs_and_renumbers_results():
-    from simia_plus.experiments import independent_calls, mechanical_ok, reorder_rows, reorder_trace
+    from bandits_sft.experiments import independent_calls, mechanical_ok, reorder_rows, reorder_trace
     t = _two_call_trace()
     assert independent_calls(t)
     r = reorder_trace(t, [1, 0])
@@ -827,7 +827,7 @@ def test_reorder_keeps_pairs_and_renumbers_results():
 
 
 def test_combo_and_branch_jobs():
-    from simia_plus.experiments import branch_jobs, combo_jobs, hard_conflict, unused_reads
+    from bandits_sft.experiments import branch_jobs, combo_jobs, hard_conflict, unused_reads
     t = _two_call_trace()
     seed_ = {**t, "id": "S1"}
     a = {"name": "a", "change": "get_order returns empty", "applies_to": ["all"], "requires_tools": []}
@@ -850,7 +850,7 @@ def test_combo_and_branch_jobs():
 
 
 def test_null_optional_arg_and_seed_types_are_not_schema_errors():
-    from simia_plus.verify import observed_loose_type_args, schema_errors
+    from bandits_sft.verify import observed_loose_type_args, schema_errors
     spec = {"type": "object", "properties": {"q": {"type": "string"}, "id": {"type": "string"}}, "required": ["id"]}
     assert schema_errors({"q": None, "id": "x"}, spec) == []
     assert schema_errors({"id": None}, spec)  # null for a required argument is still an error
@@ -880,7 +880,7 @@ def test_state_ops_reject_bad_input_without_crashing():
 
 
 def test_selftest_case_skips_a_non_object_answer(tmp_path):
-    from simia_plus.selftest import make_case
+    from bandits_sft.selftest import make_case
     cfg = load_config(write_cfg(tmp_path, {}, target=1))
     set_llm_factory(lambda c, role: type("F", (), {"chat": lambda self, *a, **k: {"content": "[1, 2]", "tool_calls": []}})())
     case = make_case(cfg, from_sharegpt(seed(0), 0), "contradiction")

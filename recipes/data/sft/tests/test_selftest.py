@@ -1,5 +1,5 @@
 """Self-test pieces that need no model: edits applied exactly, scoring counts errors apart."""
-from simia_plus.selftest import apply_edits, score
+from bandits_sft.selftest import apply_edits, score
 
 SEED = {"id": "s", "messages": [{"role": "user", "content": "doc: the window is 5 days"},
                                 {"role": "assistant", "content": "It takes 5 days."}]}

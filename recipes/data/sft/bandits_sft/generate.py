@@ -1,9 +1,9 @@
 """Generate one trajectory per job.
 
-mode "simia":     Simia-SFT. One LLM call writes the whole trajectory (user, assistant, calls, results)
-                 from the seed as example, then Simia's fix_arguments post-processing (simia.py).
+mode "baseline":     baseline generation. One LLM call writes the whole trajectory (user, assistant, calls, results)
+                 from the seed as example, then baseline's fix_arguments post-processing (upstream.py).
                  Optional blocks add strategy, spec, persona, failure, retrieval.
-mode "simia_env": Simia-RL's environment. A teacher agent acts; one simulator model (Simia's prompt,
+mode "reference_env": reference simulation's environment. A teacher agent acts; one simulator model (baseline's prompt,
                  verbatim) plays both the user and the tools with the seed as reference data.
 mode "split":    Separate calls per step: user-sim (persona), agent (native tool calling), and a tool-sim
                  that answers from an explicit state (StateGen) and returns ops applied in code. Splitting
@@ -19,22 +19,22 @@ from .config import Config
 from .llm import chat_json, get_llm
 from .personas import PERSONAS, UNIVERSAL_RULES
 from .prompts import (
+    BASELINE_GEN,
     BLOCK_FAILURE,
     BLOCK_FORMAT,
     BLOCK_PERSONA,
     BLOCK_RETRIEVAL,
     BLOCK_SPEC,
     FAILURE_RULE,
-    SIMIA_ENV,
-    SIMIA_GEN,
+    REFERENCE_ENV,
     STRATEGIES,
     TOOL_SIM,
     USER_SIM,
 )
 from .schema import from_sharegpt, to_openai_messages, to_openai_tools
-from .simia import process_conversation, should_delete_conversation
-from .simia_text import build_sample_text, parse_simia_text, reference_text, tools_text
 from .state import apply_ops
+from .trace_text import build_sample_text, parse_trace_text, reference_text, tools_text
+from .upstream import process_conversation, should_delete_conversation
 
 DONE = "[DONE]"
 
@@ -47,9 +47,9 @@ def _examples(lines: list[str]) -> str:
     return "\n".join(f"- {u[:300]}" for u in lines) or "(none)"
 
 
-def simia_prompt(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> str:
+def baseline_prompt(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> str:
     rng = _rng(cfg, job)
-    blocks = [BLOCK_FORMAT] if cfg.simia_prompt == "fixed" else []
+    blocks = [BLOCK_FORMAT] if cfg.baseline_prompt == "fixed" else []
     if cfg.features.strategies and not job.get("spec"):
         blocks.append(f"\n## Generation Strategy (overrides requirement 1):\n{STRATEGIES[job['strategy']]}\n")
         if job.get("second_seed_id"):
@@ -67,13 +67,13 @@ def simia_prompt(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: Obs
         ex = obs.examples_for_tools(seed["tools"], cfg.retrieved_obs_per_tool, rng)
         if ex:
             blocks.append(BLOCK_RETRIEVAL.format(obs_examples=format_obs_examples(ex)))
-    return SIMIA_GEN.format(sample_text=build_sample_text(seed), available_tools=tools_text(seed["tools"]),
+    return BASELINE_GEN.format(sample_text=build_sample_text(seed), available_tools=tools_text(seed["tools"]),
                             extra_blocks="".join(blocks))
 
 
 def _unusable(conv: list[dict], deleted: bool) -> str | None:
     if deleted:
-        return "simia_markup_filter"
+        return "baseline_markup_filter"
     if not conv or conv[0]["from"] != "human":
         return "no_leading_user_turn"
     if conv[-1]["from"] != "gpt":
@@ -81,16 +81,16 @@ def _unusable(conv: list[dict], deleted: bool) -> str | None:
     return None
 
 
-def generate_simia(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> dict:
-    prompt = simia_prompt(cfg, job, seed, seeds_by_id, obs, users)
+def generate_baseline(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: ObsBank, users: UserBank) -> dict:
+    prompt = baseline_prompt(cfg, job, seed, seeds_by_id, obs, users)
     discarded = []
     for attempt in range(1, max(1, cfg.generation_attempts) + 1):
         # a unique tag per job and attempt: identical prompts must not collapse into one cached answer
         tagged = f"{prompt}\n(Generation id: {job['job_id']}/{attempt})"
         out = get_llm(cfg, "generator").chat([{"role": "user", "content": tagged}])
-        conv = parse_simia_text(out["content"])
-        deleted = should_delete_conversation(conv)  # Simia drops conversations with leaked tool markup
-        conv = process_conversation(conv)            # Simia's argument repair (string -> dict, quotes, empty)
+        conv = parse_trace_text(out["content"])
+        deleted = should_delete_conversation(conv)  # baseline drops conversations with leaked tool markup
+        conv = process_conversation(conv)            # baseline's argument repair (string -> dict, quotes, empty)
         problem = _unusable(conv, deleted)
         if problem is None or attempt == max(1, cfg.generation_attempts):
             break
@@ -101,37 +101,37 @@ def generate_simia(cfg: Config, job: dict, seed: dict, seeds_by_id: dict, obs: O
 
 
 def trace_from_raw(job: dict, seed: dict, raw: str) -> dict:
-    """Simia text output -> canonical trace (also used to re-parse saved outputs after parser fixes)."""
-    conv = parse_simia_text(raw)
+    """baseline text output -> canonical trace (also used to re-parse saved outputs after parser fixes)."""
+    conv = parse_trace_text(raw)
     deleted = should_delete_conversation(conv)
     conv = process_conversation(conv)
     trace = from_sharegpt({"id": job["job_id"], "system": seed.get("system", ""), "tools": seed["tools"],
                            "conversations": conv}, 0)
-    trace["meta"] = {"raw_turns": len(conv), "simia_deleted": deleted, "raw_output": raw}
+    trace["meta"] = {"raw_turns": len(conv), "baseline_deleted": deleted, "raw_output": raw}
     return trace
 
 
 def _hermes(content: str, call: dict | None) -> str:
-    """Agent turn as Simia-RL's simulator expects it: text plus a <tool_call> block."""
+    """Agent turn as reference simulation's simulator expects it: text plus a <tool_call> block."""
     if call is None:
         return content
     body = json.dumps({"name": call["name"], "arguments": call["arguments"]}, ensure_ascii=False)
     return f"{content}\n<tool_call>\n{body}\n</tool_call>".strip()
 
 
-def generate_simia_env(cfg: Config, job: dict, seed: dict) -> dict:
-    """Simia-RL's simulated environment (one model plays user and tools, seed as reference) with a teacher agent."""
+def generate_reference_env(cfg: Config, job: dict, seed: dict) -> dict:
+    """reference simulation's simulated environment (one model plays user and tools, seed as reference) with a teacher agent."""
     agent, env = get_llm(cfg, "agent"), get_llm(cfg, "tool_sim")
     first = next((m["content"] for m in seed["messages"] if m["role"] == "user"), None)
     if first is None:
         raise ValueError(f"seed {seed['id']} has no user message")
-    messages: list[dict] = [{"role": "user", "content": first}]  # Simia-RL starts from the seed's first message
+    messages: list[dict] = [{"role": "user", "content": first}]  # reference simulation starts from the seed's first message
     history = [f"User/Tool response: {first}"]
     ref = reference_text(seed)
     ended = "max_steps"
 
     def env_reply(agent_message: str) -> tuple[str, bool]:
-        text = env.chat([{"role": "user", "content": SIMIA_ENV.format(
+        text = env.chat([{"role": "user", "content": REFERENCE_ENV.format(
             system_prompt=seed.get("system", ""), ref_conv_text=ref, history_text="\n\n".join(history),
             agent_message=agent_message)}])["content"]
         return text.replace("[TERMINATE]", "").strip(), "[TERMINATE]" in text
@@ -236,8 +236,8 @@ def generate(cfg: Config, job: dict, seeds_by_id: dict, obs: ObsBank, users: Use
     seed = seeds_by_id[job["seed_id"]]
     if job["mode"] == "split":
         trace = generate_loop(cfg, job, seed, obs, users)
-    elif job["mode"] == "simia_env":
-        trace = generate_simia_env(cfg, job, seed)
+    elif job["mode"] == "reference_env":
+        trace = generate_reference_env(cfg, job, seed)
     elif cfg.prompt_source == "analyzer":
         from .analyzer import generate_analyzer, variation_for
         root = cfg.out / "analyzer"
@@ -245,7 +245,7 @@ def generate(cfg: Config, job: dict, seeds_by_id: dict, obs: ObsBank, users: Use
                                   json.loads((root / "system_labels.json").read_text()))
         trace = generate_analyzer(cfg, {**job, "variation": variation}, seed, (root / "chosen.txt").read_text(), obs)
     else:
-        trace = generate_simia(cfg, job, seed, seeds_by_id, obs, users)
+        trace = generate_baseline(cfg, job, seed, seeds_by_id, obs, users)
     trace["meta"].update({k: job.get(k) for k in ("job_id", "seed_id", "second_seed_id", "strategy", "mode",
                                                   "persona", "failure", "spec")})
     return trace

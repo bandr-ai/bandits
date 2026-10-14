@@ -6,10 +6,10 @@ import json
 import pytest
 from test_pipeline import seed
 
-from simia_plus.analyzer import generate_analyzer, plan_jobs
-from simia_plus.config import load_config
-from simia_plus.llm import set_llm_factory
-from simia_plus.schema import from_sharegpt
+from bandits_sft.analyzer import generate_analyzer, plan_jobs
+from bandits_sft.config import load_config
+from bandits_sft.llm import set_llm_factory
+from bandits_sft.schema import from_sharegpt
 
 WORLD = {"messages": [
     {"role": "user", "content": "cancel #W2"},
@@ -49,7 +49,7 @@ CALL = {"content": "", "tool_calls": [{"id": "c9", "name": "get_order", "argumen
 
 
 def test_agent_acts_with_simulated_results_and_the_outcome_stays_hidden(cfg):
-    from simia_plus.banks import ObsBank
+    from bandits_sft.banks import ObsBank
     prompts = []
     fakes([CALL, {"content": "It shipped with UPS, so I cannot cancel it.", "tool_calls": []}], prompts)
     s = from_sharegpt(seed(0), 0)
@@ -66,7 +66,7 @@ def test_agent_acts_with_simulated_results_and_the_outcome_stays_hidden(cfg):
 
 
 def test_agent_that_never_answers_drops_the_trace(cfg):
-    from simia_plus.banks import ObsBank
+    from bandits_sft.banks import ObsBank
     fakes([CALL] * 5, [])
     s = from_sharegpt(seed(0), 0)
     t = generate_analyzer(cfg, job(), s, "{seed_trace}{variation}{generation_id}", ObsBank.from_traces([s]))
@@ -84,7 +84,7 @@ def test_family_cap_spreads_jobs():
 def test_agents_without_tools_get_real_inputs_from_other_seeds():
     import random
 
-    from simia_plus.banks import ObsBank, format_input_examples
+    from bandits_sft.banks import ObsBank, format_input_examples
     a = {"id": "a", "messages": [{"role": "user", "content": "[DOCUMENT] policy A"}, {"role": "assistant", "content": "x"}]}
     b = {"id": "b", "messages": [{"role": "user", "content": "[DOCUMENT] policy B"}, {"role": "assistant", "content": "y"}]}
     ex = ObsBank.from_traces([a, b]).input_examples(3, random.Random(0), exclude_seed="a")
@@ -92,7 +92,7 @@ def test_agents_without_tools_get_real_inputs_from_other_seeds():
 
 
 def test_result_format_learns_the_harness_prefix_from_seeds():
-    from simia_plus.banks import ResultFormat
+    from bandits_sft.banks import ResultFormat
     seeds = [{"messages": [{"role": "tool", "content": "[r:1] {\"a\": 1}"}]}]
     f = ResultFormat(r"^\[r:(\d+)\] ", seeds)
     assert f.apply('{"b": 2}', 3) == '[r:3] {"b": 2}'
@@ -104,7 +104,7 @@ def test_result_format_learns_the_harness_prefix_from_seeds():
 
 
 def test_rollout_prefixes_simulated_results_and_retries_the_final_round(cfg):
-    from simia_plus.rollout import agent_rollout
+    from bandits_sft.rollout import agent_rollout
     prompts = []
     fakes([CALL, CALL, {"content": "done", "tool_calls": []}], prompts)
     prefix = {"system": "s", "tools": [], "messages": [{"role": "user", "content": "q"},

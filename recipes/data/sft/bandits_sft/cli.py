@@ -1,4 +1,4 @@
-"""simia-plus CLI: ingest -> [analyze -> (heldout)] -> plan -> specs -> generate -> verify -> select (or `run` for all).
+"""bandits-sft CLI: ingest -> [analyze -> (heldout)] -> plan -> specs -> generate -> verify -> select (or `run` for all).
 
 Every stage reads and writes JSONL under out_dir and resumes: re-running skips work already done.
 """
@@ -23,7 +23,7 @@ from .plan import plan_jobs, write_specs
 from .prompts import SEED_CHECK
 from .schema import load_trace, render, to_sharegpt
 from .select import dedup, diversity_report, select
-from .simia_text import tools_text
+from .trace_text import tools_text
 from .verify import ngrams, user_text, verify
 
 
@@ -157,7 +157,7 @@ def cmd_review(cfg: Config) -> None:
 
 
 def cmd_heldout(cfg: Config) -> dict:
-    """Chosen analyzer version vs simia_prompt=fixed on the held-out seeds. Separate on purpose: looking at held-out
+    """Chosen analyzer version vs baseline_prompt=fixed on the held-out seeds. Separate on purpose: looking at held-out
     results turns those seeds into dev data, so this runs only when explicitly asked for."""
     from .analyzer import compare_heldout
 
@@ -266,14 +266,14 @@ def cmd_generate(cfg: Config) -> list[dict]:
 
 
 def cmd_reparse(cfg: Config) -> list[dict]:
-    """Rebuild mode-simia traces from their saved raw outputs (no LLM calls); clears verify/select outputs."""
+    """Rebuild mode-baseline traces from their saved raw outputs (no LLM calls); clears verify/select outputs."""
     from .generate import trace_from_raw
 
     seeds = {s["id"]: s for s in _load_seeds(cfg)}
     rows = []
     for t in read_jsonl(_p(cfg, "generated.jsonl")):
         m = t["meta"]
-        if m.get("mode") == "simia" and m.get("raw_output") is not None:
+        if m.get("mode") == "baseline" and m.get("raw_output") is not None:
             new = trace_from_raw({"job_id": t["id"]}, seeds[m["seed_id"]], m["raw_output"])
             new["meta"] = {**m, **new["meta"]}
             t = new
@@ -349,10 +349,10 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["pipeline"]:  # end-to-end command, own arguments: simia-plus pipeline --seeds X --out Y --budget 5
+    if argv[:1] == ["pipeline"]:  # end-to-end command, own arguments: bandits-sft pipeline --seeds X --out Y --budget 5
         from .pipeline import main as pipeline_main
         sys.exit(pipeline_main(argv[1:]))
-    ap = argparse.ArgumentParser(prog="simia-plus", description=__doc__ + "\nEnd to end: simia-plus pipeline --help")
+    ap = argparse.ArgumentParser(prog="bandits-sft", description=__doc__ + "\nEnd to end: bandits-sft pipeline --help")
     ap.add_argument("command", choices=["ingest", "audit", "analyze", "batch", "experiment", "review", "heldout", "ab", "ab-split", "ab-vary", "mixed", "ab-models", "plan", "specs", "generate", "reparse", "verify",
                                         "select", "run"])
     ap.add_argument("--config", required=True)

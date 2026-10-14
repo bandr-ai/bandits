@@ -1,6 +1,6 @@
 """Dedup, select down to target_count, and report diversity.
 
-Exact dedup hashes every message (Simia's hashed human + assistant text only); near-dedup compares calls, results
+Exact dedup hashes every message (baseline's hashed human + assistant text only); near-dedup compares calls, results
 and answers, since seed expansions share their user context. Near-dedup and balanced selection follow
 Datology's curation: generate a bigger pool, remove redundancy, and keep coverage across seeds and
 strategies rather than the highest-scoring head (rare-but-useful examples survive).
@@ -21,7 +21,7 @@ def _calls(m: dict) -> str:
 
 
 def exact_key(trace: dict) -> str:
-    """Hash of every message: text, tool calls and tool results. (Simia hashed human + assistant text only; with seed
+    """Hash of every message: text, tool calls and tool results. (baseline hashed human + assistant text only; with seed
     expansion the context is shared by design and the differences live in calls and results.)"""
     parts = [f"{m['role'][0]}:{m.get('content') or ''}:{_calls(m)}" for m in trace["messages"]]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()

@@ -1,7 +1,7 @@
 """Seeds-only: report helpers read any agent's traces without domain config (tool-using JSON agents and free-text ones)."""
 import json
 
-from simia_plus.analyzer import answer_labels, decision_cells, outcomes
+from bandits_sft.analyzer import answer_labels, decision_cells, outcomes
 
 
 def _trace(final: str, tool: str | None = None) -> dict:

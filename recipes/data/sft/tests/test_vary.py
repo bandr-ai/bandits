@@ -6,10 +6,10 @@ import json
 import pytest
 from test_pipeline import seed
 
-from simia_plus.analyzer import _stack_pairs, coverage_summary, generate_analyzer, propose_wide, system_labels, variety
-from simia_plus.config import load_config
-from simia_plus.llm import set_llm_factory
-from simia_plus.schema import from_sharegpt
+from bandits_sft.analyzer import _stack_pairs, coverage_summary, generate_analyzer, propose_wide, system_labels, variety
+from bandits_sft.config import load_config
+from bandits_sft.llm import set_llm_factory
+from bandits_sft.schema import from_sharegpt
 
 
 @pytest.fixture
@@ -49,7 +49,7 @@ def test_proposals_keep_valid_kinds_only(cfg):
 
 
 def test_task_note_only_for_task_kind(cfg):
-    from simia_plus.banks import ObsBank
+    from bandits_sft.banks import ObsBank
     s = from_sharegpt(seed(0), 0)
     prompts = []
     reply(json.dumps({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]}), prompts)
@@ -77,7 +77,7 @@ def test_variety_and_coverage_measures():
 
 
 def test_judge_sees_the_variation_kind():
-    from simia_plus.rubric_judge import build_prompt, describe_change
+    from bandits_sft.rubric_judge import build_prompt, describe_change
     s = from_sharegpt(seed(0), 0)
     _, user = build_prompt(s, "rubric", s, describe_change({"name": "n", "change": "c", "kind": "task"}))
     assert '"kind": "task"' in user
@@ -95,7 +95,7 @@ def test_tools_the_seed_lacks_are_rejected(cfg):
 def test_llm_client_per_model_settings(tmp_path):
     import dataclasses
 
-    from simia_plus.llm import get_llm, set_llm_factory
+    from bandits_sft.llm import get_llm, set_llm_factory
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"seeds_path": "x", "out_dir": str(tmp_path), "models": {"default": {"model": "fake"}}}))
     a = load_config(p)

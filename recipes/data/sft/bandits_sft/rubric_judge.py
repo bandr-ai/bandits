@@ -34,7 +34,7 @@ Use "n/a" for I3 and I4 when no seed is given."""
 @lru_cache(maxsize=8)
 def load_rubric(path: str | Path | None = None) -> str:
     if not path:
-        raise ValueError("no rubric: set rubric_path (python -m simia_plus.rubric_loop induce --v2, or a hand-written rubric)")
+        raise ValueError("no rubric: set rubric_path (python -m bandits_sft.rubric_loop induce --v2, or a hand-written rubric)")
     text = Path(path).read_text()
     return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
 

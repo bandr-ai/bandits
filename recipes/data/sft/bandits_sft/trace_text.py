@@ -1,21 +1,21 @@
-"""Adapters between our canonical traces and Simia's text format (Simia's code is in simia.py)."""
+"""Adapters between our canonical traces and baseline's text format (baseline's code is in baseline.py)."""
 from __future__ import annotations
 
 import json
 
 from .schema import to_sharegpt
-from .simia import build_sample_text as _simia_build_sample_text
-from .simia import format_reference_conversations, parse_gpt_response
+from .upstream import build_sample_text as _baseline_build_sample_text
+from .upstream import format_reference_conversations, parse_gpt_response
 
 
 def build_sample_text(trace: dict, include_system: bool = True) -> str:
     sg = to_sharegpt(trace)
     if not include_system:
         sg["system"] = ""
-    return _simia_build_sample_text(sg)
+    return _baseline_build_sample_text(sg)
 
 
-def parse_simia_text(text: str) -> list[dict]:
+def parse_trace_text(text: str) -> list[dict]:
     """Generated text -> ShareGPT turns (human / gpt / function_call / observation)."""
     return parse_gpt_response(text)["conversations"]
 

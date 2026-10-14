@@ -1,6 +1,6 @@
 {
   "seeds_path": "seeds.jsonl",
-  "out_dir": "out/simia",
+  "out_dir": "out/baseline",
   "target_count": 1000,
   "overgen": 1.5,
   "features": {},

@@ -7,8 +7,8 @@ loop:   score the rubric on dev cases, ask REVISE (rubrics/induce_rubric_prompt_
         revision only if the dev score improves; report the first and the final rubric on test cases, which never feed
         a revision. Dev cases come from the seeds the rubric was induced from; test cases from held-out seeds.
 
-    python -m simia_plus.selftest build --config <cfg> --seeds <seeds.jsonl> --out <cases.jsonl> [--per-seed-limit N]
-    python -m simia_plus.selftest loop  --config <cfg> --rubric-dir <dir with domain.md> --dev <cases> --test <cases>
+    python -m bandits_sft.selftest build --config <cfg> --seeds <seeds.jsonl> --out <cases.jsonl> [--per-seed-limit N]
+    python -m bandits_sft.selftest loop  --config <cfg> --rubric-dir <dir with domain.md> --dev <cases> --test <cases>
                                         --out <dir> [--rounds 1]
 """
 from __future__ import annotations
@@ -187,7 +187,7 @@ def loop(cfg, slots: dict, dev: list[dict], test: list[dict], seeds: dict, out: 
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m simia_plus.selftest")
+    ap = argparse.ArgumentParser(prog="python -m bandits_sft.selftest")
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("--config", required=True)

@@ -5,10 +5,10 @@ import json
 
 from test_pipeline import seed
 
-from simia_plus.config import load_config
-from simia_plus.consistency import check, summarize
-from simia_plus.llm import set_llm_factory
-from simia_plus.schema import from_sharegpt
+from bandits_sft.config import load_config
+from bandits_sft.consistency import check, summarize
+from bandits_sft.llm import set_llm_factory
+from bandits_sft.schema import from_sharegpt
 
 
 def fake(reply: dict, prompts: list):
@@ -41,7 +41,7 @@ def test_label_follows_the_lists(tmp_path):
 def test_verify_runs_judge_and_consistency_and_either_rejects(tmp_path):
     from test_pipeline import write_cfg
 
-    from simia_plus.verify import verify
+    from bandits_sft.verify import verify
     rubric = tmp_path / "r.md"
     rubric.write_text("rubric\n## Output\n{}")
     t = from_sharegpt(seed(0), 0)
