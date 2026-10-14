@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .config import load_config
 from .io import read_jsonl
-from .llm import chat_json, configure_call_log, get_llm
+from .llm import BudgetExhausted, chat_json, configure_call_log, get_llm
 from .rubric_judge import describe_change, judge_rubric
 from .rubric_loop import RUBRICS, SLOTS_V2, assemble_v2, fill, generic_v2, parse_slots, prompt_section
 from .schema import render
@@ -76,6 +76,8 @@ def make_case(cfg, seed: dict, kind: str) -> dict:
         user = fill(_prompt("CORRUPT"), {**vals, "defect": kind, "definition": DEFECTS[kind]})
     try:
         out = chat_json(get_llm(cfg, "selftest"), "You edit traces for a judge test. Output JSON only.", user)
+    except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+        raise
     except Exception as e:  # noqa: BLE001
         return {**base, "id": f"{seed['id']}:{kind}", "skip": f"call failed: {e!r}"[:200]}
     trace = apply_edits(seed, out.get("edits") or []) if isinstance(out, dict) else None
@@ -97,6 +99,8 @@ def judge_cases(cfg, cases: list[dict], seeds: dict, rubric: str, workers: int =
         try:
             r = judge_rubric(cfg, c["trace"], seed=seeds[c["seed_id"]] if c["with_seed"] else None, rubric=rubric,
                              change=describe_change(c["change"]) if c["change"] else None)
+        except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+            raise
         except Exception as e:  # noqa: BLE001 - an unjudged case is reported as an error, never as a verdict
             r = {"label": "error", "error": repr(e)[:200]}
         return {"id": c["id"], "kind": c["kind"], "expected": c["expected"], "label": r.get("label"),
@@ -157,6 +161,8 @@ def loop(cfg, slots: dict, dev: list[dict], test: list[dict], seeds: dict, out: 
     for r in range(1, rounds + 1):
         try:
             cand, changelog = revise(cfg, best, failures_text(devc, best_v))
+        except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+            raise
         except Exception as e:  # noqa: BLE001
             history.append({"round": r, "error": repr(e)[:200]})
             continue

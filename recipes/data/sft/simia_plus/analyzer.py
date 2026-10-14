@@ -17,7 +17,7 @@ from .rollout import agent_rollout
 from .banks import ObsBank, ResultFormat, UserBank, format_input_examples, format_obs_examples
 from .config import Config
 from .io import parallel_map, read_jsonl, write_jsonl
-from .llm import chat_json, get_llm
+from .llm import BudgetExhausted, chat_json, get_llm
 from .prompts import (
     SEED_VARIATIONS,
     SEED_VARIATIONS_WIDE,
@@ -583,6 +583,8 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
             try:
                 return propose_for_seed(cfg, seed, by_key.get(system_key(seed.get("system", "")), "all"), labels, dev,
                                         out["observed_contracts"], existing, covered, cfg.variations_per_seed)
+            except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                raise
             except Exception:  # noqa: BLE001 - a failed proposal call only means fewer variations for that seed
                 return []
         with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as ex:
@@ -903,6 +905,8 @@ def _lesson_chunk(cfg: Config, multi: dict[str, list[dict]]) -> None:
         groups = out.get("duplicate_groups") if isinstance(out, dict) else None
         if not isinstance(groups, list):
             raise ValueError("no duplicate_groups list")
+    except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+        raise
     except Exception as e:  # noqa: BLE001 - advisory step: never fail the run, record why nothing was grouped
         for ts in multi.values():
             for t in ts:
@@ -1027,6 +1031,8 @@ def run_batch(cfg: Config, dev: list[dict], eval_ng: set, version: int, n: int) 
             try:
                 return propose_for_seed(cfg, seed, by_key.get(system_key(seed.get("system", "")), "all"), labels, dev,
                                         contracts, variations, covered, cfg.variations_per_seed)
+            except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                raise
             except Exception:  # noqa: BLE001 - a failed proposal call only means fewer cells for that seed
                 return []
         with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as ex:
@@ -1299,6 +1305,8 @@ def _wide_variations(cfg: Config, adir: Path, fname: str, seed_ids: list[str], d
         lab = by_key.get(system_key(by_id[sid].get("system", "")), "all")
         try:
             return propose_wide(cfg, by_id[sid], lab, labels, dev, contracts, batch_vars, cov.get(lab, ""), n)
+        except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+            raise
         except Exception as e:  # noqa: BLE001 - a failed proposal only means fewer cells for that seed; logged
             failed.append({"seed": sid, "error": repr(e)[:300]})
             return []

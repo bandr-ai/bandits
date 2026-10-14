@@ -31,7 +31,7 @@ from pathlib import Path
 
 from .config import Config, load_config
 from .io import parallel_map, read_jsonl, write_jsonl
-from .llm import configure_call_log, current_item
+from .llm import Budget, BudgetExhausted, configure_call_log, current_item, get_budget, set_budget
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "pipeline_fireworks.json"
 ROLES = ("default", "generator", "judge", "analyzer", "diagnose", "rubric_induce", "selftest")
@@ -116,7 +116,14 @@ class Pipeline:
         self.save()
         try:
             note = fn()
+            budget = get_budget()
+            if budget is not None and budget.hit:  # a call was refused inside the step: it did not complete
+                raise BudgetExhausted("a call was refused")
             row.update(status="done", note=note)
+        except BudgetExhausted as e:
+            row.update(status="stopped", note=f"budget: {e}"[:300])
+            raise Stop(f"budget ${self.budget} reached during step {step} (spent ${self.spend.update():.3f}); finished "
+                       "work is kept, re-run with a higher --budget to continue", ok=True) from None
         except Stop as e:
             row.update(status="stopped", note=str(e))
             raise
@@ -199,6 +206,8 @@ class Pipeline:
                     text = induce(cfg, seeds, v2=True)
                     slots = parse_slots(text)
                     break
+                except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                    raise
                 except Exception as e:  # noqa: BLE001
                     last = e
                     if attempt == 1:
@@ -227,6 +236,8 @@ class Pipeline:
                 current_item.set("judge/loop")
                 try:
                     rep = loop(cfg, slots, dev, test, by_id, ldir, cfg.judge_revise_rounds)
+                except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                    raise
                 except Exception as e:  # noqa: BLE001 - REVISE only polishes: keep the induced rubric
                     self.fallback("judge_setup", f"REVISE loop failed ({type(e).__name__}: {str(e)[:120]}); using the induced rubric")
                     (ldir / "rubric_final.md").write_text((idir / "rubric.md").read_text())
@@ -328,6 +339,8 @@ class Pipeline:
                     if not got:
                         break
                     wide += got
+            except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                raise
             except Exception as e:  # noqa: BLE001 - a failed proposal call only means fewer variations for this seed
                 failures.append({"seed": sid, "error": f"{type(e).__name__}: {e}"[:300]})
             out += [{**v, "_type": "old"} for v in old[:want["old"]]]
@@ -642,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.out.mkdir(parents=True, exist_ok=True)
     configure_call_log(cfg.out / "llm_calls.jsonl")
     p = Pipeline(cfg, a.budget, a.target or cfg.target_count)
+    set_budget(Budget(a.budget, p.spend.total))  # hard cap on every model call; spend so far counts on resume
     if p.state.get("rubric_path"):
         cfg.rubric_path = p.state["rubric_path"]
     stop = None
@@ -658,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         stop = Stop("interrupted; re-run the same command to resume")
         print(f"\nSTOPPED: {stop}")
+    set_budget(None)
     rep = p.report(stop)
     print(json.dumps({k: rep[k] for k in ("status", "target", "final", "unique_kept", "cost_usd", "budget_usd")}, default=str))
     print(f"report: {cfg.out / 'final' / 'report.md'}")

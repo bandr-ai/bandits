@@ -33,7 +33,9 @@ def parallel_map(fn: Callable[[dict], dict | list[dict] | None], items: list[dic
     """Run fn over items not already present in out_path (by key), appending results as they finish.
 
     fn may return one row, several rows, or None (skipped). Exceptions are logged to <out>.errors.jsonl
-    and the item is retried on the next run.
+    and the item is retried on the next run. When the run's budget is spent (llm.BudgetExhausted), items not yet
+    started are cancelled and BudgetExhausted is raised once the started ones finish, so nothing after the map
+    treats a partial result as complete.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,6 +45,7 @@ def parallel_map(fn: Callable[[dict], dict | list[dict] | None], items: list[dic
     err_path = out_path.with_suffix(".errors.jsonl")
     lock = threading.Lock()
     ok = failed = 0
+    budget_hit: Exception | None = None
     with out_path.open("a") as out, ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         from .llm import current_item
 
@@ -50,11 +53,21 @@ def parallel_map(fn: Callable[[dict], dict | list[dict] | None], items: list[dic
             current_item.set(key(it))
             return fn(it)
 
+        from .llm import BudgetExhausted
+
         futures = {pool.submit(run, it): it for it in todo}
         for fut in as_completed(futures):
             it = futures[fut]
+            if fut.cancelled():
+                continue
             try:
                 res = fut.result()
+            except BudgetExhausted as e:
+                if budget_hit is None:
+                    budget_hit = e
+                    for f in futures:
+                        f.cancel()  # not-yet-started items stay undone; a resumed run picks them up
+                continue
             except Exception as e:  # noqa: BLE001 - one bad item must not stop the run; logged and retried next run
                 failed += 1
                 with lock, err_path.open("a") as ef:
@@ -69,4 +82,6 @@ def parallel_map(fn: Callable[[dict], dict | list[dict] | None], items: list[dic
             ok += 1
     if desc:
         print(f"{desc}: {ok} done, {failed} failed, {len(items) - len(todo)} already present")
+    if budget_hit is not None:
+        raise budget_hit
     return read_jsonl(out_path)

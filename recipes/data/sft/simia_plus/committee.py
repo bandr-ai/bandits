@@ -10,7 +10,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
-from .llm import chat_json, get_llm
+from .llm import BudgetExhausted, chat_json, get_llm
 from .schema import render
 
 ASPECTS = {
@@ -58,6 +58,8 @@ def _one(cfg: Config, name: str, seed: dict, trace: dict) -> dict:
         out = chat_json(get_llm(cfg, "judge"), "You are a strict, precise reviewer. Output JSON only.",
                         PROMPT.format(system=trace.get("system", ""), seed=render(seed, max_obs_chars=2500)[:14000],
                                       generated=render(trace, max_obs_chars=2500)[:14000], aspect=ASPECTS[name]))
+    except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+        raise
     except Exception as e:  # truncated or failed call: recorded as "error", never a pass
         out = {"error": str(e)[:120]}
     ok = isinstance(out, dict) and out.get("verdict") in ("pass", "fail")

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import load_config
 from .io import read_jsonl
-from .llm import chat_json, configure_call_log, current_item, get_llm
+from .llm import BudgetExhausted, chat_json, configure_call_log, current_item, get_llm
 from .prompts import CONSISTENCY_CHECK
 from .schema import render
 from .simia_text import tools_text
@@ -72,6 +72,8 @@ def main(argv=None):
         row = {"id": c["id"], "expected": c.get("expected")}
         try:
             row.update(check(cfg, c["trace"], c.get("seed")))
+        except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+            raise
         except Exception as e:  # noqa: BLE001 - an unchecked case is reported as an error, never as good
             row["error"] = repr(e)[:300]
         return row

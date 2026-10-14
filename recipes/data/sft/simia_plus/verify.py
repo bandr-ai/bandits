@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .config import Config
-from .llm import chat_json, get_llm
+from .llm import BudgetExhausted, chat_json, get_llm
 from .prompts import DEFAULT_CHECKLIST, JUDGE, JUDGE_CHECKS, JUDGE_EXPANSION
 from .schema import render
 from .state import state_match
@@ -570,6 +570,8 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
         def guarded(fn):  # each gate fails closed: an unchecked trace is not kept, and says why
             try:
                 return fn()
+            except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                raise
             except Exception as e:  # noqa: BLE001
                 return {"label": "error", "error": f"{type(e).__name__}: {e}"[:300]}
         notes = v.get("soft_flags") or None  # code-found differences from the seed: the judges weigh them, code never gates on them
@@ -592,6 +594,8 @@ def verify(cfg: Config, trace: dict, eval_ngrams: set[tuple], expansion: dict | 
             v["judge_attempts"] += 1
             try:
                 j = judge_expansion(cfg, trace, expansion) if expansion else judge(cfg, trace, spec)
+            except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+                raise
             except Exception as e:  # noqa: BLE001 - an evaluator failure is recorded, never read as a verdict on the trace
                 v["eval_error"] = f"{type(e).__name__}: {e}"[:300]
                 break

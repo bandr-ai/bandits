@@ -46,6 +46,51 @@ class EmptyResponse(RuntimeError):
 class Truncated(RuntimeError):
     """The response hit the token limit (finish_reason=length); an identical retry would hit it again, so not retried."""
 
+
+class BudgetExhausted(RuntimeError):
+    """The run's budget cannot cover this call. Never retried; callers re-raise it so the run stops cleanly."""
+
+
+class Budget:
+    """Hard spend cap for every model call in a process. Each call reserves its maximum possible cost before it starts
+    (prompt + max_tokens at configured prices) and settles to the actual cost after, so concurrent calls together can
+    never pass the limit. Once a call is refused the budget stays exhausted: later, cheaper calls are refused too, so a
+    run stops instead of trickling on."""
+
+    def __init__(self, limit_usd: float, spent_usd: float = 0.0):
+        self.limit, self.spent, self.reserved, self.hit = limit_usd, spent_usd, 0.0, False
+        self._lock = threading.Lock()
+
+    def reserve(self, amount: float) -> float:
+        with self._lock:
+            if self.hit or self.spent + self.reserved + amount > self.limit:
+                self.hit = True
+                raise BudgetExhausted(f"budget ${self.limit:.4f} reached (spent ${self.spent:.4f}, "
+                                      f"in flight ${self.reserved:.4f}, next call up to ${amount:.4f})")
+            self.reserved += amount
+            return amount
+
+    def settle(self, reserved: float, actual: float) -> None:
+        with self._lock:
+            self.reserved -= reserved
+            self.spent += actual
+
+
+_budget: Budget | None = None
+
+
+def set_budget(budget: Budget | None) -> None:
+    """Cap every later model call in this process (None: no cap)."""
+    global _budget
+    _budget = budget
+
+
+def get_budget() -> Budget | None:
+    return _budget
+
+
+NON_RETRYABLE = {400, 401, 403, 404, 422}  # a retry of these cannot succeed; 408, 409, 429 and 5xx are retried
+
 from .config import Config, ModelCfg
 
 
@@ -84,6 +129,7 @@ class OpenAILLM:
             body["cache"] = {**body.get("cache", {}), "no-cache": True, "no-store": True}
             kwargs["extra_body"] = body
         last: Exception | None = None
+        billed = 0.0  # what the provider charged across attempts (failed calls that returned usage are billed)
         for attempt in range(1, self.retries + 1):
             t0 = time.monotonic()
             row: dict[str, Any] = {"role": self.role, "model": self.cfg.model, "attempt": attempt,
@@ -115,22 +161,26 @@ class OpenAILLM:
                            call_id=raw.headers.get("x-litellm-call-id"), provider=extra.get("provider"),
                            cache_hit=raw.headers.get("x-litellm-cache-hit"),
                            served_model=model, response={"content": content, "tool_calls": calls, "reasoning": reasoning})
+                billed += cost or 0.0
                 if finish == "length":
                     raise Truncated(f"response hit the token limit ({self.cfg.max_tokens})")
                 if not (content or "").strip() and not calls:
                     raise EmptyResponse(f"empty response (finish_reason={finish})")
                 log_call(row)
-                return {"content": content or "", "tool_calls": calls}
+                return {"content": content or "", "tool_calls": calls, "cost": billed}
             except Exception as e:  # noqa: BLE001 - provider SDKs raise many types; logged, retried, then re-raised
                 last = e
                 row.update(ok=False, latency_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:2000],
                            status=row.get("status") or getattr(e, "status_code", None))
                 log_call(row)
-                if isinstance(e, Truncated):
+                if isinstance(e, Truncated) or row.get("status") in NON_RETRYABLE:
+                    e.billed = billed
                     raise
                 if attempt < self.retries:
                     time.sleep(min(60, 2 ** attempt))
-        raise RuntimeError(f"LLM call failed after {self.retries} attempts: {last}")
+        err = RuntimeError(f"LLM call failed after {self.retries} attempts: {last}")
+        err.billed = billed
+        raise err
 
     def _stream(self, kwargs: dict):
         """One streamed completion folded into the same pieces a plain response gives."""
@@ -202,7 +252,36 @@ def get_llm(cfg: Config, role: str) -> ChatLLM:
     with _lock:
         if key not in _cache:
             _cache[key] = _factory(m, role)
-        return _cache[key]
+        return _Metered(_cache[key], m)
+
+
+def max_call_cost(cfg: ModelCfg, messages: list[dict]) -> float:
+    """Upper bound of one call's cost: prompt at ~3 characters per token (an overestimate) plus max_tokens of output.
+    0 when the model has no configured prices (preflight refuses a budgeted run without them)."""
+    prompt = len(json.dumps(messages, ensure_ascii=False)) // 3 + 1
+    return token_cost(cfg, {"prompt_tokens": prompt, "completion_tokens": cfg.max_tokens}) or 0.0 \
+        if isinstance(cfg, ModelCfg) else 0.0
+
+
+class _Metered:
+    """Wraps any client so the process budget (set_budget) gates and accounts every call, fakes included."""
+
+    def __init__(self, inner: ChatLLM, cfg: ModelCfg):
+        self.inner, self.cfg = inner, cfg
+
+    def chat(self, messages, *args, **kwargs):
+        budget = _budget
+        if budget is None:
+            return self.inner.chat(messages, *args, **kwargs)
+        held = budget.reserve(max_call_cost(self.cfg, messages))
+        try:
+            out = self.inner.chat(messages, *args, **kwargs)
+        except Exception as e:
+            budget.settle(held, getattr(e, "billed", 0.0) or 0.0)
+            raise
+        cost = out.get("cost") if isinstance(out, dict) else None
+        budget.settle(held, held if cost is None else cost)  # a client that reports no cost is charged its maximum
+        return out
 
 
 def parse_args(arguments: Any) -> dict:

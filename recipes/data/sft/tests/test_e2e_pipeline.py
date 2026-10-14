@@ -28,8 +28,9 @@ class E2EFake(FakeLLM):
     def chat(self, messages, tools=None, json_mode=False, tool_choice=None):
         out = self._answer(messages)
         prod = "prod/" in messages[-1]["content"] and "prod_cost" in self.opts
-        log_call({"role": self.role, "ok": True, "cost": self.opts["prod_cost"] if prod else self.opts.get("cost", 0.001)})
-        return out
+        cost = self.opts["prod_cost"] if prod else self.opts.get("cost", 0.001)
+        log_call({"role": self.role, "ok": True, "cost": cost})
+        return {**out, "cost": cost}  # like the real client: the budget settles each call to its actual cost
 
     def _answer(self, messages):
         text, sys_ = messages[-1]["content"], messages[0]["content"]
@@ -285,3 +286,57 @@ def test_input_json_flag_is_soft_and_reaches_both_judges(tmp_path):
 def test_flag_kind_groups_specifics():
     assert pl._flag_kind("message 3: JSON block no longer parses (Expecting ',' at char 40); the seed's does") == "message N: JSON block no longer parses"
     assert pl._flag_kind("answer keys differ from seed: +['a'] -[]") == "answer keys differ from seed: +[..] -[..]"
+
+
+def test_budget_smaller_than_setup_is_a_hard_cap(tmp_path, fake):
+    """Review repro: $0.01 per call and a budget below setup cost used to spend $0.42 in judge setup."""
+    cfg, out = make(tmp_path)
+    fake["cost"] = 0.01
+    assert run(cfg, budget=0.05) == 0  # a budget stop is a normal end
+    rep = json.loads((out / "final" / "report.json").read_text())
+    assert rep["status"].startswith("stopped: budget") and "judge_setup" in rep["status"]
+    assert rep["cost_usd"] <= 0.05 and rep["steps"]["judge_setup"]["status"] == "stopped"
+    assert not (out / "judge" / "selftest" / "dev.jsonl").exists()  # nothing partial saved as finished
+
+
+def test_budget_reservations_are_concurrent_safe():
+    import threading
+
+    from simia_plus.llm import Budget, BudgetExhausted
+    b, got, refused = Budget(1.0), [], []
+
+    def take():
+        try:
+            got.append(b.reserve(0.3))
+        except BudgetExhausted:
+            refused.append(1)
+    ts = [threading.Thread(target=take) for _ in range(10)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(got) == 3 and len(refused) == 7 and b.hit
+    with pytest.raises(BudgetExhausted):  # stays exhausted: a later, cheaper call is refused too
+        b.reserve(0.01)
+
+
+def test_permanent_client_errors_are_not_retried(monkeypatch):
+    from simia_plus import llm
+    from simia_plus.config import ModelCfg
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    calls = []
+
+    def client(status):
+        def create(**kw):
+            calls.append(status)
+            e = RuntimeError(f"http {status}")
+            e.status_code = status
+            raise e
+        raw = type("R", (), {"create": staticmethod(create)})
+        return type("C", (), {"chat": type("Ch", (), {"completions": type("Co", (), {"with_raw_response": raw})})})
+
+    for status, attempts in ((400, 1), (401, 1), (429, 3), (503, 3)):
+        calls.clear()
+        c = llm.OpenAILLM(ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY"), "r", retries=3)
+        c.client = client(status)
+        with pytest.raises(Exception):
+            c.chat([{"role": "user", "content": "x"}])
+        assert len(calls) == attempts, (status, calls)

@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .config import Config
-from .llm import chat_json, get_llm
+from .llm import BudgetExhausted, chat_json, get_llm
 from .schema import render
 
 FULL = 10**7
@@ -99,6 +99,8 @@ def judge_rubric(cfg: Config, trace: dict, seed: dict | None = None, rubric: str
     for i in range(attempts):  # DeepSeek occasionally loops until the token limit; one retry clears it
         try:
             return normalize(chat_json(get_llm(cfg, "judge"), system, user))
+        except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
+            raise
         except Exception:
             if i == attempts - 1:
                 raise
