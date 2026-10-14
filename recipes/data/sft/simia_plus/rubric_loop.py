@@ -22,7 +22,7 @@ from .llm import get_llm
 from .schema import render
 from .verify import system_key
 
-RUBRICS = Path(__file__).resolve().parents[1] / "rubrics"
+RUBRICS = Path(__file__).resolve().parent / "rubrics"  # package data: ships in the wheel
 
 
 SLOTS_V2 = ("consistency_map", "answer_rules")

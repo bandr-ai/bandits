@@ -80,9 +80,11 @@ def make_case(cfg, seed: dict, kind: str) -> dict:
         raise
     except Exception as e:  # noqa: BLE001
         return {**base, "id": f"{seed['id']}:{kind}", "skip": f"call failed: {e!r}"[:200]}
-    trace = apply_edits(seed, out.get("edits") or []) if isinstance(out, dict) else None
+    if not isinstance(out, dict):  # a list or other non-object answer: skip the case, never crash the build
+        return {**base, "id": f"{seed['id']}:{kind}", "skip": "answer is not a JSON object"}
+    trace = apply_edits(seed, out.get("edits") or [])
     if trace is None:
-        return {**base, "id": f"{seed['id']}:{kind}", "skip": (out or {}).get("reason") or "edits did not apply"}
+        return {**base, "id": f"{seed['id']}:{kind}", "skip": out.get("reason") or "edits did not apply"}
     trace["id"] = f"{seed['id']}:{kind}"
     return {**base, "id": trace["id"], "trace": trace, "change": out.get("declared_change"), "defect": out.get("defect"),
             "with_seed": True, "edits": out.get("edits")}

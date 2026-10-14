@@ -8,7 +8,7 @@ Standalone: it does not import Bandits core.
 
 Current seed-only flow: [ANALYZER_SPEC.md](ANALYZER_SPEC.md). End to end:
 `simia-plus pipeline --seeds <seeds.jsonl> --out <dir> --budget 5` with the shipped defaults in
-[`configs/pipeline_fireworks.json`](configs/pipeline_fireworks.json).
+[`simia_plus/defaults/pipeline_fireworks.json`](simia_plus/defaults/pipeline_fireworks.json).
 
 ## Install
 ```bash

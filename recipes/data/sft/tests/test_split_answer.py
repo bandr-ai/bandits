@@ -61,7 +61,8 @@ def test_agent_acts_with_simulated_results_and_the_outcome_stays_hidden(cfg):
     gen_prompt = next(m for r, m in prompts if r == "generator")[0]["content"]
     sim_prompt = next(m for r, m in prompts if r == "tool_sim")[1]["content"]
     assert "SECRET-OUTCOME" not in gen_prompt + sim_prompt and "Split mode" in gen_prompt and "order is shipped" in sim_prompt
-    assert all("must be dropped" not in (m.get("content") or "") for r, ms in prompts if r == "agree" for m in ms)
+    agent_msgs = [m for r, ms in prompts if r == "agent" for m in ms]
+    assert agent_msgs and all("must be dropped" not in (m.get("content") or "") for m in agent_msgs)
 
 
 def test_agent_that_never_answers_drops_the_trace(cfg):

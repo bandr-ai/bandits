@@ -22,7 +22,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["simia_plus"]
+packages = ["simia_plus"]  # includes simia_plus/rubrics/*.md and simia_plus/defaults/*.json (package data)
+
+[tool.hatch.build.targets.wheel.force-include]
+"LICENSE-SIMIA" = "simia_plus/LICENSE-SIMIA"
 
 [tool.ruff]
 line-length = 130

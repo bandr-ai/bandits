@@ -188,6 +188,8 @@ def to_sharegpt(trace: dict) -> dict:
         if m["role"] == "user":
             conv.append({"from": "human", "value": m["content"]})
         elif m["role"] == "assistant" and m.get("tool_calls"):
+            if (m.get("content") or "").strip():  # text said alongside the calls stays, before them, as in the source
+                conv.append({"from": "gpt", "value": m["content"]})
             # one call per FUNCTION_CALL turn (Simia's format); parallel calls become consecutive turns
             for k, c in enumerate(m["tool_calls"]):
                 body = json.dumps({"name": c["name"], "arguments": c["arguments"]}, ensure_ascii=False)

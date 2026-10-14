@@ -154,7 +154,7 @@ def build_review(root: Path, seeds: list[dict]) -> Path:
                                                      for k, x in m["case"].items())
         fid = m.get("fidelity") or {}
         blocks.append(
-            f'<details class="trace" data-version="{version}" data-variation="{html.escape(variation)}" data-kept="{kept}">'
+            f'<details class="trace" data-version="{html.escape(str(version), quote=True)}" data-variation="{html.escape(variation)}" data-kept="{kept}">'
             f'<summary><span class="badge">v{html.escape(version)}</span><b>{html.escape(variation)}</b>'
             f'<span class="badge {"kept" if kept == "1" else "rej"}">{"kept" if kept == "1" else "rejected"}</span>'
             f'<span class="badge">seed {html.escape(str(m.get("seed_id"))[:13])}</span>'

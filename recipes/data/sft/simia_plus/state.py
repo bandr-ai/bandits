@@ -15,7 +15,7 @@ def _split(path: str) -> list[str]:
 
 def _child(node: Any, key: str, create: bool) -> Any:
     if isinstance(node, list):
-        return node[int(key)] if key.lstrip("-").isdigit() and abs(int(key)) <= len(node) else None
+        return node[int(key)] if key.lstrip("-").isdigit() and -len(node) <= int(key) < len(node) else None
     if isinstance(node, dict):
         if key not in node and create:
             node[key] = {}
@@ -28,6 +28,9 @@ def apply_ops(state: dict, ops: list[dict]) -> tuple[dict, list[str]]:
     new = copy.deepcopy(state)
     errors = []
     for op in ops or []:
+        if not isinstance(op, dict) or not isinstance(op.get("path", ""), str):
+            errors.append(f"invalid op: {op!r}"[:200])
+            continue
         kind, path = op.get("op"), op.get("path", "")
         parts = _split(path)
         if kind not in ("set", "delete", "append") or not parts:

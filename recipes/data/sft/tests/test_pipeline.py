@@ -857,3 +857,32 @@ def test_null_optional_arg_and_seed_types_are_not_schema_errors():
     seeds = [{"tools": [{"name": "t", "parameters": spec}],
               "messages": [{"role": "assistant", "tool_calls": [{"name": "t", "arguments": {"id": 7, "q": None}}]}]}]
     assert observed_loose_type_args(seeds) == {"t": ["id"]}
+
+
+def test_sharegpt_keeps_text_said_with_tool_calls():
+    """Review repro: an assistant turn with text plus a tool call lost its text in the ShareGPT export."""
+    t = {"id": "x", "system": "", "tools": [], "messages": [
+        {"role": "user", "content": "where is my order?"},
+        {"role": "assistant", "content": "Let me check that.", "tool_calls": [{"id": "c1", "name": "get_order", "arguments": {"order_id": "1"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "get_order", "content": "{}"},
+        {"role": "assistant", "content": "It is pending."}]}
+    conv = to_sharegpt(t)["conversations"]
+    assert [c["from"] for c in conv] == ["human", "gpt", "function_call", "observation", "gpt"]
+    assert conv[1]["value"] == "Let me check that." and json.loads(conv[2]["value"])["name"] == "get_order"
+
+
+def test_state_ops_reject_bad_input_without_crashing():
+    """Review repro: a list index equal to its length, a None op and a null path raised instead of reporting."""
+    new, errors = apply_ops({"a": [{}]}, [{"op": "set", "path": "a.1.x", "value": 1}, None, {"op": "set", "path": None}])
+    assert new == {"a": [{}]} and len(errors) == 3
+    new, errors = apply_ops({"a": [{}]}, [{"op": "set", "path": "a.0.x", "value": 1}, {"op": "set", "path": "a.-1.y", "value": 2}])
+    assert new == {"a": [{"x": 1, "y": 2}]} and errors == []
+
+
+def test_selftest_case_skips_a_non_object_answer(tmp_path):
+    from simia_plus.selftest import make_case
+    cfg = load_config(write_cfg(tmp_path, {}, target=1))
+    set_llm_factory(lambda c, role: type("F", (), {"chat": lambda self, *a, **k: {"content": "[1, 2]", "tool_calls": []}})())
+    case = make_case(cfg, from_sharegpt(seed(0), 0), "contradiction")
+    assert case["skip"] == "answer is not a JSON object"
+    set_llm_factory(lambda cfg, role: (_ for _ in ()).throw(RuntimeError("no real LLM in tests")))

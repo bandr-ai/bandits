@@ -33,7 +33,7 @@ from .config import Config, load_config
 from .io import parallel_map, read_jsonl, write_jsonl
 from .llm import Budget, BudgetExhausted, configure_call_log, current_item, get_budget, set_budget
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "pipeline_fireworks.json"
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "defaults" / "pipeline_fireworks.json"  # ships in the wheel
 ROLES = ("default", "generator", "judge", "analyzer", "diagnose", "rubric_induce", "selftest")
 STEPS = ("ingest", "judge_setup", "analyzer", "proposals", "production")
 TYPES = ("old", "task", "evidence", "stack")
