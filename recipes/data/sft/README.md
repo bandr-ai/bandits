@@ -1,7 +1,7 @@
 # Bandits trace generation
 
 Give it N good agent traces and get M new ones back for SFT (e.g. 100 → 1,000). No environment is needed:
-nothing is executed. Design and sources: [`SPEC.md`](SPEC.md). Upstream code and prompt provenance: [`THIRD_PARTY.md`](THIRD_PARTY.md).
+nothing is executed. Design and sources: [`SPEC.md`](SPEC.md).
 
 Standalone: it does not import Bandits core.
 

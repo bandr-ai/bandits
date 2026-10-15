@@ -1,6 +1,4 @@
 """Seed-conditioned generation and reference simulation prompts.
-
-Adapted upstream prompts and modifications are documented in ../THIRD_PARTY.md.
 """
 from __future__ import annotations
 

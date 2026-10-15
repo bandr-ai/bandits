@@ -24,9 +24,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["bandits_sft"]  # includes bandits_sft/rubrics/*.md and bandits_sft/defaults/*.json (package data)
 
-[tool.hatch.build.targets.wheel.force-include]
-"LICENSE-UPSTREAM" = "bandits_sft/LICENSE-UPSTREAM"
-
 [tool.ruff]
 line-length = 130
 

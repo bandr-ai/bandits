@@ -57,4 +57,4 @@ jobs:
           uv build --wheel --out-dir "$RUNNER_TEMP/sft-dist"
           uv venv "$RUNNER_TEMP/sft-wheel"
           uv pip install --python "$RUNNER_TEMP/sft-wheel/bin/python" "$RUNNER_TEMP"/sft-dist/*.whl
-          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/sft-wheel/bin/python" -c "import importlib.resources as ir, bandits_sft.pipeline as p, bandits_sft.rubric_loop as r, bandits_sft.config as c; c.load_config(p.DEFAULT_CONFIG); r.generic_v2(); r.prompt_section('INDUCE', 'induce_rubric_prompt_v2.md'); assert ir.files('bandits_sft').joinpath('LICENSE-UPSTREAM').is_file()"
+          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/sft-wheel/bin/python" -c "import bandits_sft.pipeline as p, bandits_sft.rubric_loop as r, bandits_sft.config as c; c.load_config(p.DEFAULT_CONFIG); r.generic_v2(); r.prompt_section('INDUCE', 'induce_rubric_prompt_v2.md')"

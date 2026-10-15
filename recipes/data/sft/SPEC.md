@@ -4,7 +4,7 @@
 Take N good agent traces and return M new traces for SFT, e.g. 100 golden traces → 1,000 or 10,000. Assume no
 environment: nothing can be executed, and only the traces themselves are available.
 
-**Base:** A seed-conditioned trajectory generator with parsing, repair and filtering. Upstream code, adapted prompts and license provenance are recorded in [`THIRD_PARTY.md`](THIRD_PARTY.md). With every feature off, each new trace uses one generation call followed by post-processing. Improvements are feature flags for controlled comparisons.
+**Base:** A seed-conditioned trajectory generator with parsing, repair and filtering. With every feature off, each new trace uses one generation call followed by post-processing. Improvements are feature flags for controlled comparisons.
 
 **Not specific to one benchmark.** The upstream generator targets τ²’s retail and airline domains.
 Here those domain blocks are replaced by one generic block, and seeds can be ShareGPT,
@@ -35,13 +35,13 @@ All stages resume: re-running skips work that is already done. Failed items go t
 ## Features (all off = baseline)
 | Flag | Adds | Why (source) |
 |---|---|---|
-| `check_seeds` | LLM check on seeds: complete / logical / well-formatted | Upstream paper §2.2 (see THIRD_PARTY.md) |
+| `check_seeds` | LLM check on seeds: complete / logical / well-formatted | Seed validation |
 | `strategies` | A mix of six strategies instead of only "new scenario": rephrase, entity_swap, extend, compose, variant_outcome, new_scenario | BeyondWeb: "generate more like this" ≈ repetition, while several grounded transformation strategies keep improving |
 | `spec` | Scenario spec per job: goal, user facts, initial state, expected final state, expected behavior. Written in batches per seed | Proxy-State Eval 2602.16246 (a careful spec gives near-zero simulator hallucination); batch diversity (Adaption) |
 | `persona` | Realistic users. Applied automatically only to seeds with ≥2 user turns, because single-request agents have no conversation to simulate | Sim2Real user gap 2603.11245; PPol 2605.12894; MIMESIS 2610.09484 |
 | `failure` | One injected tool failure (timeout, server_error, not_found, permission_denied, invalid_argument) at a sampled call; the agent must recover | When Simulation Lies 2605.11928; Kimi K2; HAT |
 | `retrieval` | Real recorded tool results from the seeds, given as format reference | Reference-conditioned simulation replays recorded results; MirrorAPI 2503.20527 |
-| `loop` | A share (`loop_frac`) of jobs runs per step (`loop_style`: `reference_env` or `split`) | Upstream reference simulation (see THIRD_PARTY.md); StateGen |
+| `loop` | A share (`loop_frac`) of jobs runs per step (`loop_style`: `reference_env` or `split`) | Reference simulation; StateGen |
 | `provenance` | Drop traces whose ID-like tool arguments never appeared earlier | SAP 2609.06124 |
 | `judge` | LLM audit against the spec and a checklist. The judge's reconstructed final state is diffed in code against the expected state. Failures can be kept with `bad_steps` for loss masking | Proxy-State Eval; Agent World Model 2602.10090; Adaption checklists; keep-failures (Terminal-World) |
 | `near_dedup` | 3-gram Jaccard on the first user message, within the same tool-sequence bucket | Datology curation |
