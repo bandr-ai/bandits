@@ -8,7 +8,7 @@ v2 (--v2): rubrics/generic_parts_v2.md has two domain slots (consistency map, an
 in rubrics/induce_rubric_prompt_v2.md, which also sees the generic text so it does not repeat it. lint() flags what the
 prompt forbids (table rows copied from a system prompt, unverified rows, unknowns, length) without changing the text.
 
-    python -m simia_plus.rubric_loop induce --config <cfg.json> --out <dir> [--seeds <seeds.jsonl>] [--v2]
+    python -m bandits_sft.rubric_loop induce --config <cfg.json> --out <dir> [--seeds <seeds.jsonl>] [--v2]
 """
 import argparse
 import json
@@ -129,7 +129,7 @@ def induce(cfg: Config, seeds: list[dict], v2: bool = False) -> str:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m simia_plus.rubric_loop")
+    ap = argparse.ArgumentParser(prog="python -m bandits_sft.rubric_loop")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("induce", help="write the domain part once from the seeds and assemble the rubric")
     p.add_argument("--config", required=True)

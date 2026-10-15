@@ -1,6 +1,6 @@
 """Checks on generated traces.
 
-rule_check     Simia's post-processing as checks (fix_arguments / tool_correct / validate_conversation),
+rule_check     baseline's post-processing as checks (fix_arguments / tool_correct / validate_conversation),
                generalised: parseable calls, known tools, required args and types, results follow calls,
                ends with an assistant reply. Always on: this is the baseline.
 provenance     SAP (2609.06124): every ID-like argument value must appear earlier in what the agent saw.
@@ -29,8 +29,8 @@ _IDLIKE = re.compile(r"^(?=.*\d)[\w\-#.@:/]{3,}$|^[^@\s]+@[^@\s]+\.\w+$")
 def rule_check(trace: dict, min_assistant_turns: int, arg_defaults: dict | None = None,
                optional_args: dict | None = None, loose_type_args: dict | None = None) -> list[str]:
     issues = []
-    if trace.get("meta", {}).get("simia_deleted"):
-        issues.append("leaked tool markup (Simia should_delete_conversation)")
+    if trace.get("meta", {}).get("baseline_deleted"):
+        issues.append("leaked tool markup (baseline should_delete_conversation)")
     msgs = trace["messages"]
     tools = {t["name"]: t for t in trace.get("tools", [])}
     if not msgs or msgs[0]["role"] != "user":

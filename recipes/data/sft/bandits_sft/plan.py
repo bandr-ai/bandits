@@ -16,7 +16,7 @@ from .llm import chat_json, get_llm
 from .personas import sample_persona
 from .prompts import SPEC_BATCH, STRATEGIES
 from .schema import tool_calls
-from .simia_text import build_sample_text, tools_text
+from .trace_text import build_sample_text, tools_text
 
 FAILURE_TYPES = ["timeout", "server_error", "not_found", "permission_denied", "invalid_argument"]
 SPEC_BATCH_MAX = 8  # specs per LLM call; larger batches drift
@@ -42,7 +42,7 @@ def plan_jobs(cfg: Config, seeds: list[dict]) -> list[dict]:
         strategy = (rng.choices(strategies, weights=[cfg.strategy_weights[s] for s in strategies])[0]
                     if f.strategies else "new_scenario")
         job = {"job_id": f"{seed['id']}__{j // len(seeds)}", "seed_id": seed["id"], "strategy": strategy,
-               "mode": (cfg.loop_style if f.loop and rng.random() < cfg.loop_frac else "simia")}
+               "mode": (cfg.loop_style if f.loop and rng.random() < cfg.loop_frac else "baseline")}
         if strategy == "compose":
             peers = [p for p in by_tools[json.dumps(sorted(t["name"] for t in seed["tools"]))] if p != seed["id"]]
             if peers:

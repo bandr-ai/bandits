@@ -1,7 +1,7 @@
 [project]
 name = "bandits-sft-synth"
-version = "0.1.0"
-description = "Simia+: extrapolate seed agent traces into more SFT traces, with no environment."
+version = "0.2.0"
+description = "Bandits trace generation: extrapolate seed agent traces into more SFT traces, with no environment."
 requires-python = ">=3.11"
 dependencies = [
     # Standalone: does not import Bandits core.
@@ -15,17 +15,14 @@ dev = [
 ]
 
 [project.scripts]
-simia-plus = "simia_plus.cli:main"
+bandits-sft = "bandits_sft.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["simia_plus"]  # includes simia_plus/rubrics/*.md and simia_plus/defaults/*.json (package data)
-
-[tool.hatch.build.targets.wheel.force-include]
-"LICENSE-SIMIA" = "simia_plus/LICENSE-SIMIA"
+packages = ["bandits_sft"]  # includes bandits_sft/rubrics/*.md and bandits_sft/defaults/*.json (package data)
 
 [tool.ruff]
 line-length = 130

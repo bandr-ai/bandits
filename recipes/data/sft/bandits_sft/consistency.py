@@ -2,7 +2,7 @@
 their own call, and unsupported answer claims (CONSISTENCY_CHECK). Code labels the trace bad when any list is
 non-empty.
 
-    python -m simia_plus.consistency --config <cfg> --cases <cases.jsonl> --out <dir> [--workers 6]
+    python -m bandits_sft.consistency --config <cfg> --cases <cases.jsonl> --out <dir> [--workers 6]
 
 cases.jsonl rows: {"id", "trace", optional "seed" (the real trace it was varied from), optional "expected": "good"|"bad"}; with expected labels it reports how many bad
 traces are caught and how many good ones are rejected.
@@ -20,7 +20,7 @@ from .io import read_jsonl
 from .llm import BudgetExhausted, chat_json, configure_call_log, current_item, get_llm
 from .prompts import CONSISTENCY_CHECK
 from .schema import render
-from .simia_text import tools_text
+from .trace_text import tools_text
 
 FULL = 10**7
 PROBLEMS = ("contradictions", "impossible_results", "unsupported_claims")
@@ -60,7 +60,7 @@ def summarize(rows: list[dict]) -> dict:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m simia_plus.consistency")
+    ap = argparse.ArgumentParser(prog="python -m bandits_sft.consistency")
     ap.add_argument("--config", required=True)
     ap.add_argument("--cases", required=True)
     ap.add_argument("--out", required=True)

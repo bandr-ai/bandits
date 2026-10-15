@@ -1,6 +1,6 @@
 """One command from seeds to kept traces: preflight -> ingest -> judge setup -> analyzer -> proposals -> production -> report.
 
-    simia-plus pipeline --seeds <seeds.jsonl> --out <dir> --budget 5 [--target 300] [--config <cfg.json>]
+    bandits-sft pipeline --seeds <seeds.jsonl> --out <dir> --budget 5 [--target 300] [--config <cfg.json>]
 
 Every step reuses the existing stage code and writes under --out; re-running the same command resumes (finished steps
 are skipped, unfinished ones pick up from their files). One call log (out/llm_calls.jsonl) feeds the budget.
@@ -649,7 +649,7 @@ def _now() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="simia-plus pipeline", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="bandits-sft pipeline", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seeds", help="seed traces (overrides the config's seeds_path)")
     ap.add_argument("--out", help="output dir (overrides the config's out_dir); re-run with the same --out to resume")
     ap.add_argument("--budget", type=float, required=True, help="USD cap on logged LLM spend for this --out")

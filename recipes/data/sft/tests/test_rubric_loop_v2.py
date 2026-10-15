@@ -1,8 +1,8 @@
 """v2 rubric: two domain slots filled from one induction answer, plus the lint; offline, no model calls."""
 import pytest
 
-from simia_plus.rubric_judge import build_prompt
-from simia_plus.rubric_loop import SLOTS_V2, assemble_v2, generic_v2, lint, parse_slots, prompt_section
+from bandits_sft.rubric_judge import build_prompt
+from bandits_sft.rubric_loop import SLOTS_V2, assemble_v2, generic_v2, lint, parse_slots, prompt_section
 
 ANSWER = "\n".join(f"<{k}>\n{k.upper()} TEXT\n</{k}>" for k in SLOTS_V2)
 

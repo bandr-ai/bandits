@@ -1,4 +1,4 @@
-"""End-to-end command (simia-plus pipeline): steps, resume, budget, circuit breaker, fallbacks; offline fakes only."""
+"""End-to-end command (bandits-sft pipeline): steps, resume, budget, circuit breaker, fallbacks; offline fakes only."""
 from __future__ import annotations
 
 import itertools
@@ -8,10 +8,10 @@ import re
 import pytest
 from test_pipeline import ANALYZER_OUT, FakeLLM, seed
 
-from simia_plus import pipeline as pl
-from simia_plus.llm import log_call, set_llm_factory
-from simia_plus.rubric_loop import SLOTS_V2
-from simia_plus.schema import from_sharegpt
+from bandits_sft import pipeline as pl
+from bandits_sft.llm import log_call, set_llm_factory
+from bandits_sft.rubric_loop import SLOTS_V2
+from bandits_sft.schema import from_sharegpt
 
 SLOTS = "\n".join(f"<{k}>\n{k} text\n</{k}>" for k in SLOTS_V2)
 CLEAN = {"facts": [], "contradictions": [], "impossible_results": [], "unsupported_claims": []}
@@ -216,8 +216,8 @@ def test_spend_reads_only_complete_rows(tmp_path):
 
 
 def test_lesson_dedup_is_chunked(tmp_path, monkeypatch):
-    from simia_plus import analyzer
-    from simia_plus.config import load_config
+    from bandits_sft import analyzer
+    from bandits_sft.config import load_config
     cp = tmp_path / "c.json"
     cp.write_text(json.dumps({"seeds_path": "x", "out_dir": str(tmp_path), "models": {"default": {"model": "fake"}}}))
     cfg = load_config(cp)
@@ -234,8 +234,8 @@ def test_lesson_dedup_is_chunked(tmp_path, monkeypatch):
 def test_input_json_flag_is_soft_and_reaches_both_judges(tmp_path):
     import copy
 
-    from simia_plus.config import load_config
-    from simia_plus.verify import input_json_flags, verify
+    from bandits_sft.config import load_config
+    from bandits_sft.verify import input_json_flags, verify
     s = from_sharegpt(seed(0), 0)
     s["messages"][0]["content"] = 'Failure context:\n{"a": {"b": 1}, "c": 2}'
     ok = copy.deepcopy(s)
@@ -302,7 +302,7 @@ def test_budget_smaller_than_setup_is_a_hard_cap(tmp_path, fake):
 def test_budget_reservations_are_concurrent_safe():
     import threading
 
-    from simia_plus.llm import Budget, BudgetExhausted
+    from bandits_sft.llm import Budget, BudgetExhausted
     b, got, refused = Budget(1.0), [], []
 
     def take():
@@ -319,8 +319,8 @@ def test_budget_reservations_are_concurrent_safe():
 
 
 def test_permanent_client_errors_are_not_retried(monkeypatch):
-    from simia_plus import llm
-    from simia_plus.config import ModelCfg
+    from bandits_sft import llm
+    from bandits_sft.config import ModelCfg
     monkeypatch.setattr(llm.time, "sleep", lambda s: None)
     calls = []
 
@@ -375,8 +375,8 @@ def _sdk_client(replies, sent):
 
 def test_every_billed_retry_is_reserved_before_it_is_sent(monkeypatch):
     """Review repro: one reservation covered all retries, so a billed empty reply plus a retry passed the cap."""
-    from simia_plus import llm
-    from simia_plus.config import ModelCfg
+    from bandits_sft import llm
+    from bandits_sft.config import ModelCfg
     monkeypatch.setattr(llm.time, "sleep", lambda s: None)
     cfg = ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY", max_tokens=10,
                    price_input_per_mtok=1, price_output_per_mtok=1)
@@ -409,8 +409,8 @@ def test_every_billed_retry_is_reserved_before_it_is_sent(monkeypatch):
 
 
 def test_call_cost_bound_is_a_real_upper_bound():
-    from simia_plus.config import ModelCfg
-    from simia_plus.llm import max_call_cost, token_cost
+    from bandits_sft.config import ModelCfg
+    from bandits_sft.llm import max_call_cost, token_cost
     cfg = ModelCfg(model="m", max_tokens=100, price_input_per_mtok=1, price_output_per_mtok=1)
     text = "日本語のテキスト" * 200  # 3 bytes per character: more tokens than characters/3 could allow for
     msgs = [{"role": "user", "content": text}]
@@ -426,9 +426,9 @@ def test_unknown_cost_is_charged_not_free(monkeypatch, tmp_path):
     """Review repro: replies with no usage and no cost header were settled at $0, so 5 calls fit a 1-call budget."""
     from types import SimpleNamespace as NS
 
-    from simia_plus import llm
-    from simia_plus import pipeline as pl
-    from simia_plus.config import ModelCfg
+    from bandits_sft import llm
+    from bandits_sft import pipeline as pl
+    from bandits_sft.config import ModelCfg
     monkeypatch.setattr(llm.time, "sleep", lambda s: None)
     cfg = ModelCfg(model="m", base_url="http://localhost:1", api_key_env="NO_SUCH_KEY", max_tokens=10,
                    price_input_per_mtok=1, price_output_per_mtok=1)

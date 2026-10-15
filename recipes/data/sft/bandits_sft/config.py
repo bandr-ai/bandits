@@ -1,7 +1,7 @@
 """Run configuration, loaded from a JSON file.
 
-With every feature off, the run is plain Simia: each seed is the one-shot example of a single LLM call that
-writes a whole new trajectory, followed by Simia's rule-based post-processing. Each feature adds one
+With every feature off, the run is plain baseline: each seed is the one-shot example of a single LLM call that
+writes a whole new trajectory, followed by baseline's rule-based post-processing. Each feature adds one
 improvement so it can be ablated against that baseline.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ DEFAULT_STRATEGY_WEIGHTS = {
 
 @dataclass
 class Features:
-    check_seeds: bool = False  # Simia LLM pre-filter on seeds (completeness / logic / format)
+    check_seeds: bool = False  # baseline LLM pre-filter on seeds (completeness / logic / format)
     strategies: bool = False   # mix of grounded generation strategies instead of only "new scenario" (BeyondWeb)
     spec: bool = False         # scenario spec (goal, facts, initial/expected state) written first, in batches
     persona: bool = False      # realistic user personas + real user-turn style examples; applied only to
@@ -41,7 +41,7 @@ class Features:
                                # (nothing was varied) or whose assistant side is near-identical to the seed's (nothing to
                                # learn). Code only, before any judge call. Threshold: Config.min_assistant_change.
     lesson_dedup: bool = True  # seed expansion: after generation, one judge-model call groups conversations of one seed that teach the same lesson
-    near_dedup: bool = False   # near-duplicate removal on top of Simia's exact dedup
+    near_dedup: bool = False   # near-duplicate removal on top of baseline's exact dedup
     input_json_gate: bool = True  # seed expansion: reject a trace whose user-turn JSON parsed in the seed but no longer parses
                                # (damaged while copying; code, before any judge call). Off: only a soft flag the judges see.
     consistency_check: bool = True  # with the rubric judge, a second call at the same time (consistency.check): lists each
@@ -76,15 +76,15 @@ class Config:
     out_dir: str = "out"
     seed_format: str = "auto"  # auto | canonical (incl. OpenAI/LangChain-style messages) | sharegpt
     tool_defs_path: str | None = None  # JSON with tool schemas, for traces that list tools by name only
-    simia_prompt: str = "fixed"  # "fixed": Simia's prompt + format rules; "original": Simia's prompt only
-    prompt_source: str = "simia"  # "simia": Simia's prompt; "analyzer": the prompt written by `analyze` (ANALYZER_SPEC.md)
-    generation_attempts: int = 1  # mode simia: regenerate when the output cannot be used (no user turn,
-                                  # Simia's markup filter, no final reply); Simia itself makes one attempt
+    baseline_prompt: str = "fixed"  # "fixed": baseline's prompt + format rules; "original": baseline's prompt only
+    prompt_source: str = "baseline"  # "baseline": baseline's prompt; "analyzer": the prompt written by `analyze` (ANALYZER_SPEC.md)
+    generation_attempts: int = 1  # mode baseline: regenerate when the output cannot be used (no user turn,
+                                  # baseline's markup filter, no final reply); baseline itself makes one attempt
     target_count: int = 1000   # traces wanted back (e.g. 100 golden traces -> 1000)
     overgen: float = 1.5       # generate target_count * overgen, then filter and select down (Datology: curate from a bigger pool)
     features: Features = field(default_factory=Features)
     loop_frac: float = 0.3     # share of jobs generated per step when features.loop is on
-    loop_style: str = "split"  # "simia_env": Simia-RL's simulator (one model plays user and tools, seed as reference)
+    loop_style: str = "split"  # "reference_env": reference simulation's simulator (one model plays user and tools, seed as reference)
                                # "split": separate user-sim, agent, and stateful tool-sim (needs features.spec)
     failure_rate: float = 0.25
     persona_all_seeds: bool = False
@@ -123,8 +123,8 @@ class Config:
     case_block: bool = False   # analyzer generator writes a "case" (the changed situation, no answer) before the messages
     combo_share: float = 0.0   # share of analyzer jobs that apply one of the analyzer's variation combinations
     quarantine_seeds: dict[str, str] = field(default_factory=dict)  # seed id (or unique prefix) -> reason; kept on disk, never used as a seed
-    heldout_jobs_per_seed: int = 3  # final comparison on held-out seeds: chosen analyzer prompt vs simia_prompt=fixed
-    # pipeline (simia-plus pipeline): see pipeline.py
+    heldout_jobs_per_seed: int = 3  # final comparison on held-out seeds: chosen analyzer prompt vs baseline_prompt=fixed
+    # pipeline (bandits-sft pipeline): see pipeline.py
     judge_revise_rounds: int = 1  # REVISE rounds of the judge self-test loop (round 1 gives nearly all the gain)
     selftest_seeds: int = 8       # seeds the self-test dev cases are built from (7 cases each)
     selftest_test_seeds: int = 0  # other seeds for held-out self-test cases; report only, so off by default
@@ -161,12 +161,12 @@ def load_config(path: str | Path) -> Config:
     if unknown:
         raise ValueError(f"unknown config keys: {sorted(unknown)}")
     cfg = Config(**raw, features=feats, models=models)
-    if cfg.simia_prompt not in ("fixed", "original"):
-        raise ValueError("simia_prompt must be 'fixed' or 'original'")
-    if cfg.prompt_source not in ("simia", "analyzer"):
-        raise ValueError("prompt_source must be 'simia' or 'analyzer'")
-    if cfg.loop_style not in ("split", "simia_env"):
-        raise ValueError("loop_style must be 'split' or 'simia_env'")
+    if cfg.baseline_prompt not in ("fixed", "original"):
+        raise ValueError("baseline_prompt must be 'fixed' or 'original'")
+    if cfg.prompt_source not in ("baseline", "analyzer"):
+        raise ValueError("prompt_source must be 'baseline' or 'analyzer'")
+    if cfg.loop_style not in ("split", "reference_env"):
+        raise ValueError("loop_style must be 'split' or 'reference_env'")
     if feats.loop and cfg.loop_style == "split" and not feats.spec:
         raise ValueError("features.loop with loop_style 'split' needs features.spec (the tool simulator answers from the spec's state)")
     bad_mix = set(cfg.variation_mix) - {"old", "task", "evidence", "stack"}

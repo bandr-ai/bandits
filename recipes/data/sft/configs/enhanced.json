@@ -1,6 +1,6 @@
 {
   "seeds_path": "seeds.jsonl",
-  "out_dir": "out/simia_plus",
+  "out_dir": "out/bandits_sft",
   "target_count": 1000,
   "overgen": 1.5,
   "features": {

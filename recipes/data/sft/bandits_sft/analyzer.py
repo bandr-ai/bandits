@@ -36,7 +36,7 @@ from .prompts import (
 from .rollout import agent_rollout
 from .schema import render
 from .select import _shingles, action_signature, body_text, dedup, diversity_report
-from .simia_text import tools_text
+from .trace_text import tools_text
 from .verify import final_answer, judge_flags, observed_loose_type_args, observed_optional_args, system_key, verify
 
 _SLOT = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -923,7 +923,7 @@ def _lesson_chunk(cfg: Config, multi: dict[str, list[dict]]) -> None:
 
 
 def run_arm(cfg: Config, adir: Path, jobs: list[dict], gen_fn, seeds: list[dict], eval_ng: set, observed_contracts: str | None = None) -> dict:
-    """observed_contracts=None judges without seed context (the Simia baseline arm, which has no seed variation)."""
+    """observed_contracts=None judges without seed context (the baseline baseline arm, which has no seed variation)."""
     by_id = {s["id"]: s for s in seeds}
     cfg.tool_optional_args = observed_optional_args(seeds)
     cfg.tool_loose_type_args = observed_loose_type_args(seeds)
@@ -1075,9 +1075,9 @@ def _all_rounds(cfg: Config, root: Path, n_versions: int, seeds: list[dict]) -> 
 
 def compare_heldout(cfg: Config, root: Path, template: str, variations: list[dict], heldout: list[dict], dev: list[dict],
                     eval_ng: set) -> dict:
-    """Chosen analyzer prompt vs simia_prompt=fixed (no other features), same held-out seeds and job count.
-    Run only on request (`simia-plus heldout`), never as part of `analyze`."""
-    from .generate import generate_simia
+    """Chosen analyzer prompt vs baseline_prompt=fixed (no other features), same held-out seeds and job count.
+    Run only on request (`bandits-sft heldout`), never as part of `analyze`."""
+    from .generate import generate_baseline
 
     obs, users = ObsBank.from_traces(dev), UserBank.from_traces(dev)
     by_id = {s["id"]: s for s in heldout}
@@ -1089,18 +1089,18 @@ def compare_heldout(cfg: Config, root: Path, template: str, variations: list[dic
                                lambda j: generate_analyzer(cfg, j, by_id[j["seed_id"]], template, obs), heldout, eval_ng,
                                observed_contracts=(root / "chosen_observed_contracts.md").read_text())}
     base = copy.deepcopy(cfg)
-    base.simia_prompt, base.prompt_source = "fixed", "simia"
+    base.baseline_prompt, base.prompt_source = "fixed", "baseline"
     base.features.strategies = base.features.retrieval = False
 
-    def gen_simia(j: dict) -> dict:
-        t = generate_simia(base, j, by_id[j["seed_id"]], by_id, obs, users)
+    def gen_baseline(j: dict) -> dict:
+        t = generate_baseline(base, j, by_id[j["seed_id"]], by_id, obs, users)
         t["meta"].update({k: j.get(k) for k in ("job_id", "seed_id", "strategy", "mode")})
         t["meta"]["fidelity"] = fidelity(t, by_id[j["seed_id"]], cfg.tool_result_prefix)
         return t
 
-    simia_jobs = [{"job_id": f"heldout-simia/{s['id']}__{k}", "seed_id": s["id"], "strategy": "new_scenario", "mode": "simia"}
+    baseline_jobs = [{"job_id": f"heldout-baseline/{s['id']}__{k}", "seed_id": s["id"], "strategy": "new_scenario", "mode": "baseline"}
                   for k in range(cfg.heldout_jobs_per_seed) for s in heldout]
-    rep["simia_fixed"] = run_arm(cfg, hdir / "simia_fixed", simia_jobs, gen_simia, heldout, eval_ng)
+    rep["baseline_fixed"] = run_arm(cfg, hdir / "baseline_fixed", baseline_jobs, gen_baseline, heldout, eval_ng)
     summary = {arm: {k: r[k] for k in ("jobs", "format_ok", "kept", "unique_kept", "usable_rate", "checklist_failed",
                                        "outcomes_kept", "fidelity_kept")}
                | {"distinct_action_signatures": r["diversity_kept"]["distinct_action_signatures"]} for arm, r in rep.items()}
@@ -1111,7 +1111,7 @@ def compare_heldout(cfg: Config, root: Path, template: str, variations: list[dic
 def run_ab(cfg: Config, dev: list[dict], eval_ng: set, version: int, n_jobs: int) -> dict:
     """Generator A/B on identical jobs: one analyzer version's template with the plain output format ("plain") vs with
     the case block first ("case"). Both arms get the same checks; only the case arm
-    has a case for the judge to check. Run only on request (`simia-plus ab`)."""
+    has a case for the judge to check. Run only on request (`bandits-sft ab`)."""
     root = cfg.out / "analyzer"
     vdir = root / f"v{version}"
     if not (vdir / "prompt.txt").exists():
@@ -1151,7 +1151,7 @@ def run_ab_split(cfg: Config, dev: list[dict], eval_ng: set, n_jobs: int) -> dic
     """Split-generation A/B on identical jobs: the chosen analyzer version's template, generated as now ("current": one
     call writes observations and answer) vs split ("split": the generator writes the world without the intended
     outcome, the agent answers blind). Same judge and checks for both. Jobs come from the
-    batch plan when there is one, else from a fresh plan. Run only on request (`simia-plus ab-split`)."""
+    batch plan when there is one, else from a fresh plan. Run only on request (`bandits-sft ab-split`)."""
     root = cfg.out / "analyzer"
     version = json.loads((root / "chosen.json").read_text())["version"]
     vdir = root / f"v{version}"
@@ -1325,7 +1325,7 @@ def _wide_variations(cfg: Config, adir: Path, fname: str, seed_ids: list[str], d
 def run_ab_vary(cfg: Config, dev: list[dict], eval_ng: set, n_jobs: int) -> dict:
     """Variety A/B over the same seeds: "current" (sampled batch jobs, one evidence change), "vary" (task / evidence kinds
     proposed with coverage, kinds rotated per seed) and "stack" (two existing variations of different
-    decision types applied together). Every arm gets the same template, checks and judge, plus variety measures. Run only on request (`simia-plus ab-vary`)."""
+    decision types applied together). Every arm gets the same template, checks and judge, plus variety measures. Run only on request (`bandits-sft ab-vary`)."""
     root = cfg.out / "analyzer"
     version = json.loads((root / "chosen.json").read_text())["version"]
     vdir = root / f"v{version}"
@@ -1395,7 +1395,7 @@ def run_mixed(cfg: Config, dev: list[dict], eval_ng: set, n_seeds: int) -> dict:
     """Pilot of generating every variation type and letting the checks and judge keep what is good. For up to n_seeds
     seeds, one job per available type: "old" (an existing batch variation, one evidence change), "task" and "evidence"
     (wide proposals, SEED_VARIATIONS_WIDE), "stack" (two existing variations of different decision types). Same template,
-    checks and judge for all; per type: yield, variety. Run only on request (`simia-plus mixed`)."""
+    checks and judge for all; per type: yield, variety. Run only on request (`bandits-sft mixed`)."""
     root = cfg.out / "analyzer"
     version = json.loads((root / "chosen.json").read_text())["version"]
     vdir = root / f"v{version}"
@@ -1447,7 +1447,7 @@ def run_ab_models(cfg: Config, dev: list[dict], eval_ng: set, n_jobs: int, arms:
     overrides those roles' model settings (a role without its own model config starts from "default"; "extra" is merged
     into the API call). Jobs: a sample of the batch plan (one existing variation each), same template, checks and
     judge settings per arm as given. Per arm: yield, judge labels, cost, tokens and latency per role, from the call log.
-    Run only on request (`simia-plus ab-models --arms <json>`)."""
+    Run only on request (`bandits-sft ab-models --arms <json>`)."""
     import dataclasses
     root = cfg.out / "analyzer"
     version = json.loads((root / "chosen.json").read_text())["version"]

@@ -1,13 +1,4 @@
-"""Simia code, copied into this recipe.
-
-Source: microsoft/Simia-Agent-Training @ ea77d9d13362cc56cd1e0f33dc4cea4508aea28f (MIT, Copyright (c) 2025 Microsoft; see LICENSE-SIMIA).
-  - fix_arguments_format, should_delete_conversation, process_conversation:
-        Simia_SFT/Tau2/fix_arguments.py (unchanged)
-  - parse_gpt_response: Simia_SFT/Tau2/utils/conversation_generator.py (method -> function, otherwise unchanged)
-  - build_sample_text: Simia_SFT/Tau2/utils/data_loader.py (takes our canonical trace via ShareGPT)
-  - format_reference_conversations: Simia-RL/.../simulated_General/env.py (method -> function)
-The generation and environment prompts are in prompts.py (SIMIA_GEN, SIMIA_ENV).
-"""
+"""Parsing, repair, filtering and reference-conversation helpers."""
 # ruff: noqa
 import json
 import re

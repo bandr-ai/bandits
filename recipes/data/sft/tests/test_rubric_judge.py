@@ -6,11 +6,11 @@ import json
 import pytest
 from test_pipeline import seed
 
-from simia_plus.config import load_config
-from simia_plus.llm import set_llm_factory
-from simia_plus.rubric_judge import describe_change, normalize
-from simia_plus.schema import from_sharegpt
-from simia_plus.verify import verify
+from bandits_sft.config import load_config
+from bandits_sft.llm import set_llm_factory
+from bandits_sft.rubric_judge import describe_change, normalize
+from bandits_sft.schema import from_sharegpt
+from bandits_sft.verify import verify
 
 CLEAN = {"facts": [], "contradictions": [], "impossible_results": [], "unsupported_claims": []}
 
@@ -102,13 +102,13 @@ def test_describe_change_keeps_only_the_change():
 
 def test_no_rubric_fails_closed(cfg):
     """No default rubric: without one the judge errors and nothing is kept (never another domain's rubric)."""
-    from simia_plus.rubric_judge import load_rubric
+    from bandits_sft.rubric_judge import load_rubric
     with pytest.raises(ValueError, match="no rubric"):
         load_rubric(None)
 
 
 def test_change_gate_drops_noops_cosmetic_edits_and_copies():
-    from simia_plus.verify import change_gate
+    from bandits_sft.verify import change_gate
     s = from_sharegpt(seed(0), 0)
     same = json.loads(json.dumps(s))
     assert any(i.startswith("no_input_change") for i in change_gate(same, s, 0.02))

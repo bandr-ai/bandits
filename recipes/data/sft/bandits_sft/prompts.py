@@ -1,14 +1,8 @@
-"""Prompts.
-
-SIMIA_GEN is Simia's trajectory-synthesis prompt (arXiv 2511.01824, Fig 9; microsoft/Simia-Agent-Training,
-Simia_SFT/Tau2/utils/conversation_generator.py, MIT). The domain-specific retail/airline rule blocks are
-replaced by one generic block so it runs on any domain. Everything else is kept, including the
-HUMAN/ASSISTANT/FUNCTION_CALL/OBSERVATION text format and its parser. Improvement blocks are appended only
-when their feature is switched on, so the baseline stays Simia.
+"""Seed-conditioned generation and reference simulation prompts.
 """
 from __future__ import annotations
 
-SIMIA_GEN = """You are an AI assistant that generates multi-turn conversation data for agent training. Your task is to create new agent trajectories based on existing examples.
+BASELINE_GEN = """You are an AI assistant that generates multi-turn conversation data for agent training. Your task is to create new agent trajectories based on existing examples.
 
 ## Example Trajectory:
 {sample_text}
@@ -73,9 +67,9 @@ OBSERVATION: [tool result]
 ...(until the task is finished and the conversation is complete)
 """
 
-# ---- format fixes (config simia_prompt="fixed", the default; "original" = Simia's prompt as published) ----
+# ---- format fixes (config baseline_prompt="fixed", the default; "original" = baseline's prompt as published) ----
 # Found on real failure-analysis seeds: the model skipped the first HUMAN turn when it is a data blob,
-# wrapped calls in <tool_call> tags or JSON lists (which Simia's filter deletes), and reused the example's case.
+# wrapped calls in <tool_call> tags or JSON lists (which baseline's filter deletes), and reused the example's case.
 BLOCK_FORMAT = """
 ## Format Rules (common errors to avoid):
 1. The conversation MUST start with a HUMAN turn. It is the task input: write it in exactly the same form as the example's first HUMAN turn (same structure and fields), with NEW values for a NEW case.
@@ -86,7 +80,7 @@ BLOCK_FORMAT = """
 6. A NEW case means different concrete inputs (entities, identifiers, elements, values). Let the evidence lead to whatever outcome it supports; do not copy the example's outcome by default.
 """
 
-# ---- optional blocks for SIMIA_GEN (each tied to a feature flag) ----
+# ---- optional blocks for BASELINE_GEN (each tied to a feature flag) ----
 
 BLOCK_SPEC = """
 ## Scenario To Realize (overrides "completely NEW scenario" above):
@@ -125,7 +119,7 @@ STRATEGIES: dict[str, str] = {
     "extend": "The example's task followed by a natural follow-up request from the same user that needs further tool use (a deeper version of the task).",
     "compose": "A single conversation in which the user needs both the example's task and the second example's task, handled in a sensible order.",
     "variant_outcome": "A similar request whose correct outcome differs from the example: e.g. the policy forbids it, an entity does not exist, a precondition fails, or the user must be told no and offered an alternative.",
-    "new_scenario": "A completely new task in the same domain that requires similar problem-solving patterns (Simia's default).",
+    "new_scenario": "A completely new task in the same domain that requires similar problem-solving patterns (baseline's default).",
 }
 
 SPEC_BATCH = """You design scenarios for training a tool-using agent. Below is a real example conversation from the
@@ -159,7 +153,7 @@ STRATEGIES (one spec each, in this order):
 Return JSON: {{"specs": [{{"strategy": "...", "goal": "...", "user_facts": {{...}}, "initial_state": {{...}},
 "expected_final_state": {{...}}, "expected_behavior": "...", "difficulty": "..."}}, ...]}}"""
 
-SEED_CHECK = """Check this agent trajectory for use as a training seed (Simia pre-filter). Answer three checks:
+SEED_CHECK = """Check this agent trajectory for use as a training seed (baseline pre-filter). Answer three checks:
 completeness (task finished, all needed reasoning/tool calls/results present), logic (actions consistent with the
 reasoning, results and policy), format (proper roles, valid tool-call JSON, results follow calls).
 
@@ -171,7 +165,7 @@ TRAJECTORY:
 
 Return JSON: {{"complete": true/false, "logical": true/false, "well_formatted": true/false, "issues": ["..."]}}"""
 
-# ---- mode B (Simia-RL style per-step simulation) ----
+# ---- mode B (reference simulation style per-step simulation) ----
 
 USER_SIM = """You are role-playing a human user talking to an AI assistant of this service.
 
@@ -244,10 +238,10 @@ DEFAULT_CHECKLIST = [
 ]
 
 
-# ---- Simia-RL environment simulator (verbatim from vendored simulated_general_env.py) ----
+# ---- reference simulation environment simulator (verbatim from vendored simulated_general_env.py) ----
 # One model plays both the human and the tools, using the seed conversation as reference data and
-# replaying its recorded results when the agent's call matches. Used by loop_style "simia_env".
-SIMIA_ENV = """You are a simulation environment. Based on the RL model's response, you need to simulate the human or tool response.
+# replaying its recorded results when the agent's call matches. Used by loop_style "reference_env".
+REFERENCE_ENV = """You are a simulation environment. Based on the RL model's response, you need to simulate the human or tool response.
 
 System prompt (task description and rules):
 {system_prompt}

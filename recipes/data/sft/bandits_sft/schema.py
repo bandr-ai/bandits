@@ -1,4 +1,4 @@
-"""Canonical trace format and converters (Simia/ShareGPT <-> canonical <-> OpenAI chat)."""
+"""Canonical trace format and converters (baseline/ShareGPT <-> canonical <-> OpenAI chat)."""
 from __future__ import annotations
 
 import json
@@ -98,7 +98,7 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
 def parse_function_call(val: str) -> tuple[list[dict], str]:
     """A FUNCTION_CALL turn -> (calls, reasoning).
 
-    Accepts Simia's form (<think>...</think> then JSON) and the common deviation where reasoning is written as
+    Accepts baseline's form (<think>...</think> then JSON) and the common deviation where reasoning is written as
     plain text before the JSON. The first decodable JSON object (or list of objects) with a "name" is the call;
     text outside it is kept as reasoning. Returns no calls when none can be found.
     """
@@ -190,7 +190,7 @@ def to_sharegpt(trace: dict) -> dict:
         elif m["role"] == "assistant" and m.get("tool_calls"):
             if (m.get("content") or "").strip():  # text said alongside the calls stays, before them, as in the source
                 conv.append({"from": "gpt", "value": m["content"]})
-            # one call per FUNCTION_CALL turn (Simia's format); parallel calls become consecutive turns
+            # one call per FUNCTION_CALL turn (baseline's format); parallel calls become consecutive turns
             for k, c in enumerate(m["tool_calls"]):
                 body = json.dumps({"name": c["name"], "arguments": c["arguments"]}, ensure_ascii=False)
                 if k == 0 and m.get("reasoning"):
