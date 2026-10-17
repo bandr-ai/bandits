@@ -14,3 +14,9 @@ def test_resources_load_from_the_package():
     assert load_config(pipeline.DEFAULT_CONFIG).features.rubric_judge
     assert "{consistency_map}" in rubric_loop.generic_v2()
     assert rubric_loop.prompt_section("INDUCE", "induce_rubric_prompt_v2.md")
+
+
+def test_scenario_recipe_exports():
+    from bandits_sft import scenario_pipeline as sp
+    assert sp.SCENARIO_STEPS == ("ingest", "judge_setup", "contracts", "coverage", "scenarios")
+    assert issubclass(sp.ScenarioPipeline, pipeline.Pipeline) and callable(sp.main)
