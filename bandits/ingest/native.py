@@ -221,9 +221,126 @@ def _span(
     return result
 
 
+_LANGFUSE_TYPES = frozenset(
+    {
+        "SPAN",
+        "EVENT",
+        "GENERATION",
+        "AGENT",
+        "TOOL",
+        "CHAIN",
+        "RETRIEVER",
+        "EVALUATOR",
+        "EMBEDDING",
+        "GUARDRAIL",
+    }
+)
+"""Langfuse observation types; a flat export line is recognised by one of these."""
+
+_FLAT_OBSERVATION_KEYS = {
+    "parent_observation_id": "parentObservationId",
+    "start_time": "startTime",
+    "end_time": "endTime",
+    "usage_details": "usageDetails",
+    "model_parameters": "modelParameters",
+    "provided_model_name": "model",
+}
+"""Snake-case column names (blob-storage exports) -> the camel-case names the
+converter reads. Applied only when the camel-case name is absent."""
+
+_FLAT_TRACE_KEYS = {
+    "traceName": "name",
+    "trace_name": "name",
+    "traceInput": "input",
+    "trace_input": "input",
+    "traceOutput": "output",
+    "trace_output": "output",
+    "userId": "userId",
+    "user_id": "userId",
+    "sessionId": "sessionId",
+    "session_id": "sessionId",
+    "tags": "tags",
+    "release": "release",
+    "traceTags": "tags",
+}
+"""Trace-level columns repeated on every line of a flat export -> trace fields."""
+
+
+def is_flat_langfuse_observation(record: dict[str, Any]) -> bool:
+    """One observation per line, as the Langfuse UI and blob-storage exports
+    write them: no ``observations[]``, a trace id on the line itself."""
+    kind = record.get("type")
+    return (
+        not isinstance(record.get("observations"), list)
+        and bool(record.get("traceId") or record.get("trace_id"))
+        and bool(record.get("id"))
+        and isinstance(kind, str)
+        and kind.upper() in _LANGFUSE_TYPES
+    )
+
+
+def _flat_langfuse(record: dict[str, Any]) -> dict[str, Any]:
+    """Wrap one flat observation line as a trace holding just that observation.
+
+    The converter then handles it like any nested one. The trace-level columns
+    repeated on the line become the trace fields, carried only by a root
+    observation (no parent), so a trace is not described once per step.
+    """
+    trace_id = record.get("traceId") or record.get("trace_id")
+    trace: dict[str, Any] = {"id": trace_id}
+    observation: dict[str, Any] = {}
+    for key, value in record.items():
+        if key in ("traceId", "trace_id"):
+            continue
+        if key in _FLAT_TRACE_KEYS:
+            if value is not None:
+                trace[_FLAT_TRACE_KEYS[key]] = value
+            continue
+        canonical = _FLAT_OBSERVATION_KEYS.get(key)
+        if canonical is not None and canonical not in record:
+            observation[canonical] = value
+        else:
+            observation[key] = value
+    if not observation.get("parentObservationId"):
+        # Langfuse shows a root observation's input/output as its trace's when the
+        # trace sets none, and the task is read from the trace input.
+        for key in ("input", "output"):
+            if key not in trace and observation.get(key) is not None:
+                trace[key] = observation[key]
+    return {**trace, "observations": [observation]}
+
+
 def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str, Any]], Skipped]:
+    flat = False
+    if not isinstance(record.get("observations"), list) and isinstance(record.get("data"), list):
+        # A saved API response ({"data": [...], "meta": {...}}): read each element as its own record.
+        kept: list[dict[str, Any]] = []
+        lost: Skipped = []
+        for item in record["data"]:
+            if not isinstance(item, dict):
+                lost.append(("not an object", None))
+                continue
+            more, dropped = _langfuse(item, position)
+            kept.extend(more)
+            lost.extend(dropped)
+        return kept, lost
+    observations = record.get("observations")
+    if (
+        isinstance(observations, list)
+        and observations
+        and all(isinstance(o, str) for o in observations)
+    ):
+        raise ValueError(
+            "Langfuse trace lists observation ids only, not the observations; export the "
+            "traces with their observations (the UI's JSONL export, or GET /api/public/traces/{id})"
+        )
     if not isinstance(record.get("observations"), list):
-        raise ValueError("Langfuse input requires a trace with observations[]")
+        if not is_flat_langfuse_observation(record):
+            raise ValueError(
+                "Langfuse input requires a trace with observations[], or one observation "
+                "per line with its traceId"
+            )
+        record, flat = _flat_langfuse(record), True
     trace_record = record.get("trace") if isinstance(record.get("trace"), dict) else record
     trace_id = trace_record.get("trace_id") or trace_record.get("id")
     if not trace_id:
@@ -268,7 +385,7 @@ def _langfuse(record: dict[str, Any], position: Position) -> tuple[list[dict[str
             "bandits.source.record": {**position, "observation_id": str(native_id)},
         }
         parent = observation.get("parentObservationId") or enclosing_id
-        if parent is None or str(parent) not in present:
+        if (parent is None or str(parent) not in present) and not (flat and parent):
             # Carried on every top step (any may become the request, which is
             # not stored as a step); the decoder moves it onto the trace.
             attributes[TRACE_RECORD] = {
