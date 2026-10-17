@@ -572,6 +572,7 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
         attempts.append({"output": out, "errors": errs})
         if not errs:
             break
+    template = out.get("template", "")  # also set when a saved attempt was reused and the loop never ran
     vdir.mkdir(parents=True, exist_ok=True)
     (vdir / "analyzer_raw.json").write_text(json.dumps({"request": request, "attempts": attempts}, ensure_ascii=False, indent=1))
     errs = attempts[-1]["errors"]

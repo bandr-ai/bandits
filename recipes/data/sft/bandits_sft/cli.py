@@ -24,7 +24,7 @@ from .prompts import SEED_CHECK
 from .schema import load_trace, render, to_sharegpt
 from .select import dedup, diversity_report, select
 from .trace_text import tools_text
-from .verify import boilerplate, copied, ngrams, user_text, verify
+from .verify import boilerplate, copied_profiles, copy_profile, ngrams, user_text, verify
 
 
 def _p(cfg: Config, name: str) -> Path:
@@ -88,7 +88,12 @@ def cmd_ingest(cfg: Config) -> list[dict]:
         # judged on distinctive text: shared input templates would otherwise mark every seed as a copy
         common = boilerplate(seeds + evals)
         before = len(seeds)
-        seeds = [s for s in seeds if not any(copied(user_text(s), user_text(e), common) for e in evals)]
+        eval_profiles = [copy_profile(user_text(e), common) for e in evals]  # once, not per (seed, eval) pair
+
+        def is_copy(seed: dict) -> bool:
+            p = copy_profile(user_text(seed), common)
+            return any(copied_profiles(p, q) for q in eval_profiles)
+        seeds = [s for s in seeds if not is_copy(s)]
         print(f"decontam: dropped {before - len(seeds)} seeds copying eval traces")
     if cfg.features.check_seeds:
         llm = get_llm(cfg, "seed_check")

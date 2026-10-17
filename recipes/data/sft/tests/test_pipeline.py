@@ -430,6 +430,35 @@ def test_analyzer_rounds_split_ledger_and_separate_heldout(tmp_path, fake_llms):
     assert set(cmp) == {"analyzer", "baseline_fixed"} and cmp["baseline_fixed"]["jobs"] == 2
 
 
+def test_analyzer_resumes_from_saved_answer_without_prompt(tmp_path, fake_llms):
+    # a stop after analyzer_raw.json is saved but before prompt.txt: the resume reuses the answer, paying nothing
+    cfg_path = write_cfg(tmp_path, {}, target=2, n_seeds=5, holdout_frac=0.4, analyzer_rounds=1, pilot_jobs=2,
+                         per_seed_variations=False)
+    cli.main(["ingest", "--config", cfg_path])
+    cli.main(["analyze", "--config", cfg_path])
+    v1 = load_config(cfg_path).out / "analyzer" / "v1"
+    template = (v1 / "prompt.txt").read_text()
+    assert template
+    for f in v1.iterdir():
+        if f.is_file() and f.name != "analyzer_raw.json":
+            f.unlink()
+    paid = len(fake_llms["analyzer"].seen)
+    cli.main(["analyze", "--config", cfg_path])
+    assert (v1 / "prompt.txt").read_text() == template
+    assert len(fake_llms["analyzer"].seen) == paid
+
+
+def test_decontam_catches_short_eval_inputs_but_not_shared_template():
+    from bandits_sft.verify import copied, ngrams
+    tpl = "Please read the request below carefully and answer using the tools you have. Request:"
+    assert copied("cancel order W1234 right now please, it is urgent", "cancel order W1234 right now")
+    assert not copied("yes thanks", "yes")  # too short to call a copy
+    assert not copied("the order W1234 now", "cancel order W1234 right now")  # not contained whole
+    common = frozenset(ngrams(tpl))
+    assert not copied(f"{tpl} where is my parcel", "read the request below carefully", common)  # template text only
+    assert copied(f"{tpl} where is my parcel", "where is my parcel", common)
+
+
 def test_tool_results_must_have_real_shapes_and_prefix():
     from bandits_sft.verify import tool_result_check
     t = from_sharegpt(seed(0), 0)

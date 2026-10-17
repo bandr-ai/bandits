@@ -537,12 +537,36 @@ def boilerplate(traces: list[dict]) -> frozenset:
     return frozenset(g for g, c in df.items() if c >= cut)
 
 
-def copied(a: str, b: str, common: frozenset = frozenset(), threshold: float = 0.5) -> bool:
-    """Same text, or most of the smaller input's distinctive 8-grams (template removed) found in the other."""
-    if " ".join(re.findall(r"\w+", a.lower())) == " ".join(re.findall(r"\w+", b.lower())):
+MIN_SHORT_COPY = 4  # a shorter input (a word or three) is too generic to call a copy
+
+
+def copy_profile(text: str, common: frozenset = frozenset(), n: int = 8) -> dict:
+    """What copied() compares, built once per text: its words, its distinctive n-grams, and its words with template
+    spans (words inside a common n-gram) blanked out."""
+    toks = re.findall(r"\w+", text.lower())
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    tpl = [False] * len(toks)
+    for i, g in enumerate(grams):
+        if g in common:
+            tpl[i:i + n] = [True] * n
+    free = " ".join("|" if m else t for t, m in zip(toks, tpl))  # "|" never matches a word
+    return {"words": " ".join(toks), "len": len(toks), "grams": set(grams) - common, "free": f" {free} ", "n": n}
+
+
+def copied_profiles(a: dict, b: dict, threshold: float = 0.5) -> bool:
+    if a["words"] == b["words"]:
         return True
-    x, y = ngrams(a) - common, ngrams(b) - common
+    short, long_ = (a, b) if a["len"] <= b["len"] else (b, a)
+    if short["len"] < short["n"]:  # no n-grams to compare: the whole short input inside the other's non-template text
+        return short["len"] >= MIN_SHORT_COPY and f" {short['words']} " in long_["free"]
+    x, y = a["grams"], b["grams"]
     return bool(x and y) and len(x & y) / min(len(x), len(y)) >= threshold
+
+
+def copied(a: str, b: str, common: frozenset = frozenset(), threshold: float = 0.5) -> bool:
+    """Same text, or most of the smaller input's distinctive 8-grams (template removed) found in the other; an input
+    under 8 words is a copy when it appears whole outside the other's template text."""
+    return copied_profiles(copy_profile(a, common), copy_profile(b, common), threshold)
 
 
 @lru_cache(maxsize=4)
