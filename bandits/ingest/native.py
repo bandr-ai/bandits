@@ -868,7 +868,8 @@ def _failproofai_pairs(
             reason = unpaired.get(position[id(event)])
             if reason is None:
                 unpaired[position[id(event)]] = (
-                    f"no {opener if event['event_type'] == closer else closer} shares an id with it"
+                    f"no {opener if event['event_type'] == closer else closer} "
+                    f"shares an id with it"
                 )
     return pairs, {i: r for i, r in unpaired.items() if r}
 
@@ -1060,9 +1061,7 @@ def _failproofai_session(
             )
         )
         parent = (
-            f"agent_start:{owner['id']}"
-            if owner is not None and owner is not opener
-            else session_span
+            f"agent_start:{owner['id']}" if owner is not None and owner is not opener else session_span
         )
         name = (
             attributes.get("gen_ai.request.model")
