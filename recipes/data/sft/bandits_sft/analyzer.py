@@ -500,8 +500,9 @@ def variation_errors(v: dict, labels: dict, seed_ids: list[str], contracts: str)
 
 
 def propose_for_seed(cfg: Config, seed: dict, label: str, labels: dict, dev: list[dict], contracts: str, existing: list[dict],
-                     covered: list[dict], n: int) -> list[dict]:
-    """One short analyzer call for one seed: n new variations of that seed (siblings under the same label shown for contrast)."""
+                     covered: list[dict], n: int, cache: Path | None = None) -> list[dict]:
+    """One short analyzer call for one seed: n new variations of that seed (siblings under the same label shown for contrast).
+    With cache, the raw answer is saved per (seed, prompt) as soon as it returns, so a stop or resume never pays twice."""
     keys = set(label_keys(labels.get(label, [])))
     sibs = [s for s in dev if s["id"] != seed["id"] and system_key(s.get("system", "")) in keys][:2]
     cov = [f'- {r["variation"]}: ' + ("kept" if r.get("kept") else "refused" if r.get("refused") else "rejected") for r in covered if r["seed_id"] == seed["id"]]
@@ -510,7 +511,14 @@ def propose_for_seed(cfg: Config, seed: dict, label: str, labels: dict, dev: lis
         siblings="\n".join(f'<sibling id="{s["id"]}">\n{seed_json(s)[:6000]}\n</sibling>' for s in sibs) or "(none)",
         covered=("cells finished on this seed:\n" + "\n".join(cov) if cov else "(none yet)") + "\nnames already used: " + ", ".join(sorted({x["name"] for x in existing})[:80]),
         n=n)
-    out = chat_json(get_llm(cfg, "analyzer"), "You are an expert in agent training data. Output JSON only.", prompt)
+    hit = cache / f'{re.sub(r"[^A-Za-z0-9_.-]", "_", seed["id"])}_{hashlib.sha256(prompt.encode()).hexdigest()[:16]}.json' if cache else None
+    if hit and hit.exists():
+        out = json.loads(hit.read_text())
+    else:
+        out = chat_json(get_llm(cfg, "analyzer"), "You are an expert in agent training data. Output JSON only.", prompt)
+        if hit:
+            hit.parent.mkdir(parents=True, exist_ok=True)
+            hit.write_text(json.dumps(out, ensure_ascii=False))
     vs = out.get("variations") if isinstance(out, dict) else None
     ids = {s["id"] for s in dev}
     good = []
@@ -544,8 +552,15 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
     request = ANALYZER.format(**inputs, revision=revision,
                               rationale_extra="; and what you changed in response to the diagnosis" if prev else "")
     llm = get_llm(cfg, "analyzer")
-    attempts = []
-    for _ in range(3):
+    raw = vdir / "analyzer_raw.json"
+    saved = json.loads(raw.read_text()) if raw.exists() else {}
+    # Resume: reuse the saved answer for the identical request (accepted, or out of tries) instead of paying again.
+    attempts = saved.get("attempts", []) if saved.get("request") == request else []
+    if attempts and attempts[-1]["errors"] and len(attempts) < 3:
+        attempts = []
+    attempts = [{"output": x["output"], "errors": x["errors"]} for x in attempts]  # per-seed fields are recomputed
+    out = attempts[-1]["output"] if attempts else {}
+    for _ in range(0 if attempts else 3):
         msg = request + (f"\n\nYour previous answer failed these checks; fix them: {attempts[-1]['errors']}" if attempts else "")
         out = chat_json(llm, "You are an expert in agent training data and prompt design. Output JSON only.", msg)
         out = out if isinstance(out, dict) else {}
@@ -557,6 +572,7 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
         attempts.append({"output": out, "errors": errs})
         if not errs:
             break
+    template = out.get("template", "")  # also set when a saved attempt was reused and the loop never ran
     vdir.mkdir(parents=True, exist_ok=True)
     (vdir / "analyzer_raw.json").write_text(json.dumps({"request": request, "attempts": attempts}, ensure_ascii=False, indent=1))
     errs = attempts[-1]["errors"]
@@ -582,7 +598,8 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
         def one(seed):
             try:
                 return propose_for_seed(cfg, seed, by_key.get(system_key(seed.get("system", "")), "all"), labels, dev,
-                                        out["observed_contracts"], existing, covered, cfg.variations_per_seed)
+                                        out["observed_contracts"], existing, covered, cfg.variations_per_seed,
+                                        vdir / "proposals")
             except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
                 raise
             except Exception:  # noqa: BLE001 - a failed proposal call only means fewer variations for that seed
@@ -1004,6 +1021,27 @@ def analyze(cfg: Config, dev: list[dict], heldout: list[dict], eval_ng: set) -> 
     return chosen
 
 
+def contracts_only(cfg: Config, dev: list[dict]) -> dict:
+    """Scenario-only setup: the main analyzer call alone (observed contracts), without the controlled lane's
+    template pilot, per-seed proposals or version choice. Same files as analyze() so later steps read them."""
+    root = cfg.out / "analyzer"
+    root.mkdir(parents=True, exist_ok=True)
+    chosen_path = root / "chosen.json"
+    if chosen_path.exists():
+        return json.loads(chosen_path.read_text())
+    labels = system_labels(dev)
+    (root / "system_labels.json").write_text(json.dumps(labels, indent=1))
+    per_seed, cfg.per_seed_variations = cfg.per_seed_variations, False
+    try:
+        write_version(cfg, root / "v1", 1, _analyzer_inputs(cfg, dev, ObsBank.from_traces(dev), labels), None, [], labels)
+    finally:
+        cfg.per_seed_variations = per_seed
+    (root / "chosen_observed_contracts.md").write_text((root / "v1" / "observed_contracts.md").read_text())
+    chosen = {"version": 1, "by": "contracts only (scenario lane): no controlled pilot", "dev_usable_rates": {}}
+    chosen_path.write_text(json.dumps(chosen, indent=1))
+    return chosen
+
+
 def run_batch(cfg: Config, dev: list[dict], eval_ng: set, version: int, n: int) -> dict:
     """Scale step: freeze analyzer version <version> (its template and observed contracts), open fresh cells with one short
     proposal call per seed (finished cells are shown so they are not repeated), plan n jobs over UNTRIED cells only, and
@@ -1029,7 +1067,7 @@ def run_batch(cfg: Config, dev: list[dict], eval_ng: set, version: int, n: int) 
         def one(seed):
             try:
                 return propose_for_seed(cfg, seed, by_key.get(system_key(seed.get("system", "")), "all"), labels, dev,
-                                        contracts, variations, covered, cfg.variations_per_seed)
+                                        contracts, variations, covered, cfg.variations_per_seed, bdir / "proposals")
             except BudgetExhausted:  # the run's budget is spent: stop the run, never record it as a result
                 raise
             except Exception:  # noqa: BLE001 - a failed proposal call only means fewer cells for that seed
@@ -1204,8 +1242,8 @@ def coverage_summary(seeds: list[dict], variations: list[dict], fields: list[str
 
 
 def propose_wide(cfg: Config, seed: dict, label: str, labels: dict, dev: list[dict], contracts: str, existing: list[dict],
-                 coverage: str, n: int, n_siblings: int = 2) -> list[dict]:
-    """One proposal call for one seed: n variations of kinds task / evidence (SEED_VARIATIONS_WIDE)."""
+                 coverage: str, n: int, n_siblings: int = 2, cache: Path | None = None) -> list[dict]:
+    """One proposal call for one seed: n variations of kinds task / evidence (SEED_VARIATIONS_WIDE). cache: as propose_for_seed."""
     keys = set(label_keys(labels.get(label, [])))
     have = {t["name"] for t in seed["tools"]}
     sibs = [s for s in dev if s["id"] != seed["id"] and system_key(s.get("system", "")) in keys]
@@ -1215,7 +1253,14 @@ def propose_wide(cfg: Config, seed: dict, label: str, labels: dict, dev: list[di
         tools=tools_text(seed["tools"]) if seed["tools"] else "(none: this agent has no tools)",
         siblings="\n".join(f'<sibling id="{s["id"]}">\n{_head_tail(seed_json(s), 4000)}\n</sibling>' for s in sibs) or "(none)",
         coverage=coverage, covered=", ".join(sorted({x["name"] for x in existing})[:80]) or "(none)", n=n)
-    out = chat_json(get_llm(cfg, "analyzer"), "You are an expert in agent training data. Output JSON only.", prompt)
+    hit = cache / f'{re.sub(r"[^A-Za-z0-9_.-]", "_", seed["id"])}_{hashlib.sha256(prompt.encode()).hexdigest()[:16]}.json' if cache else None
+    if hit and hit.exists():
+        out = json.loads(hit.read_text())
+    else:
+        out = chat_json(get_llm(cfg, "analyzer"), "You are an expert in agent training data. Output JSON only.", prompt)
+        if hit:
+            hit.parent.mkdir(parents=True, exist_ok=True)
+            hit.write_text(json.dumps(out, ensure_ascii=False))
     vs = out.get("variations") if isinstance(out, dict) else None
     ids = {s["id"] for s in dev}
     good = []

@@ -324,7 +324,7 @@ class Pipeline:
                 while len(old) < want["old"] and calls < math.ceil(want["old"] / ppc) + 1:
                     current_item.set(f"prod/propose/old/{sid}")
                     got = propose_for_seed(cfg, seed, lab, labels, seeds, contracts, base_vars + old, ledger,
-                                           min(ppc, want["old"] - len(old)))
+                                           min(ppc, want["old"] - len(old)), self.prod / "proposals")
                     calls += 1
                     if not got:
                         break
@@ -334,7 +334,7 @@ class Pipeline:
                 while len(wide) < n_wide and calls < math.ceil(n_wide / ppc) + 1:
                     current_item.set(f"prod/propose/wide/{sid}")
                     got = propose_wide(cfg, seed, lab, labels, seeds, contracts, base_vars + old + wide, cov.get(lab, ""),
-                                       min(ppc, n_wide - len(wide)))
+                                       min(ppc, n_wide - len(wide)), cache=self.prod / "proposals")
                     calls += 1
                     if not got:
                         break
@@ -484,20 +484,7 @@ class Pipeline:
         kept_n = sum(bool(t["meta"]["verify"].get("kept")) for t in pool)
         why["duplicate (exact/near/same lesson)"] = kept_n - len(unique)
         self.spend.update()
-        calls = read_jsonl(self.out / "llm_calls.jsonl")
-        roles: dict[str, dict] = {}
-        for c in calls:
-            r = roles.setdefault(c.get("role") or "?", {"calls": 0, "failed_attempts": 0, "cost_usd": 0.0, "lat": []})
-            r["calls"] += 1
-            r["failed_attempts"] += not c.get("ok")
-            r["cost_usd"] += c.get("cost") or 0
-            if c.get("ok"):
-                r["lat"].append(c.get("latency_s") or 0)
-        for r in roles.values():
-            lat = sorted(r.pop("lat"))
-            r["cost_usd"] = round(r["cost_usd"], 4)
-            r["mean_latency_s"] = round(sum(lat) / len(lat), 1) if lat else None
-            r["p90_latency_s"] = lat[int(0.9 * (len(lat) - 1))] if lat else None
+        roles = self.role_stats()
         flags: dict[str, Counter] = {}  # soft flags: how often each fired, and how often the judges then rejected
         for t in pool:
             v = t["meta"]["verify"]
@@ -529,6 +516,24 @@ class Pipeline:
         return rep
 
     # ---- helpers ----
+
+    def role_stats(self) -> dict[str, dict]:
+        """Calls, failed attempts, cost and latency per model role, from the call log."""
+        calls = read_jsonl(self.out / "llm_calls.jsonl")
+        roles: dict[str, dict] = {}
+        for c in calls:
+            r = roles.setdefault(c.get("role") or "?", {"calls": 0, "failed_attempts": 0, "cost_usd": 0.0, "lat": []})
+            r["calls"] += 1
+            r["failed_attempts"] += not c.get("ok")
+            r["cost_usd"] += c.get("cost") or 0
+            if c.get("ok"):
+                r["lat"].append(c.get("latency_s") or 0)
+        for r in roles.values():
+            lat = sorted(r.pop("lat"))
+            r["cost_usd"] = round(r["cost_usd"], 4)
+            r["mean_latency_s"] = round(sum(lat) / len(lat), 1) if lat else None
+            r["p90_latency_s"] = lat[int(0.9 * (len(lat) - 1))] if lat else None
+        return roles
 
     def _seeds(self) -> list[dict]:
         from .cli import _load_seeds
