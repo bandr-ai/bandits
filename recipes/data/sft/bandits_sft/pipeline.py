@@ -324,7 +324,7 @@ class Pipeline:
                 while len(old) < want["old"] and calls < math.ceil(want["old"] / ppc) + 1:
                     current_item.set(f"prod/propose/old/{sid}")
                     got = propose_for_seed(cfg, seed, lab, labels, seeds, contracts, base_vars + old, ledger,
-                                           min(ppc, want["old"] - len(old)))
+                                           min(ppc, want["old"] - len(old)), self.prod / "proposals")
                     calls += 1
                     if not got:
                         break
@@ -334,7 +334,7 @@ class Pipeline:
                 while len(wide) < n_wide and calls < math.ceil(n_wide / ppc) + 1:
                     current_item.set(f"prod/propose/wide/{sid}")
                     got = propose_wide(cfg, seed, lab, labels, seeds, contracts, base_vars + old + wide, cov.get(lab, ""),
-                                       min(ppc, n_wide - len(wide)))
+                                       min(ppc, n_wide - len(wide)), cache=self.prod / "proposals")
                     calls += 1
                     if not got:
                         break
