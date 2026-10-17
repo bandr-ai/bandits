@@ -529,6 +529,22 @@ def user_text(trace: dict) -> str:
     return " ".join(m["content"] for m in trace["messages"] if m["role"] == "user")
 
 
+def boilerplate(traces: list[dict]) -> frozenset:
+    """8-grams shared by many traces' user text (input templates): ignored when testing for copies, else every
+    templated input looks copied (one real set: 117 of 118 seeds over Jaccard 0.5)."""
+    df = Counter(g for t in traces for g in ngrams(user_text(t)))
+    cut = max(3, 0.05 * len(traces))
+    return frozenset(g for g, c in df.items() if c >= cut)
+
+
+def copied(a: str, b: str, common: frozenset = frozenset(), threshold: float = 0.5) -> bool:
+    """Same text, or most of the smaller input's distinctive 8-grams (template removed) found in the other."""
+    if " ".join(re.findall(r"\w+", a.lower())) == " ".join(re.findall(r"\w+", b.lower())):
+        return True
+    x, y = ngrams(a) - common, ngrams(b) - common
+    return bool(x and y) and len(x & y) / min(len(x), len(y)) >= threshold
+
+
 @lru_cache(maxsize=4)
 def load_answer_schemas(path: str | None) -> dict[str, dict]:
     return json.loads(Path(path).read_text()) if path else {}

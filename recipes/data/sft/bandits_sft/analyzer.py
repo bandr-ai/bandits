@@ -544,8 +544,15 @@ def write_version(cfg: Config, vdir: Path, version: int, inputs: dict, prev: dic
     request = ANALYZER.format(**inputs, revision=revision,
                               rationale_extra="; and what you changed in response to the diagnosis" if prev else "")
     llm = get_llm(cfg, "analyzer")
-    attempts = []
-    for _ in range(3):
+    raw = vdir / "analyzer_raw.json"
+    saved = json.loads(raw.read_text()) if raw.exists() else {}
+    # Resume: reuse the saved answer for the identical request (accepted, or out of tries) instead of paying again.
+    attempts = saved.get("attempts", []) if saved.get("request") == request else []
+    if attempts and attempts[-1]["errors"] and len(attempts) < 3:
+        attempts = []
+    attempts = [{"output": x["output"], "errors": x["errors"]} for x in attempts]  # per-seed fields are recomputed
+    out = attempts[-1]["output"] if attempts else {}
+    for _ in range(0 if attempts else 3):
         msg = request + (f"\n\nYour previous answer failed these checks; fix them: {attempts[-1]['errors']}" if attempts else "")
         out = chat_json(llm, "You are an expert in agent training data and prompt design. Output JSON only.", msg)
         out = out if isinstance(out, dict) else {}
@@ -1001,6 +1008,27 @@ def analyze(cfg: Config, dev: list[dict], heldout: list[dict], eval_ng: set) -> 
     (root / "chosen_variations.json").write_text((bdir / "variations.json").read_text())
     (root / "chosen_observed_contracts.md").write_text((bdir / "observed_contracts.md").read_text())
     (root / "chosen.json").write_text(json.dumps(chosen, indent=1))
+    return chosen
+
+
+def contracts_only(cfg: Config, dev: list[dict]) -> dict:
+    """Scenario-only setup: the main analyzer call alone (observed contracts), without the controlled lane's
+    template pilot, per-seed proposals or version choice. Same files as analyze() so later steps read them."""
+    root = cfg.out / "analyzer"
+    root.mkdir(parents=True, exist_ok=True)
+    chosen_path = root / "chosen.json"
+    if chosen_path.exists():
+        return json.loads(chosen_path.read_text())
+    labels = system_labels(dev)
+    (root / "system_labels.json").write_text(json.dumps(labels, indent=1))
+    per_seed, cfg.per_seed_variations = cfg.per_seed_variations, False
+    try:
+        write_version(cfg, root / "v1", 1, _analyzer_inputs(cfg, dev, ObsBank.from_traces(dev), labels), None, [], labels)
+    finally:
+        cfg.per_seed_variations = per_seed
+    (root / "chosen_observed_contracts.md").write_text((root / "v1" / "observed_contracts.md").read_text())
+    chosen = {"version": 1, "by": "contracts only (scenario lane): no controlled pilot", "dev_usable_rates": {}}
+    chosen_path.write_text(json.dumps(chosen, indent=1))
     return chosen
 
 

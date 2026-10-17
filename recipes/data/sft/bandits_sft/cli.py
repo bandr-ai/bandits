@@ -24,7 +24,7 @@ from .prompts import SEED_CHECK
 from .schema import load_trace, render, to_sharegpt
 from .select import dedup, diversity_report, select
 from .trace_text import tools_text
-from .verify import ngrams, user_text, verify
+from .verify import boilerplate, copied, ngrams, user_text, verify
 
 
 def _p(cfg: Config, name: str) -> Path:
@@ -83,11 +83,13 @@ def cmd_ingest(cfg: Config) -> list[dict]:
         counts[s["id"]] = n + 1
         if n:
             s["id"] = f"{s['id']}#{n}"
-    eval_ng = _eval_ngrams(cfg)
-    if eval_ng:  # decontaminate before synthesis, so generation cannot launder eval items (Datology)
+    evals = [load_trace(r, i, "auto") for path in cfg.decontam_paths for i, r in enumerate(read_jsonl(path))]
+    if evals:  # decontaminate before synthesis, so generation cannot launder eval items (Datology)
+        # judged on distinctive text: shared input templates would otherwise mark every seed as a copy
+        common = boilerplate(seeds + evals)
         before = len(seeds)
-        seeds = [s for s in seeds if not (ngrams(user_text(s)) & eval_ng)]
-        print(f"decontam: dropped {before - len(seeds)} seeds overlapping eval traces")
+        seeds = [s for s in seeds if not any(copied(user_text(s), user_text(e), common) for e in evals)]
+        print(f"decontam: dropped {before - len(seeds)} seeds copying eval traces")
     if cfg.features.check_seeds:
         llm = get_llm(cfg, "seed_check")
 
@@ -349,10 +351,14 @@ def _llm_summary(cfg: Config) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["dataset"]:
+        from .seed_scenarios import main as dataset_main
+        sys.exit(dataset_main(argv[1:]))
     if argv[:1] == ["pipeline"]:  # end-to-end command, own arguments: bandits-sft pipeline --seeds X --out Y --budget 5
         from .pipeline import main as pipeline_main
         sys.exit(pipeline_main(argv[1:]))
-    ap = argparse.ArgumentParser(prog="bandits-sft", description=__doc__ + "\nEnd to end: bandits-sft pipeline --help")
+    ap = argparse.ArgumentParser(prog="bandits-sft", description=__doc__ +
+                                 "\nEnd to end: bandits-sft pipeline --help; varied seed-only dataset: bandits-sft dataset --help")
     ap.add_argument("command", choices=["ingest", "audit", "analyze", "batch", "experiment", "review", "heldout", "ab", "ab-split", "ab-vary", "mixed", "ab-models", "plan", "specs", "generate", "reparse", "verify",
                                         "select", "run"])
     ap.add_argument("--config", required=True)
