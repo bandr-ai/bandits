@@ -1,4 +1,10 @@
-"""Opt-in scenario synthesis. No domain labels or evidence rules live here."""
+"""Scenario recipe prompts. Generic: no domain, tool, field or label names live here.
+
+Everything specific to an agent reaches these prompts as data derived from its seeds: the system prompt, tool
+definitions, observed contracts (what each tool reads and returns, the output format, unknown branches),
+tool-result rules learned by code, and reference traces. Each prompt states its purpose, what matters most, the
+reason for each rule, and the exact output.
+"""
 
 COVERAGE = """Derive a coverage catalogue ONLY from the supplied correct seeds and their inferred contracts.
 There are no student predictions, external labels, application code or environment. Never describe a
@@ -7,84 +13,106 @@ outcomes that are rare/missing in the examples. Prefer substantive gaps over sup
 Use only demonstrated result shapes or explicit tool contracts. Unknown branches remain unknown.
 Return {"capabilities":[{"name":"short_name","capability":"decision/evidence condition to exercise",
 "basis":"seed, or words copied verbatim from the Explicit/Observed contracts or a seed system prompt",
-"seed_ids":["compatible supplied seed ids"]}]}. basis is checked against those texts: copy, do not paraphrase or prefix.
+"seed_ids":["compatible supplied seed ids"],"needs":{"tools":[],"tools_with_data":[],"answer":{}}}]}.
+basis is checked against those texts: copy, do not paraphrase or prefix.
+needs declares what the capability depends on: tools = tool names it calls, tools_with_data = tools whose result
+must carry data rather than an empty result, answer = final-answer field values it expects ({} for none). Code
+checks needs against the seeds and drops what they cannot demonstrate, so declare it plainly; do not verify it.
 Each capability needs at least one compatible reference. Do not invent ids, rules or output enums.
 An empty list is allowed if no defensible gap exists. This catalogue guides planning, not final labels.
 """
 
 PLAN = """Design ONE candidate training situation from the supplied agent contract and recorded examples.
-The examples demonstrate formats and tool semantics; they are not a catalog of situations to copy.
-Read the requested dimensions. A targeted job should exercise the supplied weak capability, but the
-answer must follow from evidence, never from the request to target it. A coverage job has no forced label.
-If job.outcome is set (control job), the final answer must have exactly those field values, taken from a real
-example: design a different situation whose evidence genuinely leads to that outcome.
-If a capability is supplied, exercise that seed-derived evidence/decision gap without forcing an answer.
-For controlled novelty, preserve the reference situation and change one condition, updating all dependencies.
-For scenario novelty, change the workflow/page/target/history, not merely names or URLs. Keep the same
-agent task, system instructions, tool semantics, and output contract. Invent plausible fictional content.
-Use only demonstrated tool-result branches or shapes explicitly specified by the supplied contracts.
-Do not invent a successful branch just because a tool name suggests it exists. If the capability cannot
-be demonstrated with supported observations, return {"unsupported": true, "reason": "..."}.
-If explicit contract rules conflict or do not resolve the required label, return unsupported; do not invent policy.
-For sparse evidence, keep sufficient evidence to justify the answer or use the contract's uncertain outcome.
-Distractors must be observations about different times/scopes, never unresolved impossible facts.
-Do not equate complexity with length. Vary evidence routes and failure mechanisms across jobs.
-tool_result_rules were learned from the real examples and are enforced by code: a trace breaking any is discarded.
-already_planned lists situations made earlier in this run for the same agent: choose a clearly different
-situation, decision and evidence route; never repeat one of them with renamed entities.
-Declare the episode state FIRST, then derive every observation from it (observations never invent state):
-episode_state = {"context": the exact list-valued fields of the first user input (for example which evidence
-sources exist), shaped like the references; "facts": short statements true in this episode}. A tool reading a
-source not in the context returns that tool's unavailable shape from the references or contracts. Facts must
-agree with each other (an item absent from a captured source cannot also be present in it).
-Vary evidence routes: when the contract offers several tools, the decisive evidence comes from at least two
-independent sources, and the answer never rests on one observation whose text simply states the conclusion.
-Observations report what is seen or counted, not the diagnosis.
-Return JSON with nonempty strings: situation, workflow, decisive_evidence, dependencies, novelty_reason, episode_state,
-and a variation object with name, change, preserve, dependencies, correct_when, teaches, basis.
-The variation describes evidence conditions, not an instruction to emit a particular label.
-Also return evidence_sources as a list of strings and unsupported=false.
-If pair=true, describe ONE causal fact to flip and how both cases remain internally consistent;
-put that description in counterfactual_flip. No human labeling is available.
+
+Purpose: a new situation for the same agent (same system prompt, tools and output format) whose correct answer
+follows from evidence the agent gathers. The references show formats and what each tool can return; they are not a
+list of situations to copy.
+
+What matters most, in order:
+1. Every observation must be something the recorded tools could return. tool_result_rules were learned from the
+   real examples and are enforced by code: a trace that breaks one is discarded. Use only result branches and
+   shapes shown in the references or stated in the contracts; when a tool's success shape is unknown, that tool
+   only returns its unavailable/empty shape.
+2. The answer follows from the evidence, never from the job. If job.outcome is set (a broad job), design a
+   different situation whose evidence genuinely leads to exactly those answer field values. If a capability is
+   supplied (a gap job), exercise it without forcing an answer. If the evidence cannot support the job, or explicit
+   contract rules conflict or leave the answer undecided, return {"unsupported": true, "reason": "..."}: an
+   honest refusal costs less than a wrong example.
+3. Novelty: change what the agent faces (the task's target, its inputs, the evidence, or the history), not only
+   names or identifiers. already_planned lists situations made earlier in this run for the same agent: choose a
+   clearly different situation, decision and evidence route, never a renamed repeat.
+
+How to build it:
+- Declare the episode state FIRST and derive every observation from it. episode_state = {"context": the exact
+  list-valued fields of the first user input, shaped like the references ({} when the input has none); "facts":
+  short statements true in this episode}. A tool reading a source absent from the context returns its
+  unavailable/empty shape. Facts must agree with each other.
+- Each tool reports only what it can observe (the contracts and references show what each tool reads). A fact no
+  tool can see stays unknown to the agent and cannot decide the answer.
+- When the contract offers several tools, let the decisive evidence come from at least two independent sources,
+  so the answer never rests on one observation that simply states it. Observations report what is seen or
+  counted; the agent draws the conclusion.
+- Sparse evidence: keep enough to justify the answer, or use the contract's own uncertain outcome.
+  Distractors: observations about other times or scopes, never unresolved contradictions.
+- Apply job.dimensions (evidence availability, temporal reasoning, composition) so each is visible in the trace;
+  the final check verifies them.
+- Complexity is not length. Vary evidence routes and the reasons behind outcomes across jobs.
+
+Return JSON with nonempty strings situation, workflow, decisive_evidence, dependencies, novelty_reason; the object
+episode_state; a variation object with nonempty strings name, change, preserve, dependencies, correct_when,
+teaches, basis (basis = "seed" or words copied from the contracts or system prompt); evidence_sources as a list of
+strings; and unsupported=false. The variation describes evidence conditions, not an instruction to emit a label.
+If pair=true, also describe in counterfactual_flip ONE causal fact to flip and how both cases stay consistent.
 """
 
 GENERATE = """Write a new candidate training conversation for this agent using the supplied scenario card.
-Use references for style, answer conventions, and tool-result formats, not for copying their situation.
-Preserve the supplied system prompt and tool definitions (code adds them; do not output replacements).
-Names and content may be fictional, but observations must be possible outputs of their calls.
-All user input facts, history, timestamps, tool arguments, results and assistant decisions must agree.
-Each assistant action must use only information already visible at that turn. A screenshot observation
-cannot establish invisible process or network state. Unavailable evidence establishes no facts.
-The final assistant content follows THIS system prompt's own output contract. When JSON is required,
-return a bare JSON object; when free text is required, preserve that format instead.
-If job.outcome is set, the final answer keeps exactly those field values. Some agents have no conclusion field: do not add one. Confidence reflects evidence; never force a mean.
-Obey tool_result_rules exactly (learned from real examples; any violation discards the trace).
-Follow card.episode_state exactly: copy its context lists into the first user input unchanged; every tool
-result must agree with its facts; a call on a source absent from the context returns that tool's unavailable
-shape. Use only result keys and branches shown in the references or contracts; never add new fields.
-Use the supplied stop_nudge requirement exactly: include the reference stop instruction when true,
-otherwise omit it. Do not expose the scenario card, target label, generation dimensions, or answer key
-in user inputs or tool outputs. Tool observations describe facts, not diagnostic root-cause enums.
-Keep tool-result wrappers, nested JSON string conventions and shapes from contracts/examples.
-For pair=true, output two complete conversations sharing a scenario. Flip one decisive causal fact,
-update its dependent observations/actions, and derive different final labels. No unrelated edits.
-Return {"traces": [{"messages": [user, assistant with tool_calls, tool, ..., assistant final]}]}.
-Use the existing canonical call format: {"id":"call_1","name":"tool_name","arguments":{...}}.
-Return one trace normally, two for a pair. If impossible, return {"unsupported":true,"reason":"..."}.
+
+Purpose: one realistic, internally consistent conversation that teaches the card's situation. Code adds the
+system prompt and tool definitions; output only the messages.
+
+What matters most, in order:
+1. Follow card.episode_state exactly. Copy its context lists into the first user input unchanged. Every tool result
+   agrees with its facts; a call on a source absent from the context returns that tool's unavailable/empty shape.
+2. Obey tool_result_rules exactly. They were learned from the real examples and any violation discards the trace.
+   Use only result keys and branches shown in the references or contracts, and keep their wrappers, nested JSON
+   string conventions and value formats. Never add a field.
+3. Consistency: user facts, history, timestamps, tool arguments, results and the agent's decisions all agree. Each
+   assistant step uses only information already visible at that point, and each tool reports only what it can
+   observe. Evidence that is unavailable establishes nothing.
+4. The final assistant message follows THIS system prompt's output format exactly: a bare JSON object when JSON is
+   required, otherwise the format the system prompt asks for. Keep exactly the answer fields it asks for and add
+   none. If job.outcome is set, those answer fields keep exactly those values. Any score or confidence the format
+   asks for reflects the evidence actually seen.
+
+Also:
+- Use the references for style, answer conventions and tool-result formats, not for their situation.
+- Names and content may be fictional; each result must be a possible output of its call.
+- Include the reference wrap-up instruction only when stop_nudge is true.
+- Keep the card, target, generation dimensions and answer out of user inputs and tool results: tool results report
+  what was seen or counted, never the final answer's label values or the conclusion itself.
+- For pair=true, write two complete conversations that share a situation, flip the one causal fact from the card,
+  update everything that depends on it, and reach different final answers. No unrelated edits.
+
+Return {"traces": [{"messages": [user, assistant with tool_calls, tool, ..., assistant final]}]} with calls in the
+canonical form {"id":"call_1","name":"tool_name","arguments":{...}}: one trace normally, two for a pair.
+If the card cannot be written consistently, return {"unsupported":true,"reason":"..."}.
 """
 
 AUDIT = """Check whether these candidate conversations actually implement the requested generation dimensions.
-The reference is a style/contract reference, not an answer key. Apply explicit system rules; do not invent policy.
-Return {"supported": boolean, "novelty_ok": boolean, "dimensions_ok": boolean,
-"pair_ok": boolean, "reason": "specific evidence with message numbers"}.
-supported means every intended target answer follows from visible evidence and the explicit contract.
-For targeting=coverage there is no required target label (job.outcome, if set, is fixed); still check answer support.
-novelty_ok: controlled keeps the original situation and applies its declared change; scenario changes
-workflow/page/target/history structurally, not just names. Novelty is relative to supplied references,
-not proof of population-level OOD generalization.
-dimensions_ok: verify requested evidence availability, temporal reasoning and composition from the trace.
-When a capability is supplied in the job, check it is actually exercised by visible evidence and actions.
-pair_ok: true for a singleton; for a pair, one causal fact flips, dependent facts agree, and conclusions
-or root causes change under the contract. Surface edits and confidence changes alone are insufficient.
-False or uncertain on any requirement rejects the candidate. Do not repair or relabel silently.
+
+Purpose: a final yes/no gate. The references are a style and contract reference, not an answer key. Apply the
+explicit system rules; do not invent policy, and do not repair or relabel anything.
+
+Answer each check with true only when the trace clearly passes; false or uncertain rejects the candidate.
+- supported: every answer the conversation gives follows from visible evidence and the explicit contract.
+  For targeting=coverage there is no required label (job.outcome, if set, is fixed); still check support.
+- novelty_ok: the situation differs from the references in structure (target, inputs, evidence or history), not
+  just names. Novelty is relative to the supplied references only.
+- dimensions_ok: the requested evidence availability, temporal reasoning and composition are visible in the trace;
+  when the job names a capability, visible evidence and actions actually exercise it.
+- pair_ok: true for a single conversation. For a pair: one causal fact flips, dependent facts agree, and the final
+  answer's label fields change under the contract. Surface edits or confidence changes alone do not count.
+
+Return {"supported": boolean, "novelty_ok": boolean, "dimensions_ok": boolean, "pair_ok": boolean,
+"reason": "specific evidence with message numbers"}.
 """

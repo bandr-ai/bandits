@@ -16,9 +16,14 @@ class ScenarioFake(E2EFake):
     def _answer(self, messages):
         system, o = messages[0]["content"], self.opts
         if system.startswith("Derive a coverage catalogue"):
+            if o.get("coverage_cut", 0) > 0:
+                from bandits_sft.llm import Truncated
+                o["coverage_cut"] -= 1
+                raise Truncated("thinking ran out of tokens")
             data = json.JSONDecoder().raw_decode(messages[-1]["content"])[0]  # a retry appends feedback text
             result = {"capabilities": [{"name": "scope", "capability": "handle an alternate evidence condition",
-                                        "basis": "seed", "seed_ids": [data["seeds"][0]["id"]]}]}
+                                        "basis": "seed", "seed_ids": [data["seeds"][0]["id"]],
+                                        "needs": {"tools": [], "tools_with_data": [], "answer": {}}}]}
         elif system.startswith("Design ONE candidate"):
             result = {k: "new warehouse transfer workflow" for k in
                       ("situation", "workflow", "decisive_evidence", "dependencies", "novelty_reason")}
@@ -32,7 +37,12 @@ class ScenarioFake(E2EFake):
             msgs = data["references"][0]["messages"]
             n = o["n"] = o.get("n", 0) + 1
             msgs[0]["content"] = f"Warehouse inventory transfer inspection for item {n}-{'xyz' * n}."
-            msgs[-1]["content"] = '{"status":"pending"}'
+            try:  # keep the reference's answer format: JSON object or free text
+                as_json = isinstance(json.loads(msgs[-1]["content"]), dict)
+            except ValueError:
+                as_json = False
+            outcome = (data.get("job") or {}).get("outcome") or {}
+            msgs[-1]["content"] = json.dumps({"status": "pending", **outcome}) if as_json else f"Transfer {n} is pending."
             result = {"traces": [{"messages": msgs}]}
         elif system.startswith("Check whether these candidate"):
             result = {"supported": True, "novelty_ok": True, "dimensions_ok": True, "pair_ok": True, "reason": "ok"}
@@ -55,9 +65,11 @@ def fake(monkeypatch):
     configure_call_log(None)
 
 
-def drive(tmp_path, budget=5, target=4, on_progress=None, progress_every=1, **extra):
-    """The platform worker's loop."""
+def drive(tmp_path, budget=5, target=4, on_progress=None, progress_every=1, seeds=None, **extra):
+    """The platform worker's loop. seeds: optional ShareGPT-style seed rows replacing the default set."""
     config, out = make(tmp_path, per_seed_variations=False, prompt_source="analyzer", **extra)
+    if seeds is not None:
+        (tmp_path / "seeds.jsonl").write_text("\n".join(json.dumps(x) for x in seeds) + "\n")
     cfg = load_config(config)
     configure_call_log(out / "llm_calls.jsonl")
     p = ScenarioPipeline(cfg, budget, target, on_progress, progress_every)
@@ -238,3 +250,97 @@ def test_reference_cap_is_a_config_field_and_cuts_references():
     big = {"id": "b", "system": "s", "tools": [], "messages": [{"role": "user", "content": "w " * 20000},
                                                            {"role": "assistant", "content": "{}"}]}
     assert len(json.dumps(s.references(big, [big], 5000))) < 6000
+
+
+def test_scenario_prompts_name_no_domain():
+    """The shipped scenario prompts must not assume a domain, a tool, a page or a label name."""
+    import re
+
+    from bandits_sft import scenario_prompts as sp
+    text = f"{sp.COVERAGE} {sp.PLAN} {sp.GENERATE} {sp.AUDIT}".lower()
+    for word in ("screenshot", "page", "network", "browser", "url", "urls", "root cause", "root_cause", "root-cause",
+                 "conclusion field", "refund", "airline", "patient", "invoice"):
+        assert not re.search(rf"\b{re.escape(word)}\b", text), word
+
+
+def _tool_seed(i, tool, result, answer):
+    return {"id": f"s{i}", "system": "sys", "tools": [{"name": tool, "parameters": {}}], "messages": [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c", "name": tool, "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c", "content": json.dumps(result)},
+        {"role": "assistant", "content": json.dumps(answer)}]}
+
+
+def test_coverage_needs_are_checked_against_the_seeds():
+    from bandits_sft.scenario_pipeline import Demonstrable
+    full, empty = {"found": True, "rows": [1]}, {"found": False, "rows": []}
+    seeds = [_tool_seed(i, "read", full, {"verdict": "ok"}) for i in range(3)]
+    seeds += [_tool_seed(10 + i, "read", empty, {"verdict": "bad"}) for i in range(2)]
+    seeds += [_tool_seed(20 + i, "logs", empty, {"verdict": "bad"}) for i in range(3)]
+    d = Demonstrable(seeds, "Explicit: verdict is ok, bad or unclear.")
+
+    def cap(**needs):
+        return {"name": "x", "seed_ids": ["s0", "s20"], "needs": {"tools": [], "tools_with_data": [], "answer": {}, **needs}}
+    assert d.check(cap(tools=["read"])) == []
+    narrowed = cap(tools=["read"])
+    d.check(narrowed)
+    assert narrowed["seed_ids"] == ["s0"]  # only seeds whose agent has the tool
+    assert "no seed agent has" in d.check(cap(tools=["mail"]))[0]
+    assert "never returned data" in d.check(cap(tools_with_data=["logs"]))[0]
+    assert d.check(cap(answer={"verdict": "unclear"})) == []  # stated by the contracts
+    assert "no seed gave" in d.check(cap(answer={"verdict": "maybe"}))[0]
+    assert "needs must be" in d.check({"name": "x", "seed_ids": ["s0"]})[0]
+
+
+def _scripted_catalogue(monkeypatch, tmp_path, answers):
+    """catalogue() over 3 seeds, the smaller request showing only s0; answers: per call, a capability list or "cut"."""
+    from bandits_sft import scenario_pipeline as sp
+    from bandits_sft.config import Config
+    from bandits_sft.llm import Truncated
+    seeds = [_tool_seed(i, "read", {"rows": [1]}, {"verdict": "ok"}) for i in range(3)]
+    cfg = Config(seeds_path="x", coverage_max_chars=4000)
+    monkeypatch.setattr(sp, "coverage_seeds", lambda s, n: s if n >= cfg.coverage_max_chars else s[:1])
+    monkeypatch.setattr(sp, "get_llm", lambda cfg, role: None)
+    sent, notes = [], []
+
+    def chat(llm, system, msg):
+        sent.append(msg)
+        a = answers.pop(0)
+        if a == "cut":
+            raise Truncated("cut off")
+        return {"capabilities": a}
+    monkeypatch.setattr(sp, "chat_json", chat)
+    kept = sp.catalogue(cfg, seeds, "Explicit: verdict is ok.", tmp_path, lambda step, why: notes.append(why))
+    return kept, sent, notes
+
+
+def _cap(name, seed_id):
+    return {"name": name, "capability": "a gap", "basis": "seed", "seed_ids": [seed_id],
+            "needs": {"tools": [], "tools_with_data": [], "answer": {}}}
+
+
+def test_cut_off_coverage_keeps_the_smaller_request_for_the_corrective_retry(tmp_path, monkeypatch):
+    kept, sent, _ = _scripted_catalogue(monkeypatch, tmp_path, [
+        "cut", [_cap("a", "s0"), _cap("bad", "nope")], [_cap("a", "s0"), _cap("b", "s0")]])
+    assert [c["name"] for c in kept] == ["a", "b"]
+    assert '"s1"' not in sent[2] and "at most 12" in sent[2] and "bad: seed_ids" in sent[2]  # small request + feedback
+    assert (tmp_path / "coverage_small").exists()  # a resume uses the same smaller request
+
+
+def test_corrective_retry_cut_off_twice_keeps_the_earlier_items(tmp_path, monkeypatch):
+    kept, _, notes = _scripted_catalogue(monkeypatch, tmp_path, [
+        [_cap("a", "s2"), _cap("bad", "nope")], "cut", "cut"])
+    assert [c["name"] for c in kept] == ["a"] and "keeping the 1 items" in notes[0]
+
+
+def test_cut_off_coverage_retries_smaller_then_falls_back_to_broad_jobs(tmp_path, fake):
+    fake["coverage_cut"] = 1  # first answer cut off, the smaller retry works
+    _p, rep, stop, out = drive(tmp_path)
+    assert stop is None and rep["setup"]["capabilities"] == 1
+
+    fake["coverage_cut"] = 2  # cut off twice: the run goes on with broad jobs only
+    (tmp_path / "twice").mkdir()
+    _p, rep, stop, out = drive(tmp_path / "twice")
+    assert stop is None and rep["final"] >= 1 and rep["setup"]["capabilities"] == 0
+    assert any(f["step"] == "coverage" for f in rep["fallbacks"])
+    assert {j["cell"] for j in read_jsonl(out / "scenarios/jobs.jsonl")} == {"scenario_broad"}
