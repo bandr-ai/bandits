@@ -54,13 +54,9 @@ def label_values(ans: dict, fields) -> dict:
     return {k: ans[k] for k in fields if k in ans}
 
 
-def label_fields(seeds: list[dict], min_share: float = 0.5, max_values: int = 12, max_len: int = 60) -> list[str]:
-    """Final-answer keys that act as labels, learned from the seeds: present in at least min_share of the seeds whose
-    final answer is a JSON object, with few short string/bool values that repeat (few: at most max_values, or 30% of
-    the answers that have the field when that is more). [] for free-text finals."""
-    answers = [a for a in (final_answer(s) for s in seeds) if isinstance(a, dict)]
-    out = []
-    for key in sorted({k for a in answers for k in a}):
+def _label_fields(answers: list[dict], min_share: float, max_values: int, max_len: int) -> set[str]:
+    out = set()
+    for key in {k for a in answers for k in a}:
         values = [a[key] for a in answers if key in a]
         if len(values) < min_share * len(answers):
             continue
@@ -68,8 +64,34 @@ def label_fields(seeds: list[dict], min_share: float = 0.5, max_values: int = 12
             continue
         distinct = {json.dumps(v) for v in values}
         if len(distinct) <= max(max_values, 0.3 * len(values)) and len(distinct) < len(values):
-            out.append(key)
+            out.add(key)
     return out
+
+
+def label_fields(seeds: list[dict], min_share: float = 0.5, max_values: int = 12, max_len: int = 60,
+                 min_agent: int = 3) -> list[str]:
+    """Final-answer keys that act as labels, learned from the seeds: present in at least min_share of the seeds whose
+    final answer is a JSON object, with few short string/bool values that repeat (few: at most max_values, or 30% of
+    the answers that have the field when that is more). Learned over all seeds and within each agent (system prompt)
+    with at least min_agent JSON answers, so agents with different answer formats do not dilute each other.
+    [] for free-text finals."""
+    return sorted(set().union(*label_fields_by_agent(seeds, min_share, max_values, max_len, min_agent).values()))
+
+
+def label_fields_by_agent(seeds: list[dict], min_share: float = 0.5, max_values: int = 12, max_len: int = 60,
+                          min_agent: int = 3) -> dict[str, list[str]]:
+    """Per agent (system prompt): the label fields learned from that agent's own answers when it has at least
+    min_agent JSON answers; otherwise (too few to learn from) those learned over all seeds. A field one agent uses
+    never binds another agent that has enough answers of its own."""
+    by_agent: dict[str, list[dict]] = {}
+    for s in seeds:
+        a = final_answer(s)
+        by_agent.setdefault(s.get("system") or "", [])
+        if isinstance(a, dict):
+            by_agent[s.get("system") or ""].append(a)
+    pooled = _label_fields([a for g in by_agent.values() for a in g], min_share, max_values, max_len)
+    return {agent: sorted(_label_fields(g, min_share, max_values, max_len) if len(g) >= min_agent else pooled)
+            for agent, g in by_agent.items()}
 
 
 def canonical_answer(trace: dict, canon: dict, fields=()) -> dict:

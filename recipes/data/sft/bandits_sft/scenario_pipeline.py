@@ -32,7 +32,7 @@ from .config import Config, load_config
 from .io import read_jsonl, write_jsonl
 from .llm import Budget, BudgetExhausted, chat_json, configure_call_log, current_item, get_llm, set_budget
 from .pipeline import DEFAULT_CONFIG, Pipeline, Stop, _now
-from .scenarios import DEFAULTS, EvaluatorError, append, export, label_fields, run_job, seed_rules
+from .scenarios import DEFAULTS, EvaluatorError, append, export, label_fields, label_fields_by_agent, run_job, seed_rules
 from .schema import load_trace, to_sharegpt
 from .verify import final_answer, observed_loose_type_args, observed_optional_args
 
@@ -68,14 +68,16 @@ def stop_rate(seeds: list[dict]) -> float:
     return _wrapups(seeds)[text] / len(seeds) if text else 0.0
 
 
-def outcome(seed: dict, fields: list[str]) -> dict:
-    """The seed's values for the label fields ({} for free text or when no label field was learned)."""
+def outcome(seed: dict, fields: list[str] | dict[str, list[str]]) -> dict:
+    """The seed's values for the label fields of its own agent ({} for free text or when none was learned). fields
+    is one list for every agent, or a list per system prompt (label_fields_by_agent)."""
     ans = final_answer(seed)
-    return {k: ans[k] for k in fields if isinstance(ans, dict) and k in ans}
+    own = fields.get(seed.get("system") or "", []) if isinstance(fields, dict) else fields
+    return {k: ans[k] for k in own if isinstance(ans, dict) and k in ans}
 
 
 def scenario_jobs(seeds: list[dict], capabilities: list[dict], count: int, rng_seed: int, nudge: float = 0.0,
-                  fields: list[str] | None = None) -> list[dict]:
+                  fields: list[str] | dict[str, list[str]] | None = None) -> list[dict]:
     """Interleaved coverage-gap and broad jobs from the same generator and checks. A broad job keeps a uniformly drawn
     seed's outcome in a new situation, so its label mix matches the seeds'. Deterministic: the first N jobs of a longer
     plan are the N jobs of a shorter one, so a resume with a bigger target only appends."""
@@ -150,10 +152,57 @@ def _capability_errors(c, names: set, ids: set, basis_text: str) -> list[str]:
     return []
 
 
+class Demonstrable:
+    """What a capability may depend on, learned from the seeds: their tools, which tools ever returned data, and
+    the values each label field took. A capability needing more cannot become a valid example, so it is dropped
+    before any planner or generator call is paid for it."""
+
+    def __init__(self, seeds: list[dict], known_contracts: str):
+        self.tools = {s["id"]: {t["name"] for t in s["tools"]} for s in seeds}
+        self.all_tools = set().union(*self.tools.values()) if self.tools else set()
+        self.rules = seed_rules(seeds)
+        self.fields = label_fields(seeds)
+        self.values: dict[str, set] = {k: set() for k in self.fields}
+        for s in seeds:
+            ans = final_answer(s)
+            for k in self.fields:
+                if isinstance(ans, dict) and k in ans:
+                    self.values[k].add(json.dumps(ans[k]))
+        self.known = known_contracts
+
+    def _stated(self, v) -> bool:
+        """The contracts state this value as a whole word (a short value like "no" inside "none" does not count)."""
+        return isinstance(v, str) and bool(v) and re.search(rf"(?<![\w-]){re.escape(v)}(?![\w-])", self.known) is not None
+
+    def check(self, c: dict) -> list[str]:
+        """Errors, and narrows c["seed_ids"] to the seeds whose agent has every tool the capability needs."""
+        name, needs = c["name"], c.get("needs")
+        if not isinstance(needs, dict) or not all(isinstance(needs.get(k), list) and all(isinstance(x, str) for x in needs[k])
+                                                  for k in ("tools", "tools_with_data")) \
+                or not isinstance(needs.get("answer"), dict):
+            return [f"{name}: needs must be {{\"tools\": [names], \"tools_with_data\": [names], \"answer\": {{field: value}}}}"]
+        wanted = set(needs["tools"]) | set(needs["tools_with_data"])
+        if wanted - self.all_tools:
+            return [f"{name}: needs tools no seed agent has: {sorted(wanted - self.all_tools)}"]
+        empty = [t for t in needs["tools_with_data"] if self.rules.never_returns_data(t)]
+        if empty:
+            return [f"{name}: needs data from {empty}, which never returned data in the seeds (an unknown branch)"]
+        for k, v in needs["answer"].items():
+            if k in self.values and json.dumps(v) not in self.values[k] and not self._stated(v):
+                return [f"{name}: answer {k}={json.dumps(v)} is a value no seed gave and the contracts do not state"]
+        compatible = [i for i in c["seed_ids"] if wanted <= self.tools.get(i, set())]
+        if not compatible:
+            return [f"{name}: none of its seed_ids has all of {sorted(wanted)}"]
+        c["seed_ids"] = compatible
+        return []
+
+
 def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path) -> list[dict]:
     """LLM coverage catalogue. Each raw answer is saved before checking (resume never pays twice); invalid items are
     dropped one by one after one corrective retry, and kept in coverage_rejected.json. The call sees at most
-    cfg.coverage_max_chars of seed text; capabilities may only name seeds it saw."""
+    cfg.coverage_max_chars of seed text; capabilities may only name seeds it saw. A capability must be demonstrable
+    with what the seeds show (Demonstrable): its tools exist, the tools it needs data from returned data at least
+    once, and its expected answer values occur in the seeds or the contracts."""
     path = out_dir / "coverage.json"
     if path.exists():
         return json.loads(path.read_text())
@@ -166,6 +215,7 @@ def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path) -> 
                                                              "trace": json.loads(seed_json(s))} for s in shown]},
                          ensure_ascii=False)
     ids = {s["id"] for s in shown}
+    demonstrable = Demonstrable(seeds, known)
     msg = request
     for attempt in range(2):
         raw_path = out_dir / f"coverage_raw_{attempt}.json"
@@ -179,7 +229,7 @@ def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path) -> 
             raise TypeError("coverage catalogue needs capabilities list")
         kept, rejected, names = [], [], set()
         for c in capabilities:
-            errs = _capability_errors(c, names, ids, basis_text)
+            errs = _capability_errors(c, names, ids, basis_text) or demonstrable.check(c)
             if errs:
                 rejected.append({"item": c, "errors": errs})
             else:
@@ -199,10 +249,11 @@ def domain_setup(seeds: list[dict], contracts_path: Path, rubric_path: str | Non
     silently switching checks off."""
     rules = seed_rules(seeds)
     fields = label_fields(seeds)
-    branch_keys = ["available"] if rules.availability else []
+    branch_keys = sorted(rules.branch_keys)
     nudge = stop_text(seeds)
     return {"seeds": len(seeds), "label_fields": fields, "branch_keys": branch_keys, "gates": len(rules.gates),
-            "shape_rules": len(rules.shapes), "unavailable_only_signatures": sum(v == {False} for v in rules.availability.values()),
+            "shape_rules": sum(n >= rules.min_support for n in rules.support.values()),
+            "empty_only_signatures": len(rules.empty_only()),
             "stop_text": nudge, "stop_rate": round(stop_rate(seeds), 3), "capabilities": capabilities,
             "contracts_path": str(contracts_path), "rubric_path": rubric_path, "no_op": not fields and not branch_keys}
 
@@ -269,7 +320,7 @@ class ScenarioPipeline(Pipeline):
         """The frozen job list. A later run with a bigger target appends jobs (the plan is a deterministic prefix)."""
         path = self.sdir / "jobs.jsonl"
         want = scenario_jobs(seeds, caps, math.ceil(self.target * self.cfg.scenario_attempts_per_target),
-                             self.cfg.random_seed, setup["stop_rate"], setup["label_fields"])
+                             self.cfg.random_seed, setup["stop_rate"], label_fields_by_agent(seeds))
         have = read_jsonl(path)
         if len(have) < len(want) and want[:len(have)] == have:
             write_jsonl(path, want)
