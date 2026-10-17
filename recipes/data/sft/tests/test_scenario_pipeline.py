@@ -16,6 +16,10 @@ class ScenarioFake(E2EFake):
     def _answer(self, messages):
         system, o = messages[0]["content"], self.opts
         if system.startswith("Derive a coverage catalogue"):
+            if o.get("coverage_cut", 0) > 0:
+                from bandits_sft.llm import Truncated
+                o["coverage_cut"] -= 1
+                raise Truncated("thinking ran out of tokens")
             data = json.JSONDecoder().raw_decode(messages[-1]["content"])[0]  # a retry appends feedback text
             result = {"capabilities": [{"name": "scope", "capability": "handle an alternate evidence condition",
                                         "basis": "seed", "seed_ids": [data["seeds"][0]["id"]],
@@ -286,3 +290,16 @@ def test_coverage_needs_are_checked_against_the_seeds():
     assert d.check(cap(answer={"verdict": "unclear"})) == []  # stated by the contracts
     assert "no seed gave" in d.check(cap(answer={"verdict": "maybe"}))[0]
     assert "needs must be" in d.check({"name": "x", "seed_ids": ["s0"]})[0]
+
+
+def test_cut_off_coverage_retries_smaller_then_falls_back_to_broad_jobs(tmp_path, fake):
+    fake["coverage_cut"] = 1  # first answer cut off, the smaller retry works
+    _p, rep, stop, out = drive(tmp_path)
+    assert stop is None and rep["setup"]["capabilities"] == 1
+
+    fake["coverage_cut"] = 2  # cut off twice: the run goes on with broad jobs only
+    (tmp_path / "twice").mkdir()
+    _p, rep, stop, out = drive(tmp_path / "twice")
+    assert stop is None and rep["final"] >= 1 and rep["setup"]["capabilities"] == 0
+    assert any(f["step"] == "coverage" for f in rep["fallbacks"])
+    assert {j["cell"] for j in read_jsonl(out / "scenarios/jobs.jsonl")} == {"scenario_broad"}

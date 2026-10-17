@@ -7,29 +7,19 @@ reason for each rule, and the exact output.
 """
 
 COVERAGE = """Derive a coverage catalogue ONLY from the supplied correct seeds and their inferred contracts.
-
-Purpose: list decisions, evidence routes or permitted outcomes that the seeds show rarely or not at all, so new
-training situations can exercise them. These are coverage gaps in the examples, not measured model failures, so
-never describe them as failures. There are no labels, predictions, application code or environment.
-
-What matters most: every capability must be demonstrable with what the seeds actually show. A capability that
-needs a tool the agent lacks, a tool result never seen, or an answer value the output contract does not allow
-cannot become a valid training example, and code rejects it.
-
-Rules:
-- Prefer substantive gaps (a different decision or evidence route) over surface changes such as new names.
-- Use only result shapes the seeds demonstrate or the contracts state explicitly. A branch listed as Unknown
-  stays unknown: do not build a capability on it.
-- basis: write "seed", or copy words verbatim from the Explicit/Observed contracts or a seed system prompt.
-  Code checks the copy, so do not paraphrase or prefix it.
-- seed_ids: supplied seed ids whose agent has every tool the capability needs. Never invent ids.
-- needs: what the capability depends on, so code can check it is demonstrable:
-  tools = tool names it calls; tools_with_data = tools whose result must carry data (not an empty result);
-  answer = final-answer field values it expects, copied exactly from the seeds or contracts ({} for none).
-- An empty list is fine when no defensible gap exists. The catalogue guides planning; it never sets final labels.
-
+There are no student predictions, external labels, application code or environment. Never describe a
+coverage gap as a measured student failure. Identify decisions, evidence routes or explicitly permitted
+outcomes that are rare/missing in the examples. Prefer substantive gaps over superficial name changes.
+Use only demonstrated result shapes or explicit tool contracts. Unknown branches remain unknown.
 Return {"capabilities":[{"name":"short_name","capability":"decision/evidence condition to exercise",
-"basis":"...","seed_ids":["..."],"needs":{"tools":[],"tools_with_data":[],"answer":{}}}]}.
+"basis":"seed, or words copied verbatim from the Explicit/Observed contracts or a seed system prompt",
+"seed_ids":["compatible supplied seed ids"],"needs":{"tools":[],"tools_with_data":[],"answer":{}}}]}.
+basis is checked against those texts: copy, do not paraphrase or prefix.
+needs declares what the capability depends on: tools = tool names it calls, tools_with_data = tools whose result
+must carry data rather than an empty result, answer = final-answer field values it expects ({} for none). Code
+checks needs against the seeds and drops what they cannot demonstrate, so declare it plainly; do not verify it.
+Each capability needs at least one compatible reference. Do not invent ids, rules or output enums.
+An empty list is allowed if no defensible gap exists. This catalogue guides planning, not final labels.
 """
 
 PLAN = """Design ONE candidate training situation from the supplied agent contract and recorded examples.

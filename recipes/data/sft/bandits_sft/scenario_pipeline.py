@@ -30,7 +30,17 @@ from . import scenario_prompts
 from .analyzer import basis_errors, seed_json
 from .config import Config, load_config
 from .io import read_jsonl, write_jsonl
-from .llm import Budget, BudgetExhausted, chat_json, configure_call_log, current_item, get_llm, set_budget
+from .llm import (
+    Budget,
+    BudgetExhausted,
+    EmptyResponse,
+    Truncated,
+    chat_json,
+    configure_call_log,
+    current_item,
+    get_llm,
+    set_budget,
+)
 from .pipeline import DEFAULT_CONFIG, Pipeline, Stop, _now
 from .scenarios import DEFAULTS, EvaluatorError, append, export, label_fields, label_fields_by_agent, run_job, seed_rules
 from .schema import load_trace, to_sharegpt
@@ -197,7 +207,7 @@ class Demonstrable:
         return []
 
 
-def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path) -> list[dict]:
+def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path, fallback=None) -> list[dict]:
     """LLM coverage catalogue. Each raw answer is saved before checking (resume never pays twice); invalid items are
     dropped one by one after one corrective retry, and kept in coverage_rejected.json. The call sees at most
     cfg.coverage_max_chars of seed text; capabilities may only name seeds it saw. A capability must be demonstrable
@@ -222,7 +232,22 @@ def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path) -> 
         if raw_path.exists():
             out = json.loads(raw_path.read_text())
         else:
-            out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE, msg)
+            try:
+                out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE, msg)
+            except (Truncated, EmptyResponse):
+                # an answer cut off (a model that thinks without end) gets one smaller, shorter retry
+                shown = coverage_seeds(seeds, cfg.coverage_max_chars // 4)
+                ids = {s["id"] for s in shown}
+                small = json.dumps({"contracts": contracts, "seeds": [
+                    {"id": s["id"], "system": s["system"], "tools": s["tools"], "trace": json.loads(seed_json(s))}
+                    for s in shown]}, ensure_ascii=False)
+                try:
+                    out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE,
+                                    small + "\n\nReturn at most 12 capabilities.")
+                except (Truncated, EmptyResponse):
+                    if fallback:
+                        fallback("coverage", "the coverage answer was cut off twice: no gap jobs, broad jobs only")
+                    out = {"capabilities": []}
             raw_path.write_text(json.dumps(out, ensure_ascii=False, indent=1))
         capabilities = out.get("capabilities") if isinstance(out, dict) else None
         if not isinstance(capabilities, list):
@@ -308,7 +333,7 @@ class ScenarioPipeline(Pipeline):
     def coverage(self) -> str:
         cfg, seeds = self.cfg, self._seeds()
         self.sdir.mkdir(parents=True, exist_ok=True)
-        caps = catalogue(cfg, seeds, self._contracts_path().read_text(), self.sdir)
+        caps = catalogue(cfg, seeds, self._contracts_path().read_text(), self.sdir, self.fallback)
         setup = domain_setup(seeds, self._contracts_path(), cfg.rubric_path, len(caps))
         (self.out / "setup").mkdir(exist_ok=True)
         (self.out / "setup" / "domain.json").write_text(json.dumps(setup, indent=1))
