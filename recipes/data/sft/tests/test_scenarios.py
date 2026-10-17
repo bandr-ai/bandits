@@ -177,3 +177,11 @@ def test_fit_cuts_long_messages_only_when_needed():
     small = s.fit(t, 1000)
     assert len(json.dumps(small)) <= 1200 and "chars cut" in small["messages"][0]["content"]
     assert t["messages"][0]["content"] == "x" * 5000
+
+
+def test_rule_cache_never_serves_another_seed_list():
+    """A long-lived worker runs many jobs: a new seed list must get its own rules even if Python reuses an id()."""
+    a = [{"id": "a", "messages": []}]
+    first = s.seed_rules(a)
+    b = [{"id": "b", "messages": []}]
+    assert s.seed_rules(a) is first and s.seed_rules(b) is not first and s.seed_template(b) == s.seed_template(list(b))

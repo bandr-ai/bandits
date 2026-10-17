@@ -111,24 +111,24 @@ def references(seed: dict, seeds: list[dict], max_chars: int | None = None) -> l
     return [fit(r, max_chars) for r in refs] if max_chars else refs
 
 
-_RULES: dict[int, SeedRules] = {}
+# One cache entry, holding the seed list itself: a later run's list can reuse a freed list's id(), so the entry is
+# reused only for the very same list object (a long-lived worker runs many jobs in one process).
+_RULES: list = [None, None]
 
 
 def seed_rules(seeds: list[dict]) -> SeedRules:
-    if id(seeds) not in _RULES:
-        _RULES.clear()
-        _RULES[id(seeds)] = SeedRules(seeds)
-    return _RULES[id(seeds)]
+    if _RULES[0] is not seeds:
+        _RULES[:] = [seeds, SeedRules(seeds)]
+    return _RULES[1]
 
 
-_COMMON: dict[int, frozenset] = {}
+_COMMON: list = [None, None]
 
 
 def seed_template(seeds: list[dict]) -> frozenset:
-    if id(seeds) not in _COMMON:
-        _COMMON.clear()
-        _COMMON[id(seeds)] = boilerplate(seeds)
-    return _COMMON[id(seeds)]
+    if _COMMON[0] is not seeds:
+        _COMMON[:] = [seeds, boilerplate(seeds)]
+    return _COMMON[1]
 
 
 def append(path: Path, row: dict) -> None:
