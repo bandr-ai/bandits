@@ -54,9 +54,10 @@ def label_values(ans: dict, fields) -> dict:
     return {k: ans[k] for k in fields if k in ans}
 
 
-def label_fields(seeds: list[dict], min_share: float = 0.8, max_values: int = 12, max_len: int = 60) -> list[str]:
+def label_fields(seeds: list[dict], min_share: float = 0.5, max_values: int = 12, max_len: int = 60) -> list[str]:
     """Final-answer keys that act as labels, learned from the seeds: present in at least min_share of the seeds whose
-    final answer is a JSON object, with few short string/bool values that repeat. [] for free-text finals."""
+    final answer is a JSON object, with few short string/bool values that repeat (few: at most max_values, or 30% of
+    the answers that have the field when that is more). [] for free-text finals."""
     answers = [a for a in (final_answer(s) for s in seeds) if isinstance(a, dict)]
     out = []
     for key in sorted({k for a in answers for k in a}):
@@ -66,7 +67,7 @@ def label_fields(seeds: list[dict], min_share: float = 0.8, max_values: int = 12
         if not all(v is None or isinstance(v, bool) or isinstance(v, str) and len(v) <= max_len for v in values):
             continue
         distinct = {json.dumps(v) for v in values}
-        if len(distinct) <= max_values and len(distinct) < len(values):
+        if len(distinct) <= max(max_values, 0.3 * len(values)) and len(distinct) < len(values):
             out.append(key)
     return out
 

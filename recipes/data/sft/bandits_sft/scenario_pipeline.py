@@ -57,9 +57,9 @@ def _wrapups(seeds: list[dict]) -> Counter:
 
 def stop_text(seeds: list[dict]) -> str:
     """A wrap-up user turn the seeds themselves put right before the final answer (a harness nudge), or ''. It must
-    precede the final answer in at least max(3, 20%) of the seeds: a chat's repeated 'thanks' does not qualify."""
+    precede the final answer in at least max(3, 5%) of the seeds: a chat's repeated 'thanks' does not qualify."""
     top = _wrapups(seeds).most_common(1)
-    return top[0][0] if top and top[0][1] >= max(3, math.ceil(0.2 * len(seeds))) else ""
+    return top[0][0] if top and top[0][1] >= max(3, math.ceil(0.05 * len(seeds))) else ""
 
 
 def stop_rate(seeds: list[dict]) -> float:

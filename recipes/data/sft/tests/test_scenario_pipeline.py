@@ -203,3 +203,38 @@ def test_cli_dispatches_dataset(monkeypatch):
     with pytest.raises(SystemExit) as e:
         cli.main(["dataset", "--help"])
     assert e.value.code == 0 and seen == ["--help"]
+
+
+def _shaped_seeds():
+    """118 made-up seeds shaped like a large real set: a label in 78%, a second label with 19 values, a wrap-up turn in 11%."""
+    out = []
+    for i in range(118):
+        answer = {"detail": f"unique {i}", "confidence": 0.9}
+        if i % 9 < 7:
+            answer["verdict"] = ["pass", "fail"][i % 2]
+        answer["cause"] = f"cause{i % 19}"
+        msgs = [{"role": "user", "content": f"q{i}"}, {"role": "assistant", "content": "a"}]
+        if i < 13:
+            msgs.append({"role": "user", "content": "wrap up now"})
+        msgs.append({"role": "assistant", "content": json.dumps(answer)})
+        out.append({"id": f"s{i}", "system": "sys", "tools": [], "messages": msgs})
+    return out
+
+
+def test_large_set_shape_keeps_labels_nudge_and_all_coverage_seeds():
+    from bandits_sft.config import Config
+    seeds = _shaped_seeds()
+    from bandits_sft.scenarios import label_fields
+    assert label_fields(seeds) == ["cause", "verdict"]
+    assert stop_text(seeds) == "wrap up now" and 0.1 < stop_rate(seeds) < 0.12
+    wide = [{**s, "messages": [{**s["messages"][0], "content": "x " * 3500}, *s["messages"][1:]]} for s in seeds]
+    assert len(coverage_seeds(wide, Config(seeds_path="x").coverage_max_chars)) == 118
+
+
+def test_reference_cap_is_a_config_field_and_cuts_references():
+    from bandits_sft import scenarios as s
+    from bandits_sft.config import Config
+    assert Config(seeds_path="x").reference_max_chars > 0
+    big = {"id": "b", "system": "s", "tools": [], "messages": [{"role": "user", "content": "w " * 20000},
+                                                           {"role": "assistant", "content": "{}"}]}
+    assert len(json.dumps(s.references(big, [big], 5000))) < 6000
