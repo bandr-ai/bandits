@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.native import is_flat_langfuse_observation
+
 _MAX_SAMPLE = 512 * 1024 * 1024
 """A single JSON document up to this size is parsed whole to recognize it; its
 reader loads it whole anyway. JSONL is sampled line by line."""
@@ -104,6 +106,8 @@ def _shape(record: Any) -> tuple[str, str] | None:
         or (isinstance(record.get("trace"), dict) and record["trace"].get("id"))
     ):
         return "langfuse", "Langfuse trace with observations"
+    if is_flat_langfuse_observation(record):
+        return "langfuse", "Langfuse observations, one per line, with a traceId"
     context = record.get("context")
     if isinstance(context, dict) and context.get("trace_id") and context.get("span_id"):
         return "phoenix", "Phoenix span context IDs"
@@ -117,6 +121,12 @@ def _shape(record: Any) -> tuple[str, str] | None:
         if "span_attributes" in spans[0] and "span_id" in spans[0]:
             return "trail", "TRAIL nested span tree"
     data = record.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        inner = _shape(data[0])
+        if inner is not None and inner[0] == "langfuse":
+            return "langfuse", "Langfuse API response: data[] of " + inner[1][0].lower() + inner[1][
+                1:
+            ]
     if (
         isinstance(data, list)
         and data
