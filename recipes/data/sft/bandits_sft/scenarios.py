@@ -10,8 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import scenario_prompts as prompts
-from .analyzer import basis_errors, generate_analyzer, parse_output, to_trace
-from .banks import ObsBank
+from .analyzer import basis_errors, parse_output, to_trace
 from .io import write_jsonl
 from .llm import (
     EmptyResponse,
@@ -47,23 +46,68 @@ def leakage(trace: dict, protected: list[dict], threshold: float = 0.5, common: 
     return any(copied(a, user_text(t), common, threshold) for t in protected)
 
 
-def canonical_answer(trace: dict, canon: dict) -> dict:
-    """Optional exact answer map: JSON-serialized answer subset -> canonical subset. No invented domain rules."""
+class EvaluatorError(RuntimeError):
+    """A judge or consistency call failed: the job is not a reject, it is retried on resume."""
+
+
+def label_values(ans: dict, fields) -> dict:
+    return {k: ans[k] for k in fields if k in ans}
+
+
+def label_fields(seeds: list[dict], min_share: float = 0.8, max_values: int = 12, max_len: int = 60) -> list[str]:
+    """Final-answer keys that act as labels, learned from the seeds: present in at least min_share of the seeds whose
+    final answer is a JSON object, with few short string/bool values that repeat. [] for free-text finals."""
+    answers = [a for a in (final_answer(s) for s in seeds) if isinstance(a, dict)]
+    out = []
+    for key in sorted({k for a in answers for k in a}):
+        values = [a[key] for a in answers if key in a]
+        if len(values) < min_share * len(answers):
+            continue
+        if not all(v is None or isinstance(v, bool) or isinstance(v, str) and len(v) <= max_len for v in values):
+            continue
+        distinct = {json.dumps(v) for v in values}
+        if len(distinct) <= max_values and len(distinct) < len(values):
+            out.append(key)
+    return out
+
+
+def canonical_answer(trace: dict, canon: dict, fields=()) -> dict:
+    """The label part of the final answer (fields = learned label fields), through an optional exact map."""
     ans = final_answer(trace)
     if not isinstance(ans, dict):
         return {}
-    label = {k: ans[k] for k in ("conclusion", "root_cause") if k in ans}
+    label = label_values(ans, fields)
     return canon.get(json.dumps(label, sort_keys=True), label)
 
 
-def target_matches(trace: dict, target: dict, canon: dict) -> bool:
-    ans = canonical_answer(trace, canon)
+def target_matches(trace: dict, target: dict, canon: dict, fields=()) -> bool:
+    ans = canonical_answer(trace, canon, fields)
     return all(k in ans and ans[k] == v for k, v in target.items())
 
 
-def references(seed: dict, seeds: list[dict]) -> list[dict]:
+def fit(trace: dict, max_chars: int) -> dict:
+    """The trace with long message contents cut to head + tail until it serializes under max_chars (a copy)."""
+    size = len(json.dumps(trace, ensure_ascii=False))
+    if size <= max_chars:
+        return trace
+    cap = max(200, max_chars // max(1, len(trace["messages"])))
+    while True:
+        messages = []
+        for m in trace["messages"]:
+            c = m.get("content")
+            if isinstance(c, str) and len(c) > cap:
+                c = c[:cap // 2] + f" ...[{len(c) - cap} chars cut]... " + c[-(cap // 2):]
+            messages.append({**m, "content": c} if "content" in m else m)
+        out = {**trace, "messages": messages}
+        if len(json.dumps(out, ensure_ascii=False)) <= max_chars or cap <= 200:
+            return out
+        cap //= 2
+
+
+def references(seed: dict, seeds: list[dict], max_chars: int | None = None) -> list[dict]:
     siblings = [s for s in seeds if s["id"] != seed["id"] and s["system"] == seed["system"] and s["tools"] == seed["tools"]]
-    return [seed, *siblings[:2]]
+    refs = [seed, *siblings[:2]]
+    return [fit(r, max_chars) for r in refs] if max_chars else refs
 
 
 _RULES: dict[int, SeedRules] = {}
@@ -145,12 +189,20 @@ def planned(out: Path, system: str, job_id: str, limit: int = 40) -> list[str]:
     return seen[-limit:]
 
 
+def reject(job: dict, category: str, reason: str, traces: list | None = None) -> dict:
+    return {"id": job["job_id"], "job": job, "traces": traces or [], "kept": False, "category": category, "reason": reason}
+
+
 def run_job(cfg, job: dict, seeds: list[dict], contracts: str, out: Path, protected: list[dict], spec: dict, canon: dict) -> dict:
+    """One scenario job. Every paid answer is saved before it is checked, so a retry or resume never pays twice.
+    Rejections are rows with a category; an unavailable judge raises EvaluatorError (never a false reject)."""
     seed = next(s for s in seeds if s["id"] == job["seed_id"])
+    fields = tuple(spec.get("label_fields") or ())
     path = out / "jobs" / job["job_id"]
     path.mkdir(parents=True, exist_ok=True)
     context = {"job": job, "system": seed["system"], "tools": seed["tools"], "contracts": contracts,
-               "tool_result_rules": seed_rules(seeds).describe(), "references": references(seed, seeds),
+               "tool_result_rules": seed_rules(seeds).describe(),
+               "references": references(seed, seeds, getattr(cfg, "reference_max_chars", None)),
                "already_planned": planned(out, seed["system"], job["job_id"])}
     card_path, raw_card = path / "card.json", path / "card_raw.json"
     if not card_path.exists():
@@ -160,75 +212,64 @@ def run_job(cfg, job: dict, seeds: list[dict], contracts: str, out: Path, protec
             try:
                 card = chat_json(get_llm(cfg, "analyzer"), prompts.PLAN, json.dumps(context, ensure_ascii=False))
             except (Truncated, EmptyResponse) as e:  # an over-long answer rejects this job only; saved so resume skips it
-                card = {"unsupported": True, "reason": f"planner: {type(e).__name__}"}
+                card = {"unsupported": True, "category": "bad_generation", "reason": f"planner: {type(e).__name__}"}
             raw_card.write_text(json.dumps(card, ensure_ascii=False, indent=2))
         problem = card_errors(card, job, basis_text(contracts, seed))
         if problem:  # one bad card rejects this job only, with its reason; it never stops the run
-            return {"id": job["job_id"], "job": job, "traces": [], "kept": False, "reason": f"bad card: {problem}"}
+            return reject(job, "bad_card", f"bad card: {problem}")
         card_path.write_text(json.dumps(card, ensure_ascii=False, indent=2))
         (path / "system.txt").write_text(json.dumps(seed["system"]))
     card = json.loads(card_path.read_text())
     if card.get("unsupported") is True:
-        return {"id": job["job_id"], "job": job, "traces": [], "kept": False, "reason": card.get("reason", "unsupported")}
+        return reject(job, card.get("category", "unsupported"), card.get("reason", "unsupported"))
     generated_path = path / "generated.json"
-    controlled = job["dimensions"]["novelty"] == "controlled"
     if not generated_path.exists():
-        if controlled:
-            gen_job = {**job, "variation": card["variation"], "mode": "analyzer", "strategy": "analyzer",
-                       "case_block": cfg.case_block}
-            traces = [generate_analyzer(cfg, gen_job, seed, Path(spec["controlled_template"]).read_text(), ObsBank.from_traces(seeds))]
+        raw_gen = path / "generated_raw.json"
+        if raw_gen.exists():
+            raw = json.loads(raw_gen.read_text())
         else:
-            raw_gen = path / "generated_raw.json"
-            if raw_gen.exists():
-                raw = json.loads(raw_gen.read_text())
-            else:
-                try:
-                    raw = chat_json(get_llm(cfg, "generator"), prompts.GENERATE,
-                                    json.dumps({**context, "card": card}, ensure_ascii=False))
-                except (Truncated, EmptyResponse) as e:  # rejects this job only, never the run
-                    raw = {"unsupported": True, "reason": f"generator: {type(e).__name__}"}
-                raw_gen.write_text(json.dumps(raw, ensure_ascii=False))
-
-            def bad(reason):  # malformed output rejects this job only; the raw answer stays for inspection
-                return {"id": job["job_id"], "job": job, "traces": [], "kept": False, "reason": f"bad generation: {reason}"}
-            if not isinstance(raw, dict):
-                return bad("non-object")
-            if raw.get("unsupported") is True:
-                return {"id": job["job_id"], "job": job, "traces": [], "kept": False, "reason": raw.get("reason", "unsupported")}
-            items = raw.get("traces")
-            if not isinstance(items, list) or len(items) != (2 if job["pair"] else 1):
-                return bad("wrong number of conversations")
-            traces = []
-            for i, item in enumerate(items):
-                messages, issues = parse_output(json.dumps(item))
-                if issues:
-                    return bad(str(issues)[:300])
-                traces.append(to_trace({"job_id": f"{job['job_id']}/{i}"}, seed, messages))
+            try:
+                raw = chat_json(get_llm(cfg, "generator"), prompts.GENERATE,
+                                json.dumps({**context, "card": card}, ensure_ascii=False))
+            except (Truncated, EmptyResponse) as e:  # rejects this job only, never the run
+                raw = {"unsupported": True, "category": "bad_generation", "reason": f"generator: {type(e).__name__}"}
+            raw_gen.write_text(json.dumps(raw, ensure_ascii=False))
+        if not isinstance(raw, dict):
+            return reject(job, "bad_generation", "bad generation: non-object")
+        if raw.get("unsupported") is True:
+            return reject(job, raw.get("category", "unsupported"), raw.get("reason", "unsupported"))
+        items = raw.get("traces")
+        if not isinstance(items, list) or len(items) != (2 if job["pair"] else 1):
+            return reject(job, "bad_generation", "bad generation: wrong number of conversations")
+        traces = []
+        for i, item in enumerate(items):
+            messages, issues = parse_output(json.dumps(item))
+            if issues:
+                return reject(job, "bad_generation", f"bad generation: {str(issues)[:300]}")
+            traces.append(to_trace({"job_id": f"{job['job_id']}/{i}"}, seed, messages))
         generated_path.write_text(json.dumps(traces, ensure_ascii=False))
     traces = json.loads(generated_path.read_text())
-    nudge = spec.get("stop_text") if isinstance(spec, dict) else ""
+    nudge = spec.get("stop_text") or ""
     for t in traces:
         if job.get("stop_nudge") and nudge and not any(m["role"] == "user" for m in t["messages"][1:]) \
                 and len(t["messages"]) >= 3 and t["messages"][-1]["role"] == "assistant":
             # the seeds' own wrap-up turn, placed before the final answer as in the real traces
             t["messages"].insert(len(t["messages"]) - 1, {"role": "user", "content": nudge})
-        t["meta"].update(seed_id=seed["id"], lane="controlled" if controlled else "scenario", dimensions=job["dimensions"],
+        t["meta"].update(seed_id=seed["id"], lane="scenario", dimensions=job["dimensions"],
                          cell=job["cell"], failure_id=job["failure_id"], pair_id=job["job_id"] if job["pair"] else None,
                          allocation=job.get("allocation"), capability=job.get("capability"))
         if leakage(t, protected, common=seed_template(seeds)):
-            return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": "protected input overlap"}
+            return reject(job, "leakage", "protected input overlap", traces)
         want = job.get("outcome") or {}
         got = final_answer(t)
         if want and (not isinstance(got, dict) or any(got.get(k) != v for k, v in want.items())):
             # control keeps a real seed's outcome so its label mix matches the seeds; checked before paying judges
-            return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": "control outcome mismatch"}
-        if not controlled:  # novel tool results must be ones the recorded harness could return (checked before paying judges)
-            harness = seed_rules(seeds).errors(t)
-            if harness:
-                return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": f"seed rules: {harness[0]}"}
-        ctx = {"seed": seed, "variation": card["variation"], "harness": contracts} if controlled else None
+            return reject(job, "control_mismatch", "control outcome mismatch", traces)
+        harness = seed_rules(seeds).errors(t)  # novel tool results must be ones the recorded harness could return
+        if harness:
+            return reject(job, "seed_rules", f"seed rules: {harness[0]}", traces)
         # Novel scenarios use seed-independent integrity checks; I3/I4 are n/a, not weakened globally.
-        verify(cfg, t, set(), ctx)
+        verify(cfg, t, set(), None)
         issues = explicit_answer_check(t, seed)
         if isinstance(final_answer(seed), dict) and not isinstance(final_answer(t), dict):
             issues.append("final answer must be a JSON object under this reference contract")
@@ -237,25 +278,26 @@ def run_job(cfg, job: dict, seeds: list[dict], contracts: str, out: Path, protec
             t["meta"]["verify"]["kept"] = False
         v = t["meta"]["verify"]
         if any(v.get(k, {}).get("label") == "error" for k in ("rubric", "consistency")):
-            raise RuntimeError("evaluator error; generation saved for retry")
+            raise EvaluatorError("evaluator error; generation saved for retry")
     if not all(t["meta"]["verify"]["kept"] for t in traces):
-        return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": "quality gate"}
-    if job["target"] and not any(target_matches(t, job["target"], canon) for t in traces):
-        return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": "target not reached"}
-    if job["pair"] and canonical_answer(traces[0], canon) == canonical_answer(traces[1], canon):
-        return {"id": job["job_id"], "job": job, "traces": traces, "kept": False, "reason": "pair did not flip label"}
+        return reject(job, "quality_gate", "quality gate", traces)
+    if job["target"] and not any(target_matches(t, job["target"], canon, fields) for t in traces):
+        return reject(job, "audit", "target not reached", traces)
+    if job["pair"] and canonical_answer(traces[0], canon, fields) == canonical_answer(traces[1], canon, fields):
+        return reject(job, "audit", "pair did not flip label", traces)
     audit = chat_json(get_llm(cfg, "judge"), prompts.AUDIT,
                       json.dumps({"job": job, "card": card, "references": context["references"], "traces": traces}, ensure_ascii=False))
     keys = ("supported", "novelty_ok", "dimensions_ok", "pair_ok")
     if not isinstance(audit, dict) or any(not isinstance(audit.get(k), bool) for k in keys):
         raise ValueError("dimension audit returned malformed verdicts")
-    return {"id": job["job_id"], "job": job, "traces": traces, "audit": audit,
-            "kept": all(audit[k] is True for k in keys), "reason": audit.get("reason", "dimension audit")}
+    kept = all(audit[k] is True for k in keys)
+    return {"id": job["job_id"], "job": job, "traces": traces, "audit": audit, "kept": kept,
+            "category": "kept" if kept else "audit", "reason": audit.get("reason", "dimension audit")}
 
 
-def export(out: Path, rows: list[dict], canon: dict) -> dict:
+def export(out: Path, rows: list[dict], canon: dict, fields=()) -> dict:
     """Atomic units: contrastive pairs survive or drop together, including dedup."""
-    kept, signatures, inputs, dup = [], {}, {}, 0
+    kept, signatures, inputs, dup, dup_jobs = [], {}, {}, 0, 0
     by_cell = Counter()
     for r in rows:
         if not r["kept"]:
@@ -266,12 +308,13 @@ def export(out: Path, rows: list[dict], canon: dict) -> dict:
             # Dedup the actual evidence/answer body; shared context alone does not collapse a pair.
             body = tokens(json.dumps([m for m in t["messages"] if m["role"] != "user"], sort_keys=True))
             inp = json.dumps([t["system"], t["tools"], t["messages"][:-1]], sort_keys=True)
-            label = canonical_answer(t, canon)
+            label = canonical_answer(t, canon, fields)
             if any(jaccard(body, s) >= 0.7 for s in cell_signatures) or (inp in inputs and inputs[inp] != label):
                 break
             pending.append((t, body, inp, label))
         if len(pending) != len(r["traces"]):
             dup += len(r["traces"])
+            dup_jobs += 1
             continue
         for t, body, inp, label in pending:
             kept.append(t)
@@ -280,6 +323,8 @@ def export(out: Path, rows: list[dict], canon: dict) -> dict:
             by_cell[t["meta"]["cell"]] += 1
     write_jsonl(out / "synthetic.jsonl", kept)
     report = {"jobs_finished": len(rows), "traces_kept": len(kept), "kept_by_cell": dict(by_cell),
-              "duplicate_or_conflicting_traces": dup, "rejected_jobs": dict(Counter(r["reason"] for r in rows if not r["kept"]))}
+              "duplicate_or_conflicting_traces": dup,
+              "rejected_by_category": {**Counter(r.get("category", "other") for r in rows if not r["kept"]),
+                                       **({"duplicate": dup_jobs} if dup_jobs else {})}}
     (out / "report.json").write_text(json.dumps(report, indent=2))
     return report

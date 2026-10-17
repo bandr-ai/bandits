@@ -80,7 +80,7 @@ def job(i=1, **kw):
 
 
 def run(tmp_path, **kw):
-    return s.run_job(config(tmp_path), job(**kw), [seed()], "X allowed", tmp_path / "out", [], {}, {})
+    return s.run_job(config(tmp_path), job(**kw), [seed()], "X allowed", tmp_path / "out", [], {"label_fields": ["root_cause"]}, {})
 
 
 def test_job_resume_reuses_card_and_generation(tmp_path, fake):
@@ -159,3 +159,21 @@ def test_truncated_generation_rejects_job_only(tmp_path, fake, monkeypatch):
     row = run(tmp_path)
     assert row["kept"] is False and "Truncated" in row["reason"]
     assert (tmp_path / "out/jobs/scenarios/0001/generated_raw.json").exists()  # resume does not pay again
+
+
+def test_label_fields_learned_from_seeds():
+    def t(label, detail, conf):
+        return {"id": detail, "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content":
+                json.dumps({"verdict": label, "detail": detail, "confidence": conf})}]}
+    seeds = [t(["a", "b", "a", "b", "a"][i], f"unique text {i}", 0.5) for i in range(5)]
+    assert s.label_fields(seeds) == ["verdict"]  # detail never repeats, confidence is numeric
+    free = [{"id": "f", "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "plain text"}]}]
+    assert s.label_fields(free) == []
+
+
+def test_fit_cuts_long_messages_only_when_needed():
+    t = {"messages": [{"role": "user", "content": "x" * 5000}, {"role": "assistant", "content": "ok"}]}
+    assert s.fit(t, 10_000) is t
+    small = s.fit(t, 1000)
+    assert len(json.dumps(small)) <= 1200 and "chars cut" in small["messages"][0]["content"]
+    assert t["messages"][0]["content"] == "x" * 5000

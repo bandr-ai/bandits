@@ -132,6 +132,10 @@ class Config:
     proposals_per_call: int = 8   # variations asked per proposal call (bigger calls get slow)
     breaker_window: int = 20      # circuit breaker: last N production jobs ...
     breaker_max_bad: float = 0.5  # ... stop when more than this share failed (execution error, judge or check call error)
+    # scenario recipe (scenario_pipeline.py)
+    scenario_attempts_per_target: float = 2.0  # planned jobs per wanted trace; rejection never buys more than this
+    coverage_max_chars: int = 150_000  # the coverage call sees at most this much seed text (round robin over agents, long traces cut)
+    reference_max_chars: int = 20_000  # each reference trace shown to the planner / generator is cut to this
     workers: int = 16
     random_seed: int = 0
     models: dict[str, ModelCfg] = field(default_factory=dict)

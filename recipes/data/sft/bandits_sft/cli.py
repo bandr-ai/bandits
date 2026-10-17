@@ -352,13 +352,13 @@ def _llm_summary(cfg: Config) -> dict:
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["dataset"]:
-        from .seed_scenarios import main as dataset_main
+        from .scenario_pipeline import main as dataset_main
         sys.exit(dataset_main(argv[1:]))
     if argv[:1] == ["pipeline"]:  # end-to-end command, own arguments: bandits-sft pipeline --seeds X --out Y --budget 5
         from .pipeline import main as pipeline_main
         sys.exit(pipeline_main(argv[1:]))
     ap = argparse.ArgumentParser(prog="bandits-sft", description=__doc__ +
-                                 "\nEnd to end: bandits-sft pipeline --help; varied seed-only dataset: bandits-sft dataset --help")
+                                 "\nEnd to end: bandits-sft pipeline --help; new situations beyond the seeds: bandits-sft dataset --help")
     ap.add_argument("command", choices=["ingest", "audit", "analyze", "batch", "experiment", "review", "heldout", "ab", "ab-split", "ab-vary", "mixed", "ab-models", "plan", "specs", "generate", "reparse", "verify",
                                         "select", "run"])
     ap.add_argument("--config", required=True)
