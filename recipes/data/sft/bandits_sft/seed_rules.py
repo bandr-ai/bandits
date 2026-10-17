@@ -91,20 +91,33 @@ def _emptiness(groups: dict[str, list]) -> dict[str, float]:
     return {v: sum(e for _, e in g) / len(g) for v, g in groups.items()}
 
 
+def _witness(rates: dict, order: list[str], empty_at_least: float = 0.8, full_at_most: float = 0.2) -> bool:
+    """A real empty branch has a witness field: empty in nearly all of its results (a zero count, an empty list) and
+    filled in nearly all results of every other value. A category (values with different but full results) has none."""
+    first, rest = rates[order[0]], [rates[v] for v in order[1:]]
+    return any(n and e / n >= empty_at_least and all(f in o and o[f][1] and o[f][0] / o[f][1] <= full_at_most for o in rest)
+               for f, (e, n) in first.items())
+
+
 def branch_keys(calls: list[tuple], max_values: int = 3, min_each: int = 2) -> dict[str, list]:
     """Result fields whose value decides which other fields come back, from (tool, arguments, result) calls: few
-    short values, each seen at least min_each times, not an echo of an argument, and one value's results carry
-    fields the other's never do or are clearly emptier. Values are ordered from the emptiest branch to the fullest;
-    every value after the first is a data branch."""
+    short values, each seen at least min_each times, not an echo of an argument, and the emptiest value has a witness
+    field (empty under it, filled under the others; see _witness). Values are ordered from the emptiest branch to the
+    fullest; every value after the first is a data branch."""
     by_key: dict[str, dict] = defaultdict(lambda: defaultdict(list))
     echoed, present = defaultdict(int), defaultdict(int)
     empties: dict[str, dict] = defaultdict(lambda: defaultdict(list))
+    fields: dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [0, 0])))
     for tool, args, r in calls:
         for k, v in r.items():
             present[k] += 1
             if _flag(v):
                 by_key[k][json.dumps(v)].append((tool, frozenset(r) - {k}))
                 empties[k][json.dumps(v)].append((tool, sum(_empty(x) for k2, x in r.items() if k2 != k)))
+                for f, x in r.items():
+                    if f != k:
+                        fields[k][json.dumps(v)][f][0] += _empty(x)
+                        fields[k][json.dumps(v)][f][1] += 1
                 echoed[k] += v in {a for a in args.values() if isinstance(a, str)}
     out = {}
     for k, groups in by_key.items():
@@ -113,12 +126,11 @@ def branch_keys(calls: list[tuple], max_values: int = 3, min_each: int = 2) -> d
             continue
         if n < present[k] or echoed[k] > 0.5 * n:
             continue  # takes long or structured values too, or repeats what the call asked for
-        ever = {v: frozenset.union(*(f for _, f in g)) for v, g in groups.items()}
         score = _emptiness(empties[k])  # higher = emptier
-        fields_differ = any(ever[a] - ever[b] for a in groups for b in groups if a != b)
-        if not fields_differ and max(score.values()) - min(score.values()) < 0.5:
-            continue  # same fields, equally full: a category, not a branch
-        out[k] = [json.loads(v) for v in sorted(groups, key=lambda v: (-score[v], v))]
+        order = sorted(groups, key=lambda v: (-score[v], v))
+        if not _witness(fields[k], order):
+            continue  # values differ, but none is an empty result: a category, not a branch
+        out[k] = [json.loads(v) for v in order]
     return out
 
 

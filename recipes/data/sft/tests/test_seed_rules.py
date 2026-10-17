@@ -85,3 +85,12 @@ def test_no_branch_flag_means_no_branch_rules():
     seeds = [trace(["a"], [("mail", {}, {"id": str(i), "subject": "s"})], i) for i in range(4)]
     rules = SeedRules(seeds)
     assert rules.branch_keys == {} and rules.gates == {} and rules.empty_only() == []
+
+
+def test_category_with_full_results_is_not_a_branch():
+    """Values that change which fields come back, but where none is an empty result, are a category, not a branch."""
+    def ticket(cls, i):
+        extra = {"lounge": "A", "meal": "hot"} if cls == "first" else {"meal": "snack"}
+        return trace(["a"], [("book", {"q": f"x{i}"}, {"cabin": cls, "seat": f"{i}A", "price": 100 + i, **extra})], i)
+    seeds = [ticket("first", i) for i in range(3)] + [ticket("coach", 10 + i) for i in range(3)]
+    assert "cabin" not in SeedRules(seeds).branch_keys
