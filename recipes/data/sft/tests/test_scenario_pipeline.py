@@ -292,6 +292,47 @@ def test_coverage_needs_are_checked_against_the_seeds():
     assert "needs must be" in d.check({"name": "x", "seed_ids": ["s0"]})[0]
 
 
+def _scripted_catalogue(monkeypatch, tmp_path, answers):
+    """catalogue() over 3 seeds, the smaller request showing only s0; answers: per call, a capability list or "cut"."""
+    from bandits_sft import scenario_pipeline as sp
+    from bandits_sft.config import Config
+    from bandits_sft.llm import Truncated
+    seeds = [_tool_seed(i, "read", {"rows": [1]}, {"verdict": "ok"}) for i in range(3)]
+    cfg = Config(seeds_path="x", coverage_max_chars=4000)
+    monkeypatch.setattr(sp, "coverage_seeds", lambda s, n: s if n >= cfg.coverage_max_chars else s[:1])
+    monkeypatch.setattr(sp, "get_llm", lambda cfg, role: None)
+    sent, notes = [], []
+
+    def chat(llm, system, msg):
+        sent.append(msg)
+        a = answers.pop(0)
+        if a == "cut":
+            raise Truncated("cut off")
+        return {"capabilities": a}
+    monkeypatch.setattr(sp, "chat_json", chat)
+    kept = sp.catalogue(cfg, seeds, "Explicit: verdict is ok.", tmp_path, lambda step, why: notes.append(why))
+    return kept, sent, notes
+
+
+def _cap(name, seed_id):
+    return {"name": name, "capability": "a gap", "basis": "seed", "seed_ids": [seed_id],
+            "needs": {"tools": [], "tools_with_data": [], "answer": {}}}
+
+
+def test_cut_off_coverage_keeps_the_smaller_request_for_the_corrective_retry(tmp_path, monkeypatch):
+    kept, sent, _ = _scripted_catalogue(monkeypatch, tmp_path, [
+        "cut", [_cap("a", "s0"), _cap("bad", "nope")], [_cap("a", "s0"), _cap("b", "s0")]])
+    assert [c["name"] for c in kept] == ["a", "b"]
+    assert '"s1"' not in sent[2] and "at most 12" in sent[2] and "bad: seed_ids" in sent[2]  # small request + feedback
+    assert (tmp_path / "coverage_small").exists()  # a resume uses the same smaller request
+
+
+def test_corrective_retry_cut_off_twice_keeps_the_earlier_items(tmp_path, monkeypatch):
+    kept, _, notes = _scripted_catalogue(monkeypatch, tmp_path, [
+        [_cap("a", "s2"), _cap("bad", "nope")], "cut", "cut"])
+    assert [c["name"] for c in kept] == ["a"] and "keeping the 1 items" in notes[0]
+
+
 def test_cut_off_coverage_retries_smaller_then_falls_back_to_broad_jobs(tmp_path, fake):
     fake["coverage_cut"] = 1  # first answer cut off, the smaller retry works
     _p, rep, stop, out = drive(tmp_path)

@@ -220,13 +220,18 @@ def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path, fal
     # Embedded instructions are seed data: a capability may cite them as well as the derived contracts.
     known = re.split(r"(?im)^#+\s*unknown\b", contracts, maxsplit=1)[0]
     basis_text = known + "\n" + "\n".join(sorted({s["system"] for s in seeds if s.get("system")}))
-    shown = coverage_seeds(seeds, cfg.coverage_max_chars)
-    request = json.dumps({"contracts": contracts, "seeds": [{"id": s["id"], "system": s["system"], "tools": s["tools"],
-                                                             "trace": json.loads(seed_json(s))} for s in shown]},
-                         ensure_ascii=False)
-    ids = {s["id"] for s in shown}
+    def request_for(max_chars: int, tail: str = "") -> tuple[set, str]:
+        shown = coverage_seeds(seeds, max_chars)
+        return {s["id"] for s in shown}, json.dumps({"contracts": contracts, "seeds": [
+            {"id": s["id"], "system": s["system"], "tools": s["tools"], "trace": json.loads(seed_json(s))}
+            for s in shown]}, ensure_ascii=False) + tail
+
+    # once an answer was cut off, every later call (retry or resume) uses the smaller request and its seed ids
+    small_mark = out_dir / "coverage_small"
+    small = (cfg.coverage_max_chars // 4, "\n\nReturn at most 12 capabilities.")
+    ids, request = request_for(*small) if small_mark.exists() else request_for(cfg.coverage_max_chars)
     demonstrable = Demonstrable(seeds, known)
-    msg = request
+    msg, kept = request, []
     for attempt in range(2):
         raw_path = out_dir / f"coverage_raw_{attempt}.json"
         if raw_path.exists():
@@ -236,18 +241,17 @@ def catalogue(cfg: Config, seeds: list[dict], contracts: str, out_dir: Path, fal
                 out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE, msg)
             except (Truncated, EmptyResponse):
                 # an answer cut off (a model that thinks without end) gets one smaller, shorter retry
-                shown = coverage_seeds(seeds, cfg.coverage_max_chars // 4)
-                ids = {s["id"] for s in shown}
-                small = json.dumps({"contracts": contracts, "seeds": [
-                    {"id": s["id"], "system": s["system"], "tools": s["tools"], "trace": json.loads(seed_json(s))}
-                    for s in shown]}, ensure_ascii=False)
+                small_ids, small_request = request_for(*small)
+                feedback = msg[len(request):]  # a corrective retry keeps its feedback
                 try:
-                    out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE,
-                                    small + "\n\nReturn at most 12 capabilities.")
+                    out = chat_json(get_llm(cfg, "analyzer"), scenario_prompts.COVERAGE, small_request + feedback)
+                    ids, request = small_ids, small_request
+                    small_mark.touch()
                 except (Truncated, EmptyResponse):
                     if fallback:
-                        fallback("coverage", "the coverage answer was cut off twice: no gap jobs, broad jobs only")
-                    out = {"capabilities": []}
+                        left = f"keeping the {len(kept)} items kept before" if kept else "no gap jobs, broad jobs only"
+                        fallback("coverage", f"the coverage answer was cut off twice: {left}")
+                    out = {"capabilities": kept}  # the items an earlier attempt kept are not thrown away
             raw_path.write_text(json.dumps(out, ensure_ascii=False, indent=1))
         capabilities = out.get("capabilities") if isinstance(out, dict) else None
         if not isinstance(capabilities, list):
