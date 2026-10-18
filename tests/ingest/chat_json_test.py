@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from bandits.ingest.chat_json import load_chat_json
@@ -259,3 +260,67 @@ def test_a_result_cannot_replace_the_recorded_call_name(tmp_path) -> None:
     assert tool_span.name == "charge"
     assert tool_span.call_recorded is False
     assert any(issue.kind == "mismatched_tool_result" for issue in corpus.issues)
+
+
+_CONVERSATION = [
+    {"role": "user", "content": "Refund order 7741"},
+    {"role": "assistant", "content": "Done."},
+]
+
+
+def _traces(tmp_path, name: str, text: str) -> tuple[int, list[str]]:
+    path = tmp_path / name
+    path.write_text(text)
+    corpus = load_chat_json(path)
+    return len(corpus.traces), [i.kind for i in corpus.issues]
+
+
+def _jsonl(*records: object) -> str:
+    return "\n".join(json.dumps(r) for r in records) + "\n"
+
+
+def test_json_lines_of_wrapped_conversations_are_read(tmp_path) -> None:
+    wrapped = {"id": "a", "messages": _CONVERSATION}
+    assert _traces(tmp_path, "c.jsonl", _jsonl(wrapped, wrapped)) == (2, [])
+
+
+def test_json_lines_of_bare_message_arrays_are_read(tmp_path) -> None:
+    assert _traces(tmp_path, "c.jsonl", _jsonl(_CONVERSATION, _CONVERSATION, _CONVERSATION)) == (
+        3,
+        [],
+    )
+
+
+def test_an_array_of_message_arrays_is_read(tmp_path) -> None:
+    text = json.dumps([_CONVERSATION, _CONVERSATION])
+    assert _traces(tmp_path, "c.json", text) == (2, [])
+
+
+def test_one_message_per_line_is_one_conversation(tmp_path) -> None:
+    assert _traces(tmp_path, "c.jsonl", _jsonl(*_CONVERSATION)) == (1, [])
+
+
+def test_an_array_of_wrapped_conversations_is_still_read(tmp_path) -> None:
+    text = json.dumps([{"messages": _CONVERSATION}, {"messages": _CONVERSATION}])
+    assert _traces(tmp_path, "c.json", text) == (2, [])
+
+
+def test_a_bad_json_line_is_an_issue_with_its_line_number(tmp_path) -> None:
+    path = tmp_path / "c.jsonl"
+    path.write_text(_jsonl(_CONVERSATION) + "{broken\n" + _jsonl(_CONVERSATION))
+
+    corpus = load_chat_json(path)
+
+    assert len(corpus.traces) == 2
+    assert [(i.kind, i.location) for i in corpus.issues] == [("malformed_json", f"{path}:2")]
+
+
+def test_an_unrecognized_item_is_an_issue_not_a_silent_skip(tmp_path) -> None:
+    text = json.dumps([_CONVERSATION, "oops", 3])
+    count, kinds = _traces(tmp_path, "c.json", text)
+    assert (count, kinds) == (1, ["unrecognized_record", "unrecognized_record"])
+
+
+def test_a_pretty_printed_malformed_document_is_not_read_as_lines(tmp_path) -> None:
+    count, kinds = _traces(tmp_path, "c.json", '{\n  "messages": [\n')
+    assert (count, kinds) == (0, ["malformed_json"])

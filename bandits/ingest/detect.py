@@ -72,11 +72,13 @@ def _shape(record: Any) -> tuple[str, str] | None:
             isinstance(item, dict) and isinstance(item.get("role"), str) for item in record
         ):
             return "chat-json", "top-level role/content messages"
-        if record and isinstance(record[0], dict):
+        if record and isinstance(record[0], (dict, list)):
             return _shape(record[0])
         return None
     if not isinstance(record, dict):
         return None
+    if isinstance(record.get("role"), str) and "messages" not in record:
+        return "chat-json", "one role/content message per record"
     if isinstance(record.get("resourceSpans"), list) or (
         isinstance(record.get("batches"), list)
         and record["batches"]

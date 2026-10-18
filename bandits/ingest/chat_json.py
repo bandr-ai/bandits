@@ -43,24 +43,77 @@ def _settings_of(container: dict) -> dict:
     return {key: container[key] for key in _SETTING_KEYS if container.get(key) is not None}
 
 
-def _conversations(payload: object) -> list[tuple[list[dict], str | None, dict]]:
-    """A file is either one conversation (a bare message array) or a list of them.
+def _is_messages(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, dict) and "role" in item for item in value)
+    )
+
+
+def _conversations(
+    payload: object, issues: list[TraceIssue], location: str = ""
+) -> list[tuple[list[dict], str | None, dict]]:
+    """Every shape a chat export commonly takes, each reduced to conversations.
+
+    - a bare message array: one conversation
+    - ``{"messages": [...], ...}``: one conversation, the rest being its wrapper
+    - an array of either of those, or an array of message arrays
+    - JSON lines (``payload`` is then the list of lines): one of the above per
+      line, or one message per line, which is one conversation
 
     Each is paired with its declared session id and whatever else the wrapper
     declared around the messages — the offered toolset and the settings the run
-    used. A bare message array has nowhere to declare any of that.
+    used. A bare message array has nowhere to declare any of that. An item that
+    fits none of these is an issue, never a silent skip.
     """
-    if (
-        isinstance(payload, list)
-        and payload
-        and all(isinstance(item, dict) and "role" in item for item in payload)
-    ):
-        return [(payload, None, {})]
-    if isinstance(payload, list):
-        return [(c.get("messages", []), _lineage_of(c), c) for c in payload if isinstance(c, dict)]
-    if isinstance(payload, dict):
-        return [(payload.get("messages", []), _lineage_of(payload), payload)]
-    return []
+    found: list[tuple[list[dict], str | None, dict]] = []
+
+    def visit(item: object, where: str, nested: bool) -> None:
+        if _is_messages(item):
+            found.append((item, None, {}))  # type: ignore[arg-type]
+        elif isinstance(item, dict):
+            found.append((item.get("messages", []), _lineage_of(item), item))
+        elif isinstance(item, list) and not nested:
+            for index, inner in enumerate(item):
+                visit(inner, f"{where}[{index}]", True)
+        else:
+            issues.append(
+                TraceIssue(
+                    kind="unrecognized_record",
+                    detail=f"{where}: expected a message array or an object with "
+                    f"messages, found {type(item).__name__}",
+                    location=location,
+                )
+            )
+
+    if _is_messages(payload):
+        return [(payload, None, {})]  # type: ignore[list-item]
+    visit(payload, location or "$", False)
+    return found
+
+
+def _lines(path: Path, raw: bytes, issues: list[TraceIssue]) -> object | None:
+    """Read JSON lines: the whole file did not parse, but its first line might.
+
+    A file whose first line is not JSON by itself (a pretty-printed document) is
+    not JSON lines, and is reported with the error the whole-file parse gave.
+    Lines that do not parse are issues with their line number; the rest are kept.
+    One message per line comes back as a message array, which is one conversation.
+    """
+    records: list[object] = []
+    for number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            if not records:
+                return None
+            issues.append(
+                TraceIssue(kind="malformed_json", detail=str(exc), location=f"{path}:{number}")
+            )
+    return records
 
 
 def _tool_result(content: object) -> object:
@@ -305,15 +358,19 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        issues.append(TraceIssue(kind="malformed_json", detail=str(exc), location=str(path)))
-        return TraceCorpus(
-            source="chat-json",
-            traces=(),
-            issues=tuple(issues),
-            redaction_ruleset=source.ruleset,
-        )
+        payload = None
+        if isinstance(exc, json.JSONDecodeError):
+            payload = _lines(path, raw, issues)
+        if payload is None:
+            issues.append(TraceIssue(kind="malformed_json", detail=str(exc), location=str(path)))
+            return TraceCorpus(
+                source="chat-json",
+                traces=(),
+                issues=tuple(issues),
+                redaction_ruleset=source.ruleset,
+            )
 
-    conversations = _conversations(payload)
+    conversations = _conversations(payload, issues, str(path))
     traces: list[Trace] = []
     for index, (messages, lineage_id, wrapper) in enumerate(conversations):
         location = f"{path}[{index}]"

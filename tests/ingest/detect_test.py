@@ -192,3 +192,26 @@ def test_check_does_not_call_an_errored_model_response_lost(tmp_path: Path) -> N
     result = CliRunner().invoke(app, ["ingest", str(source), "--dry-run"])
     assert result.exit_code == 0, result.output
     assert "no output in a field Bandits reads" not in uncolored(result.output)
+
+
+_CONVERSATION = [
+    {"role": "user", "content": "Refund order 7741"},
+    {"role": "assistant", "content": "Done."},
+]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps([_CONVERSATION, _CONVERSATION]),
+        "\n".join(json.dumps(c) for c in (_CONVERSATION, _CONVERSATION)),
+        "\n".join(json.dumps({"id": str(i), "messages": _CONVERSATION}) for i in range(2)),
+        "\n".join(json.dumps(message) for message in _CONVERSATION),
+    ],
+    ids=["array-of-arrays", "jsonl-bare-arrays", "jsonl-wrapped", "one-message-per-line"],
+)
+def test_detect_every_chat_export_shape_the_loader_reads(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "chat.json"
+    path.write_text(text)
+    assert detect_source(path).source == "chat-json"
+    assert len(load_corpus(path, "auto").traces) >= 1
