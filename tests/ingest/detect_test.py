@@ -215,3 +215,77 @@ def test_detect_every_chat_export_shape_the_loader_reads(tmp_path: Path, text: s
     path.write_text(text)
     assert detect_source(path).source == "chat-json"
     assert len(load_corpus(path, "auto").traces) >= 1
+
+
+def _jsonl(path: Path, *records: object) -> Path:
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return path
+
+
+CLAUDE_CODE_TURN = [
+    {"type": "user", "sessionId": "s", "message": {"role": "user", "content": "hi"}},
+    {"type": "assistant", "sessionId": "s", "message": {"role": "assistant", "content": []}},
+]
+NOISE = [
+    {"type": "summary", "summary": "x", "leafUuid": "u"},
+    {"type": "file-history-snapshot", "messageId": "m", "snapshot": {}},
+    {"type": "queue-operation", "operation": "enqueue", "sessionId": "s"},
+]
+
+
+def test_claude_code_events_between_turns_do_not_hide_the_format(tmp_path: Path) -> None:
+    path = _jsonl(tmp_path / "s.jsonl", *NOISE, *CLAUDE_CODE_TURN, NOISE[0])
+    assert detect_source(path).source == "claude-code"
+
+
+def test_a_file_of_only_noise_is_not_recognized(tmp_path: Path) -> None:
+    with pytest.raises(DetectionError, match="unrecognized"):
+        detect_source(_jsonl(tmp_path / "s.jsonl", *NOISE))
+
+
+def test_a_langchain_system_message_is_not_skipped_as_noise(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "c.json", [{"type": "system", "content": "s"}, {"type": "human", "content": "q"}]
+    )
+    assert detect_source(path).source == "chat-json"
+
+
+def test_tolerant_detection_lets_an_unreadable_line_through_strict_does_not(tmp_path: Path) -> None:
+    good = {"id": "1", "messages": [{"role": "user", "content": "q"}]}
+    path = tmp_path / "c.jsonl"
+    path.write_text("\n".join([json.dumps(good)] * 5 + ["{broken"] + [json.dumps(good)] * 4) + "\n")
+    with pytest.raises(DetectionError, match="malformed JSONL"):
+        detect_source(path)
+    assert detect_source(path, tolerant=True).source == "chat-json"
+
+
+def test_tolerant_detection_still_refuses_when_most_of_the_sample_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    good = {"id": "1", "messages": [{"role": "user", "content": "q"}]}
+    path = tmp_path / "c.jsonl"
+    path.write_text("\n".join([json.dumps(good), "x", "y", "z"]) + "\n")
+    with pytest.raises(DetectionError, match="malformed JSONL"):
+        detect_source(path, tolerant=True)
+
+
+def test_tolerant_detection_lets_a_minority_of_unknown_records_through(tmp_path: Path) -> None:
+    good = {"id": "1", "messages": [{"role": "user", "content": "q"}]}
+    path = _jsonl(tmp_path / "c.jsonl", *([good] * 6), {"unrelated": True})
+    with pytest.raises(DetectionError, match="unrecognized"):
+        detect_source(path)
+    assert detect_source(path, tolerant=True).source == "chat-json"
+
+
+def test_a_leading_blank_line_and_a_bom_do_not_matter(tmp_path: Path) -> None:
+    path = tmp_path / "c.jsonl"
+    path.write_bytes(
+        b"\xef\xbb\xbf\n" + json.dumps({"messages": [{"role": "user", "content": "q"}]}).encode()
+    )
+    assert detect_source(path).source == "chat-json"
+
+
+def test_a_byte_that_is_not_utf8_is_not_a_crash(tmp_path: Path) -> None:
+    path = tmp_path / "c.jsonl"
+    path.write_bytes(b'{"messages": [{"role": "user", "content": "bad \xff"}]}\n')
+    assert detect_source(path).source == "chat-json"

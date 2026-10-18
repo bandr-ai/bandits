@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.records import read_records
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
@@ -172,19 +173,9 @@ def _load_session(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> Tr
     session_id: str | None = None
     ordinal = 0
 
-    records: list[dict] = []
-    for index, line in enumerate(source.data.decode("utf-8", "replace").splitlines()):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            issues.append(
-                TraceIssue(kind="malformed_json", detail=str(exc), location=f"{path}:{index + 1}")
-            )
-            continue
-        if isinstance(record, dict):
-            records.append(record)
+    read = read_records(source.data, str(path))
+    issues.extend(read.issues)
+    records: list[dict] = [r.value for r in read.records if isinstance(r.value, dict)]
 
     # Results are collected first: a tool_result appears in a later record than
     # the call it answers, and a call whose result never arrives must stay

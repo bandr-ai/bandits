@@ -15,6 +15,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from bandits.ingest.records import read_records
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn
@@ -43,12 +44,60 @@ def _settings_of(container: dict) -> dict:
     return {key: container[key] for key in _SETTING_KEYS if container.get(key) is not None}
 
 
+_ROLES = {
+    "user": "user", "human": "user",
+    "assistant": "assistant", "ai": "assistant", "gpt": "assistant", "bot": "assistant",
+    "model": "assistant",
+    "system": "system", "developer": "developer",
+    "tool": "tool", "function": "tool", "observation": "tool",
+}  # fmt: skip
+"""Role names exports use for the five roles Bandits reads (OpenAI, ShareGPT, Gemini, LangChain)."""
+_ROLE_KEYS = ("role", "from", "speaker")
+_TYPE_ROLES = {
+    "human": "user",
+    "ai": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "function": "tool",
+}
+"""LangChain spells the role as ``type``. ``user`` and ``assistant`` are left out on purpose: a
+Claude Code event is ``{"type": "user", ...}`` and must not be taken for a chat message."""
+_WRAPPER_KEYS = (
+    "messages",
+    "conversations",
+    "conversation",
+    "turns",
+    "contents",
+    "chat",
+    "history",
+)
+"""Where a wrapper object keeps its list of messages."""
+_TEXT_TYPES = (None, "text", "input_text", "output_text")
+
+
+def _role_of(message: dict) -> tuple[str | None, str | None]:
+    """The role as Bandits names it, and the role as the export wrote it (None if it has none)."""
+    for key in _ROLE_KEYS:
+        raw = message.get(key)
+        if isinstance(raw, str):
+            return _ROLES.get(raw.strip().lower()), raw
+    raw = message.get("type")
+    if isinstance(raw, str) and raw in _TYPE_ROLES and "sessionId" not in message:
+        return _TYPE_ROLES[raw], raw
+    return None, None
+
+
 def _is_messages(value: object) -> bool:
     return (
         isinstance(value, list)
         and bool(value)
-        and all(isinstance(item, dict) and "role" in item for item in value)
+        and all(isinstance(item, dict) and _role_of(item)[1] is not None for item in value)
     )
+
+
+def messages_key(container: dict) -> str | None:
+    """The key a wrapper keeps its messages under, if it keeps them under one."""
+    return next((k for k in _WRAPPER_KEYS if _is_messages(container.get(k))), None)
 
 
 def _conversations(
@@ -57,7 +106,8 @@ def _conversations(
     """Every shape a chat export commonly takes, each reduced to conversations.
 
     - a bare message array: one conversation
-    - ``{"messages": [...], ...}``: one conversation, the rest being its wrapper
+    - ``{"messages": [...], ...}`` (or ``conversations``, ``turns``, ``contents``...): one
+      conversation, the rest being its wrapper
     - an array of either of those, or an array of message arrays
     - JSON lines (``payload`` is then the list of lines): one of the above per
       line, or one message per line, which is one conversation
@@ -73,7 +123,8 @@ def _conversations(
         if _is_messages(item):
             found.append((item, None, {}))  # type: ignore[arg-type]
         elif isinstance(item, dict):
-            found.append((item.get("messages", []), _lineage_of(item), item))
+            key = messages_key(item)
+            found.append((item[key] if key else item.get("messages", []), _lineage_of(item), item))
         elif isinstance(item, list) and not nested:
             for index, inner in enumerate(item):
                 visit(inner, f"{where}[{index}]", True)
@@ -93,27 +144,149 @@ def _conversations(
     return found
 
 
-def _lines(path: Path, raw: bytes, issues: list[TraceIssue]) -> object | None:
-    """Read JSON lines: the whole file did not parse, but its first line might.
+def _text_of(content: object) -> object:
+    """A message or tool-result body as text when it is made of text blocks, else as it came."""
+    if not isinstance(content, list):
+        return content
+    texts = [
+        b if isinstance(b, str) else b.get("text")
+        for b in content
+        if isinstance(b, str) or (isinstance(b, dict) and b.get("type") in _TEXT_TYPES)
+    ]
+    if all(isinstance(t, str) for t in texts) and len(texts) == len(content):
+        return "\n".join(texts)
+    return content
 
-    A file whose first line is not JSON by itself (a pretty-printed document) is
-    not JSON lines, and is reported with the error the whole-file parse gave.
-    Lines that do not parse are issues with their line number; the rest are kept.
-    One message per line comes back as a message array, which is one conversation.
-    """
-    records: list[object] = []
-    for number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            if not records:
-                return None
-            issues.append(
-                TraceIssue(kind="malformed_json", detail=str(exc), location=f"{path}:{number}")
+
+def _blocks(sequence: list) -> dict:
+    """Split content blocks (OpenAI parts, Anthropic blocks, Gemini parts) by what they are."""
+    out: dict = {"texts": [], "calls": [], "results": [], "thinking": [], "other": False}
+    for block in sequence:
+        if isinstance(block, str):
+            out["texts"].append(block)
+        elif not isinstance(block, dict):
+            out["other"] = True
+        elif block.get("type") == "tool_use":
+            out["calls"].append(
+                {
+                    "id": block.get("id"),
+                    "function": {"name": block.get("name"), "arguments": block.get("input")},
+                }
             )
-    return records
+        elif block.get("type") == "tool_result":
+            out["results"].append(
+                {
+                    "tool_call_id": block.get("tool_use_id"),
+                    "content": _text_of(block.get("content")),
+                }
+            )
+        elif isinstance(block.get("functionCall"), dict):
+            call = block["functionCall"]
+            out["calls"].append(
+                {
+                    "id": None,
+                    "_by_name": True,
+                    "function": {"name": call.get("name"), "arguments": call.get("args")},
+                }
+            )
+        elif isinstance(block.get("functionResponse"), dict):
+            reply = block["functionResponse"]
+            out["results"].append(
+                {
+                    "name": reply.get("name"),
+                    "_by_name": True,
+                    "content": json.dumps(reply.get("response")),
+                }
+            )
+        elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+            out["thinking"].append(block["thinking"])
+        elif block.get("type") == "redacted_thinking":
+            continue
+        elif block.get("type") in _TEXT_TYPES and isinstance(block.get("text"), str):
+            out["texts"].append(block["text"])
+        else:
+            out["other"] = True
+    return out
+
+
+def _normalize(messages: list, issues: list[TraceIssue], location: str) -> list[dict]:
+    """Every message as the OpenAI-style ``{role, content, tool_calls}`` the conversion reads.
+
+    Roles and keys other exports use are mapped (ShareGPT ``from``/``value``, LangChain
+    ``type``, Gemini ``role: model`` with ``parts``); Anthropic content blocks become text,
+    ``tool_calls`` and ``tool`` messages. A message that cannot be mapped is an issue, never
+    a silent drop. ``_index`` keeps the message's place in the export for issue details.
+    """
+    out: list[dict] = []
+    for position, message in enumerate(messages):
+        index = message.get("_index", position)
+        if not isinstance(message, dict):
+            issues.append(
+                TraceIssue(
+                    kind="unrecognized_record",
+                    detail=f"message {index} is a {type(message).__name__}, not an object",
+                    location=location,
+                )
+            )
+            continue
+        role, raw = _role_of(message)
+        if raw is None:
+            issues.append(
+                TraceIssue(
+                    kind="unrecognized_record",
+                    detail=f"message {index} has no role",
+                    location=location,
+                )
+            )
+            continue
+        if role is None:
+            issues.append(
+                TraceIssue(
+                    kind="unrecognized_role",
+                    detail=f"message {index} has the role {raw[:40]!r}, which Bandits does not read",
+                    location=location,
+                )
+            )
+            continue
+        by_name = raw.strip().lower() == "function"
+        content = next((message[k] for k in ("content", "value", "text") if k in message), None)
+        sequence = content if isinstance(content, list) else message.get("parts")
+        plain = {
+            **message,
+            "role": role,
+            "content": _text_of(content) if sequence is None else content,
+            "_index": index,
+        }
+        if isinstance(message.get("function_call"), dict) and not message.get("tool_calls"):
+            plain["tool_calls"] = [
+                {"id": None, "_by_name": True, "function": message["function_call"]}
+            ]
+        if by_name:
+            plain["_by_name"] = True
+        if not isinstance(sequence, list):
+            out.append(plain)
+            continue
+        parts = _blocks(sequence)
+        text = "\n".join(parts["texts"]) if parts["texts"] else None
+        for result in parts["results"]:
+            out.append({**result, "role": "tool", "_index": index})
+        if role == "assistant":
+            calls = [*(message.get("tool_calls") or []), *parts["calls"]]
+            out.append(
+                {
+                    **plain,
+                    "content": text,
+                    "tool_calls": calls,
+                    "_thinking": "\n".join(parts["thinking"]) or None,
+                }
+            )
+        elif parts["results"] and not (parts["texts"] or parts["other"]):
+            continue
+        elif parts["other"] and role == "user":
+            out.append({**plain, "content": sequence})
+        else:
+            out.append({**plain, "content": text})
+    return out
 
 
 def _tool_result(content: object) -> object:
@@ -150,6 +323,7 @@ def _convert_conversation(
     location: str,
     issues: list[TraceIssue],
 ) -> Trace | None:
+    messages = _normalize(messages, issues, location)
     # Every system and developer message, in order. Keeping only the first
     # dropped the developer instruction that narrowed it, which is the half that
     # usually carries the constraint the run was actually held to.
@@ -165,6 +339,9 @@ def _convert_conversation(
     unrepresented = 0
     pending_calls: dict[str, tuple[str, str]] = {}
     """tool_call_id -> (span_id, tool name) for a call awaiting one result."""
+    pending_by_name: dict[str, list[str]] = {}
+    """Calls with no id (the legacy ``function_call``, Gemini's ``functionCall``), by tool name:
+    their result names the function instead of an id, and answers the oldest one."""
     ordinal = 0
 
     for index, message in enumerate(messages):
@@ -196,7 +373,25 @@ def _convert_conversation(
 
         if role == "assistant":
             calls = _tool_calls(message)
+            text = message.get("content")
+            thinking = {"thinking": message["_thinking"]} if message.get("_thinking") else {}
             if calls:
+                if isinstance(text, str) and text.strip():
+                    # What the assistant said before its calls is a span of its own, ahead of
+                    # them, as the Claude Code reader records it. It is part of the turn.
+                    spans.append(
+                        Span(
+                            span_id=f"{trace_id}:span-{ordinal}",
+                            parent_span_id=None,
+                            kind=SpanKind.MODEL,
+                            name="assistant",
+                            started_at=timestamp,
+                            ended_at=timestamp,
+                            output=text,
+                            attributes={"synthetic_time": True, **thinking},
+                        )
+                    )
+                    ordinal += 1
                 for call in calls:
                     function = (
                         call.get("function") if isinstance(call.get("function"), dict) else call
@@ -233,6 +428,8 @@ def _convert_conversation(
                     )
                     if isinstance(call_id, str) and call_id:
                         pending_calls[call_id] = (span_id, name)
+                    elif call.get("_by_name"):
+                        pending_by_name.setdefault(name, []).append(span_id)
                     ordinal += 1
             else:
                 content = message.get("content")
@@ -246,7 +443,7 @@ def _convert_conversation(
                         started_at=timestamp,
                         ended_at=timestamp,
                         output=content,
-                        attributes={"synthetic_time": True},
+                        attributes={"synthetic_time": True, **thinking},
                     )
                 )
                 ordinal += 1
@@ -255,6 +452,10 @@ def _convert_conversation(
             call_id = message.get("tool_call_id")
             pending = pending_calls.pop(call_id, None) if isinstance(call_id, str) else None
             declared_name = message.get("name")
+            if pending is None and message.get("_by_name") and isinstance(declared_name, str):
+                waiting = pending_by_name.get(declared_name)
+                if waiting:
+                    pending = (waiting.pop(0), declared_name)
             name_mismatch = (
                 pending is not None
                 and isinstance(declared_name, str)
@@ -355,20 +556,20 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
     source_digest = source.source_digest
 
     issues: list[TraceIssue] = list(source.issues)
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        payload = None
-        if isinstance(exc, json.JSONDecodeError):
-            payload = _lines(path, raw, issues)
-        if payload is None:
-            issues.append(TraceIssue(kind="malformed_json", detail=str(exc), location=str(path)))
-            return TraceCorpus(
-                source="chat-json",
-                traces=(),
-                issues=tuple(issues),
-                redaction_ruleset=source.ruleset,
+    read = read_records(raw, str(path))
+    issues.extend(read.issues)
+    if not read.records:
+        if not read.issues:
+            issues.append(
+                TraceIssue(kind="empty_file", detail="the file has no content", location=str(path))
             )
+        return TraceCorpus(
+            source="chat-json",
+            traces=(),
+            issues=tuple(issues),
+            redaction_ruleset=source.ruleset,
+        )
+    payload = read.records[0].value if read.layout == "document" else read.values
 
     conversations = _conversations(payload, issues, str(path))
     traces: list[Trace] = []
