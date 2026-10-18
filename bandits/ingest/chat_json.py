@@ -101,7 +101,7 @@ def messages_key(container: dict) -> str | None:
 
 
 def _conversations(
-    payload: object, issues: list[TraceIssue], location: str = ""
+    payload: object, issues: list[TraceIssue], location: str = "", lines: bool = False
 ) -> list[tuple[list[dict], str | None, dict]]:
     """Every shape a chat export commonly takes, each reduced to conversations.
 
@@ -110,7 +110,8 @@ def _conversations(
       conversation, the rest being its wrapper
     - an array of either of those, or an array of message arrays
     - JSON lines (``payload`` is then the list of lines): one of the above per
-      line, or one message per line, which is one conversation
+      line (a line may itself be an array of conversations), or one message per line,
+      which is one conversation
 
     Each is paired with its declared session id and whatever else the wrapper
     declared around the messages — the offered toolset and the settings the run
@@ -140,7 +141,13 @@ def _conversations(
 
     if _is_messages(payload):
         return [(payload, None, {})]  # type: ignore[list-item]
-    visit(payload, location or "$", False)
+    if lines and isinstance(payload, list):
+        # Each line is its own document, so an array of conversations on one line is as
+        # welcome as it is in a single-document file.
+        for index, line in enumerate(payload):
+            visit(line, f"{location or '$'}[{index}]", False)
+    else:
+        visit(payload, location or "$", False)
     return found
 
 
@@ -582,7 +589,9 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
     # list would turn a document of conversations into a conversation of lists.
     payload = read.records[0].value if len(read.records) == 1 else read.values
 
-    conversations = _conversations(payload, issues, str(path))
+    conversations = _conversations(
+        payload, issues, str(path), lines=len(read.records) > 1
+    )
     traces: list[Trace] = []
     for index, (messages, lineage_id, wrapper) in enumerate(conversations):
         location = f"{path}[{index}]"

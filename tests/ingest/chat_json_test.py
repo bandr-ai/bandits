@@ -293,6 +293,11 @@ def test_json_lines_of_bare_message_arrays_are_read(tmp_path) -> None:
     )
 
 
+def test_json_lines_each_holding_an_array_of_conversations_are_read(tmp_path) -> None:
+    batch = [_CONVERSATION, _CONVERSATION]
+    assert _traces(tmp_path, "c.jsonl", _jsonl(batch, [_CONVERSATION])) == (3, [])
+
+
 def test_an_array_of_message_arrays_is_read(tmp_path) -> None:
     text = json.dumps([_CONVERSATION, _CONVERSATION])
     assert _traces(tmp_path, "c.json", text) == (2, [])
