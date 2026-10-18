@@ -218,8 +218,16 @@ def _normalize(messages: list, issues: list[TraceIssue], location: str) -> list[
     a silent drop. ``_index`` keeps the message's place in the export for issue details.
     """
     out: list[dict] = []
-    for position, message in enumerate(messages):
-        index = message.get("_index", position)
+    if not isinstance(messages, list):
+        issues.append(
+            TraceIssue(
+                kind="unrecognized_record",
+                detail=f"the messages are a {type(messages).__name__}, not a list",
+                location=location,
+            )
+        )
+        return out
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             issues.append(
                 TraceIssue(
@@ -344,7 +352,8 @@ def _convert_conversation(
     their result names the function instead of an id, and answers the oldest one."""
     ordinal = 0
 
-    for index, message in enumerate(messages):
+    for position, message in enumerate(messages):
+        index = message.get("_index", position)
         role = message.get("role")
         timestamp = _EPOCH + timedelta(seconds=ordinal)
 

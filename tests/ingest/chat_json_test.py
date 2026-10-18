@@ -577,3 +577,49 @@ def test_an_empty_file_is_an_issue(tmp_path) -> None:
     path.write_text("  \n")
     corpus = load_chat_json(path)
     assert corpus.traces == () and [i.kind for i in corpus.issues] == ["empty_file"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"messages": "oops"}, id="string"),
+        pytest.param({"messages": [1, 2, 3]}, id="list-of-numbers"),
+        pytest.param({"messages": 5}, id="number"),
+        pytest.param({"messages": None}, id="null"),
+        pytest.param({"messages": {"role": "user", "content": "x"}}, id="object"),
+        pytest.param([{"messages": "oops"}, {"messages": [1, 2, 3]}], id="list-of-bad-wrappers"),
+    ],
+)
+def test_a_wrapper_whose_messages_are_not_messages_is_an_issue_not_a_crash(
+    tmp_path, payload
+) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(payload))
+
+    corpus = load_chat_json(path)
+
+    assert corpus.traces == ()
+    kinds = {i.kind for i in corpus.issues}
+    assert "unrecognized_record" in kinds
+    assert "no_user_message" in kinds
+
+
+def test_issue_details_name_the_message_by_its_place_in_the_export(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "narrator", "content": "skipped"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "image"}]},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
+    )
+
+    corpus = load_chat_json(path)
+
+    details = {i.kind: i.detail for i in corpus.issues}
+    assert "message 1" in details["unrecognized_role"]
+    assert "message 3" in details["unrepresentable_user_turn"]
