@@ -119,3 +119,18 @@ def test_reading_resumes_at_the_next_record_after_a_bad_one() -> None:
     result = read_records(b'{"a": 1}\n{"b": \n{"c": 3}\n', "f")
     assert result.values == [{"a": 1}, {"c": 3}]
     assert [i.kind for i in result.issues] == ["malformed_json"]
+
+
+def test_a_replaced_byte_does_not_turn_one_document_into_a_stream() -> None:
+    data = b'[{"t": "bad \xff"}, {"t": "ok"}]'
+    result = read_records(data, "f")
+    assert result.layout == "document"
+    assert [i.kind for i in result.issues] == ["invalid_utf8"]
+    assert len(result.records) == 1
+
+
+def test_a_malformed_tail_after_one_document_makes_it_a_stream_with_the_document_kept() -> None:
+    result = read_records(b'[{"a": 1}]\n{oops\n', "f")
+    assert result.layout == "stream"
+    assert result.values == [[{"a": 1}]]
+    assert [i.kind for i in result.issues] == ["malformed_json"]

@@ -146,5 +146,7 @@ def read_records(
         out.records.append(Record(value, line))
         at = _skip_space(text, stop)
     flush_bad(1 + text.rstrip().count("\n") + 1)
-    out.layout = "document" if len(out.records) == 1 and not out.issues else "stream"
+    # Only a stretch that was not JSON makes it a stream; a replaced byte does not.
+    malformed = any(i.kind == "malformed_json" for i in out.issues)
+    out.layout = "document" if len(out.records) == 1 and not malformed else "stream"
     return out

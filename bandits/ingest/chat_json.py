@@ -578,7 +578,9 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
             issues=tuple(issues),
             redaction_ruleset=source.ruleset,
         )
-    payload = read.records[0].value if read.layout == "document" else read.values
+    # One record is the export itself, however clean the rest of the file was. Wrapping it in a
+    # list would turn a document of conversations into a conversation of lists.
+    payload = read.records[0].value if len(read.records) == 1 else read.values
 
     conversations = _conversations(payload, issues, str(path))
     traces: list[Trace] = []

@@ -623,3 +623,52 @@ def test_issue_details_name_the_message_by_its_place_in_the_export(tmp_path) -> 
     details = {i.kind: i.detail for i in corpus.issues}
     assert "message 1" in details["unrecognized_role"]
     assert "message 3" in details["unrepresentable_user_turn"]
+
+
+def _wrapped(text: str) -> dict:
+    return {"messages": [{"role": "user", "content": text}, {"role": "assistant", "content": "yo"}]}
+
+
+@pytest.mark.parametrize(
+    ("name", "suffix"),
+    [
+        pytest.param("bad-byte", b"", id="invalid-utf8-inside"),
+        pytest.param("malformed-tail", b"\n{oops\n", id="malformed-json-after"),
+        pytest.param("trailing-text", b"\ntrailing words\n", id="text-after"),
+    ],
+)
+def test_one_document_of_conversations_is_still_read_when_the_file_has_a_problem(
+    tmp_path, name, suffix
+) -> None:
+    body = json.dumps([_wrapped("a"), _wrapped("b")]).encode()
+    if name == "bad-byte":
+        body = body.replace(b'"a"', b'"h\xffi"', 1)
+    path = tmp_path / "c.json"
+    path.write_bytes(body + suffix)
+
+    corpus = load_chat_json(path)
+
+    assert len(corpus.traces) == 2
+    assert {i.kind for i in corpus.issues} <= {"invalid_utf8", "malformed_json"}
+    assert corpus.issues
+
+
+def test_a_stray_non_object_among_the_messages_is_one_issue_and_the_rest_is_read(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    "hi",
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]
+            }
+        )
+    )
+
+    corpus = load_chat_json(path)
+
+    assert [t.task for t in corpus.traces] == ["q"]
+    assert [i.kind for i in corpus.issues] == ["unrecognized_record"]
+    assert "message 0" in corpus.issues[0].detail
