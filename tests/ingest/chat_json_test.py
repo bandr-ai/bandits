@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from bandits.ingest.chat_json import load_chat_json
 from bandits.traces import SpanKind
@@ -259,3 +262,418 @@ def test_a_result_cannot_replace_the_recorded_call_name(tmp_path) -> None:
     assert tool_span.name == "charge"
     assert tool_span.call_recorded is False
     assert any(issue.kind == "mismatched_tool_result" for issue in corpus.issues)
+
+
+_CONVERSATION = [
+    {"role": "user", "content": "Refund order 7741"},
+    {"role": "assistant", "content": "Done."},
+]
+
+
+def _traces(tmp_path, name: str, text: str) -> tuple[int, list[str]]:
+    path = tmp_path / name
+    path.write_text(text)
+    corpus = load_chat_json(path)
+    return len(corpus.traces), [i.kind for i in corpus.issues]
+
+
+def _jsonl(*records: object) -> str:
+    return "\n".join(json.dumps(r) for r in records) + "\n"
+
+
+def test_json_lines_of_wrapped_conversations_are_read(tmp_path) -> None:
+    wrapped = {"id": "a", "messages": _CONVERSATION}
+    assert _traces(tmp_path, "c.jsonl", _jsonl(wrapped, wrapped)) == (2, [])
+
+
+def test_json_lines_of_bare_message_arrays_are_read(tmp_path) -> None:
+    assert _traces(tmp_path, "c.jsonl", _jsonl(_CONVERSATION, _CONVERSATION, _CONVERSATION)) == (
+        3,
+        [],
+    )
+
+
+def test_json_lines_each_holding_an_array_of_conversations_are_read(tmp_path) -> None:
+    batch = [_CONVERSATION, _CONVERSATION]
+    assert _traces(tmp_path, "c.jsonl", _jsonl(batch, [_CONVERSATION])) == (3, [])
+
+
+def test_an_array_of_message_arrays_is_read(tmp_path) -> None:
+    text = json.dumps([_CONVERSATION, _CONVERSATION])
+    assert _traces(tmp_path, "c.json", text) == (2, [])
+
+
+def test_one_message_per_line_is_one_conversation(tmp_path) -> None:
+    assert _traces(tmp_path, "c.jsonl", _jsonl(*_CONVERSATION)) == (1, [])
+
+
+def test_an_array_of_wrapped_conversations_is_still_read(tmp_path) -> None:
+    text = json.dumps([{"messages": _CONVERSATION}, {"messages": _CONVERSATION}])
+    assert _traces(tmp_path, "c.json", text) == (2, [])
+
+
+def test_a_bad_json_line_is_an_issue_with_its_line_number(tmp_path) -> None:
+    path = tmp_path / "c.jsonl"
+    path.write_text(_jsonl(_CONVERSATION) + "{broken\n" + _jsonl(_CONVERSATION))
+
+    corpus = load_chat_json(path)
+
+    assert len(corpus.traces) == 2
+    assert [(i.kind, i.location) for i in corpus.issues] == [("malformed_json", f"{path}:2")]
+
+
+def test_an_unrecognized_item_is_an_issue_not_a_silent_skip(tmp_path) -> None:
+    text = json.dumps([_CONVERSATION, "oops", 3])
+    count, kinds = _traces(tmp_path, "c.json", text)
+    assert (count, kinds) == (1, ["unrecognized_record", "unrecognized_record"])
+
+
+def test_a_pretty_printed_malformed_document_is_not_read_as_lines(tmp_path) -> None:
+    count, kinds = _traces(tmp_path, "c.json", '{\n  "messages": [\n')
+    assert (count, kinds) == (0, ["malformed_json"])
+
+
+def _spans(corpus):
+    return [(s.kind.name, s.name, s.parent_span_id is not None) for s in corpus.traces[0].spans]
+
+
+def test_text_said_before_a_tool_call_is_its_own_span_ahead_of_the_call(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "refund 7"},
+                {
+                    "role": "assistant",
+                    "content": "Let me check the order first.",
+                    "tool_calls": [{"id": "c1", "function": {"name": "lookup", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "c1", "name": "lookup", "content": "{}"},
+                {"role": "assistant", "content": "Done."},
+            ]
+        )
+    )
+    corpus = load_chat_json(path)
+    spans = corpus.traces[0].spans
+    assert [s.name for s in spans] == ["assistant", "lookup", "lookup", "assistant"]
+    assert spans[0].output == "Let me check the order first."
+    assert spans[2].parent_span_id == spans[1].span_id
+    assert corpus.issues == ()
+
+
+def test_legacy_function_call_and_function_result_pair_by_name(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "refund 7"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "lookup", "arguments": '{"id": "7"}'},
+                },
+                {"role": "function", "name": "lookup", "content": '{"status": "paid"}'},
+                {"role": "assistant", "content": "Done."},
+            ]
+        )
+    )
+    corpus = load_chat_json(path)
+    assert _spans(corpus) == [
+        ("MODEL", "lookup", False),
+        ("TOOL", "lookup", True),
+        ("MODEL", "assistant", False),
+    ]
+    assert corpus.traces[0].spans[1].output == {"status": "paid"}
+    assert corpus.issues == ()
+
+
+def test_an_unknown_role_is_an_issue_and_the_rest_of_the_conversation_is_kept(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "narrator", "content": "meanwhile"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        )
+    )
+    corpus = load_chat_json(path)
+    assert len(corpus.traces) == 1
+    assert [i.kind for i in corpus.issues] == ["unrecognized_role"]
+    assert "narrator" in corpus.issues[0].detail
+
+
+def test_anthropic_content_blocks_become_text_calls_and_results(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "refund 7"}]},
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "hmm"},
+                                {"type": "text", "text": "checking"},
+                                {
+                                    "type": "tool_use",
+                                    "id": "t1",
+                                    "name": "lookup",
+                                    "input": {"id": "7"},
+                                },
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "t1", "content": "paid"}
+                            ],
+                        },
+                        {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+                    ]
+                }
+            ]
+        )
+    )
+    corpus = load_chat_json(path)
+    trace = corpus.traces[0]
+    assert trace.task == "refund 7"
+    assert [(s.kind.name, s.name) for s in trace.spans] == [
+        ("MODEL", "assistant"),
+        ("MODEL", "lookup"),
+        ("TOOL", "lookup"),
+        ("MODEL", "assistant"),
+    ]
+    assert trace.spans[0].attributes["thinking"] == "hmm"
+    assert trace.spans[1].arguments == {"id": "7"}
+    assert trace.spans[2].parent_span_id == trace.spans[1].span_id
+    assert corpus.issues == ()
+
+
+def test_a_user_turn_with_an_image_block_is_still_counted_not_flattened(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ok"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "see"}, {"type": "image", "source": {}}],
+                },
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
+    )
+    corpus = load_chat_json(path)
+    assert [i.kind for i in corpus.issues] == ["unrepresentable_user_turn"]
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        pytest.param(
+            [{"conversations": [{"from": "human", "value": "q"}, {"from": "gpt", "value": "a"}]}],
+            id="sharegpt",
+        ),
+        pytest.param(
+            [
+                {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "q"}]},
+                        {"role": "model", "parts": [{"text": "a"}]},
+                    ]
+                }
+            ],
+            id="gemini",
+        ),
+        pytest.param(
+            [{"type": "human", "content": "q"}, {"type": "ai", "content": "a"}], id="langchain"
+        ),
+        pytest.param(
+            [
+                {
+                    "id": "1",
+                    "turns": [
+                        {"role": "user", "content": "q"},
+                        {"role": "assistant", "content": "a"},
+                    ],
+                }
+            ],
+            id="turns",
+        ),
+        pytest.param(
+            [{"role": "user", "text": "q"}, {"role": "assistant", "text": "a"}], id="text-key"
+        ),
+    ],
+)
+def test_other_exports_chat_shapes_are_read(tmp_path, export) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(export))
+    corpus = load_chat_json(path)
+    assert [t.task for t in corpus.traces] == ["q"]
+    assert corpus.issues == ()
+
+
+def test_gemini_function_call_and_response_pair_by_name(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            {
+                "contents": [
+                    {"role": "user", "parts": [{"text": "refund 7"}]},
+                    {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "lookup", "args": {"id": "7"}}}],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"functionResponse": {"name": "lookup", "response": {"status": "paid"}}}
+                        ],
+                    },
+                    {"role": "model", "parts": [{"text": "Done."}]},
+                ]
+            }
+        )
+    )
+    corpus = load_chat_json(path)
+    assert _spans(corpus) == [
+        ("MODEL", "lookup", False),
+        ("TOOL", "lookup", True),
+        ("MODEL", "assistant", False),
+    ]
+    assert corpus.traces[0].spans[1].output == {"status": "paid"}
+
+
+def test_a_claude_code_event_is_not_taken_for_a_chat_message(tmp_path) -> None:
+    path = tmp_path / "c.jsonl"
+    path.write_text(
+        json.dumps({"type": "user", "sessionId": "s", "message": {"role": "user", "content": "x"}})
+    )
+    corpus = load_chat_json(path)
+    assert corpus.traces == ()
+
+
+def test_jsonl_with_raw_unicode_line_separators_and_a_bom_is_read(tmp_path) -> None:
+    path = tmp_path / "c.jsonl"
+    rows = [
+        {
+            "id": str(i),
+            "messages": [
+                {"role": "user", "content": f"a b {i}"},
+                {"role": "assistant", "content": "ok"},
+            ],
+        }
+        for i in range(2)
+    ]
+    path.write_bytes(
+        b"\xef\xbb\xbf" + "\n".join(json.dumps(r, ensure_ascii=False) for r in rows).encode()
+    )
+    corpus = load_chat_json(path)
+    assert [t.task for t in corpus.traces] == ["a b 0", "a b 1"]
+    assert corpus.issues == ()
+
+
+def test_an_empty_file_is_an_issue(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text("  \n")
+    corpus = load_chat_json(path)
+    assert corpus.traces == () and [i.kind for i in corpus.issues] == ["empty_file"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"messages": "oops"}, id="string"),
+        pytest.param({"messages": [1, 2, 3]}, id="list-of-numbers"),
+        pytest.param({"messages": 5}, id="number"),
+        pytest.param({"messages": None}, id="null"),
+        pytest.param({"messages": {"role": "user", "content": "x"}}, id="object"),
+        pytest.param([{"messages": "oops"}, {"messages": [1, 2, 3]}], id="list-of-bad-wrappers"),
+    ],
+)
+def test_a_wrapper_whose_messages_are_not_messages_is_an_issue_not_a_crash(
+    tmp_path, payload
+) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(payload))
+
+    corpus = load_chat_json(path)
+
+    assert corpus.traces == ()
+    kinds = {i.kind for i in corpus.issues}
+    assert "unrecognized_record" in kinds
+    assert "no_user_message" in kinds
+
+
+def test_issue_details_name_the_message_by_its_place_in_the_export(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "narrator", "content": "skipped"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "image"}]},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
+    )
+
+    corpus = load_chat_json(path)
+
+    details = {i.kind: i.detail for i in corpus.issues}
+    assert "message 1" in details["unrecognized_role"]
+    assert "message 3" in details["unrepresentable_user_turn"]
+
+
+def _wrapped(text: str) -> dict:
+    return {"messages": [{"role": "user", "content": text}, {"role": "assistant", "content": "yo"}]}
+
+
+@pytest.mark.parametrize(
+    ("name", "suffix"),
+    [
+        pytest.param("bad-byte", b"", id="invalid-utf8-inside"),
+        pytest.param("malformed-tail", b"\n{oops\n", id="malformed-json-after"),
+        pytest.param("trailing-text", b"\ntrailing words\n", id="text-after"),
+    ],
+)
+def test_one_document_of_conversations_is_still_read_when_the_file_has_a_problem(
+    tmp_path, name, suffix
+) -> None:
+    body = json.dumps([_wrapped("a"), _wrapped("b")]).encode()
+    if name == "bad-byte":
+        body = body.replace(b'"a"', b'"h\xffi"', 1)
+    path = tmp_path / "c.json"
+    path.write_bytes(body + suffix)
+
+    corpus = load_chat_json(path)
+
+    assert len(corpus.traces) == 2
+    assert {i.kind for i in corpus.issues} <= {"invalid_utf8", "malformed_json"}
+    assert corpus.issues
+
+
+def test_a_stray_non_object_among_the_messages_is_one_issue_and_the_rest_is_read(tmp_path) -> None:
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    "hi",
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]
+            }
+        )
+    )
+
+    corpus = load_chat_json(path)
+
+    assert [t.task for t in corpus.traces] == ["q"]
+    assert [i.kind for i in corpus.issues] == ["unrecognized_record"]
+    assert "message 0" in corpus.issues[0].detail

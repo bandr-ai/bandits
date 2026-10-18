@@ -77,3 +77,29 @@ def test_a_tool_result_record_is_still_not_counted_against_the_trace() -> None:
     trace = load_claude_code(MULTI_TURN).traces[0]
 
     assert trace.unrepresented_user_turns == 0
+
+
+def test_a_raw_unicode_line_separator_in_a_message_does_not_split_its_record(tmp_path) -> None:
+    import json
+
+    rows = [
+        {"type": "user", "sessionId": "s", "message": {"role": "user", "content": "fix the bug"}},
+        {
+            "type": "assistant",
+            "sessionId": "s",
+            "message": {
+                "role": "assistant",
+                "model": "m",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+        },
+    ]
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8"
+    )
+
+    corpus = load_claude_code(path)
+
+    assert [t.task for t in corpus.traces] == ["fix the bug"]
+    assert [i.kind for i in corpus.issues if i.kind != "redaction"] == []

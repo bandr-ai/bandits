@@ -108,7 +108,9 @@ def finish(health: Health, corpus: TraceCorpus, hints: list[str] | None = None) 
     other = Counter(i.kind for i in corpus.issues if i.kind not in NOTICE_ISSUE_KINDS)
 
     if not health.traces:
-        health.fatal.append("no traces could be read from this file")
+        # Issue kinds are a fixed vocabulary, so naming them leaks nothing from the data.
+        why = ", ".join(f"{kind} x{n}" for kind, n in other.most_common(3))
+        health.fatal.append("no traces could be read from this file" + (f" ({why})" if why else ""))
     elif not health.model_calls and (
         corpus.source not in CATALOGUED_SOURCES
         or other["unrepresented_span"]

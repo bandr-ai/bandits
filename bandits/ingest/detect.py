@@ -7,10 +7,12 @@ inputs must be declared explicitly or mapped separately, not guessed.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from bandits.ingest.chat_json import _is_messages, messages_key
+from bandits.ingest.records import read_records
 
 _MAX_SAMPLE = 512 * 1024 * 1024
 """A single JSON document up to this size is parsed whole to recognize it; its
@@ -28,55 +30,69 @@ class Detection:
     files_checked: int
 
 
-def _samples(path: Path) -> list[Any]:
+_SAMPLE_PREFIX = 4 * 1024 * 1024
+"""How much of the front of a file is read to recognize it. A single record larger than this
+is read in full, up to ``_MAX_SAMPLE``."""
+_SAMPLE_RECORDS = 10
+_TOLERATED_UNKNOWN = 0.3
+"""In tolerant mode: the share of sampled records, and of sampled lines, that may be unknown
+or unreadable before the file is refused."""
+
+_CLAUDE_CODE_NOISE = frozenset({"summary", "file-history-snapshot", "queue-operation"})
+_CLAUDE_CODE_SESSION_NOISE = frozenset({"system", "progress"})
+"""Event types a Claude Code log carries between conversation turns. They say nothing about the
+format, so a file that starts with one is still recognized by its other records."""
+
+
+def _is_noise(record: Any) -> bool:
+    if not isinstance(record, dict) or "role" in record or "messages" in record:
+        return False
+    kind = record.get("type")
+    if kind in _CLAUDE_CODE_NOISE:
+        return True
+    return kind in _CLAUDE_CODE_SESSION_NOISE and isinstance(record.get("sessionId"), str)
+
+
+def _samples(path: Path, tolerant: bool = False) -> list[Any]:
+    size = path.stat().st_size
     with path.open("rb") as stream:
-        first = stream.readline(_MAX_SAMPLE + 1)
-        if not first:
-            raise DetectionError(f"empty file: {path}")
-        if len(first) > _MAX_SAMPLE:
+        data = stream.read(_SAMPLE_PREFIX)
+    if not data.strip():
+        raise DetectionError(f"empty file: {path}")
+    whole = size <= len(data)
+    found = read_records(data, str(path), limit=_SAMPLE_RECORDS, tolerate_cut=not whole)
+    if not found.records and not whole:
+        # One record larger than the prefix, e.g. a single exported document.
+        if size > _MAX_SAMPLE:
             raise DetectionError(
-                f"first record exceeds {_MAX_SAMPLE} bytes: {path}; declare --source"
+                f"JSON sample exceeds {_MAX_SAMPLE} bytes: {path}; declare --source"
             )
-        try:
-            first_record = json.loads(first)
-        except json.JSONDecodeError:
-            rest = stream.read(_MAX_SAMPLE - len(first) + 1)
-            if len(first) + len(rest) > _MAX_SAMPLE:
-                raise DetectionError(
-                    f"JSON sample exceeds {_MAX_SAMPLE} bytes: {path}; declare --source"
-                ) from None
-            try:
-                return [json.loads(first + rest)]
-            except json.JSONDecodeError as exc:
-                raise DetectionError(f"cannot parse first JSON record in {path}: {exc}") from exc
-        samples = [first_record]
-        for line in stream:
-            if not line.strip():
-                continue
-            if len(samples) == 10:
-                break
-            if len(line) > _MAX_SAMPLE:
-                raise DetectionError(
-                    f"sample record exceeds {_MAX_SAMPLE} bytes: {path}; declare --source"
-                )
-            try:
-                samples.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise DetectionError(f"malformed JSONL in {path}: {exc}; declare --source") from exc
-        return samples
+        found = read_records(path.read_bytes(), str(path), limit=_SAMPLE_RECORDS)
+    bad = [i for i in found.issues if i.kind == "malformed_json"]
+    if not found.records:
+        why = bad[0].detail if bad else "no JSON value"
+        raise DetectionError(f"cannot parse first JSON record in {path}: {why}")
+    if bad:
+        # A strict detector refuses a file with an unreadable line, as the CLI always has. A
+        # tolerant one lets the reader report those lines and keep the rest, unless they are
+        # a large share of what was sampled.
+        share = found.bad_lines / (found.bad_lines + len(found.records))
+        if not tolerant or share > _TOLERATED_UNKNOWN:
+            raise DetectionError(f"malformed JSONL in {path}: {bad[0].detail}; declare --source")
+    return found.values
 
 
 def _shape(record: Any) -> tuple[str, str] | None:
     if isinstance(record, list):
-        if record and all(
-            isinstance(item, dict) and isinstance(item.get("role"), str) for item in record
-        ):
+        if _is_messages(record):
             return "chat-json", "top-level role/content messages"
-        if record and isinstance(record[0], dict):
+        if record and isinstance(record[0], (dict, list)):
             return _shape(record[0])
         return None
     if not isinstance(record, dict):
         return None
+    if "messages" not in record and messages_key(record) is None and _is_messages([record]):
+        return "chat-json", "one role/content message per record"
     if isinstance(record.get("resourceSpans"), list) or (
         isinstance(record.get("batches"), list)
         and record["batches"]
@@ -140,20 +156,20 @@ def _shape(record: Any) -> tuple[str, str] | None:
         and isinstance(record.get("attributes"), dict)
     ):
         return "otlp", "legacy flat OTLP span"
-    if (
-        isinstance(record.get("messages"), list)
-        and record["messages"]
-        and all(
-            isinstance(item, dict) and isinstance(item.get("role"), str)
-            for item in record["messages"]
-        )
-    ):
+    if messages_key(record):
         return "chat-json", "conversation messages with roles"
     return None
 
 
-def detect_source(path: Path) -> Detection:
-    """Recognize only unambiguous supported JSON shapes; never call an LLM."""
+def detect_source(path: Path, *, tolerant: bool = False) -> Detection:
+    """Recognize only unambiguous supported JSON shapes; never call an LLM.
+
+    Strict by default: one unreadable line, or one record of an unknown shape, stops it, and
+    the caller names the source. ``tolerant`` lets a minority of either through (the readers
+    report them and keep the rest) for callers that cannot ask, such as an upload. Known
+    event types that carry no conversation, like a Claude Code ``summary``, are skipped
+    either way.
+    """
     if path.is_file():
         files = [path]
     elif path.is_dir():
@@ -166,15 +182,26 @@ def detect_source(path: Path) -> Detection:
         raise DetectionError(f"no JSON or JSONL files under {path}")
     found: dict[str, list[str]] = {}
     for file in files:
-        for record in _samples(file):
+        recognized = unknown = 0
+        for record in _samples(file, tolerant):
+            if _is_noise(record):
+                continue
             result = _shape(record)
             if result is None:
-                raise DetectionError(
-                    f"unrecognized trace structure in {file}; declare --source if known, "
-                    "otherwise a new reader is required"
-                )
+                unknown += 1
+                continue
+            recognized += 1
             source, evidence = result
             found.setdefault(source, []).append(evidence)
+        if (
+            not recognized
+            or unknown
+            and (not tolerant or unknown / (unknown + recognized) > _TOLERATED_UNKNOWN)
+        ):
+            raise DetectionError(
+                f"unrecognized trace structure in {file}; declare --source if known, "
+                "otherwise a new reader is required"
+            )
     if len(found) != 1:
         raise DetectionError(
             f"mixed source schemas under {path}: {', '.join(sorted(found))}; ingest separately"
