@@ -35,23 +35,8 @@ from bandits.emulate.models import (
     RolloutResult,
     TerminationReason,
 )
+from bandits.rank.stats import pass_at_k, wilson_interval  # noqa: F401 - re-exported
 from bandits.traces import Contract
-
-
-def pass_at_k(n: int, c: int, k: int) -> float | None:
-    """Probability that at least one of k draws from n attempts succeeds.
-
-    The unbiased estimator, computed as the complement of drawing k failures.
-    None when k exceeds what was actually run: reporting pass@10 from four
-    attempts would be an extrapolation dressed as a measurement.
-    """
-    if n <= 0 or k <= 0 or k > n or c < 0:
-        return None
-    if c >= n:
-        return 1.0
-    if n - c < k:
-        return 1.0
-    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
 def reliability(n: int, c: int, k: int) -> float | None:
@@ -67,24 +52,6 @@ def reliability(n: int, c: int, k: int) -> float | None:
     if c < k:
         return 0.0
     return math.comb(c, k) / math.comb(n, k)
-
-
-def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float] | None:
-    """A confidence interval that stays inside [0, 1] at small n.
-
-    The normal approximation gives negative lower bounds on the sample sizes
-    this lab actually runs — a family with eight held-out traces is normal here —
-    and an interval that reports impossible values invites ignoring intervals.
-    """
-    if total <= 0:
-        return None
-    proportion = successes / total
-    denominator = 1 + z**2 / total
-    centre = (proportion + z**2 / (2 * total)) / denominator
-    spread = (
-        z * math.sqrt(proportion * (1 - proportion) / total + z**2 / (4 * total**2)) / denominator
-    )
-    return (max(0.0, centre - spread), min(1.0, centre + spread))
 
 
 class AbstentionReport(Contract):
@@ -261,9 +228,7 @@ def _bootstrap_mean_interval(
     if len(values) == 1:
         return (values[0], values[0])
     rng = random.Random(seed)
-    means = sorted(
-        sum(rng.choice(values) for _ in values) / len(values) for _ in range(draws)
-    )
+    means = sorted(sum(rng.choice(values) for _ in values) / len(values) for _ in range(draws))
     return (means[int(0.025 * (draws - 1))], means[int(0.975 * (draws - 1))])
 
 
