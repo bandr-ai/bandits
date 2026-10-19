@@ -57,3 +57,31 @@ def test_receipts_are_collected_from_responses():
     got.add(httpx.Response(200, headers={"x-bandr-record-id": "rec1"}))
     got.add(httpx.Response(200))
     assert got.ids == ["rec1"]
+
+
+def test_a_cleartext_endpoint_is_refused_but_localhost_is_allowed():
+    with pytest.raises(ValueError):
+        RankClient("http://app.example.com", "k")
+    RankClient("http://localhost:8000", "k").close()
+    RankClient("https://app.example.com", "k").close()
+
+
+def test_metadata_cannot_override_the_reported_task_and_odd_error_bodies_are_survived():
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    ep = _client(lambda r: httpx.Response(200, json=EP)).next_episode("r1")
+    _client(handler).report(ep, score=1, references=["r"], metadata={"task": "other", "x": 1})
+    assert seen["metadata"] == {"task": "t1", "x": 1}
+    for body in (None, "oops", [1]):
+        with pytest.raises(RankError):
+            _client(lambda r, body=body: httpx.Response(500, json=body)).next_episode("r1")
+
+
+def test_close_leaves_an_injected_client_open():
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(204)))
+    RankClient("https://x.test", "k", http=http).close()
+    assert not http.is_closed

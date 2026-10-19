@@ -16,15 +16,24 @@ def task_from_trace(trace: Trace) -> dict[str, Any] | None:
     tool calls, in order) so a customer check, or a reference judge, can compare against it. The
     recorded outcome is evidence about the original run, not a score for the new one.
     """
+    # A trace that lost a user message, or has follow-up user turns, cannot be replayed from its
+    # opening instruction: the recorded outcome answers instructions the agent would never receive.
+    if trace.unrepresented_user_turns or any(t.after_span_id is not None for t in trace.user_turns):
+        return None
     opening = next((t.text for t in trace.user_turns if t.after_span_id is None), None)
     user = opening or trace.task
     if not user:
         return None
-    tools = [t.offered_projection() for t in trace.tools_available or ()]
+    # None stays None: the source did not say which tools were on offer, which is not "no tools".
+    tools = (
+        None
+        if trace.tools_available is None
+        else [t.offered_projection() for t in trace.tools_available]
+    )
     calls = [
         {"tool": s.name, "arguments": s.arguments, "status": s.status.value}
         for s in trace.spans
-        if s.kind is SpanKind.TOOL
+        if s.kind is SpanKind.TOOL and s.call_recorded
     ]
     model_spans = [s for s in trace.spans if s.kind is SpanKind.MODEL]
     final = model_spans[-1].output if model_spans else None
@@ -46,15 +55,18 @@ def tasks_from_traces(traces: Iterable[Trace], limit: int = 100) -> list[dict[st
     counted twice.
     """
     out: list[dict[str, Any]] = []
+    if limit <= 0:
+        return out
     seen: set[str] = set()
     for trace in traces:
-        if trace.lineage_id:
-            if trace.lineage_id in seen:
-                continue
-            seen.add(trace.lineage_id)
+        if trace.lineage_id and trace.lineage_id in seen:
+            continue
         task = task_from_trace(trace)
-        if task is not None:
-            out.append(task)
+        if task is None:
+            continue
+        if trace.lineage_id:
+            seen.add(trace.lineage_id)
+        out.append(task)
         if len(out) >= limit:
             break
     return out
