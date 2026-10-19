@@ -17,9 +17,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 EPISODE_HEADER = "x-bandr-episode"
 RECEIPT_HEADER = "x-bandr-record-id"
 
@@ -53,10 +55,21 @@ class RankError(RuntimeError):
 
 class RankClient:
     def __init__(self, base_url: str, api_key: str, *, http: httpx.Client | None = None):
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https" and not (
+            parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
+        ):
+            raise ValueError("base_url must be https (plain http only for localhost)")
         self.base_url = base_url.rstrip("/")
         self.gateway_url = f"{self.base_url}/v1"
         self._auth = {"Authorization": f"Bearer {api_key}"}
+        self._owns_http = http is None
         self._http = http or httpx.Client(timeout=60.0)
+
+    def close(self) -> None:
+        """Close the HTTP client this object created; an injected client is left to its owner."""
+        if self._owns_http:
+            self._http.close()
 
     def headers(self, episode: Episode) -> dict[str, str]:
         """Headers for the agent's model client: the Bandr key and the episode."""
@@ -99,7 +112,7 @@ class RankClient:
                 "score": score,
                 "feedback": feedback,
                 "references": references,
-                "metadata": {"task": episode.task["id"], **(metadata or {})},
+                "metadata": {**(metadata or {}), "task": episode.task["id"]},
             },
         )
         if r.status_code != 200:
@@ -116,6 +129,7 @@ class RankClient:
 
 def _detail(r: httpx.Response) -> str:
     try:
-        return str(r.json().get("detail", r.text))
+        body = r.json()
     except ValueError:
         return r.text
+    return str(body.get("detail", r.text)) if isinstance(body, dict) else r.text

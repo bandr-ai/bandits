@@ -92,6 +92,8 @@ def summarize(
 
 def order(summaries: Sequence[Summary]) -> list[tuple[Summary, list[str]]]:
     """Best first by predicted post-RL, each with the models it cannot be separated from."""
+    if len({s.k for s in summaries}) > 1:
+        raise ValueError("summaries must share one k before they are compared")
     ranked = sorted(summaries, key=lambda s: s.predicted, reverse=True)
     return [
         (

@@ -58,3 +58,28 @@ def test_traces_without_an_instruction_are_skipped_and_retries_count_once():
     ]
     assert [t["id"] for t in tasks_from_traces(traces)] == ["a", "d"]
     assert len(tasks_from_traces([_trace(str(i), task="x") for i in range(5)], limit=2)) == 2
+
+
+def test_traces_that_cannot_be_replayed_from_their_opening_are_skipped():
+    follow_up = _trace(
+        task="Draft an email, do not send",
+        user_turns=(
+            UserTurn(text="Draft an email, do not send"),
+            UserTurn(text="Approved, send it", after_span_id="s1"),
+        ),
+    )
+    assert task_from_trace(follow_up) is None
+    assert task_from_trace(_trace(task="x", unrepresented_user_turns=1)) is None
+
+
+def test_an_unknown_toolset_stays_unknown_and_orphaned_tool_results_are_not_calls():
+    orphan = _span(span_id="s9", kind=SpanKind.TOOL, name="ghost", call_recorded=False)
+    task = task_from_trace(_trace(task="x", spans=(_span(span_id="s1", output="a"), orphan)))
+    assert task["input"]["tools"] is None
+    assert task["expected"]["tool_calls"] == []
+
+
+def test_a_lineage_is_used_up_only_by_a_trace_that_made_a_task_and_limit_zero_is_empty():
+    traces = [_trace("a", lineage_id="L"), _trace("b", task="hello", lineage_id="L")]
+    assert [t["id"] for t in tasks_from_traces(traces)] == ["b"]
+    assert tasks_from_traces([_trace("c", task="x")], limit=0) == []

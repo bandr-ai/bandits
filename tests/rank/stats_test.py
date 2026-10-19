@@ -41,3 +41,8 @@ def test_rank_agreement():
     assert stats.spearman_rho([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1)
     assert stats.spearman_rho([1, 1, 1], [1, 2, 3]) is None
     assert stats.spearman_rho([1, 2, 2, 4], [1, 2, 3, 4]) == pytest.approx(0.9487, abs=1e-3)
+
+
+def test_unequal_k_cannot_be_ordered_together():
+    with pytest.raises(ValueError):
+        stats.order([stats.summarize("a", [(3, 5)] * 5), stats.summarize("b", [(1, 1)] * 5)])
