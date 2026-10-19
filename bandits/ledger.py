@@ -30,6 +30,7 @@ the call. One row, one id, always.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -43,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 _ENV_PATH = "BANDITS_LEDGER"
-"""Where to append. Unset means record nothing, so the ledger is opt-in."""
+"""Explicit destination override. Model-driven CLI commands default to their project ledger."""
 
 _local = threading.local()
 
@@ -59,10 +60,8 @@ def _context() -> dict[str, Any]:
 _ENV_STRICT = "BANDITS_LEDGER_STRICT"
 """Set alongside the path to make a lost record fail the run.
 
-Best effort is right for ordinary use, where a full disk should not destroy the
-work being recorded. It is wrong for a formal experiment, where a run that
-quietly recorded nine tenths of itself is not a cheaper experiment but an
-invalid one that still costs money.
+Model-driven CLI commands require recording and fail if a record cannot be
+written. Other callers may enable strict recording explicitly.
 """
 
 
@@ -97,11 +96,46 @@ def stage(name: str, **fields: Any) -> Iterator[None]:
 
 
 def enabled() -> bool:
-    return bool(os.environ.get(_ENV_PATH))
+    return bool(_path())
+
+
+def _path() -> str | None:
+    return getattr(_local, "ledger_path", None) or os.environ.get(_ENV_PATH)
+
+
+def project_recording(function):
+    """Record model-driven CLI runs in their project, without an opt-in flag."""
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        previous = getattr(_local, "ledger_path", None)
+        required = getattr(_local, "ledger_required", False)
+        project = Path(kwargs.get("project", Path.cwd()))
+        _local.ledger_path = os.environ.get(_ENV_PATH) or str(project / ".bandits" / "ledger.jsonl")
+        _local.ledger_required = True
+        old_path, old_strict = os.environ.get(_ENV_PATH), os.environ.get(_ENV_STRICT)
+        # Sub-LM batches use worker threads; the destination must reach them too.
+        os.environ[_ENV_PATH] = _local.ledger_path
+        os.environ[_ENV_STRICT] = "1"
+        try:
+            record({"event_type": "recording_started", "command": function.__name__})
+            return function(*args, **kwargs)
+        finally:
+            _local.ledger_path = previous
+            _local.ledger_required = required
+            for key, value in ((_ENV_PATH, old_path), (_ENV_STRICT, old_strict)):
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return wrapped
 
 
 def strict() -> bool:
-    return bool(os.environ.get(_ENV_STRICT)) and enabled()
+    return (
+        getattr(_local, "ledger_required", False) or bool(os.environ.get(_ENV_STRICT))
+    ) and enabled()
 
 
 def record(event: dict[str, Any]) -> None:
@@ -113,7 +147,7 @@ def record(event: dict[str, Any]) -> None:
     raised, because a formal experiment missing records is not a partial
     result — it is one that cannot be checked.
     """
-    path = os.environ.get(_ENV_PATH)
+    path = _path()
     if not path:
         return
     row = {
