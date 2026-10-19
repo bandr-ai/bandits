@@ -198,6 +198,7 @@ audit = [
     { name = "litellm" },
 ]
 dev = [
+    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -210,11 +211,16 @@ emulate = [
 llm = [
     { name = "litellm" },
 ]
+rank = [
+    { name = "httpx" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "dspy", extras = ["deno"], marker = "extra == 'audit'", specifier = ">=3.3.1" },
     { name = "dspy", extras = ["deno"], marker = "extra == 'emulate'", specifier = ">=3.3.1" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'rank'", specifier = ">=0.27" },
     { name = "jsonschema", marker = "extra == 'emulate'", specifier = ">=4.23" },
     { name = "litellm", marker = "extra == 'audit'", specifier = ">=1.100" },
     { name = "litellm", marker = "extra == 'emulate'", specifier = ">=1.100" },
@@ -226,7 +232,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["llm", "audit", "emulate", "dev"]
+provides-extras = ["llm", "audit", "emulate", "rank", "dev"]
 
 [[package]]
 name = "boto3"
