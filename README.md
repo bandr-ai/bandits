@@ -4,7 +4,7 @@
 
 ### Turn agent traces into training data you can trust.
 
-[![quality](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml/badge.svg)](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/) [![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv)](https://docs.astral.sh/uv/) [![LiteLLM](https://img.shields.io/badge/models-any%20LiteLLM%20provider-0f172a)](https://docs.litellm.ai/docs/providers)
+[![PyPI](https://img.shields.io/pypi/v/bandits-cli?color=3775A9&logo=pypi&logoColor=white)](https://pypi.org/project/bandits-cli/) [![quality](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml/badge.svg)](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/) [![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv)](https://docs.astral.sh/uv/) [![LiteLLM](https://img.shields.io/badge/models-any%20LiteLLM%20provider-0f172a)](https://docs.litellm.ai/docs/providers)
 
 🚀 [Quickstart](#-quickstart) · 🔄 [Method](#-method) · 🔬 [Worked example](#-a-worked-example) · 📊 [Results](#-results) · 🧭 [Workflow](#-the-full-workflow) · 🔐 [Trust model](#-trust-is-a-data-model) · 📖 [CLI](#-cli-reference)
 
@@ -131,37 +131,47 @@ What this shows:
 
 ## 🚀 Quickstart
 
-Bandits needs Python 3.11+ and uses [uv](https://docs.astral.sh/uv/).
+Bandits needs Python 3.11+. Install the `bandits` command from PyPI:
 
 ```bash
-git clone https://github.com/bandr-ai/bandits.git
-cd bandits
-uv sync                 # core: ingest, inspect, export (no model needed)
-uv sync --extra llm     # add model calls (judge, review) via LiteLLM
-uv sync --extra audit   # add RLM mining, check proposal and audit (DSPy + sandbox)
+pipx install bandits-cli                 # or: uv tool install bandits-cli
+pipx install "bandits-cli[llm]"          # add model calls (judge, review) via LiteLLM
+pipx install "bandits-cli[audit]"        # add RLM mining, check proposal and audit (DSPy + sandbox)
+bandits --version
 ```
 
-Ingest the bundled fixture and look inside. No API key is needed:
+`pip install bandits-cli` works too, inside a virtualenv. The package is called `bandits-cli` because the name `bandits` on PyPI belongs to another project; the command and the import are both `bandits`.
+
+Ingest a small sample trace file and look inside. No API key is needed:
 
 ```bash
-uv run bandits ingest tests/fixtures/traces.otlp.jsonl --source otlp
-
-# The fixture deterministically produces corpus-67e49fdc2268c1e5.
-uv run bandits show corpus-67e49fdc2268c1e5
-uv run bandits show corpus-67e49fdc2268c1e5 --issues
+curl -LO https://raw.githubusercontent.com/bandr-ai/bandits/main/tests/fixtures/traces.otlp.jsonl
+bandits ingest traces.otlp.jsonl --source otlp   # prints artifact_id: corpus-…
+bandits list                                     # every corpus in this folder
+bandits show <corpus-id>
+bandits show <corpus-id> --issues
 ```
 
 Then go from traces to a dataset:
 
 ```bash
-uv run bandits judge-turns <corpus-id> --archetype coding      # score every turn by its reaction
-uv run bandits propose-verifier <judge-run-id>                 # RLM writes checks, sandbox re-verifies them
-uv run bandits review-checks <family-verifier-id>              # accept / reject, one keypress each
-uv run bandits score-traces <family-verifier-id>               # pass/fail and a score per trace
-uv run bandits export-nextstate <verifier-scores-id> --output sft.jsonl
+bandits judge-turns <corpus-id> --archetype coding      # score every turn by its reaction
+bandits propose-verifier <judge-run-id>                 # RLM writes checks, sandbox re-verifies them
+bandits review-checks <family-verifier-id>              # accept / reject, one keypress each
+bandits score-traces <family-verifier-id>               # pass/fail and a score per trace
+bandits export-nextstate <verifier-scores-id> --output sft.jsonl
 ```
 
-Everything is written as immutable artifacts under `.bandits/` in the project directory. Re-ingesting identical content resolves to the same id.
+Everything is written as immutable artifacts under `.bandits/` in the current directory (or `--project`). Ingesting the same file again resolves to the same id.
+
+To work on Bandits itself, run it from a checkout instead (and see Development below):
+
+```bash
+git clone https://github.com/bandr-ai/bandits.git
+cd bandits
+uv sync --extra llm
+uv run bandits --help
+```
 
 ## 📥 Supported inputs
 
@@ -202,7 +212,7 @@ Every step that calls a model (the next-state judge, direct review, RLM mining a
 | `ollama/<name>` | `OLLAMA_API_BASE` |
 
 ```bash
-uv run bandits judge-turns <corpus-id> --archetype support --model anthropic/claude-sonnet-5
+bandits judge-turns <corpus-id> --archetype support --model anthropic/claude-sonnet-5
 export BANDITS_MODEL=anthropic/claude-sonnet-5   # or move every stage's default at once
 ```
 
@@ -214,28 +224,28 @@ A missing key fails once, before the first request, and names the variable. Keys
 # 1. (Optional) Group traces into task families for family-scoped checks.
 #    Skip this and the whole corpus is one family, which is what a
 #    benchmark split usually is.
-uv run bandits analyze <corpus-id> --tasks
-uv run bandits mine-rlm <analysis-id>
-uv run bandits materialize-rlm-taskset <clustering-run-id>
+bandits analyze <corpus-id> --tasks
+bandits mine-rlm <analysis-id>
+bandits materialize-rlm-taskset <clustering-run-id>
 
 # 2. Score every observed turn by its reaction: the tool result, the
 #    execution log, the user's next message. Never the agent's own claim.
-uv run bandits judge-turns <corpus-id> --archetype computer-use \
+bandits judge-turns <corpus-id> --archetype computer-use \
   --task-set <task-set-id> --family <family-id>
 
 # 3. Have an RLM propose cheap check(turn) predicates from the verdicts,
 #    re-execute every one over the whole family in a sandbox, and keep
 #    only what fires often enough and agrees with the judge.
-uv run bandits propose-verifier <judge-run-id> --family <family-id>
+bandits propose-verifier <judge-run-id> --family <family-id>
 
 # 4. Accept or reject each proposed check. One prompt each; resumable.
-uv run bandits review-checks <family-verifier-id>
+bandits review-checks <family-verifier-id>
 
 # 5. Apply the accepted checks, plus the judge, to every trace.
-uv run bandits score-traces <family-verifier-id>
+bandits score-traces <family-verifier-id>
 
 # 6. Export scored traces as labeled positive/negative SFT rows.
-uv run bandits export-nextstate <verifier-scores-id> --output sft.jsonl
+bandits export-nextstate <verifier-scores-id> --output sft.jsonl
 ```
 
 Every export also writes a sibling `<name>.unresolved.jsonl`. A trace is quarantined there with a reason, instead of vanishing or being labeled by a guess, when:
@@ -256,7 +266,7 @@ Every export also writes a sibling `<name>.unresolved.jsonl`. A trace is quarant
 For a dataset straight from raw traces, with an LLM reviewing each candidate directly rather than turn by turn:
 
 ```bash
-uv run bandits build-sft <corpus-id> --output work/direct-dataset
+bandits build-sft <corpus-id> --output work/direct-dataset
 ```
 
 It writes `sft.jsonl`, `review.jsonl` (borderline candidates), `rejected.jsonl`, and a selection report. It is independent of the workflow above and does not use `judge-turns` or any verifier artifact.
@@ -352,16 +362,16 @@ Every SFT row, from either exporter, uses chat-completions-shaped `messages`. As
 | `export-nextstate` | Write scored traces as labeled positive/negative SFT rows, plus a quarantine file |
 | `build-sft` | Quicker, independent path: LLM-reviewed SFT rows straight from raw traces |
 
-Run `uv run bandits <command> --help` for every option.
+Run `bandits <command> --help` for every option.
 
 ## 🔒 Redaction and local state
 
-Ingest uses the `default-v1` redaction ruleset. Use `--redaction secrets-only-v1` when email addresses are task identifiers that must be kept:
+Ingest uses the `default-v2` redaction ruleset. Use `--redaction secrets-only-v2` when email addresses are task identifiers that must be kept:
 
 ```bash
-uv run bandits ingest traces.jsonl \
+bandits ingest traces.jsonl \
   --source chat-json \
-  --redaction secrets-only-v1 \
+  --redaction secrets-only-v2 \
   --project ./my-experiment
 ```
 
