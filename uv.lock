@@ -183,8 +183,7 @@ wheels = [
 ]
 
 [[package]]
-name = "bandits"
-version = "0.1.0"
+name = "bandits-cli"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
@@ -226,7 +225,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["llm", "audit", "emulate", "dev"]
+provides-extras = ["audit", "dev", "emulate", "llm"]
 
 [[package]]
 name = "boto3"

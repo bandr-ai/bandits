@@ -279,6 +279,31 @@ def test_list_shows_ingested_artifact(tmp_path) -> None:
     assert "otlp" in plain(result.stdout)
 
 
+def test_list_prints_full_ids_a_narrow_terminal_can_still_copy(tmp_path) -> None:
+    ingest = runner.invoke(
+        app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)]
+    )
+    corpus_id = next(
+        line.split(": ", 1)[1]
+        for line in plain(ingest.stdout).splitlines()
+        if line.startswith("artifact_id: ")
+    )
+
+    result = runner.invoke(app, ["list", "--project", str(tmp_path)], env={"COLUMNS": "60"})
+
+    assert result.exit_code == 0
+    assert corpus_id in plain(result.stdout)
+
+
+def test_version_prints_the_installed_version() -> None:
+    from bandits import __version__
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert plain(result.stdout).strip() == f"bandits {__version__}"
+
+
 def test_show_lists_traces_then_one_traces_spans(tmp_path) -> None:
     runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
     artifact_id = compute_artifact_id(load_otlp(FIXTURE))
@@ -453,10 +478,11 @@ def test_list_shows_problems_and_warns_on_mixed_derivation_versions(tmp_path) ->
         ).model_dump_json(exclude={"derivation_version", "problem_count"})
     )
 
-    result = runner.invoke(app, ["list", "--project", str(tmp_path)])
+    result = runner.invoke(app, ["list", "--project", str(tmp_path)], env={"COLUMNS": "120"})
     out = plain(result.stdout)
     assert result.exit_code == 0
     assert "problems" in out and "issues" not in out
+    assert "derivation" in out
     assert "different versions (1, 2)" in " ".join(out.split())
     row = next(line for line in out.splitlines() if "corpus-old" in line)
     assert "?" in row and " - " in row  # derivation unknown, problems not recorded
@@ -466,6 +492,8 @@ def test_list_is_quiet_when_derivation_versions_agree(tmp_path) -> None:
     runner.invoke(app, ["ingest", str(FIXTURE), "--source", "otlp", "--project", str(tmp_path)])
     result = runner.invoke(app, ["list", "--project", str(tmp_path)])
     assert "different versions" not in plain(result.stdout)
+    # No corpus here has a derivation version, so the column is left out.
+    assert "derivation" not in plain(result.stdout)
 
 
 LANGFUSE_FIXTURE = (
