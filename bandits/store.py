@@ -61,6 +61,10 @@ class ArtifactEnvelope(Contract):
     redaction_count: int | None = None
 
 
+# The distribution was called "bandits" before it was published as "bandits-cli".
+_OWN_NAMES = ("bandits-cli", "bandits")
+
+
 @functools.cache
 def code_version() -> tuple[str, str | None, bool | None]:
     """``(bandits_version, git_commit, git_dirty)`` of the running code.
@@ -86,7 +90,7 @@ def code_version() -> tuple[str, str | None, bool | None]:
         declared = tomllib.loads((Path(top) / "pyproject.toml").read_text(encoding="utf-8"))  # type: ignore[arg-type]
     except (TypeError, OSError, tomllib.TOMLDecodeError):
         declared = {}
-    if top is None or declared.get("project", {}).get("name") != "bandits":
+    if top is None or declared.get("project", {}).get("name") not in _OWN_NAMES:
         return bandits.__version__, None, None
     commit = git("rev-parse", "HEAD")
     # Pathspecs resolve against the working directory, so run from the top.
