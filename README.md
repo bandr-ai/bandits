@@ -134,11 +134,15 @@ What this shows:
 Bandits needs Python 3.11+. Install the `bandits` command from PyPI:
 
 ```bash
-pipx install bandits-cli                 # or: uv tool install bandits-cli
-pipx install "bandits-cli[llm]"          # add model calls (judge, review) via LiteLLM
-pipx install "bandits-cli[audit]"        # add RLM mining, check proposal and audit (DSPy + sandbox)
+# Pick one:
+pipx install bandits-cli                 # core: ingest, inspect, export (no model needed)
+pipx install "bandits-cli[llm]"          # + model calls (judge, review) via LiteLLM
+pipx install "bandits-cli[audit]"        # + model calls, RLM mining, check proposal and audit (DSPy + sandbox)
+
 bandits --version
 ```
+
+`uv tool install` takes the same arguments. To add extras to an existing install, run `pipx install --force` with the new extras.
 
 `pip install bandits-cli` works too, inside a virtualenv. The package is called `bandits-cli` because the name `bandits` on PyPI belongs to another project; the command and the import are both `bandits`.
 

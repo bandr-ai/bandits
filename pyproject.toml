@@ -82,11 +82,11 @@ content-type = "text/markdown"
 path = "README.md"
 
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
-pattern = '(\]\(|src=")(?!https?://|#)([^)"]+\.(?:png|webp|gif|svg|jpg))'
+pattern = '(\]\(|src="|srcset=")(?!https?://|#)([^)"]+\.(?:png|webp|gif|svg|jpg))'
 replacement = '\1https://raw.githubusercontent.com/bandr-ai/bandits/main/\2'
 
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
-pattern = '(\]\(|src=")(?!https?://|#)([^)"]+)'
+pattern = '(\]\(|src="|srcset=")(?!https?://|#)([^)"]+)'
 replacement = '\1https://github.com/bandr-ai/bandits/blob/main/\2'
 
 [tool.ruff]
