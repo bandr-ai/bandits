@@ -14,6 +14,19 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest --cov=bandits --cov-report=term-missing
 
+  package:
+    # Build what a release would publish and run it from a clean install, so a
+    # packaging break shows up on the PR, not on release day.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - run: scripts/smoke_wheel.sh dist/*.whl
+
   jev:
     # The Jev recipe (recipes/jev), in its own environment so core never
     # installs torch. Its model tests run a real tiny model
