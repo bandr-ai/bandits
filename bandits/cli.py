@@ -11,11 +11,12 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import typer
+from rich import box
 from rich.console import Console
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
-from bandits import ledger
+from bandits import __version__, ledger
 from bandits.analyze import (
     DEFAULT_HELD_OUT,
     analyze_corpus,
@@ -135,6 +136,26 @@ from bandits.verify.judge import DEFAULT_MODEL, JudgeError
 app = typer.Typer(add_completion=False)
 console = Console()
 err_console = Console(stderr=True)
+
+
+def _print_version(value: bool) -> None:
+    if value:
+        console.print(f"bandits {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_print_version,
+        is_eager=True,
+        help="Print the installed version and exit.",
+    ),
+) -> None:
+    """Turn agent traces into training data you can trust."""
+
 
 _MAX_INLINE_ISSUES = 3
 _DEFAULT_PROJECT = Path(".")
@@ -668,22 +689,39 @@ def list_artifacts(project: Path = typer.Option(_DEFAULT_PROJECT, "--project")) 
     """List every artifact in the local store."""
     store = ArtifactStore(project / ".bandits")
     envelopes = store.list()
+    # Envelopes written before the field existed cannot say; newer ones leave
+    # it None only for non-workflow corpora.
+    derivations = [
+        str(e.derivation_version)
+        if e.derivation_version is not None
+        else ("?" if e.schema_version < 2 else "-")
+        for e in envelopes
+    ]
+    show_derivation = any(d != "-" for d in derivations)
+    # The id is what every other command takes, so it is never shortened or
+    # wrapped. The derivation column only appears when some corpus has one,
+    # so the common case fits an 80-column terminal.
     table = Table(
-        "artifact_id", "source", "traces", "spans", "problems", "derivation", "created_at"
+        Column("artifact_id", no_wrap=True, min_width=23),
+        "source",
+        "traces",
+        "spans",
+        "problems",
+        *(["derivation"] if show_derivation else []),
+        Column("created", no_wrap=True),
+        box=box.SIMPLE_HEAD,
+        show_edge=False,
+        pad_edge=False,
     )
-    for envelope in envelopes:
+    for envelope, derivation in zip(envelopes, derivations, strict=True):
         table.add_row(
-            envelope.artifact_id[:19],
+            envelope.artifact_id,
             envelope.source,
             str(envelope.trace_count),
             str(envelope.span_count),
             "-" if envelope.problem_count is None else str(envelope.problem_count),
-            # Envelopes written before the field existed cannot say; newer
-            # ones leave it None only for non-workflow corpora.
-            str(envelope.derivation_version)
-            if envelope.derivation_version is not None
-            else ("?" if envelope.schema_version < 2 else "-"),
-            envelope.created_at,
+            *([derivation] if show_derivation else []),
+            envelope.created_at[:16].replace("T", " "),
         )
     console.print(table)
     versions = sorted({e.derivation_version for e in envelopes if e.derivation_version is not None})

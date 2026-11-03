@@ -1,8 +1,25 @@
 [project]
-name = "bandits"
-version = "0.1.0"
-description = "Ingest agent traces into an inspectable local corpus."
+# The import package and the command are both `bandits`; the PyPI name
+# `bandits` belongs to an unrelated project.
+name = "bandits-cli"
+dynamic = ["version", "readme"]
+description = "Turn agent traces into training data you can trust: ingest, judge, verify, and export SFT and RL data."
 requires-python = ">=3.11"
+authors = [{ name = "Bandr" }]
+keywords = ["agents", "traces", "llm", "evaluation", "verifiers", "sft", "rl", "opentelemetry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "pydantic>=2.7",
     "typer>=0.12",
@@ -34,15 +51,43 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/bandr-ai/bandits"
+Source = "https://github.com/bandr-ai/bandits"
+Issues = "https://github.com/bandr-ai/bandits/issues"
+Changelog = "https://github.com/bandr-ai/bandits/blob/main/CHANGELOG.md"
+
 [project.scripts]
 bandits = "bandits.cli:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-fancy-pypi-readme>=24.1"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "bandits/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["bandits"]
+
+[tool.hatch.build.targets.sdist]
+include = ["bandits", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
+
+# PyPI renders the README away from the repo, so relative links and images
+# would break there. Point them at GitHub in the published copy only.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(\]\(|src="|srcset=")(?!https?://|#)([^)"]+\.(?:png|webp|gif|svg|jpg))'
+replacement = '\1https://raw.githubusercontent.com/bandr-ai/bandits/main/\2'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(\]\(|src="|srcset=")(?!https?://|#)([^)"]+)'
+replacement = '\1https://github.com/bandr-ai/bandits/blob/main/\2'
 
 [tool.ruff]
 line-length = 100

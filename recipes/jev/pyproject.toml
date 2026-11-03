@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Bandits core, read-only: traces, turn-judge runs, task sets, the artifact
     # store. Core never imports this package.
-    "bandits",
+    "bandits-cli",
     "pydantic>=2.7",
     "typer>=0.12",
     "rich>=13.7",
@@ -31,7 +31,7 @@ dev = [
 jev = "bandits_jev.cli:app"
 
 [tool.uv.sources]
-bandits = { path = "../..", editable = true }
+bandits-cli = { path = "../..", editable = true }
 
 [build-system]
 requires = ["hatchling"]
