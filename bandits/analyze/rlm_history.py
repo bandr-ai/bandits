@@ -14,7 +14,9 @@ share it.
 
 from __future__ import annotations
 
+import json
 import re
+import threading
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -82,7 +84,50 @@ def scoped_to_history(predict: Predictor, language_model: Any) -> Predictor:
 _CODE_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
 
 
+def wire_value(value: Any) -> Any:
+    """Keep provider response fields, including reasoning, as JSON values."""
+
+    def convert(item):
+        if hasattr(item, "model_dump"):
+            return item.model_dump(mode="json")
+        if hasattr(item, "__dict__"):
+            return vars(item)
+        return str(item)
+
+    return json.loads(json.dumps(value, default=convert))
+
+
+def record_repl(rlm: Any) -> Any:
+    """Persist each execution before DSPy truncates its output for the next prompt."""
+    execute = rlm._execute_code
+
+    def recorded(repl, code, input_args):
+        ledger.record(
+            {"event_type": "repl_start", "code": code, "variables": wire_value(input_args)}
+        )
+        try:
+            result = execute(repl, code, input_args)
+        except BaseException as exc:
+            ledger.record({"event_type": "repl_error", "code": code, "error": str(exc)})
+            raise
+        ledger.record({"event_type": "repl_end", "code": code, "output": wire_value(result)})
+        return result
+
+    rlm._execute_code = recorded
+    return rlm
+
+
+_history_record_lock = threading.Lock()
+
+
 def record_history(entries: Sequence[Any], *, language_model: Any = None) -> None:
+    # Batched subcalls share an LM history. Their overlapping history slices
+    # must not both persist the same entry before it is marked recorded.
+    with _history_record_lock:
+        _record_history(entries, language_model=language_model)
+
+
+def _record_history(entries: Sequence[Any], *, language_model: Any = None) -> None:
     """Write each RLM subcall to the ledger as the physical call it was.
 
     Verified against a real run: each entry carries the messages sent, the text
@@ -102,6 +147,8 @@ def record_history(entries: Sequence[Any], *, language_model: Any = None) -> Non
         return
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
+            continue
+        if entry.get("_bandits_recorded"):
             continue
         outputs = entry.get("outputs") or []
         text = ""
@@ -153,7 +200,12 @@ def record_history(entries: Sequence[Any], *, language_model: Any = None) -> Non
                 "iteration": index + 1,
                 "adapter": adapter,
                 "request": {"messages": entry.get("messages"), "kwargs": request_kwargs},
-                "response": {"text": text, "finish_reason": finish_reason},
+                "response": {
+                    "text": text,
+                    "finish_reason": finish_reason,
+                    "outputs": wire_value(outputs),
+                    "raw": wire_value(response_obj),
+                },
                 # Pulled out of the reply rather than left inside it: the code
                 # is what the root model actually did, and grepping a ledger
                 # for it should not mean parsing markdown fences back out.
@@ -165,6 +217,7 @@ def record_history(entries: Sequence[Any], *, language_model: Any = None) -> Non
                 "status": "success",
             }
         )
+        entry["_bandits_recorded"] = True
 
 
 _USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")

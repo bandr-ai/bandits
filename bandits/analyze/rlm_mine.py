@@ -273,7 +273,7 @@ def build_predictor(
     except ImportError as exc:  # pragma: no cover - depends on the extra
         raise MiningError("RLM mining needs the 'audit' extra: uv sync --extra audit") from exc
 
-    from bandits.analyze.rlm_history import scoped_to_history
+    from bandits.analyze.rlm_history import record_repl, scoped_to_history
 
     language_model = providers.dspy_lm(
         model,
@@ -304,11 +304,13 @@ def build_predictor(
     # The query, in the RLM's sense: it belongs in the token window, not in a
     # REPL variable the model has to remember to print.
     _Mine.__doc__ = instruction_for(view)
-    rlm = dspy.RLM(
-        _Mine,
-        max_iters=max_iterations,
-        max_llm_calls=max_llm_calls,
-        sub_lm=language_model,
+    rlm = record_repl(
+        dspy.RLM(
+            _Mine,
+            max_iters=max_iterations,
+            max_llm_calls=max_llm_calls,
+            sub_lm=language_model,
+        )
     )
 
     def predict(*, chunk: str, taxonomy: str, question: str = "") -> Any:
@@ -1435,6 +1437,8 @@ def _run_chunk(
                 taxonomy=taxonomy_json,
                 question="",
             )
+    except ledger.LedgerWriteError:
+        raise
     except Exception as exc:  # noqa: BLE001 - a failed chunk is recorded, not fatal
         calls, tokens = _spend_of(predict)
         return ChunkResult(
@@ -1655,6 +1659,8 @@ def _repair_contracts(
             # it got wrong, and a long payload would push this past the peek.
             question=_REPAIR_INSTRUCTION + "\n" + "\n".join(item[:300] for item in rejected[:4]),
         )
+    except ledger.LedgerWriteError:
+        raise
     except Exception:  # noqa: BLE001 - a failed repair must not lose the chunk
         return []
     repaired = []
