@@ -76,7 +76,11 @@ class FakeJudge:
                 user = body["messages"][1]["content"]
                 n = len(re.findall(r"^\d+\. ", user.split("CRITERIA:")[1], re.M))
                 ans = re.search(r"<<<ANSWER\n(.*)\nANSWER>>>", user, re.S).group(1)
-                if "WRONG" in ans:
+                if outer.mode == "yes":
+                    v = ["supported"] * n
+                elif outer.mode == "no":
+                    v = ["contradicted"] * n
+                elif "WRONG" in ans:
                     v = ["contradicted"] * n
                 elif "HALF" in ans:
                     v = ["supported"] * (n // 2) + ["insufficient"] * (n - n // 2)
@@ -301,3 +305,64 @@ def test_status_and_report_show_judged_separately_with_warning(env, judge):
     assert "| judge | 3 | 0 | 3 | 0 | 0 |" in md
     assert "model opinion, not ground truth" in md and "## Judge" in md
     assert "why no deterministic check: free text answer" in md
+
+
+def validate_judge(env, *extra):
+    return env.run("validate", "--judge", "--sample-size", "3", "--json", *extra)
+
+
+def test_validate_judge_runs_the_gates_and_stability(env, judge):
+    setup(env)
+    env.run("run", "generate")
+    code, _, _, res = validate_judge(env)
+    assert code == 0, res
+    assert judge.calls == 3 * 5  # oracle + 2 stability repeats + wrong + alternative; no-op is free
+    assert "judge_skipped" not in res["data"]
+    r = next(iter(rows(env).values()))
+    assert r["status"] == "judged" and r["gates"]["exec"] == "pass"
+    assert r["gates"]["exec_detail"] == {
+        "oracle": "pass",
+        "noop": "pass",
+        "wrong": "pass",
+        "alternatives": "pass",
+        "stability": "pass",
+    }
+    assert {x["status"] for x in rows(env).values()} == {"judged"}  # never validated
+
+
+def test_judge_that_accepts_a_wrong_answer_blocks_the_type(env, judge):
+    setup(env)
+    env.run("run", "generate")
+    judge.mode = "yes"
+    code, _, _, res = validate_judge(env)
+    causes = " ".join(c["cause"] for c in res["data"]["types"]["judge"]["causes"])
+    assert code == 1 and "wrong answer was accepted" in causes
+    assert {x["status"] for x in rows(env).values()} == {"exec_failed"}
+
+
+def test_judge_that_rejects_the_reference_fails_the_oracle_gate(env, judge):
+    setup(env)
+    env.run("run", "generate")
+    judge.mode = "no"
+    code, _, _, res = validate_judge(env)
+    causes = " ".join(c["cause"] for c in res["data"]["types"]["judge"]["causes"])
+    assert code == 1 and "oracle did not pass" in causes
+
+
+def test_unstable_judge_is_flagged(env, judge):
+    flaky = JUDGE_PY.replace("KW = {}", "KW = {'answer': Answer('FLAKY total', 'judge')}")
+    setup(env, flaky)
+    env.run("run", "generate")
+    code, _, _, res = validate_judge(env)
+    causes = " ".join(c["cause"] for c in res["data"]["types"]["judge"]["causes"])
+    assert code == 1 and "judge unstable" in causes
+    r = next(iter(rows(env).values()))
+    assert r["gates"]["exec_detail"]["stability"] == "fail"
+
+
+def test_validate_judge_needs_config_up_front(env, judge, no_judge_env):
+    setup(env)
+    env.run("run", "generate")
+    code, _, err, _ = validate_judge(env)
+    assert code == 1 and "MINT_JUDGE_BASE_URL" in err
+    assert judge.calls == 0

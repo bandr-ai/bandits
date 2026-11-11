@@ -28,6 +28,17 @@ other gates still run and `exec` is `no_oracle`: the task stays `generated`. Run
 Verifier crashes, missing reward files, timeouts and Harbor build/agent errors are **infra errors**,
 not task failures: the task stays `generated` (never `exec_failed` or `blocked`) until a clean run.
 
+Judge tasks (`check = "judge"`) are skipped at level 2 because every gate costs model calls. Opt in with
+`mint validate --judge` (needs `MINT_JUDGE_BASE_URL` and `MINT_JUDGE_API_KEY` exported; `MINT_JUDGE_MODEL`
+optionally overrides the pinned model). Gates: the reference (oracle) answer passes, an empty answer
+fails (no call is made), each wrong answer fails, each alternative passes (pass = every criterion
+judged supported), plus a stability gate: the reference is judged 3 times and any difference in
+reward is a flip, which fails the gate. Missing config, endpoint errors and unparseable replies are
+infrastructure errors (no reward is written). With Harbor the key reaches the verifier through
+`[verifier.env]` (`${VAR}` taken from the host environment) and the verifier container needs outbound
+network access (`network_mode = "public"`, set for judge tasks). Whatever the gates say, judge tasks
+end `judged`, never `validated`: the judge is a model opinion, not ground truth.
+
 A type whose sample fails marks its unvalidated tasks `exec_failed` and uses one fix attempt
 (`--max-fix-attempts`, default 3). After that, stop and report. Fix, `mint run generate`, `mint validate`.
 
@@ -41,6 +52,7 @@ and `no_oracle` stay `generated`); `generated` = structure+leak+secrets passed; 
 package is malformed or its gates failed (fix and regenerate); `blocked` = leak or secret found.
 Reasons are in results.jsonl. `ready` (report only) = validated, environment not partial, grading
 trust not imitation/none, no open gaps.
+`judged` = a judge task that passed structure + leak + secrets: model opinion, never `validated`.
 `validated` means the gates passed, not that the answer is correct: `status` and `report` show the
 gold kind next to it (`validated (imitation)`) and warn about validated tasks with no audit or
 derivability decision.

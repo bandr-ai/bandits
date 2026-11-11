@@ -292,13 +292,16 @@ def plan_exec_gates(
     wrong: list,
     alternatives: list,
     auto_wrong: bool,
+    reference: str | None = None,
 ) -> tuple[list[Callable[[], RunOutcome]], Callable[[list[RunOutcome]], dict]]:
     """Split the exec gates into independent runs plus a pure `assemble(outcomes)`.
 
     `calls` are zero-argument callables (oracle if any, no-op, each wrong answer, each
     alternative, in that order); each is an independent runner call and can run in any
     order or concurrently. `assemble` takes their outcomes in the same order and builds the
-    exact result `run_exec_gates` returns, so parallel and sequential runs agree."""
+    exact result `run_exec_gates` returns, so parallel and sequential runs agree.
+    `reference` (judge tasks only) adds a stability gate: the judge scores the reference answer
+    three times (the oracle run counts as one) and any difference in reward is a flip."""
     has_oracle = (task_dir / "solution" / "solve.sh").is_file()
     calls: list[Callable[[], RunOutcome]] = []
     if has_oracle:
@@ -308,6 +311,9 @@ def plan_exec_gates(
         calls.append(lambda w=w: _try(runner, task_dir, answer_file, w))
     for a in alternatives:
         calls.append(lambda a=a: _try(runner, task_dir, answer_file, a))
+    if reference is not None:
+        for _ in range(2):
+            calls.append(lambda: runner.run_verifier(task_dir, {answer_file: reference}))
 
     def assemble(outs: list[RunOutcome]) -> dict:
         it = iter(outs)
@@ -336,7 +342,24 @@ def plan_exec_gates(
             "gate": _combine([a["gate"] for a in alts]) if alts else "not_run",
             "runs": alts,
         }
-        gates = [detail[k]["gate"] for k in ("oracle", "noop", "wrong", "alternatives")]
+        if reference is not None:
+            runs = [detail["oracle"]] if has_oracle else []
+            extra = [next(it), next(it)]
+            states = [r.get("state") for r in runs] + [x.state for x in extra]
+            rewards = [r.get("reward") for r in runs] + [x.reward for x in extra]
+            gate = (
+                "error"
+                if any(s != "ok" for s in states)
+                else "pass"
+                if len(set(rewards)) == 1
+                else "fail"
+            )
+            detail["stability"] = {"gate": gate, "rewards": rewards}
+        gates = [
+            detail[k]["gate"]
+            for k in ("oracle", "noop", "wrong", "alternatives", "stability")
+            if k in detail
+        ]
         if "fail" in gates:
             exec_state = "fail"
         elif "error" in gates:
@@ -358,13 +381,14 @@ def run_exec_gates(
     wrong: list,
     alternatives: list,
     auto_wrong: bool,
+    reference: str | None = None,
 ) -> dict:
     """Run oracle / no-op / wrong outcomes / alternatives. Value = gate satisfied?
 
     No solution/solve.sh (oracle_kind none): the oracle is not run and, if every other gate
     passes, exec is `no_oracle` (the task can be generated, never validated)."""
     calls, assemble = plan_exec_gates(
-        runner, task_dir, answer_file, wrong, alternatives, auto_wrong
+        runner, task_dir, answer_file, wrong, alternatives, auto_wrong, reference
     )
     return assemble([c() for c in calls])
 

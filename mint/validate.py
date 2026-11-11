@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from collections import defaultdict
@@ -79,7 +80,8 @@ def _plan_task(
         canon = spec["expected"][0] if isinstance(spec["expected"], list) else spec["expected"]
         wrong, auto = [derive_wrong(str(canon), spec.get("check", "exact"))], True
     answer_file = spec.get("file", "answer.txt") if spec else None
-    return plan_exec_gates(runner, d, answer_file, wrong, m["alternatives"], auto)
+    ref = str(spec["expected"]) if spec.get("check") == "judge" else None
+    return plan_exec_gates(runner, d, answer_file, wrong, m["alternatives"], auto, ref)
 
 
 def level2_task(ws: Workspace, row: dict, runner: Runner) -> dict:
@@ -175,7 +177,10 @@ def failure_causes(rows_detail: list[tuple[str, dict]]) -> list[dict]:
             ("noop", "no-op"),
             ("wrong", "wrong answer"),
             ("alternatives", "alternative answer"),
+            ("stability", "judge stability"),
         ):
+            if gate not in det:
+                continue
             g = det[gate]["gate"]
             if g in ("pass", "not_run"):
                 continue
@@ -192,6 +197,7 @@ def failure_causes(rows_detail: list[tuple[str, dict]]) -> list[dict]:
                     "noop": "no-op answer was accepted by the verifier",
                     "wrong": "wrong answer was accepted by the verifier",
                     "alternatives": "valid alternative answer was rejected (verifier too strict)",
+                    "stability": "judge unstable: the same answer got different rewards across 3 runs",
                 }[gate]
                 items.append((msg, tid))
     return group_errors(items)
@@ -207,6 +213,7 @@ def run_validate(
     dry: bool,
     runner: Runner | None = None,
     jobs: int | None = None,
+    judge: bool = False,
 ) -> dict:
     t0 = time.monotonic()
     cfg = ws.config()
@@ -219,6 +226,15 @@ def run_validate(
     if not rows:
         raise MINTError("no tasks to validate", "run `mint run generate` first")
     runner = runner or pick_runner("auto", cfg)
+    if judge and 2 in levels and any(is_judged(r) for r in rows):
+        missing = [
+            v for v in ("MINT_JUDGE_BASE_URL", "MINT_JUDGE_API_KEY") if not os.environ.get(v)
+        ]
+        if missing:
+            raise MINTError(
+                f"--judge needs {' and '.join(missing)} in the environment",
+                "export them (and optionally MINT_JUDGE_MODEL); the key is never written to the package",
+            )
     targets = [
         r
         for r in rows
@@ -270,7 +286,7 @@ def run_validate(
             ok_rows = [
                 r
                 for r in trs
-                if (not is_judged(r))  # judge gates cost calls: opt-in
+                if (judge or not is_judged(r))  # judge gates cost calls: opt-in
                 and r["gates"]["structure"] == "pass"
                 and r["gates"]["leak"] == "pass"
                 and r["gates"].get("secrets") == "pass"
@@ -437,6 +453,6 @@ def run_validate(
     ) or bool(summary.get("level1", {}).get("failed"))
     summary["any_infra_error"] = bool(summary["infra_errors"])
     summary["wall_seconds"] = round(time.monotonic() - t0, 1)
-    if 2 in levels:
+    if 2 in levels and not judge:
         summary["judge_skipped"] = sorted(r["task_id"] for r in targets if is_judged(r))
     return summary

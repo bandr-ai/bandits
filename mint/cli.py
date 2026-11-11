@@ -630,6 +630,7 @@ def cmd_validate(a, ws: Workspace) -> Result:
         a.dry_run,
         runner=pick_runner(a.runner, ws.config()),
         jobs=a.jobs,
+        judge=a.judge,
     )
     lines = [f"runner: {s['runner']}  levels: {s['levels']}  jobs: {s['jobs']}"]
     if s["runner"] == "local":
@@ -1006,6 +1007,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "harbor", "local"],
         help="auto = Harbor if harbor+docker are installed, else host-local (tasks stay `generated`)",
+    )
+    sp.add_argument(
+        "--judge",
+        action="store_true",
+        help="also run level 2 on judge tasks (costs model calls; needs MINT_JUDGE_* env vars)",
     )
 
     sp = add("decide", cmd_decide, "log a decision with its evidence")
