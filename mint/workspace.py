@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
     "gate_timeout_sec": 60,
     "harbor_timeout_sec": 1800,
     "validate_jobs": 4,
+    "judge_model": "",  # pinned model name recorded in judge tasks (endpoint/key come from env vars)
 }
 TEXT_EXTS = {".txt", ".md", ".log", ".out", ".text"}
 RECORD_EXTS = {".jsonl", ".ndjson", ".json", ".csv", ".tsv"} | TEXT_EXTS

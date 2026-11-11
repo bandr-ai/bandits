@@ -49,3 +49,14 @@ For a job that is a conversation with a user (see the skill: conversations stay 
 - Oracle: `solution/solve.sh` replays a passing attempt's tool actions against the tool service (no
   user turns needed). Wrong outcomes: no-op, a plausible wrong change.
 - `agent_timeout_sec`: conversations need more than the 900 s default.
+
+## Judge tasks
+
+Judge tasks (`check = "judge"`) add `tests/rubric.json`, `tests/evidence/`, a stdlib judge `tests/grade.py`,
+  `verifiable = false` and the pinned `judge_model` / `judge_rubric_version` / `judge_reason` under
+  `[metadata.mint]`. The key never enters the package: `[verifier.env]` forwards `MINT_JUDGE_BASE_URL`,
+  `MINT_JUDGE_API_KEY` and `MINT_JUDGE_MODEL` (default: the pinned model) from the host environment with
+  Harbor's `${VAR}` syntax, so export them before `harbor run` / `mint validate --judge`. The verifier
+  needs outbound network access: judge tasks set `[verifier.environment] network_mode = "public"`
+  (use `allowlist` + `allowed_hosts` if you must restrict it). Missing config or an endpoint error leaves
+  no reward file, which Harbor and `mint` report as an infrastructure error, never as 0 or 1.

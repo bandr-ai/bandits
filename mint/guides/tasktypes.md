@@ -68,6 +68,19 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   binary evidence such as images (`{"img/chart.png": png_bytes}`); the leak and secret scans skip
   binary files, so a secret or answer inside an image is not caught: review those by eye.
   The solver writes its answer to `/app/answer/<answer.file>`.
+- Verifier choice, in order: force a deterministic check first. (1) structured answer: `exact` or
+  `allowed_set`; (2) tests that run the answer (override `tests/test.sh` via `BuildResult.files`, keep the
+  `MINT_*` variables); (3) `numeric` with tolerance; (4) required elements checked by code (partial credit
+  allowed); (5) an `alternatives` list for other valid answers. Use the `judge` check only when none of
+  these can work, and state why in `SPEC["judge_reason"]`.
+- Judge tasks (last resort): `Answer(expected=<reference answer>, check="judge")`, `rubric=[3-6 yes/no
+  criteria]` written from the instruction and evidence, never from the logged answer, `wrong_answers`
+  (required), optional `alternatives`, text-only evidence and `SPEC["judge_reason"]` (non-empty, or
+  `mint validate` fails structure). The verifier grades the solver's answer against the evidence
+  (copied to `tests/evidence/`) and the reward is the fraction of criteria judged supported. The
+  reference is shown to the judge as "may be wrong", never as the key. The model is pinned in
+  `mint.json` (`judge_model`) or `BuildResult.judge_model` and recorded in `task.toml` with the rubric
+  version and `verifiable = false`. Judged tasks end `judged`, never `validated`.
 - Gold (`gold_type`) = why the grading is trusted: `verified` (an outside label for this job; mint's
   own check is `computed`),
   `computed` (recomputed from the inputs), `independent` (end-state/behaviour check not tied to the

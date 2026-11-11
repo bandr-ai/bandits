@@ -82,7 +82,7 @@ def scan(
         d = task_dir / sub
         if d.is_dir():
             for p in d.rglob("*"):
-                if p.is_file():
+                if p.is_file() and not (sub == "tests" and p.relative_to(d).parts[0] == "evidence"):
                     guarded[hashlib.sha256(p.read_bytes()).hexdigest()] = (
                         f"{sub}/{p.relative_to(d)}"
                     )

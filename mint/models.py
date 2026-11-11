@@ -16,10 +16,10 @@ ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
 # gold = why the grading is trusted (grading trust); see guides/tasktypes.md
 GOLD_TYPES = ("verified", "computed", "independent", "solved", "imitation", "none")
-CHECK_KINDS = ("exact", "allowed_set", "numeric")
-GRADING_METHODS = (*CHECK_KINDS, "behavioral", "judge")  # how the verifier grades
+CHECK_KINDS = ("exact", "allowed_set", "numeric", "judge")
+GRADING_METHODS = (*CHECK_KINDS, "behavioral")  # how the verifier grades
 NORMALIZERS = ("strip", "lower", "collapse_ws", "percent", "thousands", "sorted_list")
-STATUSES = ("validated", "generated", "exec_failed", "blocked")
+STATUSES = ("validated", "judged", "generated", "exec_failed", "blocked")
 GATE_STATES = ("pass", "fail", "error", "not_run", "no_oracle")
 # where solution/solve.sh comes from: a logged attempt replayed, a fresh solve, a known-good
 # reference, a script that writes the expected answer (proves grader wiring only), or none
@@ -309,6 +309,7 @@ class Answer:
     tolerance: float = 0.0
     rel_tolerance: float = 0.0
     choices: list = field(default_factory=list)  # label vocabulary shown to the solver, if any
+    # judge: expected is the reference answer shown to the judge as "may be wrong", never the key
 
     def validate(self) -> None:
         if self.check not in CHECK_KINDS:
@@ -325,8 +326,15 @@ class Answer:
             missing = [e for e in exp if str(e).strip() not in [c.strip() for c in self.choices]]
             if self.check in ("exact", "allowed_set") and missing:
                 raise ContractError(f"answer.expected {missing} not in answer.choices")
-        if self.check == "exact" and isinstance(self.expected, list | dict):
-            raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
+        if self.check in ("exact", "judge") and isinstance(self.expected, list | dict):
+            raise ContractError(
+                f"{self.check} needs a scalar expected answer; use allowed_set for lists"
+            )
+        if self.check == "judge" and not str(self.expected).strip():
+            raise ContractError(
+                "judge needs a non-empty reference answer as answer.expected (the oracle writes it; "
+                "the judge sees it labelled 'may be wrong')"
+            )
         if not self.file.strip() or "/" in self.file or self.file.startswith("."):
             raise ContractError("answer.file must be a plain file name")
 
@@ -443,6 +451,12 @@ class BuildResult:
     runtime_env: dict = field(default_factory=dict)
     # the solver's time budget (task.toml [agent] timeout_sec); None = 900. Conversations need more.
     agent_timeout_sec: float | None = None
+    # judge check only: 3-6 yes/no criteria written from the instruction and evidence, not the
+    # logged answer; the pinned model (default: mint.json judge_model). judge_reason comes from the
+    # task type's SPEC and is filled in by mint.
+    rubric: list = field(default_factory=list)
+    judge_model: str = ""
+    judge_reason: str = ""
 
 
 @dataclass

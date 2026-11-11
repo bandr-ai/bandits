@@ -199,6 +199,21 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     return L
 
 
+JUDGED_NOTE = (
+    "WARNING: `judged` tasks are graded by a model: the judge is a model opinion, not ground truth, "
+    "and they are never `validated`."
+)
+
+
+def calibrations(ws: Workspace) -> dict[str, dict]:
+    """Latest judge-calibration decision per calibrated type."""
+    return {
+        d["type"]: d
+        for d in ws.decision_rows()
+        if d.get("kind") == "judge_calibration" and d.get("type")
+    }
+
+
 def status_gold(rows: list[dict]) -> Counter:
     """Counts like {"validated (imitation)": 2}: status always shown with its gold kind."""
     return Counter(f"{r['status']} ({r['gold']})" for r in rows)
@@ -280,21 +295,42 @@ def build_report(ws: Workspace) -> str:
     L += ["## Tasks per type", ""]
     if rows:
         L += [
-            "| type | tasks | validated | ready | generated | exec_failed | blocked | gold (trust) |",
-            "|---|---|---|---|---|---|---|---|",
+            "| type | tasks | validated | judged | ready | generated | exec_failed | blocked | gold (trust) |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for t, rs in sorted(by.items()):
             sc, gc = Counter(r["status"] for r in rs), Counter(r["gold"] for r in rs)
             n_ready = sum(1 for r in rs if ready(r)[0])
             gold = ", ".join(f"{k} {v}" for k, v in sorted(gc.items()))
             L.append(
-                f"| {t} | {len(rs)} | {sc['validated']} | {n_ready} | {sc['generated']} | "
+                f"| {t} | {len(rs)} | {sc['validated']} | {sc['judged']} | {n_ready} | {sc['generated']} | "
                 f"{sc['exec_failed']} | {sc['blocked']} | {gold} |"
             )
         L += ["", VALIDATED_NOTE, ""]
+        if any(r["status"] == "judged" for r in rows):
+            L += [JUDGED_NOTE, ""]
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
     else:
         L.append("- no tasks generated")
+    cals = calibrations(ws)
+    judged_rows = [r for r in rows if r.get("check") == "judge"]
+    if judged_rows or cals:
+        L += ["", "## Judge (model opinion, not ground truth)", ""]
+        for t in sorted({r["type"] for r in judged_rows}):
+            tr = [r for r in judged_rows if r["type"] == t]
+            reasons = sorted({r.get("judge_reason", "") for r in tr})
+            L.append(
+                f"- {t}: {len(tr)} judged task(s); why no deterministic check: {'; '.join(reasons)}"
+            )
+        for t, d in sorted(cals.items()):
+            L.append(
+                f"- calibration on {t}: judge agrees with the deterministic result "
+                f"{d['agreement']:.0%} ({d['agreed']}/{d['total']}); {d['why']}"
+            )
+        if judged_rows and not cals:
+            L.append(
+                "- no calibration recorded: run `mint judge-calibrate --type <deterministic type>`"
+            )
     L += ["", "## Gate results", ""]
     gc = Counter()
     for r in rows:

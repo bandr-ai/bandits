@@ -214,10 +214,10 @@ def _stage_report(ws: Workspace) -> dict:
             "tasks": len(rows),
         },
         "5_validate": {
-            "done": bool(rows) and any(r["status"] == "validated" for r in rows),
+            "done": bool(rows) and any(r["status"] in ("validated", "judged") for r in rows),
             "local_only": bool(rows)
             and not any(r["status"] == "validated" for r in rows)
-            and any(r["gates"]["exec"] == "pass" for r in rows),
+            and any(r["gates"]["exec"] == "pass" and r["status"] != "judged" for r in rows),
             "by_status": dict(sc),
             "by_status_gold": dict(report_mod.status_gold(rows)),
             "validated_without_decision": report_mod.validated_without_decision(ws, rows),
@@ -299,6 +299,8 @@ def cmd_status(a, ws: Workspace) -> Result:
         lines.append(
             "tasks: " + ", ".join(f"{k}={n}" for k, n in sorted(v5["by_status_gold"].items()))
         )
+    if v5["by_status"].get("judged"):
+        lines.append(f"note: {report_mod.JUDGED_NOTE}")
     if v5["by_status"].get("validated"):
         lines.append(f"note: {report_mod.VALIDATED_NOTE}")
         if v5["validated_without_decision"]:
@@ -646,6 +648,11 @@ def cmd_validate(a, ws: Workspace) -> Result:
         lines += _group_lines(v["causes"])
         if v.get("message"):
             lines.append(f"  {v['message']}")
+    if s.get("judge_skipped"):
+        lines.append(
+            f"level 2 skipped {len(s['judge_skipped'])} judge task(s): they cost model calls and "
+            "never become `validated`; opt in with `mint validate --judge`"
+        )
     if "level3_audit_sample" in s:
         lines.append(
             "level 3 audit sample (read these; record the verdict with `mint decide --kind audit`):"
@@ -771,7 +778,7 @@ def schema_data() -> dict:
             "note": "findings are observations, not exclusions",
         },
         "tasktypes/<type>.py": {
-            "SPEC": "{env, job, check, gold, hidden, applies_when}; job = the id from jobs.json this type rebuilds end to end (Mint builds whole jobs only, no subtasks)",
+            "SPEC": "{env, job, check, gold, hidden, applies_when, judge_reason}; judge_reason = required non-empty when check is judge (why no deterministic check works); job = the id from jobs.json this type rebuilds end to end (Mint builds whole jobs only, no subtasks)",
             "jobs.json": '{"jobs": [{id, description, where, repeats, outcome, notes?}]}: every job the logged agents were given, from step 1; one task (or candidate) per job instance',
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
@@ -793,6 +800,8 @@ def schema_data() -> dict:
                 "grading_method": f"{list(GRADING_METHODS)}; default answer.check or behavioral",
                 "grading_reason": "one line: why this grading is trusted",
                 "gaps": f"[{{what, affects in {list(GAP_AFFECTS)}}}]",
+                "rubric": "judge only: 3-6 distinct yes/no criteria written from the instruction and evidence, never the logged answer; answer.expected is then the reference answer (shown to the judge as 'may be wrong'); evidence must be text and is copied to tests/evidence/",
+                "judge_model": "judge only: pinned model name (default: mint.json judge_model); endpoint and key come from MINT_JUDGE_BASE_URL / MINT_JUDGE_API_KEY / MINT_JUDGE_MODEL at verify time",
                 "leak_allow": "[task-relative path] skipped by the leak scan (recorded in results)",
                 "secret_allow": "[task-relative path] skipped by the secret scan (recorded in results)",
                 "hidden": "extra strings that must never appear in instruction.md/environment/ (original final response, ...)",
@@ -818,6 +827,7 @@ def schema_data() -> dict:
                 "runner": ["local", "harbor"],
                 "trials": "Harbor trial ids; required (with runner=harbor) for `validated`",
             },
+            "check": "present (= judge) only on judge tasks; those end `judged`, never `validated`",
             "status": list(STATUSES),
             "provenance": "{job, oracle, oracle_source, outcomes{wrong, alternatives}, env_source, grading{method, trust, reason}, gaps}",
             "rule": "validated only if gates.exec == pass (oracle included) from a real Harbor run (runner=harbor with trial ids); host-local passes and no_oracle stay generated; exec_failed = malformed or gates failed; blocked = leak/secret",

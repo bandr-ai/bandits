@@ -67,8 +67,9 @@ from mint import Answer, Blocked, BuildResult, Candidate, Outcome, Trajectory
 SPEC = {{
     "env": "evidence",            # evidence | harness | rebuilt | partial
     "job": "TODO",               # the job id from jobs.json this type rebuilds end to end
-    "check": "exact",             # exact | allowed_set | numeric | behavioral (your own tests/test.sh)
+    "check": "exact",             # exact | allowed_set | numeric | judge | behavioral (your own tests/test.sh)
     "gold": "imitation",          # verified | computed | independent | solved | imitation | none
+    # "judge_reason": "",         # judge only: why no deterministic check can work (required)
     "hidden": ["answer key", "original final response"],
     "applies_when": "describe which records and findings this type can use",
 }}

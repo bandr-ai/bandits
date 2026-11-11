@@ -113,9 +113,13 @@ class LocalRunner(Runner):
         log = (cp.stdout or "") + (cp.stderr or "")
         reward_file = scratch / "verifier" / "reward.txt"
         if not reward_file.is_file():
+            why = next(
+                (x for x in log.splitlines() if x.startswith("judge infrastructure error")), ""
+            )
             return RunOutcome(
                 "infra_error",
-                detail=f"verifier exited {cp.returncode} without writing /logs/verifier/reward.txt",
+                detail=f"verifier exited {cp.returncode} without writing /logs/verifier/reward.txt"
+                + (f" ({why})" if why else ""),
                 log=log,
             )
         try:

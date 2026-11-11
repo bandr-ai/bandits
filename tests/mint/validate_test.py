@@ -196,7 +196,7 @@ def test_decide_dedupes_and_report_lists_everything(env):
         "raw records that landed in no trajectory: 4",
         "has_answer",
         "boom",
-        "| addnums | 3 | 1 | 0 | 2 | 0 | 0 |",
+        "| addnums | 3 | 1 | 0 | 0 | 2 | 0 | 0 |",
         "## Jobs",
         "imitation",
         "needs a live system",

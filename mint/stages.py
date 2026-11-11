@@ -478,6 +478,10 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                         if p.is_file():
                             extra[p.relative_to(stage).as_posix()] = p.read_bytes()
                     res.files = {**extra, **res.files}
+                    if res.answer is not None and res.answer.check == "judge":
+                        # pinned model and the reason a judge is needed come from config / SPEC
+                        res.judge_model = (res.judge_model or cfg.get("judge_model") or "").strip()
+                        res.judge_reason = str(tt.spec.get("judge_reason") or "").strip()
                     harbor.materialize(res, dest, tt.name, tt.generator, srcs, spec=tt.spec)
                 except Exception as e:
                     detail = f"{type(e).__name__}: {e}"
@@ -492,6 +496,8 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     )
                     continue
                 row = new_row(res.task_id, tt.name, srcs, tt.generator, res.gold_type)
+                if res.answer is not None and res.answer.check == "judge":
+                    row["check"], row["judge_reason"] = "judge", res.judge_reason
                 row["assumptions"] = list(res.assumptions)
                 row["provenance"] = {
                     "job": tt.spec.get("job"),

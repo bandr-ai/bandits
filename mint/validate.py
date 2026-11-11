@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from . import scan
 from .gates import Runner, RunOutcome, derive_wrong, pick_runner, plan_exec_gates
 from .output import MINTError, progress
-from .results import check_invariants, finalize
+from .results import check_invariants, finalize, is_judged
 from .stages import group_errors, package_hash
 from .workspace import Workspace, read_json, write_json
 
@@ -270,7 +270,8 @@ def run_validate(
             ok_rows = [
                 r
                 for r in trs
-                if r["gates"]["structure"] == "pass"
+                if (not is_judged(r))  # judge gates cost calls: opt-in
+                and r["gates"]["structure"] == "pass"
                 and r["gates"]["leak"] == "pass"
                 and r["gates"].get("secrets") == "pass"
                 and not r.get("blocked_reason")
@@ -436,4 +437,6 @@ def run_validate(
     ) or bool(summary.get("level1", {}).get("failed"))
     summary["any_infra_error"] = bool(summary["infra_errors"])
     summary["wall_seconds"] = round(time.monotonic() - t0, 1)
+    if 2 in levels:
+        summary["judge_skipped"] = sorted(r["task_id"] for r in targets if is_judged(r))
     return summary

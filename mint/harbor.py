@@ -8,6 +8,7 @@ Conventions (checked against harbor-framework/harbor, schema_version 1.4):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -36,6 +37,18 @@ REQUIRED = ["task.toml", "instruction.md", "tests/test.sh"]
 
 def grade_source() -> str:
     return resources.files("mint").joinpath("templates/grade.py").read_text()
+
+
+JUDGE_ENV = ("MINT_JUDGE_BASE_URL", "MINT_JUDGE_API_KEY", "MINT_JUDGE_MODEL")
+RUBRIC_MIN, RUBRIC_MAX = 3, 6
+
+
+def judge_source() -> str:
+    return resources.files("mint").joinpath("templates/judge.py").read_text()
+
+
+def rubric_version(criteria: list) -> str:
+    return hashlib.sha256(json.dumps(criteria).encode()).hexdigest()[:8]
 
 
 def _toml_str(s: str) -> str:
@@ -90,6 +103,7 @@ def task_toml(
     """separate=True: answer-file task, verifier in its own image reading /app/answer.
     separate=False: custom verifier, runs in the solver's environment (checks its end state)."""
     name = f"{ORG}/{ttype}-{b.task_id}".lower()
+    judge = b.answer is not None and b.answer.check == "judge"
     spec = spec or {}
     gaps = [f"{g['affects']}: {g['what']}" for g in b.gaps]
     lines = [f'schema_version = "{SCHEMA_VERSION}"']
@@ -122,16 +136,33 @@ def task_toml(
         f"gaps = {_toml_list(gaps)}",
         f"sources = {_toml_list(sources)}",
         f"assumptions = {_toml_list(b.assumptions)}",
+    ]
+    if judge:
+        lines += [
+            "verifiable = false  # graded by a model: an opinion, not ground truth",
+            f"judge_model = {_toml_str(b.judge_model)}",
+            "judge_temperature = 0",
+            f"judge_rubric_version = {_toml_str(rubric_version(b.rubric))}",
+            f"judge_reason = {_toml_str(b.judge_reason)}",
+        ]
+    lines += [
         "",
         "[verifier]",
-        f"timeout_sec = {_verifier_timeout(b)}",
+        f"timeout_sec = {300.0 if judge and b.verifier_timeout_sec is None else _verifier_timeout(b)}",
     ]
     if separate:
+        lines += ['environment_mode = "separate"', ""]
+        if (
+            judge
+        ):  # the key reaches the verifier from the host environment; it is never written here
+            lines += ["[verifier.env]"]
+            for var in JUDGE_ENV:
+                ref = f"${{{var}:-{b.judge_model}}}" if var == "MINT_JUDGE_MODEL" else f"${{{var}}}"
+                lines.append(f"{var} = {_toml_str(ref)}")
+            lines.append("")
         lines += [
-            'environment_mode = "separate"',
-            "",
             "[verifier.environment]",
-            'network_mode = "no-network"',
+            f'network_mode = "{"public" if judge else "no-network"}"',
         ]
     lines += [
         "",
@@ -270,6 +301,23 @@ def materialize(
     resolve(b)
     custom = b.answer is None
     files: dict[str, str | bytes] = {}
+    judge = b.answer is not None and b.answer.check == "judge"
+    if judge:
+        crit = b.rubric
+        if not (
+            isinstance(crit, list)
+            and RUBRIC_MIN <= len(crit) <= RUBRIC_MAX
+            and all(isinstance(c, str) and c.strip() for c in crit)
+            and len({c.strip() for c in crit}) == len(crit)
+        ):
+            raise ContractError(
+                f"a judge task needs a rubric of {RUBRIC_MIN}-{RUBRIC_MAX} distinct yes/no criteria "
+                "(strings), written from the instruction and evidence, not the logged answer"
+            )
+        if not b.wrong_answers:
+            raise ContractError(
+                "a judge task needs `wrong_answers`: plausible mistakes the judge must reject"
+            )
 
     if b.instruction is not None:
         text = b.instruction.rstrip() + "\n"
@@ -299,6 +347,8 @@ def materialize(
         files.setdefault("solution/solve.sh", solve_sh(b.answer, None, b.gold_type))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
+    if judge:
+        add_judge_files(files, b)
 
     if dest.exists():
         import shutil
@@ -316,6 +366,33 @@ def materialize(
             p.chmod(0o755)
         written.append(relp)
     return written
+
+
+def add_judge_files(files: dict, b: BuildResult) -> None:
+    """tests/ gets what the separate verifier needs: the judge script, the rubric (with the task
+    text and pinned model) and a copy of the evidence. No file here is solver-visible."""
+    instr = files.get("instruction.md")
+    if not isinstance(instr, str) or not instr.strip():
+        raise ContractError("a judge task needs an instruction (the judge grades against it)")
+    ev = {
+        k[len("environment/data/") :]: v
+        for k, v in files.items()
+        if k.startswith("environment/data/")
+    }
+    if not ev:
+        raise ContractError("a judge task needs text evidence: the judge grades against it")
+    if any(not isinstance(v, str) for v in ev.values()):
+        raise ContractError("a judge task supports text evidence only (no bytes)")
+    rubric = {
+        "version": rubric_version(b.rubric),
+        "model": b.judge_model,
+        "task": instr,
+        "criteria": [c.strip() for c in b.rubric],
+    }
+    files["tests/rubric.json"] = json.dumps(rubric, indent=2) + "\n"
+    files["tests/grade.py"] = judge_source()
+    for k, v in ev.items():
+        files[f"tests/evidence/{k}"] = v
 
 
 def structure_check(task_dir: Path) -> list[str]:
@@ -410,4 +487,48 @@ def structure_check(task_dir: Path) -> list[str]:
         task_dir / "instruction.md"
     ).read_text().strip():
         problems.append("instruction.md is empty")
+    if cfg and exp.is_file() and _spec_check(exp) == "judge":
+        problems += judge_problems(task_dir, cfg)
     return problems
+
+
+def _spec_check(exp: Path) -> str:
+    try:
+        return str(json.loads(exp.read_text()).get("check"))
+    except (ValueError, AttributeError):
+        return ""
+
+
+def judge_problems(task_dir: Path, cfg: dict) -> list[str]:
+    """Extra structure rules for judged tasks."""
+    out: list[str] = []
+    meta = cfg.get("metadata", {}).get("mint", {})
+    if not str(meta.get("judge_reason", "")).strip():
+        out.append(
+            "judge task has no judge_reason: set SPEC['judge_reason'] in the task type "
+            "(why no deterministic check can work)"
+        )
+    if meta.get("verifiable") is not False:
+        out.append("judge task must record `verifiable = false` in [metadata.mint]")
+    rub = task_dir / "tests" / "rubric.json"
+    try:
+        r = json.loads(rub.read_text())
+        crit = r["criteria"]
+        if not (
+            isinstance(crit, list)
+            and RUBRIC_MIN <= len(crit) <= RUBRIC_MAX
+            and all(isinstance(c, str) and c.strip() for c in crit)
+        ):
+            out.append(f"tests/rubric.json needs {RUBRIC_MIN}-{RUBRIC_MAX} non-empty criteria")
+        if not str(r.get("model", "")).strip() or meta.get("judge_model") != r.get("model"):
+            out.append(
+                "judge model is not pinned (set judge_model in mint.json or BuildResult.judge_model)"
+            )
+        if not str(r.get("task", "")).strip():
+            out.append("tests/rubric.json has no task text")
+    except (OSError, ValueError, KeyError, TypeError):
+        out.append("tests/rubric.json is missing or invalid")
+    ev = task_dir / "tests" / "evidence"
+    if not (ev.is_dir() and any(p.is_file() for p in ev.rglob("*"))):
+        out.append("tests/evidence/ is empty: the judge needs the task evidence")
+    return out
