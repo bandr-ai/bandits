@@ -6,6 +6,12 @@ The scan flags: hidden strings, answer-like file names, copies of `tests/` or `s
 and short answers after labels like `answer:`. Evidence that merely shares words with the answer is fine.
 Allow a legitimate flagged file with `BuildResult.leak_allow=["environment/data/x"]` and a `decide`.
 
+The secret scan (also level 1) covers `instruction.md`, `task.toml` and `environment/`: API-key and
+token shapes, private keys, bearer tokens, `password`/`secret`/`token` followed by a literal value,
+and URLs with embedded credentials. A hit blocks the task and names the file, line and a redacted
+preview. Allow a legitimate hit with `BuildResult.secret_allow=["environment/data/x"]` and a
+`decide`; allow-lists are recorded in `results.jsonl` (`allow`) and the report.
+
 Level 2 (seeded sample per type + changed instances, `--sample-size N`): in a scratch dir the real
 `tests/test.sh` runs against: the oracle (solve.sh) must pass; an empty answer must fail; each wrong
 answer must fail; each alternative must pass. Runner is `local` (no Docker): result rows record it.

@@ -10,8 +10,10 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`l2h new tas
 - Always give `wrong_answers` that are *meaningful* (a plausible mistake, not noise) and `alternatives`
   when exact matching might be too strict. `hidden` lists strings that must never reach the solver:
   the original final response, answer keys.
-- Evidence goes in `evidence={"path": text}` and appears at `/app/path`. The solver writes its answer
-  to `/app/answer/<answer.file>`.
+- Evidence goes in `evidence={"path": text_or_bytes}` and appears at `/app/path`. Use bytes for
+  binary evidence such as images (`{"img/chart.png": png_bytes}`); the leak and secret scans skip
+  binary files, so a secret or answer inside an image is not caught: review those by eye.
+  The solver writes its answer to `/app/answer/<answer.file>`.
 - Gold: `verified` (independent verdict for this exact scope), `solved` (not in this version),
   `imitation` (logged answer), `none` (blocked).
 - Bump `VERSION` when the generator changes so changed instances are revalidated.

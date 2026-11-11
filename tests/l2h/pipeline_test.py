@@ -62,7 +62,12 @@ def test_generate_build_blocked_exception_and_exclusion(env):
         and rows[0]["generator"] == "addnums@1"
         and rows[0]["gold"] == "imitation"
     )
-    assert rows[0]["gates"] == {"structure": "pass", "leak": "pass", "exec": "not_run"}
+    assert rows[0]["gates"] == {
+        "structure": "pass",
+        "leak": "pass",
+        "secrets": "pass",
+        "exec": "not_run",
+    }
 
 
 def test_builder_exception_is_queued_not_fatal(env):

@@ -178,6 +178,7 @@ class BuildResult:
     alternatives: list = field(default_factory=list)
     hidden: list = field(default_factory=list)
     leak_allow: list = field(default_factory=list)
+    secret_allow: list = field(default_factory=list)
     difficulty: str = "medium"
     tags: list = field(default_factory=list)
     description: str = ""

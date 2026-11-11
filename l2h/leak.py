@@ -47,9 +47,13 @@ def _visible_files(task_dir: Path) -> list[Path]:
     return out
 
 
-def _read_text(p: Path) -> str | None:
+def read_text(p: Path) -> str | None:
+    """File text, or None for binary files (undecodable or containing NUL bytes)."""
+    data = p.read_bytes()
+    if b"\0" in data:
+        return None
     try:
-        return p.read_bytes().decode("utf-8")
+        return data.decode("utf-8")
     except UnicodeDecodeError:
         return None
 
@@ -85,7 +89,7 @@ def scan(
         digest = hashlib.sha256(p.read_bytes()).hexdigest()
         if digest in guarded:
             leaks.append(Leak(relp, "copy_of_hidden_file", f"identical to {guarded[digest]}"))
-        text = _read_text(p)
+        text = read_text(p)
         if text is None:
             continue
         ntext = _norm(text)

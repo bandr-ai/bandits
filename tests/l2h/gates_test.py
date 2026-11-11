@@ -117,9 +117,9 @@ def test_injected_runner_errors_are_recorded(tmp_path):
 # ------------------------------------------------------------------ status
 
 
-def row(structure="pass", leak="pass", exec_="not_run", runner=None, trials=None):
+def row(structure="pass", leak="pass", exec_="not_run", runner=None, trials=None, secrets="pass"):
     r = new_row("t", "ty", ["f#0"], "ty@1", "imitation")
-    r["gates"].update(structure=structure, leak=leak, exec=exec_)
+    r["gates"].update(structure=structure, leak=leak, secrets=secrets, exec=exec_)
     if runner:
         r["gates"]["runner"] = runner
     if trials:
@@ -137,6 +137,11 @@ def test_never_validated_without_exec_gates():
     assert finalize(row(exec_="pass", runner="local"))["status"] == "generated"
     assert finalize(row(exec_="fail", runner="local"))["status"] == "blocked"
     assert finalize(row(leak="fail"))["status"] == "blocked"
+    assert finalize(row(secrets="fail"))["status"] == "blocked"
+    assert (
+        finalize(row(secrets="not_run", exec_="pass", runner="harbor", trials=["t"]))["status"]
+        == "generated"
+    )
     assert finalize(row(structure="fail", exec_="pass", runner="local"))["status"] == "blocked"
 
 

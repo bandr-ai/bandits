@@ -81,7 +81,7 @@ def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked:
     # return BuildResult(
     #     task_id="...",
     #     instruction="...",              # what to do; never the recorded answer
-    #     evidence={{"notes.txt": "..."}},  # lands at /app/notes.txt
+    #     evidence={{"notes.txt": "..."}},  # lands at /app/notes.txt; values may be bytes (images)
     #     answer=Answer(expected="...", check="exact"),
     #     wrong_answers=["a meaningful wrong answer"],
     #     gold_type="imitation",

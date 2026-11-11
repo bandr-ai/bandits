@@ -139,6 +139,8 @@ def materialize(
             text += f"\nWrite your final answer to `{ans_path}` (just the answer, nothing else).\n"
         files["instruction.md"] = text
     for k, v in b.evidence.items():
+        if not isinstance(v, str | bytes):
+            raise ContractError(f"evidence {k!r} must be str or bytes, got {type(v).__name__}")
         files[f"environment/data/{k}"] = v
     files.update(b.files)  # generator overrides win
 

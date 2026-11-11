@@ -15,7 +15,6 @@ from . import report as report_mod
 from . import validate as validate_mod
 from .gates import LocalRunner, pick_runner
 from .harbor import ANSWER_DIR
-from .leak import scan as leak_scan
 from .models import (
     CHECK_KINDS,
     ENDED,
@@ -36,6 +35,7 @@ from .output import (
     render_error,
 )
 from .results import finalize
+from .scan import scan_task
 from .scripts import scaffold
 from .workspace import (
     CONFIG_NAME,
@@ -443,10 +443,9 @@ def cmd_task_show(a, ws: Workspace) -> Result:
     d = ws.task_dir(a.id)
     cfg = ws.config()
     mc = 0 if a.full else cfg["max_field_chars"]
-    meta = read_json(ws.internal / "taskmeta" / f"{a.id}.json", {"hidden": [], "leak_allow": []})
-    leaks = leak_scan(
-        d, meta["hidden"], meta["leak_allow"], cfg["leak"]["min_len"], cfg["leak"]["run_len"]
-    )
+    meta = read_json(ws.internal / "taskmeta" / f"{a.id}.json", {})
+    res = scan_task(d, meta, cfg)
+    leaks = res.leaks + res.secrets
     instr = (d / "instruction.md").read_text()
     files = _task_tree(d, mc)
     data = {
@@ -650,10 +649,12 @@ def schema_data() -> dict:
             "BuildResult": {
                 "task_id": "str [A-Za-z0-9._-]",
                 "instruction": "str; never the recorded answer",
-                "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>",
+                "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>; binary files are skipped by the leak and secret scans",
                 "answer": f"Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance)",
                 "wrong_answers": "meaningful wrong answers the verifier must reject (else an auto one is used and flagged)",
                 "alternatives": "other valid answers the verifier must accept",
+                "leak_allow": "[task-relative path] skipped by the leak scan (recorded in results)",
+                "secret_allow": "[task-relative path] skipped by the secret scan (recorded in results)",
                 "hidden": "extra strings that must never appear in instruction.md/environment/ (original final response, ...)",
                 "files": "optional overrides/extras keyed by task-relative path",
                 "gold_type": list(GOLD_TYPES),
@@ -671,6 +672,7 @@ def schema_data() -> dict:
             "gates": {
                 "structure": list(GATE_STATES),
                 "leak": list(GATE_STATES),
+                "secrets": list(GATE_STATES),
                 "exec": list(GATE_STATES),
                 "runner": ["local", "harbor"],
                 "trials": "Harbor trial ids; required (with runner=harbor) for `validated`",

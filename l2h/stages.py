@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from . import harbor, leak
+from . import harbor, scan
 from .models import (
     Blocked,
     BuildResult,
@@ -421,20 +421,21 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 if isinstance(res.answer.expected, list):
                     hidden += [str(x) for x in res.answer.expected]
                 hidden += [str(a) for a in res.alternatives]
-                lk = leak.scan(
-                    dest,
-                    hidden,
-                    res.leak_allow,
-                    cfg["leak"]["min_len"],
-                    cfg["leak"]["run_len"],
-                )
-                probs = harbor.structure_check(dest)
-                row["gates"]["structure"] = "fail" if probs else "pass"
-                row["gates"]["leak"] = "fail" if lk else "pass"
-                if probs or lk:
-                    row["problems"] = probs + [
-                        f"leak: {x.kind} in {x.where}: {x.detail}" for x in lk
-                    ]
+                meta = {
+                    "wrong_answers": [str(w) for w in res.wrong_answers],
+                    "alternatives": [str(a) for a in res.alternatives],
+                    "hidden": hidden,
+                    "leak_allow": list(res.leak_allow),
+                    "secret_allow": list(res.secret_allow),
+                }
+                scan.apply(row, scan.scan_task(dest, meta, cfg))
+                allow = {
+                    k: list(v)
+                    for k, v in (("leak", res.leak_allow), ("secrets", res.secret_allow))
+                    if v
+                }
+                if allow:
+                    row["allow"] = allow  # explicit allow-lists stay visible in results
                 old = old_by_id.get(res.task_id)
                 if (
                     old
@@ -445,20 +446,16 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     row = old  # unchanged: keep exec evidence (idempotent rerun)...
                     row["sources"], row["generator"] = srcs, tt.generator
                     # ...but structure/leak are re-judged now (hidden values may have changed)
-                    row["gates"]["structure"] = fresh["gates"]["structure"]
-                    row["gates"]["leak"] = fresh["gates"]["leak"]
-                    if fresh.get("problems"):
-                        row["problems"] = fresh["problems"]
-                    else:
-                        row.pop("problems", None)
+                    for g in ("structure", "leak", "secrets"):
+                        row["gates"][g] = fresh["gates"][g]
+                    for k in ("problems", "warnings", "allow"):
+                        if fresh.get(k):
+                            row[k] = fresh[k]
+                        else:
+                            row.pop(k, None)
                 elif old:
                     row["changed"] = True  # same id, new content: revalidate
-                taskmeta[res.task_id] = {
-                    "wrong_answers": [str(w) for w in res.wrong_answers],
-                    "alternatives": [str(a) for a in res.alternatives],
-                    "hidden": hidden,
-                    "leak_allow": list(res.leak_allow),
-                }
+                taskmeta[res.task_id] = meta
                 new_rows.append(finalize(row))
     finally:
         clear_dir(staging_root)
@@ -522,7 +519,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         "structure_or_leak_failures": [
             {"task_id": r["task_id"], "problems": r.get("problems", [])}
             for r in new_rows
-            if r["gates"]["structure"] == "fail" or r["gates"]["leak"] == "fail"
+            if "fail" in (r["gates"]["structure"], r["gates"]["leak"], r["gates"]["secrets"])
         ][:20],
         "sources_used": len(used),
         "trajectories_in_queue": len(queued_ids),

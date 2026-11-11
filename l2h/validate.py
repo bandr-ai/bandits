@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 
-from . import harbor, leak
+from . import scan
 from .gates import Runner, derive_wrong, pick_runner, run_exec_gates
 from .output import L2HError, progress
 from .results import check_invariants, finalize
@@ -16,7 +16,13 @@ from .workspace import Workspace, read_json, write_json
 def _meta(ws: Workspace, tid: str) -> dict:
     return read_json(
         ws.internal / "taskmeta" / f"{tid}.json",
-        {"wrong_answers": [], "alternatives": [], "hidden": [], "leak_allow": []},
+        {
+            "wrong_answers": [],
+            "alternatives": [],
+            "hidden": [],
+            "leak_allow": [],
+            "secret_allow": [],
+        },
     )
 
 
@@ -34,7 +40,7 @@ def refresh_evidence(ws: Workspace, row: dict) -> None:
     now = package_hash(d)
     if row.get("content_hash") and now != row["content_hash"]:
         # structure/leak were judged on the old content too: level 1 must re-run
-        row["gates"].update(structure="not_run", leak="not_run", exec="not_run")
+        row["gates"].update(structure="not_run", leak="not_run", secrets="not_run", exec="not_run")
         for k in ("runner", "trials", "exec_detail"):
             row["gates"].pop(k, None)
         row["changed"] = True
@@ -44,20 +50,12 @@ def refresh_evidence(ws: Workspace, row: dict) -> None:
 
 def level1(ws: Workspace, row: dict) -> None:
     """Structure + leak for one task row (mutates row)."""
-    cfg = ws.config()
     d = ws.tasks / row["type"] / row["task_id"]
     if not d.is_dir():
         row["gates"]["structure"] = "fail"
         row["problems"] = ["task directory is missing; re-run `l2h run generate`"]
         return
-    probs = harbor.structure_check(d)
-    m = _meta(ws, row["task_id"])
-    lk = leak.scan(d, m["hidden"], m["leak_allow"], cfg["leak"]["min_len"], cfg["leak"]["run_len"])
-    row["gates"]["structure"] = "fail" if probs else "pass"
-    row["gates"]["leak"] = "fail" if lk else "pass"
-    row["problems"] = probs + [f"leak: {x.kind} in {x.where}: {x.detail}" for x in lk]
-    if not row["problems"]:
-        row.pop("problems")
+    scan.apply(row, scan.scan_task(d, _meta(ws, row["task_id"]), ws.config()))
 
 
 def level2_task(ws: Workspace, row: dict, runner: Runner) -> dict:
@@ -142,12 +140,15 @@ def run_validate(
     for r in targets:
         refresh_evidence(ws, r)
     for r in targets:
-        if 1 in levels or "not_run" in (r["gates"]["structure"], r["gates"]["leak"]):
+        g = r["gates"]
+        if 1 in levels or "not_run" in (g["structure"], g["leak"], g.get("secrets", "not_run")):
             level1(ws, r)  # also for edited packages, whatever --level says
             finalize(r)
     if 1 in levels:
         bad = [
-            r for r in targets if r["gates"]["structure"] == "fail" or r["gates"]["leak"] == "fail"
+            r
+            for r in targets
+            if "fail" in (r["gates"]["structure"], r["gates"]["leak"], r["gates"].get("secrets"))
         ]
         summary["level1"] = {
             "checked": len(targets),
@@ -168,6 +169,7 @@ def run_validate(
                 for r in trs
                 if r["gates"]["structure"] == "pass"
                 and r["gates"]["leak"] == "pass"
+                and r["gates"].get("secrets") == "pass"
                 and not r.get("blocked_reason")
             ]
             if attempts.get(ttype, 0) >= max_fix and not task_ids:
