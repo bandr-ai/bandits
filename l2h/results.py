@@ -2,8 +2,10 @@
 
 Status is always derived, never assigned freely:
   blocked   - structure/leak/exec failed, or an explicit blocked_reason is set
-  validated - ONLY if exec gates ran and passed (and structure + leak passed)
-  generated - structure + leak passed, exec gates not run / errored
+  validated - ONLY if exec gates ran and passed in a real Harbor run (and
+              structure + leak passed). The host-local runner is a fast
+              verifier check, so its passes stay `generated`.
+  generated - structure + leak passed, exec gates not run / errored / local only
 """
 
 from __future__ import annotations
@@ -33,7 +35,12 @@ def derive_status(row: dict) -> tuple[str, str]:
         return "blocked", "leak scan failed"
     if g["exec"] == "fail":
         return "blocked", "exec gate failed"
-    if g["exec"] == "pass" and g["structure"] == "pass" and g["leak"] == "pass":
+    if (
+        g["exec"] == "pass"
+        and g["structure"] == "pass"
+        and g["leak"] == "pass"
+        and g.get("runner") not in (None, "local")
+    ):
         return "validated", ""
     return "generated", ""
 
@@ -55,7 +62,7 @@ def check_invariants(rows: list[dict]) -> None:
             g["exec"] == "pass"
             and g["structure"] == "pass"
             and g["leak"] == "pass"
-            and g.get("runner")
+            and g.get("runner") not in (None, "local")
         ):
             raise ContractError(
                 f"task {r['task_id']} would be 'validated' without its execution gates having run and passed"

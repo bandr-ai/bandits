@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from l2h.cli import main
+from l2h.gates import LocalRunner
 
 PARSE_PY = """
 import json
@@ -205,3 +207,23 @@ class Env:
 @pytest.fixture
 def env(tmp_path, capsys):
     return Env(tmp_path, capsys)
+
+
+@dataclass
+class _HarborSim(LocalRunner):
+    """Stands in for a real Harbor run in tests (host execution, Harbor-grade name)."""
+
+    name: str = "harbor-sim"
+
+
+@pytest.fixture
+def local_runner():
+    """Opt out of the Harbor stand-in: use the real host-local runner."""
+
+
+@pytest.fixture(autouse=True)
+def _harbor_grade_runner(request, monkeypatch):
+    if "local_runner" not in request.fixturenames:
+        from l2h import validate as v
+
+        monkeypatch.setattr(v, "LocalRunner", _HarborSim)

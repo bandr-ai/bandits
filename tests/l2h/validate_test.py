@@ -23,7 +23,7 @@ def test_generate_then_validate_promotes_to_validated(env):
     st = {tid: r["status"] for tid, r in rows(env).items()}
     assert sorted(st.values()) == ["generated", "validated", "validated"]
     r = next(r for r in rows(env).values() if r["status"] == "validated")
-    assert r["gates"]["exec"] == "pass" and r["gates"]["runner"] == "local"
+    assert r["gates"]["exec"] == "pass" and r["gates"]["runner"] == "harbor-sim"
     assert r["gates"]["exec_detail"] == {
         "oracle": "pass",
         "noop": "pass",

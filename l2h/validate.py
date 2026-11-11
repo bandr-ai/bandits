@@ -9,7 +9,7 @@ from . import harbor, leak
 from .gates import LocalRunner, Runner, derive_wrong, run_exec_gates
 from .output import L2HError, progress
 from .results import check_invariants, finalize
-from .stages import group_errors
+from .stages import group_errors, package_hash
 from .workspace import Workspace, read_json, write_json
 
 
@@ -34,6 +34,14 @@ def level1(ws: Workspace, row: dict) -> None:
         row["gates"]["structure"] = "fail"
         row["problems"] = ["task directory is missing; re-run `l2h run generate`"]
         return
+    now = package_hash(d)
+    if row.get("content_hash") and now != row["content_hash"]:
+        # files changed since generation: earlier exec evidence no longer applies
+        row["gates"]["exec"] = "not_run"
+        row["gates"].pop("runner", None)
+        row["gates"].pop("exec_detail", None)
+        row["changed"] = True
+    row["content_hash"] = now
     probs = harbor.structure_check(d)
     m = _meta(ws, row["task_id"])
     lk = leak.scan(d, m["hidden"], m["leak_allow"], cfg["leak"]["min_len"], cfg["leak"]["run_len"])

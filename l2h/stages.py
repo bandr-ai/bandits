@@ -91,7 +91,13 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
         + "|".join(f"{rel(logs, p)}:{p.stat().st_size}:{p.stat().st_mtime_ns}" for p in files)
     )
     st = ws.state().get("parse", {})
-    if not no_cache and limit is None and st.get("fingerprint") == fp and ws.trajectories.exists():
+    if (
+        not no_cache
+        and limit is None
+        and st.get("fingerprint") == fp
+        and st.get("complete", True)
+        and ws.trajectories.exists()
+    ):
         return {
             **st["summary"],
             "cached": True,
@@ -175,7 +181,14 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
     )
     if not dry:
         write_jsonl(ws.trajectories, trajs)
-        ws.update_state(parse={"fingerprint": fp, "script": ld.digest, "summary": _stored(summary)})
+        ws.update_state(
+            parse={
+                "fingerprint": fp,
+                "complete": limit is None,
+                "script": ld.digest,
+                "summary": _stored(summary),
+            }
+        )
     return summary
 
 
@@ -436,7 +449,12 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     finally:
         clear_dir(staging_root)
 
-    kept = [r for r in old_rows if only_type and r["type"] != only_type]
+    partial = limit is not None
+    new_ids = {r["task_id"] for r in new_rows}
+    if partial:  # a limited run updates its slice and never prunes the rest
+        kept = [r for r in old_rows if r["task_id"] not in new_ids]
+    else:
+        kept = [r for r in old_rows if only_type and r["type"] != only_type]
     all_rows = kept + new_rows
     check_invariants(all_rows)
 
@@ -483,7 +501,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         return summary
 
     # persist: swap in new task dirs, drop stale ones for rebuilt types
-    for tt in built_types:
+    for tt in [] if partial else built_types:
         keep = {r["task_id"] for r in new_rows if r["type"] == tt.name}
         tdir = ws.tasks / tt.name
         if tdir.is_dir():
@@ -494,7 +512,18 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     meta_dir = ws.internal / "taskmeta"
     for tid, m in taskmeta.items():
         write_json(meta_dir / f"{tid}.json", m)
-    if not only_type:
+    seen_t = {t["id"] for t in trajs}
+    if partial:
+        old_ex = [e for e in read_jsonl(ws.excluded) if e["trajectory_id"] not in seen_t]
+        write_jsonl(ws.excluded, old_ex + excluded)
+        old_q = [
+            q
+            for q in read_jsonl(ws.queue)
+            if not (set(q["trajectory_ids"]) & seen_t)
+            and not (only_type and q["type"] == only_type)
+        ]
+        write_jsonl(ws.queue, old_q + queue)
+    elif not only_type:
         write_jsonl(ws.excluded, excluded)
         write_jsonl(ws.queue, queue)
     else:
