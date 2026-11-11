@@ -85,7 +85,7 @@ def _read(env, rel):
 
 GROUPED = """
 from l2h import Answer, Blocked, BuildResult
-SPEC = {"unit": "episode", "env": "static", "task_scope": "decision", "check": "numeric", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 

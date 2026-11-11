@@ -5,7 +5,7 @@ import json
 from l2h import cli
 from l2h.cli import main
 
-from .conftest import CHECKS_PY, PARSE_PY, TASKTYPE_PY
+from .conftest import CHECKS_PY, JOBS_JSON, PARSE_PY, TASKTYPE_PY
 
 
 def test_json_shape_stdout_only_progress_on_stderr(env):
@@ -92,8 +92,14 @@ def test_dry_run_writes_nothing(env):
     env.write("parse.py", PARSE_PY)
     env.write("checks.py", CHECKS_PY)
     env.write("tasktypes/addnums.py", TASKTYPE_PY)
+    env.write("jobs.json", JOBS_JSON)
     base = env.snapshot()
-    assert set(base) - set(before) == {"ws/parse.py", "ws/checks.py", "ws/tasktypes/addnums.py"}
+    assert set(base) - set(before) == {
+        "ws/parse.py",
+        "ws/checks.py",
+        "ws/tasktypes/addnums.py",
+        "ws/jobs.json",
+    }
     for cmd in (
         ["new", "check", "foo"],
         ["new", "parser", "--force"],
@@ -182,12 +188,29 @@ def test_scaffolded_templates_load(env):
     env.run("new", "parser")
     env.run("new", "check", "c1")
     env.run("new", "tasktype", "qa")
-    from l2h.scripts import load_checks, load_parser, load_tasktypes
+    env.run("new", "jobs")
+    from l2h.output import L2HError
+    from l2h.scripts import load_checks, load_jobs, load_parser, load_tasktypes
     from l2h.workspace import Workspace
 
     ws = Workspace(env.ws)
     assert callable(load_parser(ws).module.parse)
     assert load_checks(ws)[1][0].id == "c1"
+    try:  # the scaffolded job map must be filled in before task types load
+        load_jobs(ws)
+    except L2HError as e:
+        assert "TODO" in e.message
+    else:
+        raise AssertionError("an unfilled jobs.json must not load")
+    env.write("jobs.json", JOBS_JSON)
+    tt = env.ws / "tasktypes/qa.py"
+    try:  # and a task type must name a real job
+        load_tasktypes(ws)
+    except L2HError as e:
+        assert "SPEC['job']" in e.message
+    else:
+        raise AssertionError("a task type without a known job must not load")
+    tt.write_text(tt.read_text().replace('"job": "TODO"', '"job": "main"'))
     assert load_tasktypes(ws)[0].generator == "qa@1"
     code, _, _, res = env.run("run", "parse", "--json")
     assert code == 1 and "NotImplementedError" in res["error"]["message"]

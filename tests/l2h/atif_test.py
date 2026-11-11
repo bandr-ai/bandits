@@ -169,7 +169,9 @@ def test_task_scope_is_required_and_shown_in_report(env):
     env.build_pipeline()
     env.write(
         "tasktypes/addnums.py",
-        (env.ws / "tasktypes/addnums.py").read_text().replace('"task_scope": "decision", ', ""),
+        (env.ws / "tasktypes/addnums.py")
+        .read_text()
+        .replace('"job": "main", "task_scope": "decision", ', ""),
     )
     code, _, err, res = env.run("run", "generate", "--json")
     assert code == 1 and "task_scope" in res["error"]["message"]
@@ -177,14 +179,16 @@ def test_task_scope_is_required_and_shown_in_report(env):
         "tasktypes/addnums.py",
         (env.ws / "tasktypes/addnums.py")
         .read_text()
-        .replace('"env": "static",', '"env": "static", "task_scope": "everything",'),
+        .replace('"env": "static",', '"env": "static", "job": "main", "task_scope": "everything",'),
     )
     assert env.run("run", "generate", "--json")[0] == 1
     env.write(
         "tasktypes/addnums.py",
         (env.ws / "tasktypes/addnums.py")
         .read_text()
-        .replace('"task_scope": "everything"', '"task_scope": "full_job"'),
+        .replace(
+            '"job": "main", "task_scope": "everything"', '"job": "main", "task_scope": "full_job"'
+        ),
     )
     assert env.run("run", "generate", "--json")[0] == 0
     env.run("report")
@@ -211,3 +215,21 @@ def test_show_field_accepts_l2h_shortcuts(env):
     assert env.run("show", "q1", "--field", "meta.answer", "--json")[3]["data"]["record"] == "42"
     d = env.run("show", "q1", "--field", "extra.l2h.ended", "--json")[3]["data"]
     assert d["record"] == "done"
+
+
+def test_report_lists_jobs_and_unbuilt_ones(env):
+    env.build_pipeline()
+    env.run("run", "generate")
+    env.run("report")
+    md = (env.ws / "report.md").read_text()
+    assert "## Jobs" in md and "| main | full_job |  | addnums |" in md
+    assert "Jobs with no task type yet (say why in a decision): sub" in md
+
+
+def test_old_events_format_gets_a_migration_error():
+    import pytest
+
+    from l2h.models import ContractError, normalize_trajectory
+
+    with pytest.raises(ContractError, match="pre-ATIF format"):
+        normalize_trajectory({"id": "a", "source_refs": [{"file": "x", "offset": 0}], "events": []})

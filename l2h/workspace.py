@@ -92,6 +92,10 @@ class Workspace:
         return self.root / "source_notes.md"
 
     @property
+    def jobs(self) -> Path:
+        return self.root / "jobs.json"
+
+    @property
     def parse_py(self) -> Path:
         return self.root / "parse.py"
 

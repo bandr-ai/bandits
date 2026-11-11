@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import TASK_SCOPES, Check, ContractError, safe_id
+from .models import JOB_SCOPES, TASK_SCOPES, Check, ContractError, safe_id
 from .output import L2HError, UsageError
 from .workspace import Workspace, sha
 
@@ -66,7 +67,8 @@ from l2h import Answer, Blocked, BuildResult, Trajectory
 SPEC = {{
     "unit": "episode",            # episode | subtask
     "env": "static",              # static evidence files in v1
-    "task_scope": "decision",     # full_job | decision (see `l2h docs --topic tasktypes`)
+    "job": "TODO",               # a job id from jobs.json
+    "task_scope": "decision",     # full_job | subtask | decision (see `l2h docs --topic tasktypes`)
     "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
     "gold": "imitation",          # verified | solved | imitation | negative | none
     "hidden": ["answer key", "original final response"],
@@ -99,12 +101,75 @@ def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked:
 '''
 
 
+JOBS_TEMPLATE = """{
+  "jobs": [
+    {
+      "id": "whole-run",
+      "scope": "full_job",
+      "description": "TODO: the job the logged agent was given, start to end (inputs -> output)",
+      "where": "TODO: which trajectories contain it (a query expression over r, or prose)",
+      "repeats": "TODO: how attempts at the same instance are recognised (or 'none')",
+      "outcome": "TODO: how success/failure is known from the logs (or 'unknown')",
+      "notes": ""
+    },
+    {
+      "id": "TODO-sub-capability",
+      "scope": "subtask",
+      "parent": "whole-run",
+      "description": "TODO: a sub-agent or step with its own inputs, tools and output",
+      "where": "",
+      "repeats": "",
+      "outcome": "",
+      "notes": ""
+    }
+  ]
+}
+"""
+
+JOB_FIELDS = ("id", "scope", "description", "where", "repeats", "outcome")
+
+
+def load_jobs(ws: Workspace) -> dict[str, dict]:
+    """The job map (jobs.json): every job the corpus contains, full jobs and sub-capabilities."""
+    if not ws.jobs.exists():
+        raise L2HError(
+            "no jobs.json: map the jobs in the corpus before building task types",
+            "`l2h new jobs`, then list the full job(s), sub-capabilities, repeats and outcomes",
+        )
+    try:
+        data = json.loads(ws.jobs.read_text())
+        jobs = data["jobs"]
+        assert isinstance(jobs, list) and jobs
+    except (ValueError, KeyError, AssertionError, TypeError) as e:
+        raise L2HError(f"jobs.json is not valid: {e}", 'expected {"jobs": [ {...}, ... ]}') from e
+    out: dict[str, dict] = {}
+    for j in jobs:
+        missing = [f for f in JOB_FIELDS if not str((j or {}).get(f, "")).strip()]
+        if missing:
+            raise L2HError(f"jobs.json: job {j.get('id')!r} is missing {missing}", "fill them in")
+        if "TODO" in json.dumps(j):
+            raise L2HError(
+                f"jobs.json: job {j['id']!r} still has TODO placeholders", "fill them in"
+            )
+        if j["scope"] not in JOB_SCOPES:
+            raise L2HError(f"jobs.json: job {j['id']!r} scope must be one of {list(JOB_SCOPES)}")
+        out[safe_id(str(j["id"]))] = j
+    for j in out.values():
+        if j.get("parent") and j["parent"] not in out:
+            raise L2HError(f"jobs.json: job {j['id']!r} has unknown parent {j['parent']!r}")
+    if not any(j["scope"] == "full_job" for j in out.values()):
+        raise L2HError("jobs.json lists no full_job", "name the job the logged agent was given")
+    return out
+
+
 def scaffold(ws: Workspace, kind: str, name: str, force: bool = False) -> tuple[Path, str]:
     """Return (path, new_content) without writing; caller decides (dry-run)."""
     if kind == "parser":
         return ws.parse_py, PARSER_TEMPLATE
+    if kind == "jobs":
+        return ws.jobs, JOBS_TEMPLATE
     try:
-        if kind != "parser":
+        if kind not in ("parser", "jobs"):
             name = safe_id(name or "")
     except ContractError as e:
         raise UsageError(str(e), "use letters, digits, '_', '-', '.'") from e
@@ -119,7 +184,7 @@ def scaffold(ws: Workspace, kind: str, name: str, force: bool = False) -> tuple[
         return ws.checks_py, cur + CHECK_TEMPLATE.format(name=name)
     if kind == "tasktype":
         return ws.tasktypes / f"{name}.py", TASKTYPE_TEMPLATE.format(name=name)
-    raise UsageError(f"unknown kind {kind!r}", "use parser, check or tasktype")
+    raise UsageError(f"unknown kind {kind!r}", "use parser, jobs, check or tasktype")
 
 
 @dataclass
@@ -195,6 +260,7 @@ class TaskType:
 def load_tasktypes(ws: Workspace, only: str | None = None) -> list[TaskType]:
     if not ws.tasktypes.is_dir():
         raise L2HError("no tasktypes/ directory", "create one with `l2h new tasktype <name>`")
+    jobs = load_jobs(ws)
     out = []
     for p in sorted(ws.tasktypes.glob("*.py")):
         if p.name.startswith("_") or (only and p.stem != only):
@@ -211,6 +277,12 @@ def load_tasktypes(ws: Workspace, only: str | None = None) -> list[TaskType]:
                 f"got {ld.module.SPEC.get('task_scope')!r}",
                 "full_job = the logged agent's whole job rebuilt; decision = evidence given, "
                 "decision asked (`l2h docs --topic tasktypes`)",
+            )
+        if ld.module.SPEC.get("job") not in jobs:
+            raise L2HError(
+                f"tasktypes/{p.name}: SPEC['job'] must name a job in jobs.json, "
+                f"got {ld.module.SPEC.get('job')!r}",
+                f"known jobs: {', '.join(jobs)}",
             )
         out.append(TaskType(p.stem, ld))
     if only and not out:

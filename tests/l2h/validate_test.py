@@ -2,7 +2,7 @@
 
 import json
 
-from .conftest import CHECKS_PY, PARSE_PY, TASKTYPE_PY
+from .conftest import CHECKS_PY, JOBS_JSON, PARSE_PY, TASKTYPE_PY
 
 
 def rows(env):
@@ -246,6 +246,8 @@ def test_status_tracks_stages_staleness_and_resumes(env):
     env.write("tasktypes/addnums.py", TASKTYPE_PY)
     env.write("source_notes.md", "a record is one jsonl line")
     env.run("run", "parse")
+    assert env.run("status", "--json")[3]["next"][0].startswith("l2h new jobs")
+    env.write("jobs.json", JOBS_JSON)
     env.run("run", "checks")
     env.run("run", "generate")
     _, _, _, res = env.run("status", "--json")

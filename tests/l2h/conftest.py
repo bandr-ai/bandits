@@ -68,10 +68,18 @@ def boom(t):
 CHECKS = [Check("has_answer", 1, has_answer), Check("boom", 1, boom)]
 """
 
+JOBS_JSON = """{"jobs": [
+  {"id": "main", "scope": "full_job", "description": "add up the numbers the user gave",
+   "where": "every trajectory", "repeats": "same numbers", "outcome": "logged answer only"},
+  {"id": "sub", "scope": "subtask", "parent": "main", "description": "read the numbers",
+   "where": "every trajectory", "repeats": "none", "outcome": "unknown"}
+]}
+"""
+
 TASKTYPE_PY = """
 from l2h import Answer, Blocked, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "task_scope": "decision", "check": "numeric", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 LEAK = False
@@ -205,6 +213,7 @@ class Env:
         assert self.init()[0] == 0
         self.write("parse.py", PARSE_PY)
         self.write("checks.py", CHECKS_PY)
+        self.write("jobs.json", JOBS_JSON)
         tt = TASKTYPE_PY.replace("LEAK = False", f"LEAK = {leak}")
         self.write("tasktypes/addnums.py", tt)
         assert self.run("run", "parse", "--json")[0] == 0

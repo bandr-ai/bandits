@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 ATIF_SOURCES = ("system", "user", "agent")
-TASK_SCOPES = ("full_job", "decision")
+TASK_SCOPES = ("full_job", "subtask", "decision")
+JOB_SCOPES = ("full_job", "subtask")
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
 GOLD_TYPES = ("verified", "solved", "imitation", "negative", "none")
@@ -210,6 +211,12 @@ def normalize_trajectory(obj: Any) -> Trajectory:
     """Validate a parse() result: a valid ATIF trajectory carrying the l2h block."""
     if not isinstance(obj, dict):
         raise ContractError(f"parse() yielded {type(obj).__name__}; expected Trajectory or dict")
+    if "events" in obj and "steps" not in obj:
+        raise ContractError(
+            "parse() yielded the pre-ATIF format (`events`); build each trajectory with "
+            "Trajectory.from_atif(doc, id=..., source_refs=..., ended=..., meta=...) where doc has "
+            "ATIF `agent` and `steps` (see `l2h docs --topic parsing`)"
+        )
     t = Trajectory(obj)
     ext = t._ext()
     if not isinstance(ext, dict) or ext.get("id") in (None, ""):

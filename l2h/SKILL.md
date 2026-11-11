@@ -35,6 +35,10 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    source_refs, ended and meta. Record how each run actually ended (done / cut_off / error / unknown). A clean
    exit is never success. `l2h run parse`; investigate dropped records and parse-error groups.
    Guide: `l2h docs --topic parsing`.
+   Then **map the jobs** (`l2h new jobs` → `jobs.json`): every full job the logged agents were given,
+   each sub-capability (a sub-agent or step with its own inputs, tools and output), how repeat
+   attempts at the same instance show up, and how success or failure is known. Task types are
+   built *from* this map (each names its job); jobs you don't build stay listed in the report.
 2. **Findings.** `l2h new check <name>`, `l2h run checks`. Findings are observations, not exclusions.
    Ask three separate questions: recording quality, execution outcome, usefulness for a task.
    Failed and partial runs stay usable. Spot-check each check on fresh data:

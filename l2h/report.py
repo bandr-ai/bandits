@@ -6,7 +6,7 @@ import json
 from collections import Counter, defaultdict
 
 from .output import L2HError
-from .scripts import load_tasktypes
+from .scripts import load_jobs, load_tasktypes
 from .stages import load_trajectories, source_strings
 from .validate import seeded_sample
 from .workspace import Workspace, read_json, read_jsonl
@@ -37,12 +37,46 @@ VALIDATED_NOTE = (
     "in a real Harbor run); it does not mean the answer is correct."
 )
 
-SCOPE_LABEL = {"full_job": "full job", "decision": "decision-from-evidence"}
+SCOPE_LABEL = {
+    "full_job": "full job",
+    "subtask": "sub-capability",
+    "decision": "decision-from-evidence",
+}
 SCOPE_NOTE = (
     "scope: `full job` rebuilds the logged agent's whole job (inputs, tools, output format) and grades "
-    "its real output; `decision-from-evidence` gives the evidence the agent gathered and asks for its "
+    "its real output; `sub-capability` rebuilds one sub-agent or step with its own inputs and tools; "
+    "`decision-from-evidence` gives the evidence the agent gathered and asks for its "
     "decision, not the full job."
 )
+
+
+def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
+    """Jobs from jobs.json and what was built for each: unbuilt jobs stay visible."""
+    try:
+        jobs = load_jobs(ws)
+        tts = load_tasktypes(ws)
+    except L2HError as e:
+        return ["", "## Jobs", "", f"- job map unavailable: {e.message}"]
+    types_of: dict[str, list[str]] = defaultdict(list)
+    for t in tts:
+        types_of[t.spec.get("job")].append(t.name)
+    L = [
+        "",
+        "## Jobs",
+        "",
+        "| job | scope | parent | task types | tasks |",
+        "|---|---|---|---|---|",
+    ]
+    for jid, j in jobs.items():
+        names = types_of.get(jid, [])
+        n = sum(len(by_type.get(t, [])) for t in names)
+        L.append(
+            f"| {jid} | {j['scope']} | {j.get('parent') or ''} | {', '.join(names) or 'none'} | {n} |"
+        )
+    unbuilt = [jid for jid in jobs if not types_of.get(jid)]
+    if unbuilt:
+        L += ["", f"Jobs with no task type yet (say why in a decision): {', '.join(unbuilt)}"]
+    return L
 
 
 def status_gold(rows: list[dict]) -> Counter:
@@ -124,9 +158,10 @@ def build_report(ws: Workspace) -> str:
         by[r["type"]].append(r)
     if rows:
         try:
-            scopes = {t.name: t.spec.get("task_scope") for t in load_tasktypes(ws)}
+            tts = load_tasktypes(ws)
         except L2HError:
-            scopes = {}
+            tts = []
+        scopes = {t.name: t.spec.get("task_scope") for t in tts}
         L += [
             "| type | scope | tasks | validated | generated | blocked | verified | solved | imitation | negative |",
             "|---|---|---|---|---|---|---|---|---|---|",
@@ -141,6 +176,7 @@ def build_report(ws: Workspace) -> str:
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
     else:
         L.append("- no tasks generated")
+    L += _job_lines(ws, by)
     L += ["", "## Gate results", ""]
     gc = Counter()
     for r in rows:

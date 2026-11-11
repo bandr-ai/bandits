@@ -21,7 +21,7 @@ RUBRIC = (
 EXACT_PY = """
 from l2h import Answer, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "task_scope": "decision", "check": "exact", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "exact", "gold": "imitation",
         "hidden": [], "applies_when": "any"}
 VERSION = 1
 EVIDENCE_EXTRA = ""

@@ -1,5 +1,8 @@
 # Task types
 
+Every type names the job it rebuilds: `SPEC["job"]` is an id from `jobs.json`; `task_scope` is
+`full_job`, `subtask` (one sub-capability) or `decision` (evidence given, decision asked).
+
 A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`l2h new tasktype <name>`).
 
 - `applies(t, findings)` decides if a record can feed this type. Return `(False, "reason")` to leave a

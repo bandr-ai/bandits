@@ -38,7 +38,7 @@ from .output import (
 )
 from .results import finalize
 from .scan import scan_task
-from .scripts import scaffold
+from .scripts import load_jobs, scaffold
 from .workspace import (
     CONFIG_NAME,
     DEFAULT_CONFIG,
@@ -156,6 +156,11 @@ def _stage_report(ws: Workspace) -> dict:
     st = ws.state()
     rows = ws.result_rows()
     notes_done = ws.notes.exists() and ws.notes.read_text() != NOTES_TEMPLATE
+    try:
+        jobs = load_jobs(ws)
+        jobs_err = ""
+    except L2HError as e:
+        jobs, jobs_err = {}, e.message
     parse = st.get("parse")
     stale_parse = bool(
         parse and ws.parse_py.exists() and sha(ws.parse_py.read_text()) != parse["script"]
@@ -181,8 +186,9 @@ def _stage_report(ws: Workspace) -> dict:
     sc = Counter(r["status"] for r in rows)
     stages_ = {
         "1_understand": {
-            "done": bool(notes_done and parse and not stale_parse),
+            "done": bool(notes_done and jobs and parse and not stale_parse),
             "notes_written": notes_done,
+            "job_map": {"jobs": len(jobs), "error": jobs_err} if ws.jobs.exists() else None,
             "parser_exists": ws.parse_py.exists(),
             "parse_run": bool(parse),
             "stale": stale_parse,
@@ -243,6 +249,11 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         return ["l2h run parse"]
     if not s["1_understand"]["notes_written"]:
         return ["write source_notes.md (what a record is, boundaries, what is missing)"]
+    jm = s["1_understand"]["job_map"]
+    if not jm:
+        return ["l2h new jobs  # map the jobs: full job(s), sub-capabilities, repeats, outcomes"]
+    if jm["error"]:
+        return [f"fix jobs.json: {jm['error']}"]
     if not s["2_findings"]["checks_exists"]:
         return ["l2h new check <name>"]
     if not s["2_findings"]["done"]:
@@ -369,6 +380,7 @@ def cmd_new(a, ws: Workspace) -> Result:
         atomic_write(path, content)
     nxt = {
         "parser": "fill in parse.py, then `l2h run parse --limit 20`",
+        "jobs": "fill in jobs.json: every full job and sub-capability, how repeats and outcomes show",
         "check": "implement the check, then `l2h run checks`",
         "tasktype": "implement it, then `l2h run generate --limit 5`",
     }[a.kind]
@@ -685,7 +697,8 @@ def schema_data() -> dict:
             "note": "findings are observations, not exclusions",
         },
         "tasktypes/<type>.py": {
-            "SPEC": f"{{unit, env, task_scope in {list(TASK_SCOPES)}, check, gold, hidden, applies_when}}; task_scope is required: full_job = the logged agent's whole job rebuilt, decision = evidence given, its decision asked",
+            "SPEC": f"{{unit, env, job, task_scope in {list(TASK_SCOPES)}, check, gold, hidden, applies_when}}; job = an id from jobs.json; task_scope is required: full_job = the logged agent's whole job rebuilt, subtask = one sub-capability rebuilt, decision = evidence given, its decision asked",
+            "jobs.json": '{"jobs": [{id, scope: full_job|subtask, parent?, description, where, repeats, outcome, notes?}]}: the job map from step 1; task types build from it',
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
             "group_key": "def group_key(t) -> str  # attempts sharing a key become one task",
@@ -853,7 +866,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=20)
 
     sp = add("new", cmd_new, "scaffold parser/check/tasktype with the contract filled in")
-    sp.add_argument("kind", choices=["parser", "check", "tasktype"])
+    sp.add_argument("kind", choices=["parser", "jobs", "check", "tasktype"])
     sp.add_argument("name", nargs="?")
     sp.add_argument("--force", action="store_true")
 
