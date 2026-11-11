@@ -295,6 +295,8 @@ def _fmt_item(it: dict, max_chars: int, full: bool) -> str:
     head = f"## {it['id']}" + (
         f"  [{it['file_type']}, shape: {it['shape'][:80]}]"
         if "file_type" in it
+        else f"  [stratum: {it['stratum']} ({it['stratum_size']})]"
+        if "stratum" in it
         else f"  [check: {it['check_result']}]"
     )
     return head + "\n" + json.dumps(rec, indent=1, default=str)
@@ -302,8 +304,12 @@ def _fmt_item(it: dict, max_chars: int, full: bool) -> str:
 
 def cmd_sample(a, ws: Workspace) -> Result:
     ws.config()
+    if a.matching and a.stratify:
+        raise UsageError("--matching and --stratify are exclusive", "use one of them")
     if a.matching:
         data = explore.sample_matching(ws, a.matching, a.n, a.unseen, a.dry_run)
+    elif a.stratify:
+        data = explore.sample_stratified(ws, a.stratify, a.n, a.unseen, a.dry_run)
     else:
         data = explore.sample_native(ws, a.n, a.unseen, a.dry_run)
     cfg = ws.config()
@@ -312,7 +318,7 @@ def cmd_sample(a, ws: Workspace) -> Result:
     text = "\n\n".join(_fmt_item(i, cfg["max_field_chars"], a.full) for i in data["items"])
     meta = (
         f"{len(data['items'])} of {data['total_records']} records, {data['strata']} strata, {data['remaining_unseen']} unseen left"
-        if data["mode"] == "native"
+        if data["mode"] in ("native", "stratified")
         else f"check {a.matching}: population {data['population']}"
     )
     return Result(
@@ -810,9 +816,14 @@ def build_parser() -> argparse.ArgumentParser:
     add("status", cmd_status, "where the run is and what is next")
 
     sp = add("sample", cmd_sample, "pick varied native records")
-    sp.add_argument("-n", type=int, default=5)
+    sp.add_argument("-n", "--n", type=int, default=5, dest="n", help="how many records")
     sp.add_argument("--unseen", action="store_true", help="skip records already shown")
     sp.add_argument("--matching", metavar="CHECK", help="fresh matches and non-matches of a check")
+    sp.add_argument(
+        "--stratify",
+        metavar="EXPR",
+        help="group key as a python expression over `r` (e.g. 'r.meta.tool'); picks evenly across groups",
+    )
 
     sp = add("show", cmd_show, "show one whole record or trajectory")
     sp.add_argument("id")

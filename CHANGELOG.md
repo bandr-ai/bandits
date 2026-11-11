@@ -15,6 +15,14 @@ change the command line or the artifact format; such changes are called out.
   scans them for answer leaks, and validates them with oracle, no-op and
   wrong-answer gates. Ships its own skill and guides (`l2h docs`). Plan:
   `docs/plans/logs-to-harbor.md`.
+  Review round: `validate` no longer reports `passed` or refunds the fix budget
+  while rows stay blocked, resets structure/leak/secret evidence when a package
+  changes, and records an exhausted type instead of aborting; attachment paths
+  and `--grep`/`--field` errors are contained. New level-1 secret scan
+  (`secret_allow`), label-vocabulary-aware leak scan, binary evidence, warnings
+  (giveaway, missing alternatives, dangling `/app` path), `negative` gold kind
+  (`forbidden` check), status/report show gold kind and flag unaudited
+  `validated` tasks, and `l2h sample --stratify <expr> --n N`.
 
 ## [0.3.0] - unreleased
 

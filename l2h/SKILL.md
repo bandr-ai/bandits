@@ -76,7 +76,7 @@ Generated tasks follow its conventions (`l2h docs --topic harbor`).
 | Need | Command |
 |---|---|
 | Start / resume | `l2h init <logs> <ws>` / `l2h status` |
-| Look at the corpus | `l2h sample [--unseen] [--matching <check>]`, `l2h show <id> [--field p] [--attachments]` |
+| Look at the corpus | `l2h sample [--unseen] [--matching <check>] [--stratify <expr over r> --n N]`, `l2h show <id> [--field p] [--attachments]` |
 | Measure a hunch | `l2h query '<expr over r>' [--count] [--group-by p] [--grep re]` |
 | Scaffold code | `l2h new parser`, `l2h new check <n>`, `l2h new tasktype <n>` |
 | Run it on everything | `l2h run parse`, `l2h run checks`, `l2h run generate [--limit N] [--type T]` |

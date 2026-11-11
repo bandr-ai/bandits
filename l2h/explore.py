@@ -183,6 +183,53 @@ def sample_matching(ws: Workspace, check_id: str, n: int, unseen: bool, dry: boo
     }
 
 
+def sample_stratified(ws: Workspace, expr: str, n: int, unseen: bool, dry: bool) -> dict:
+    """Group records by `expr` (over r) and pick evenly across the groups, seeded.
+    Uses parsed trajectories when they exist, else raw records."""
+    code = _compile(expr)
+    if ws.trajectories.exists():
+        source, records = "trajectories", [(t["id"], t) for t in load_trajectories(ws)]
+    else:
+        source, logs = "raw", ws.logs_root()
+        records = [
+            (record_id(rel(logs, p), i), rec)
+            for p in list_log_files(logs)
+            for i, rec in iter_records(p)
+        ]
+    seen = _seen(ws) if unseen else set()
+    groups: dict[str, list[tuple[str, Any]]] = defaultdict(list)
+    for rid, rec in records:
+        if rid in seen:
+            continue
+        try:
+            key = eval(code, {**_scope(), "r": _R(rec) if isinstance(rec, dict) else rec})
+        except Exception as e:
+            key = f"<error: {type(e).__name__}>"
+        groups[key if isinstance(key, str) else json.dumps(key, default=str)].append((rid, rec))
+    rng = random.Random(f"{ws.config()['seed']}:stratify:{expr}:{len(seen)}")
+    queues = {k: rng.sample(v, len(v)) for k, v in sorted(groups.items())}
+    picked = []
+    while len(picked) < n and any(queues.values()):
+        for k, q in queues.items():  # one per group per round: even across groups
+            if q and len(picked) < n:
+                picked.append((k, q.pop(0)))
+    if not dry:
+        _mark_seen(ws, [rid for _, (rid, _) in picked])
+    return {
+        "mode": "stratified",
+        "source": source,
+        "stratify": expr,
+        "groups": {k: len(v) for k, v in groups.items()},
+        "total_records": len(records),
+        "strata": len(groups),
+        "remaining_unseen": sum(len(q) for q in queues.values()),
+        "items": [
+            {"id": rid, "stratum": k, "stratum_size": len(groups[k]), "record": rec}
+            for k, (rid, rec) in picked
+        ],
+    }
+
+
 # ---------------------------------------------------------------------- show
 
 
@@ -294,6 +341,10 @@ _SAFE = {
 }
 
 
+def _scope() -> dict:
+    return {"re": re, "get": _get, "__builtins__": _SAFE}
+
+
 def _compile(expr: str):
     try:
         return compile(expr, "<query>", "eval")
@@ -344,7 +395,7 @@ def query_corpus(
         raise UsageError(
             f"bad --grep regex {grep!r}: {e}", "use a Python regular expression"
         ) from e
-    scope = {"re": re, "get": _get, "__builtins__": _SAFE}
+    scope = _scope()
     matched, groups, scanned, errors = [], Counter(), 0, Counter()
     for rid, rec in records:
         scanned += 1

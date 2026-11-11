@@ -111,3 +111,31 @@ def test_query_group_by_expression(env):
     env.build_pipeline()
     r = env.run("query", "True", "--group-by", "len(r.meta['nums'])", "--json")[3]["data"]
     assert sum(r["groups"].values()) == 5
+
+
+def test_stratified_sample_is_even_seeded_and_unseen_aware(env):
+    env.build_pipeline()
+    a = env.run("sample", "--stratify", "r.ended", "--n", "2", "--json", "--dry-run")[3]["data"]
+    b = env.run("sample", "--stratify", "r.ended", "-n", "2", "--json", "--dry-run")[3]["data"]
+    assert [i["id"] for i in a["items"]] == [i["id"] for i in b["items"]]
+    assert a["groups"] == {"done": 4, "error": 1} and a["source"] == "trajectories"
+    assert sorted(i["stratum"] for i in a["items"]) == ["done", "error"]  # one per group
+    four = env.run("sample", "--stratify", "r.ended", "--n", "4", "--json", "--dry-run")[3]["data"]
+    assert sorted(i["stratum"] for i in four["items"]) == ["done", "done", "done", "error"]
+    first = env.run("sample", "--stratify", "r.ended", "-n", "2", "--unseen", "--json")[3]["data"]
+    nxt = env.run("sample", "--stratify", "r.ended", "-n", "2", "--unseen", "--json")[3]["data"]
+    assert not ({i["id"] for i in first["items"]} & {i["id"] for i in nxt["items"]})
+
+
+def test_stratified_sample_on_raw_records_and_bad_expression(env):
+    env.init()
+    res = env.run(
+        "sample", "--stratify", "isinstance(r, dict) and r.get('kind')", "-n", "3", "--json"
+    )[3]["data"]
+    assert res["source"] == "raw" and len(res["items"]) == 3
+    assert len({i["stratum"] for i in res["items"]}) == 3  # qa, heartbeat, other
+    code, _, _, err = env.run("sample", "--stratify", "r.(", "--json")
+    assert code == 2 and "bad expression" in err["error"]["message"]
+    assert env.run("sample", "--stratify", "r.x", "--matching", "c")[0] == 2
+    # default behaviour is untouched: no --stratify -> native strata
+    assert env.run("sample", "-n", "3", "--json", "--dry-run")[3]["data"]["mode"] == "native"
