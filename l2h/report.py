@@ -30,6 +30,30 @@ def outcomes(ws: Workspace) -> dict:
     return {"total": len(trajs), **res, "unaccounted_ids": unaccounted[:10]}
 
 
+VALIDATED_NOTE = (
+    "`validated` means the gates passed (oracle accepted, no-op and wrong answers rejected, "
+    "in a real Harbor run); it does not mean the answer is correct."
+)
+
+
+def status_gold(rows: list[dict]) -> Counter:
+    """Counts like {"validated (imitation)": 2}: status always shown with its gold kind."""
+    return Counter(f"{r['status']} ({r['gold']})" for r in rows)
+
+
+def validated_without_decision(ws: Workspace, rows: list[dict]) -> list[str]:
+    """Validated tasks nobody has recorded an audit/derivability decision for."""
+    reviewed = {
+        t
+        for d in ws.decision_rows()
+        if d.get("kind") in ("derivability", "audit")
+        for t in d.get("tasks", [])
+    }
+    return sorted(
+        r["task_id"] for r in rows if r["status"] == "validated" and r["task_id"] not in reviewed
+    )
+
+
 def build_report(ws: Workspace) -> str:
     st = ws.state()
     rows = ws.result_rows()
@@ -99,6 +123,8 @@ def build_report(ws: Workspace) -> str:
             L.append(
                 f"| {t} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} |"
             )
+        L += ["", VALIDATED_NOTE, ""]
+        L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
     else:
         L.append("- no tasks generated")
     L += ["", "## Gate results", ""]
@@ -167,18 +193,16 @@ def build_report(ws: Workspace) -> str:
         L.append(f"- [{d.get('kind', 'note')}] {d['what']} — why: {d['why']}")
     if not decisions:
         L.append("- none recorded")
-    reviewed = {
-        t
-        for d in decisions
-        if d.get("kind") in ("derivability", "audit")
-        for t in d.get("tasks", [])
-    }
-    sampled = [r["task_id"] for r in rows if r["gates"]["exec"] == "pass"]
-    L += [
-        "",
-        f"Validated tasks without a derivability/audit decision: {len([t for t in sampled if t not in reviewed])} of {len(sampled)}",
-        "",
-    ]
+    undecided = validated_without_decision(ws, rows)
+    n_val = sum(1 for r in rows if r["status"] == "validated")
+    L += ["", f"Validated tasks without a derivability/audit decision: {len(undecided)} of {n_val}"]
+    if undecided:
+        L.append(
+            "- **WARNING**: not audited, so unknown whether the answer is derivable from the inputs: "
+            + ", ".join(undecided[:20])
+            + (f" (+{len(undecided) - 20} more)" if len(undecided) > 20 else "")
+        )
+    L.append("")
 
     L += ["## Sample tasks (spot-check)", ""]
     seed = ws.config()["seed"]

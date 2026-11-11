@@ -121,3 +121,40 @@ def test_invalid_grep_regex_is_a_usage_error(env):
     env.build_pipeline()
     code, _, _, res = env.run("query", "True", "--grep", "(unclosed", "--json")
     assert code == 2 and "bad --grep regex" in res["error"]["message"]
+
+
+def test_status_and_report_show_gold_next_to_status_and_warn_when_unaudited(env):
+    env.build_pipeline()
+    env.run("run", "generate")
+    env.run("validate", "--sample-size", "2")
+    _, out, _, res = env.run("status", "--json")
+    assert res["data"]["stages"]["5_validate"]["by_status_gold"] == {
+        "validated (imitation)": 2,
+        "generated (imitation)": 1,
+    }
+    _, out, _, _ = env.run("status")
+    assert "validated (imitation)=2" in out and "does not mean the answer is correct" in out
+    assert "warning: 2 validated task(s) have no audit/derivability decision" in out
+    env.run("report")
+    md = (env.ws / "report.md").read_text()
+    assert "- validated (imitation): 2" in md and "does not mean the answer is correct" in md
+    assert (
+        "**WARNING**" in md
+        and "Validated tasks without a derivability/audit decision: 2 of 2" in md
+    )
+    done = sorted(t for t, r in rows(env).items() if r["status"] == "validated")
+    env.run(
+        "decide",
+        "derivable",
+        "--why",
+        "read it",
+        "--kind",
+        "derivability",
+        "--task",
+        done[0],
+        "--task",
+        done[1],
+    )
+    env.run("report")
+    md = (env.ws / "report.md").read_text()
+    assert "without a derivability/audit decision: 0 of 2" in md and "**WARNING**" not in md

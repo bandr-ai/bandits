@@ -35,6 +35,9 @@ answer can really be derived from the visible inputs.
 
 Status: `validated` = exec gates passed in a real Harbor run (host-local passes stay `generated`); `generated` = structure+leak passed;
 `blocked` = reason in results.jsonl.
+`validated` means the gates passed, not that the answer is correct: `status` and `report` show the
+gold kind next to it (`validated (imitation)`) and warn about validated tasks with no audit or
+derivability decision.
 
 Runners (`l2h validate --runner auto|harbor|local`): `harbor` runs each gate with `harbor run`
 (oracle agent, nop agent, and an oracle on a scratch copy whose solve.sh writes the wrong or

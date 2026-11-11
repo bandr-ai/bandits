@@ -204,6 +204,8 @@ def _stage_report(ws: Workspace) -> dict:
             and not any(r["status"] == "validated" for r in rows)
             and any(r["gates"]["exec"] == "pass" for r in rows),
             "by_status": dict(sc),
+            "by_status_gold": dict(report_mod.status_gold(rows)),
+            "validated_without_decision": report_mod.validated_without_decision(ws, rows),
         },
         "6_report": {"done": ws.report.exists()},
     }
@@ -270,9 +272,18 @@ def cmd_status(a, ws: Workspace) -> Result:
         lines.append(
             f"[{'x' if v['done'] else ' '}] {k}" + (f"  ({'; '.join(flags)})" if flags else "")
         )
-    by = rep["stages"]["5_validate"]["by_status"]
-    if by:
-        lines.append("tasks: " + ", ".join(f"{k}={v}" for k, v in sorted(by.items())))
+    v5 = rep["stages"]["5_validate"]
+    if v5["by_status"]:
+        lines.append(
+            "tasks: " + ", ".join(f"{k}={n}" for k, n in sorted(v5["by_status_gold"].items()))
+        )
+    if v5["by_status"].get("validated"):
+        lines.append(f"note: {report_mod.VALIDATED_NOTE}")
+        if v5["validated_without_decision"]:
+            lines.append(
+                f"warning: {len(v5['validated_without_decision'])} validated task(s) have no "
+                "audit/derivability decision (`l2h decide ... --kind derivability --task <id>`)"
+            )
     if rep["blockers"]:
         lines.append("blockers:")
         lines += [f"  - {b}" for b in rep["blockers"]]
