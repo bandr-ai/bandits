@@ -143,6 +143,8 @@ def materialize(
         oracle_value = str(b.alternatives[0])
         if oracle_value.strip() in [str(x).strip() for x in b.answer.expected]:
             raise ContractError("the oracle's valid answer must differ from the known-wrong ones")
+        if b.answer.choices and oracle_value.strip() not in [c.strip() for c in b.answer.choices]:
+            raise ContractError("the oracle's valid answer must be one of answer.choices")
     ans_path = f"{ANSWER_DIR}/{b.answer.file}"
 
     if b.instruction is not None:
@@ -248,7 +250,7 @@ def structure_check(task_dir: Path) -> list[str]:
             Answer(
                 **{
                     k: spec[k]
-                    for k in ("expected", "check", "file", "normalize", "pattern")
+                    for k in ("expected", "check", "file", "normalize", "pattern", "choices")
                     if k in spec
                 }
             ).validate()

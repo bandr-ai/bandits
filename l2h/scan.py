@@ -20,7 +20,10 @@ class Level1:
 
 
 def _vocab(spec: dict, meta: dict) -> list[str]:
-    """The label vocabulary when the check is an allowed set: expected + alternatives + wrong."""
+    """The label vocabulary: answer.choices when given, else for an allowed set
+    expected + alternatives + wrong answers."""
+    if spec.get("choices"):
+        return [str(c) for c in spec["choices"]]
     if spec.get("check") != "allowed_set" or not isinstance(spec.get("expected"), list):
         return []
     return (
@@ -39,7 +42,8 @@ def _expected_values(spec: dict) -> list[str]:
 def warnings_for(task_dir: Path, spec: dict, meta: dict) -> list[str]:
     out: list[str] = []
     check = spec.get("check")
-    if check == "allowed_set" and not meta.get("alternatives"):
+    labelled = check == "allowed_set" or (check == "exact" and spec.get("choices"))
+    if labelled and not meta.get("alternatives"):
         out.append(
             "alternatives: allowed-set/label check with no `alternatives` given; "
             "list other valid answers the verifier must accept, or confirm there are none"
@@ -52,8 +56,9 @@ def warnings_for(task_dir: Path, spec: dict, meta: dict) -> list[str]:
             if text is None:
                 continue
             for v in _expected_values(spec):
-                if leak.norm(v) in vocab_n and leak.listed_everywhere(text, leak.norm(v)):
-                    continue
+                nv = leak.norm(v)
+                if nv in vocab_n and leak.defines_vocab(text, nv, vocab_n):
+                    continue  # the file lists/defines the label vocabulary
                 if re.search(rf"(?<![\w.]){re.escape(v.strip())}(?![\w.])", text):
                     rel = p.relative_to(task_dir).as_posix()
                     out.append(

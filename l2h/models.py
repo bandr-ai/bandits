@@ -129,6 +129,7 @@ class Answer:
     tolerance: float = 0.0
     rel_tolerance: float = 0.0
     pattern: str = ""  # forbidden only: regex a well-formed answer must fully match ("" = any)
+    choices: list = field(default_factory=list)  # label vocabulary shown to the solver, if any
 
     def validate(self) -> None:
         if self.check not in CHECK_KINDS:
@@ -147,6 +148,17 @@ class Answer:
                 re.compile(self.pattern)
             except re.error as e:
                 raise ContractError(f"answer.pattern is not a valid regex: {e}") from e
+        if self.choices:
+            if not all(isinstance(c, str) and c.strip() for c in self.choices):
+                raise ContractError("answer.choices must be a list of non-empty strings")
+            exp = self.expected if isinstance(self.expected, list) else [self.expected]
+            missing = [e for e in exp if str(e).strip() not in [c.strip() for c in self.choices]]
+            if self.check in ("exact", "allowed_set", "forbidden") and missing:
+                raise ContractError(f"answer.expected {missing} not in answer.choices")
+        if self.check == "forbidden" and not (self.pattern or self.choices):
+            raise ContractError(
+                "forbidden needs answer.pattern or answer.choices: otherwise any string passes"
+            )
         if self.check == "exact" and isinstance(self.expected, list | dict):
             raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
         if "/" in self.file or self.file.startswith("."):
@@ -161,6 +173,7 @@ class Answer:
             "tolerance": self.tolerance,
             "rel_tolerance": self.rel_tolerance,
             "pattern": self.pattern,
+            "choices": list(self.choices),
         }
 
     def canonical(self) -> str:

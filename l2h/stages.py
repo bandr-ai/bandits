@@ -521,7 +521,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         "structure_or_leak_failures": [
             {"task_id": r["task_id"], "problems": r.get("problems", [])}
             for r in new_rows
-            if "fail" in (r["gates"]["structure"], r["gates"]["leak"], r["gates"]["secrets"])
+            if "fail" in (r["gates"]["structure"], r["gates"]["leak"], r["gates"].get("secrets"))
         ][:20],
         "sources_used": len(used),
         "trajectories_in_queue": len(queued_ids),

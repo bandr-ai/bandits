@@ -40,9 +40,12 @@ def _preview(m: str) -> str:
     return f"{m[:4]}...[redacted, {len(m)} chars]" if len(m) > 8 else "[redacted]"
 
 
+CODE_RE = re.compile(r"[(\[]|^[A-Za-z_]\w*\.[A-Za-z_]")  # a call, an index, attribute access
+
+
 def _literal(val: str) -> bool:
-    """A real-looking value: not a placeholder and not a plain lowercase word."""
-    return not PLACEHOLDER_RE.match(val) and not re.fullmatch(r"[a-z]+", val)
+    """A real-looking value: not a placeholder, not a plain lowercase word, not code."""
+    return not (PLACEHOLDER_RE.match(val) or re.fullmatch(r"[a-z]+", val) or CODE_RE.search(val))
 
 
 def scan_text(text: str) -> list[tuple[int, str, str]]:

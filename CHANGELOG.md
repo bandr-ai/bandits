@@ -23,6 +23,9 @@ change the command line or the artifact format; such changes are called out.
   (giveaway, missing alternatives, dangling `/app` path), `negative` gold kind
   (`forbidden` check), status/report show gold kind and flag unaudited
   `validated` tasks, and `l2h sample --stratify <expr> --n N`.
+  Follow-up: `Answer.choices` declares a label vocabulary (leak scan, giveaway and
+  alternatives warnings use it; files that define the labels are not leaks), negative
+  tasks need `pattern` or `choices`, and the secret scan ignores code expressions.
 
 ## [0.3.0] - unreleased
 

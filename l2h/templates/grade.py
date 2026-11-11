@@ -50,6 +50,8 @@ def matches(spec, got_raw):
     if kind == "forbidden":  # negative task: any well-formed answer except the known-wrong ones
         if not got or (spec.get("pattern") and not re.fullmatch(spec["pattern"], got)):
             return False
+        if spec.get("choices") and got not in [normalize(c, opts) for c in spec["choices"]]:
+            return False
         return all(got != normalize(e, opts) for e in exp)
     if kind == "numeric":
         g, e = as_float(got), as_float(normalize(exp, opts))

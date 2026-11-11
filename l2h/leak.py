@@ -6,7 +6,7 @@ strings), files named like answer keys, or byte-identical copies of anything in
 tests/ or solution/. Legitimate evidence that merely shares words with the
 answer is not flagged: short hidden values only match in labelled context
 ("answer: 42"), long ones only as whole-string or long verbatim runs, and a label
-that is one item of a listed allowed answer set only in labelled context.
+that belongs to the declared label vocabulary (answer.choices) only in labelled context.
 """
 
 from __future__ import annotations
@@ -67,9 +67,9 @@ def scan(
     run_len: int = 60,
     vocab: list[str] | None = None,
 ) -> list[Leak]:
-    """`vocab`: the allowed answer set (labels), when the check is an allowed set. A hidden value
-    that is a member of it and only ever appears as one item of a list (label vocabulary) in a
-    file is not a leak by itself there; "answer: X" style mentions are still caught."""
+    """`vocab`: the label vocabulary (answer.choices, or an allowed set). In a file that lists or
+    defines the vocabulary (see defines_vocab) a label is not a leak just by appearing;
+    "answer: X" style mentions are still caught, and a lone label elsewhere still is a leak."""
     allow = allow or []
     vocab_n = {norm(str(v)) for v in vocab or [] if str(v).strip()}
     leaks: list[Leak] = []
@@ -101,7 +101,9 @@ def scan(
         ntext = norm(text)
         for h in hidden:
             nh = norm(h)
-            if len(nh) >= min_len and not (nh in vocab_n and listed_everywhere(text, nh)):
+            # in a file that lists/defines the label vocabulary (a rubric, the instruction), a
+            # label is only a leak in labelled context ("answer: X"); elsewhere it still is
+            if len(nh) >= min_len and not (nh in vocab_n and defines_vocab(text, nh, vocab_n)):
                 if nh in ntext:
                     leaks.append(Leak(relp, "hidden_string", f"contains hidden text {short(h)}"))
                     continue
@@ -132,6 +134,14 @@ def scan(
 ITEM_START = r"^\s*(?:[-*+\u2022|]|\d+[.)])\s*[`*\"']*$"
 SEP_BEFORE = r"[\w`'\"]\s*(?:[,;|/]|\b(?:or|and)\b)\s*[`'\"]?$"
 SEP_AFTER = r"^[`'\"]?\s*(?:[,;|/]|,?\s*\b(?:or|and)\b)\s*[`'\"]?\w"
+
+
+def defines_vocab(text: str, label_n: str, vocab_n: set[str]) -> bool:
+    """The file lists or defines the label vocabulary: every mention of the label is a list
+    item, or at least two other labels of the vocabulary appear in it too."""
+    ntext = norm(text)
+    others = sum(1 for o in vocab_n - {label_n} if o in ntext)
+    return others >= 2 or listed_everywhere(text, label_n)
 
 
 def listed_everywhere(text: str, label_n: str) -> bool:
