@@ -19,5 +19,5 @@ Record `l2h decide "..." --kind audit --verdict pass|fail --type T --task ID --w
 A fail blocks the type until regenerated. Also record `--kind derivability` after checking the
 answer can really be derived from the visible inputs.
 
-Status: `validated` = exec gates ran and passed; `generated` = structure+leak passed;
+Status: `validated` = exec gates passed in a real Harbor run (host-local passes stay `generated`); `generated` = structure+leak passed;
 `blocked` = reason in results.jsonl.
