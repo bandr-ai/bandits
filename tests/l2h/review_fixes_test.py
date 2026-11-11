@@ -186,4 +186,4 @@ def test_reused_row_gets_fresh_leak_result(env):
 def test_schema_documents_both_runners(env):
     env.init()
     _, out, _, _ = env.run("schema")
-    assert "harbor" in out and "local" in out
+    assert "trials" in out and "harbor" in out
