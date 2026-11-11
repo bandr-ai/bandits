@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 
 from .stages import source_strings
@@ -105,6 +106,7 @@ def build_report(ws: Workspace) -> str:
     for r in rows:
         gc[f"structure={r['gates']['structure']}"] += 1
         gc[f"leak={r['gates']['leak']}"] += 1
+        gc[f"secrets={r['gates'].get('secrets', 'not_run')}"] += 1
         gc[f"exec={r['gates']['exec']}"] += 1
     L.append(", ".join(f"{k}: {v}" for k, v in sorted(gc.items())) or "- none")
     runners = {r["gates"].get("runner") for r in rows if r["gates"]["exec"] != "not_run"}
@@ -130,6 +132,21 @@ def build_report(ws: Workspace) -> str:
         L.append(
             f"- wrong-answer gate used an auto-derived wrong answer (weak) for: {', '.join(auto[:10])}"
         )
+    L.append("")
+
+    L += ["## Warnings (do not block)", ""]
+    wk: dict[str, list[str]] = defaultdict(list)
+    for r in rows:
+        for w in r.get("warnings", []):
+            wk[w.split(":", 1)[0]].append(f"{r['task_id']}: {w.split(':', 1)[-1].strip()}")
+    for kind, items in sorted(wk.items()):
+        L.append(f"- {kind} x{len(items)}")
+        L += [f"  - {x}" for x in items[:5]]
+    allowed = [r for r in rows if r.get("allow")]
+    for r in allowed[:20]:
+        L.append(f"- allow-listed in {r['task_id']}: {json.dumps(r['allow'], sort_keys=True)}")
+    if not wk and not allowed:
+        L.append("- none")
     L.append("")
 
     L += ["## Blocked", ""]

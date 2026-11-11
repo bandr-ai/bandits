@@ -493,6 +493,19 @@ def cmd_task_try(a, ws: Workspace) -> Result:
     )
 
 
+def _warning_lines(warnings: dict[str, list[str]]) -> list[str]:
+    """Non-blocking warnings grouped by kind (the text before the first colon)."""
+    by: dict[str, list[str]] = {}
+    for tid, ws_ in sorted(warnings.items()):
+        for w in ws_:
+            by.setdefault(w.split(":", 1)[0], []).append(f"{tid}: {w.split(':', 1)[-1].strip()}")
+    out = ["warnings (do not block; read them):"]
+    for kind, items in sorted(by.items()):
+        out.append(f"  {kind} x{len(items)}")
+        out += [f"    {x}" for x in items[:3]]
+    return out
+
+
 def cmd_validate(a, ws: Workspace) -> Result:
     ws.config()
     try:
@@ -535,6 +548,8 @@ def cmd_validate(a, ws: Workspace) -> Result:
         )
         for t, ids in s["level3_audit_sample"].items():
             lines.append(f"  {t}: {', '.join(ids)}")
+    if s["warnings"]:
+        lines += _warning_lines(s["warnings"])
     if s["review_for_derivability"]:
         lines.append(
             "also review: can the answer be DERIVED from the inputs? (the oracle only proves wiring) -> "

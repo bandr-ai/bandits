@@ -84,3 +84,45 @@ def test_long_verbatim_run_is_caught(tmp_path):
         {"quote.txt": "prefix " + " ".join(f"word{i}" for i in range(15, 45)) + " suffix"},
     )
     assert ("environment/data/quote.txt", "verbatim_run") in kinds(scan(d, [final]))
+
+
+LABELS = ["account_suspension", "refund_requested", "billing_dispute"]
+LISTING = "Classify the ticket as one of: account_suspension, refund_requested, billing_dispute."
+
+
+def test_label_in_allowed_set_listing_is_not_a_leak(tmp_path):
+    d = make(tmp_path, LISTING, {"rubric.md": "- billing_dispute: ...\n- account_suspension: ..."})
+    assert scan(d, ["account_suspension"], vocab=LABELS) == []
+    # without the vocabulary the same label is (still) flagged
+    assert ("instruction.md", "hidden_string") in kinds(scan(d, ["account_suspension"]))
+    # a bulleted rubric or a sentence mentioning the label alone is judged per occurrence
+    d2 = make(tmp_path / "b", "Pick a label.", {"r.md": "- account_suspension: locked\n- other: x"})
+    assert scan(d2, ["account_suspension"], vocab=LABELS) == []
+
+
+def test_real_leaks_still_flagged_with_a_label_vocabulary(tmp_path):
+    d = make(
+        tmp_path,
+        LISTING + "\nThe answer: account_suspension.\n" + FINAL,
+        {"gold.txt": "x"},
+        {"expected.json": '{"expected": ["account_suspension"]}'},
+    )
+    (d / "environment/data/copy.json").write_text('{"expected": ["account_suspension"]}')
+    k = kinds(scan(d, ["account_suspension", FINAL], vocab=LABELS))
+    assert ("instruction.md", "hidden_string") in k  # "The answer: X" and the final response
+    assert ("environment/data/copy.json", "copy_of_hidden_file") in k
+    assert ("environment/data/gold.txt", "named_like_answer") in k
+
+
+def test_lone_label_outside_a_listing_is_still_a_leak(tmp_path):
+    d = make(tmp_path, "Classify the ticket.", {"t.txt": "tagged account_suspension by agent"})
+    assert ("environment/data/t.txt", "hidden_string") in kinds(
+        scan(d, ["account_suspension"], vocab=LABELS)
+    )
+
+
+def test_short_label_after_answer_label_is_flagged_even_in_a_listing(tmp_path):
+    d = make(tmp_path, "Pick one of: yes, no, maybe.\nExpected answer: maybe", {"a.txt": "x"})
+    assert ("instruction.md", "labelled_answer") in kinds(
+        scan(d, ["maybe"], vocab=["yes", "no", "maybe"])
+    )

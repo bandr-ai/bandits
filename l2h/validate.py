@@ -265,6 +265,7 @@ def run_validate(
     summary["review_for_derivability"] = sorted(
         {t for v in summary["types"].values() for t in v["sampled"]}
     )
+    summary["warnings"] = {r["task_id"]: r["warnings"] for r in targets if r.get("warnings")}
     summary["any_failure"] = any(
         v["state"] in ("failed", "exhausted") for v in summary["types"].values()
     ) or bool(summary.get("level1", {}).get("failed"))

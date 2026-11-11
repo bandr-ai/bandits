@@ -5,7 +5,8 @@ side does not contain: answer keys / the original final response (`hidden`
 strings), files named like answer keys, or byte-identical copies of anything in
 tests/ or solution/. Legitimate evidence that merely shares words with the
 answer is not flagged: short hidden values only match in labelled context
-("answer: 42"), long ones only as whole-string or long verbatim runs.
+("answer: 42"), long ones only as whole-string or long verbatim runs, and a label
+that is one item of a listed allowed answer set only in labelled context.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ class Leak:
         return {"where": self.where, "kind": self.kind, "detail": self.detail}
 
 
-def _norm(s: str) -> str:
+def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
@@ -64,8 +65,13 @@ def scan(
     allow: list[str] | None = None,
     min_len: int = 12,
     run_len: int = 60,
+    vocab: list[str] | None = None,
 ) -> list[Leak]:
+    """`vocab`: the allowed answer set (labels), when the check is an allowed set. A hidden value
+    that is a member of it and only ever appears as one item of a list (label vocabulary) in a
+    file is not a leak by itself there; "answer: X" style mentions are still caught."""
     allow = allow or []
+    vocab_n = {norm(str(v)) for v in vocab or [] if str(v).strip()}
     leaks: list[Leak] = []
     hidden = [str(h) for h in hidden if str(h).strip()]
     guarded: dict[str, str] = {}  # sha -> path under tests/ or solution/
@@ -92,19 +98,19 @@ def scan(
         text = read_text(p)
         if text is None:
             continue
-        ntext = _norm(text)
+        ntext = norm(text)
         for h in hidden:
-            nh = _norm(h)
-            if len(nh) >= min_len:
+            nh = norm(h)
+            if len(nh) >= min_len and not (nh in vocab_n and listed_everywhere(text, nh)):
                 if nh in ntext:
-                    leaks.append(Leak(relp, "hidden_string", f"contains hidden text {_short(h)}"))
+                    leaks.append(Leak(relp, "hidden_string", f"contains hidden text {short(h)}"))
                     continue
                 if len(nh) >= run_len * 1.5 and _shares_run(nh, ntext, run_len):
                     leaks.append(
                         Leak(
                             relp,
                             "verbatim_run",
-                            f"shares a {run_len}+ char verbatim run with {_short(h)}",
+                            f"shares a {run_len}+ char verbatim run with {short(h)}",
                         )
                     )
             else:
@@ -117,13 +123,42 @@ def scan(
                         Leak(
                             relp,
                             "labelled_answer",
-                            f"short hidden value {_short(h)} appears after an answer-like label",
+                            f"short hidden value {short(h)} appears after an answer-like label",
                         )
                     )
     return leaks
 
 
-def _short(s: str) -> str:
+ITEM_START = r"^\s*(?:[-*+\u2022|]|\d+[.)])\s*[`*\"']*$"
+SEP_BEFORE = r"[\w`'\"]\s*(?:[,;|/]|\b(?:or|and)\b)\s*[`'\"]?$"
+SEP_AFTER = r"^[`'\"]?\s*(?:[,;|/]|,?\s*\b(?:or|and)\b)\s*[`'\"]?\w"
+
+
+def listed_everywhere(text: str, label_n: str) -> bool:
+    """True if every occurrence of the label is one item of a list: separated from a sibling by
+    , ; | / or/and, or opening a bullet/table line when the text has several of those."""
+    pat = re.compile(
+        rf"(?<!\w){re.escape(label_n).replace(chr(92) + ' ', chr(92) + 's+')}(?!\w)", re.I
+    )
+    hits = list(pat.finditer(text))
+    if not hits:
+        return False
+    lines = text.splitlines()
+    items = sum(1 for ln in lines if re.match(r"\s*(?:[-*+\u2022|]|\d+[.)])\s+\S", ln))
+    for m in hits:
+        before, after = text[max(0, m.start() - 40) : m.start()], text[m.end() : m.end() + 40]
+        line_prefix = text[text.rfind("\n", 0, m.start()) + 1 : m.start()]
+        listed = (
+            re.search(SEP_BEFORE, before, re.I)
+            or re.match(SEP_AFTER, after, re.I)
+            or (items >= 2 and re.match(ITEM_START, line_prefix))
+        )
+        if not listed:
+            return False
+    return True
+
+
+def short(s: str) -> str:
     s = s.replace("\n", " ")
     return repr(s if len(s) <= 40 else s[:37] + "...")
 

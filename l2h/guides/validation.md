@@ -4,7 +4,15 @@ Level 1 (every task): structure (files, valid task.toml, inputs resolve, answer 
 instruction, consistent expected answer) and the leak scan over `instruction.md` + `environment/`.
 The scan flags: hidden strings, answer-like file names, copies of `tests/` or `solution/` files,
 and short answers after labels like `answer:`. Evidence that merely shares words with the answer is fine.
+For an `allowed_set` check, a label that appears only as one item of a list (comma/`or` list,
+bullets, table rows) in the instruction or evidence is a label vocabulary, not a leak; "answer: X",
+a lone mention, the original final response and copies of `tests/` files are still flagged.
 Allow a legitimate flagged file with `BuildResult.leak_allow=["environment/data/x"]` and a `decide`.
+
+Level 1 also records non-blocking **warnings** on the row (shown by `validate` and in the report):
+`giveaway` (the exact expected answer appears verbatim in an evidence file), `alternatives`
+(allowed-set check with no `alternatives` given), `missing_file` (instruction.md references an
+`/app/...` path the package does not contain).
 
 The secret scan (also level 1) covers `instruction.md`, `task.toml` and `environment/`: API-key and
 token shapes, private keys, bearer tokens, `password`/`secret`/`token` followed by a literal value,
