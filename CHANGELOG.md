@@ -36,6 +36,10 @@ change the command line or the artifact format; such changes are called out.
   per type in `l2h report`; the skill gains a rule to prefer rebuilding the agent's whole job and to
   label decision-from-evidence tasks as such.
 
+  Job map: step 1 writes `jobs.json` (full jobs, sub-capabilities, repeats, outcomes); every task
+  type names its job (`SPEC["job"]`), `task_scope` gains `subtask`, and the report lists jobs with
+  nothing built for them. Pre-ATIF parsers get a migration error.
+
 ## [0.3.0] - unreleased
 
 `bandits` is now ingest only. Everything else was removed, to be rebuilt from
