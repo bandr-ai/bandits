@@ -8,8 +8,6 @@ import pytest
 from bandits.ingest import detect_source, load_corpus
 from bandits.ingest.health import check
 from bandits.ingest.report import IngestReport
-from bandits.inspect import check_fidelity
-from bandits.store import ArtifactStore
 from bandits.traces import SpanKind, SpanStatus, WorkflowDeclaration
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "failproofai.session.json"
@@ -176,19 +174,6 @@ def test_a_session_without_calls_is_kept_with_its_events(tmp_path: Path) -> None
     assert trace.source_record["session_id"] == "s1"
 
 
-def test_v1_contract_example_with_null_end_is_kept(tmp_path: Path) -> None:
-    # The agenteye-evaluator wire-format example: one agent_start, ended_at null.
-    events = [_event(1, "agent_start", 0, goal="help the user")]
-    path = _write(tmp_path, events, ended_at=None)
-    assert detect_source(path).source == "failproofai"
-    _, trace = _session(path)
-    assert trace.source_record["ended_at"] is None  # never an invented end
-    assert "1 agent_start and 0 agent_end" in _kept(trace)[1]
-    from bandits.inspect import _trace_view
-
-    assert _trace_view(trace)["record"] == trace.source_record  # what inspect shows
-
-
 def test_v1_ended_at_may_be_absent(tmp_path: Path) -> None:
     path = _write(tmp_path, [])
     document = json.loads(path.read_text())
@@ -319,19 +304,6 @@ def test_unknown_schema_version_is_refused(tmp_path: Path) -> None:
     corpus = load_corpus(_write(tmp_path, [], schema_version="9"), "failproofai")
     assert not corpus.traces
     assert any(i.kind == "unsupported_native_record" for i in corpus.issues)
-
-
-def test_pointers_resolve_and_fields_are_kept_exactly(tmp_path: Path) -> None:
-    corpus = load_corpus(FIXTURE, "failproofai", workflow=WorkflowDeclaration())
-    store = ArtifactStore(tmp_path / ".bandits")
-    artifact = store.write(corpus, source_path=str(FIXTURE))
-    fidelity = check_fidelity(store, artifact.artifact_id, corpus.traces, "failproofai")
-    assert fidelity["steps"] > 0
-    assert fidelity["carried_wrong"] == 0, fidelity["mismatches"]
-    # The producer's own fields stay under their names.
-    model = next(s for s in corpus.traces[0].spans if s.name == "model-a")
-    closer = json.loads(model.attributes["failproofai.closer_unmapped"])
-    assert closer["payload"]["fw_cost"] == 0.01
 
 
 def test_a_session_without_model_calls_is_saved_with_a_warning(tmp_path: Path) -> None:

@@ -57,7 +57,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from bandits.genai import PIPELINE_STEP, plain_messages
+from bandits.ingest.genai import PIPELINE_STEP, plain_messages
 from bandits.ingest.mapping import LABEL_PREFIX, IngestMapping
 from bandits.ingest.otlp import (
     _LINEAGE_KEYS,

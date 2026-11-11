@@ -589,9 +589,7 @@ def load_chat_json(path: Path, ruleset: RedactionRuleset = DEFAULT_RULESET) -> T
     # list would turn a document of conversations into a conversation of lists.
     payload = read.records[0].value if len(read.records) == 1 else read.values
 
-    conversations = _conversations(
-        payload, issues, str(path), lines=len(read.records) > 1
-    )
+    conversations = _conversations(payload, issues, str(path), lines=len(read.records) > 1)
     traces: list[Trace] = []
     for index, (messages, lineage_id, wrapper) in enumerate(conversations):
         location = f"{path}[{index}]"

@@ -6,9 +6,7 @@ import json
 import re
 
 import pytest
-from typer.testing import CliRunner
 
-from bandits.cli import app
 from bandits.ingest.mapping import (
     Identity,
     IngestMapping,
@@ -21,22 +19,16 @@ from bandits.ingest.mapping import (
 )
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.report import IngestReport
-from bandits.store import ArtifactStore
 from bandits.traces import SpanKind, WorkflowDeclaration
 from tests.ingest.discovery_test import _new, _old
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
-runner = CliRunner()
 SPAN = "langfuse.observation.type=SPAN"
 CHAIN = "langfuse.observation.type=CHAIN"
 
 
 def _out(result) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
-
-
-def _cli(*args: str):
-    return runner.invoke(app, list(args))
 
 
 def _file(tmp_path, *traces):
@@ -66,108 +58,6 @@ def _load(path, mapping, **declared):
 # ---- propose / confirm / show
 
 
-def test_propose_a_single_shape_export(tmp_path) -> None:
-    path = _file(tmp_path, _old("1" * 32), _old("2" * 32))
-    result = _cli(
-        "mapping",
-        "propose",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--name",
-        "shop",
-        "--project",
-        str(tmp_path),
-    )
-    assert result.exit_code == 0, _out(result)
-    mapping = load_mapping(tmp_path, "shop")
-    assert mapping.task_fields == ("input.query",)
-    assert mapping.delivered_field == "output.answer"
-    assert mapping.invocation == (Identity(kind_label=SPAN, name="handle"),)
-    assert [(s.trace_count, s.example_trace_id) for s in mapping.shapes] == [(2, "1" * 32)]
-    assert not mapping.confirmed
-    confirmed = _cli("mapping", "confirm", "shop", "--project", str(tmp_path))
-    assert confirmed.exit_code == 0, _out(confirmed)
-    shown = _cli("mapping", "show", "shop", "--project", str(tmp_path))
-    assert "confirmed, unmodified" in _out(shown)
-
-
-def test_agreeing_candidates_need_no_invocation_and_an_explicit_one_still_works(
-    tmp_path,
-) -> None:
-    path = _file(tmp_path, _new("1" * 32), _new("2" * 32))
-    project = str(tmp_path)
-    result = _cli(
-        "mapping", "propose", str(path), "--source", "otlp-std", "--name", "m", "--project", project
-    )
-    out = _out(result)
-    assert result.exit_code == 0, out
-    # Both runs hold the same question: the fields are declared together.
-    assert load_mapping(tmp_path, "m").task_fields == ("input.payload.query", "input.question")
-    assert _cli("mapping", "confirm", "m", "--project", project).exit_code == 0
-    ingested = _cli(
-        "ingest", str(path), "--source", "otlp-std", "--mapping", "m", "--project", project
-    )
-    assert ingested.exit_code == 0, _out(ingested)
-    artifact = re.search(r"artifact_id: (\S+)", _out(ingested)).group(1)
-    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact)
-    assert [t.request.task_status for t in corpus.traces] == ["declared", "declared"]
-
-    again = _cli(
-        "mapping",
-        "propose",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--name",
-        "m",
-        "--invocation",
-        f"{SPAN}|handle",
-        "--force",
-        "--project",
-        project,
-    )
-    assert again.exit_code == 0, _out(again)
-    mapping = load_mapping(tmp_path, "m")
-    assert mapping.task_fields == ("input.payload.query",)
-    assert mapping.invocation == (Identity(kind_label=SPAN, name="handle"),)
-    assert _cli("mapping", "confirm", "m", "--project", project).exit_code == 0
-    mapping = load_mapping(tmp_path, "m")
-
-    ingested = _cli(
-        "ingest", str(path), "--source", "otlp-std", "--mapping", "m", "--project", project
-    )
-    assert ingested.exit_code == 0, _out(ingested)
-    artifact = re.search(r"artifact_id: (\S+)", _out(ingested)).group(1)
-    corpus = ArtifactStore(tmp_path / ".bandits").read(artifact)
-    assert [t.request.task_status for t in corpus.traces] == ["declared", "declared"]
-    assert {t.request.invocation_basis for t in corpus.traces} == {"mapping m: invocation identity"}
-    assert corpus.workflow.mapping_name == "m"
-    assert corpus.workflow.mapping_digest == mapping.confirmed_digest
-
-
-def test_propose_never_overwrites_without_force(tmp_path) -> None:
-    path = _file(tmp_path, _old("1" * 32))
-    args = [
-        "mapping",
-        "propose",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--name",
-        "m",
-        "--project",
-        str(tmp_path),
-    ]
-    assert _cli(*args).exit_code == 0
-    assert _cli("mapping", "confirm", "m", "--project", str(tmp_path)).exit_code == 0
-    refused = _cli(*args)
-    assert refused.exit_code == 1 and "already exists" in _out(refused)
-    assert load_mapping(tmp_path, "m").confirmed
-    assert _cli(*args, "--force").exit_code == 0
-    assert not load_mapping(tmp_path, "m").confirmed  # replacing clears confirmation
-
-
 @pytest.mark.parametrize("name", ["Upper", "-dash", "has space", "a" * 65, "../x", ""])
 def test_bad_names_are_refused(tmp_path, name) -> None:
     with pytest.raises(MappingError):
@@ -193,64 +83,6 @@ def test_an_invalid_file_is_an_error_never_partly_applied(tmp_path) -> None:
     path.write_text(json.dumps({"source": "otlp-std", "step_kinds": {"k|n": "model"}}))
     with pytest.raises(MappingError, match="not valid"):
         load_mapping(tmp_path, "m")
-
-
-def test_cli_refuses_an_edited_mapping_and_flags_still_override(tmp_path) -> None:
-    path = _file(tmp_path, _old("1" * 32))
-    project = str(tmp_path)
-    _cli(
-        "mapping", "propose", str(path), "--source", "otlp-std", "--name", "m", "--project", project
-    )
-    _cli("mapping", "confirm", "m", "--project", project)
-    flagged = _cli(
-        "ingest",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--mapping",
-        "m",
-        "--task-field",
-        "input.missing",
-        "--dry-run",
-        "--project",
-        project,
-    )
-    assert flagged.exit_code == 0 and "task:     input.missing" in _out(flagged)
-    assert "1 trace(s) have no task" in _out(flagged)
-
-    file = mapping_path(tmp_path, "m")
-    file.write_text(file.read_text().replace('"input.query"', '"input.text"'))
-    refused = _cli(
-        "ingest",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--mapping",
-        "m",
-        "--dry-run",
-        "--project",
-        project,
-    )
-    assert refused.exit_code == 1
-    assert "changed since it was confirmed" in " ".join(_out(refused).split())
-    wrong = _cli(
-        "ingest",
-        str(path),
-        "--source",
-        "langfuse",
-        "--mapping",
-        "m",
-        "--dry-run",
-        "--project",
-        project,
-    )
-    assert wrong.exit_code == 1
-
-
-def test_ingest_without_a_mapping_hints_how_to_save_one(tmp_path) -> None:
-    path = _file(tmp_path, _old("1" * 32))
-    result = _cli("ingest", str(path), "--source", "otlp-std", "--dry-run")
-    assert "to save these choices: bandits mapping propose" in _out(result)
 
 
 # ---- applying
@@ -433,38 +265,6 @@ def _shared_name(trace: str) -> list[dict]:
             trace=trace,
         ),
     ]
-
-
-def test_a_proposal_applies_as_it_was_resolved(tmp_path) -> None:
-    path = _file(tmp_path, _shared_name("1" * 32), _shared_name("2" * 32))
-    project = str(tmp_path)
-    proposed = _cli(
-        "mapping", "propose", str(path), "--source", "otlp-std", "--name", "m", "--project", project
-    )
-    assert "invocation left open" in _out(proposed)
-    mapping = load_mapping(tmp_path, "m")
-    assert mapping.task_fields == ("input.query",) and mapping.invocation == ()
-    assert _cli("mapping", "confirm", "m", "--project", project).exit_code == 0
-    corpus, _ = _load(path, load_mapping(tmp_path, "m"))
-    assert [t.request.source_span_id for t in corpus.traces] == ["a", "a"]
-
-
-def test_an_explicit_invocation_that_cannot_choose_is_warned(tmp_path) -> None:
-    path = _file(tmp_path, _shared_name("1" * 32))
-    result = _cli(
-        "mapping",
-        "propose",
-        str(path),
-        "--source",
-        "otlp-std",
-        "--name",
-        "m",
-        "--invocation",
-        f"{SPAN}|run",
-        "--project",
-        str(tmp_path),
-    )
-    assert "picks exactly one run in only 0/1 traces" in " ".join(_out(result).split())
 
 
 @pytest.mark.parametrize("key", ["invalid-key", "|name", "label|", ""])

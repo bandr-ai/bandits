@@ -4,13 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.traces import SpanKind, SpanStatus
-from tests.cli_test import plain
 
 TRACE = "5b8efff798038103d269b633813fc60c"
 T0 = 1_767_225_600_000_000_000  # 2026-01-01T00:00:00Z in unix nanoseconds
@@ -116,37 +113,6 @@ def test_nested_model_calls_with_conflicting_replies_are_not_collapsed(tmp_path:
         "child",
     ]
     assert not [issue for issue in corpus.issues if issue.kind == "duplicate_model_instrumentation"]
-
-
-def test_transport_response_repr_is_not_a_model_completion(tmp_path: Path) -> None:
-    recorded = "<APIResponse [200 OK] type=<class 'provider.ChatCompletion'>>"
-    path = _write(
-        tmp_path / "opaque.jsonl",
-        _request(
-            [
-                _span(
-                    "a",
-                    "provider call",
-                    {
-                        "openinference.span.kind": "LLM",
-                        "input.value": "question",
-                        "output.value": json.dumps(recorded),
-                        "output.mime_type": "application/json",
-                    },
-                )
-            ]
-        ),
-    )
-    model = _only_trace(load_otlp_standard(path)).spans[0]
-    assert model.kind is SpanKind.MODEL
-    assert model.output is None
-    assert model.attributes["output.value"] == json.dumps(recorded)
-    assert model.attributes["bandits.output_unusable_reason"] == "transport_response_object_repr"
-    check = CliRunner().invoke(app, ["ingest", str(path), "--dry-run"])
-    assert check.exit_code == 0, check.output
-    assert "1 model call(s) recorded an output that is not an answer" in " ".join(
-        check.output.split()
-    )
 
 
 def test_reads_genai_semconv_spans(tmp_path) -> None:
@@ -560,21 +526,6 @@ def test_bad_records_become_issues_not_failures(tmp_path) -> None:
     )
 
 
-def test_dispatch_and_cli(tmp_path) -> None:
-    chat = {"gen_ai.operation.name": "chat", "input.value": "hi"}
-    path = _write(tmp_path / "t.jsonl", _request([_span("a", "chat", chat)]))
-
-    assert load_corpus(path, "otlp-std") == load_otlp_standard(path)
-    with pytest.raises(ValueError):
-        load_corpus(path, "otlp", pipeline_steps=False)
-
-    result = CliRunner().invoke(
-        app, ["ingest", str(path), "--source", "otlp-std", "--project", str(tmp_path)]
-    )
-    assert result.exit_code == 0, result.stdout
-    assert "read:     1 traces" in plain(result.stdout)
-
-
 def test_a_filtered_agent_root_keeps_its_episode_context(tmp_path) -> None:
     tools = [
         {
@@ -702,62 +653,6 @@ def test_nothing_beneath_an_evaluator_enters_the_corpus(tmp_path) -> None:
     assert trace.task == "Refund 7741"
 
 
-def test_a_recorded_system_message_becomes_the_system_prompt(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    first = [
-        {"role": "system", "content": "Refund only paid orders."},
-        {"role": "user", "content": "Refund 7741"},
-    ]
-    spans = [
-        _span(
-            "m1",
-            "chat",
-            {
-                "gen_ai.operation.name": "chat",
-                "input.value": json.dumps(first),
-                "output.value": "Done.",
-            },
-        )
-    ]
-    path = _write(tmp_path / "sys.jsonl", _request(spans))
-
-    trace = _only_trace(load_otlp_standard(path))
-    messages, defects, _ = build_transcript(trace)
-
-    assert trace.system_prompt == "Refund only paid orders."
-    assert messages[0].role == "system"
-    assert messages[0].content == "Refund only paid orders."
-    assert defects == ()
-
-
-def test_a_call_under_a_different_system_prompt_refuses_the_row(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    def call(span_id: str, system: str, at: int) -> dict:
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": "q"}]
-        return _span(
-            span_id,
-            "chat",
-            {
-                "gen_ai.operation.name": "chat",
-                "input.value": json.dumps(messages),
-                "output.value": "a",
-            },
-            at=at,
-        )
-
-    path = _write(
-        tmp_path / "two.jsonl", _request([call("m1", "Classify.", 0), call("m2", "Answer.", 1)])
-    )
-
-    trace = _only_trace(load_otlp_standard(path))
-    _, defects, _ = build_transcript(trace)
-
-    assert trace.system_prompt == "Classify."
-    assert any("system prompt" in d for d in defects)
-
-
 def test_an_openinference_tool_call_id_is_not_recovered_twice(tmp_path) -> None:
     first_in = [{"role": "user", "content": "Weather?"}]
     first_out = {
@@ -803,81 +698,6 @@ def test_an_openinference_tool_call_id_is_not_recovered_twice(tmp_path) -> None:
     trace = _only_trace(load_otlp_standard(path))
 
     assert [s.span_id for s in trace.spans if s.kind is SpanKind.TOOL] == ["t1"]
-
-
-def test_a_tool_only_response_is_a_call_not_assistant_text(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    response = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{"id": "c9", "function": {"name": "lookup", "arguments": '{"id": 7}'}}],
-    }
-    spans = [
-        _span(
-            "m1",
-            "chat",
-            {
-                "gen_ai.operation.name": "chat",
-                "input.value": json.dumps([{"role": "user", "content": "Find 7"}]),
-                "output.value": json.dumps(response),
-            },
-        )
-    ]
-    path = _write(tmp_path / "toolonly.jsonl", _request(spans))
-
-    trace = _only_trace(load_otlp_standard(path))
-    messages, defects, _ = build_transcript(trace)
-
-    model, call = trace.spans
-    assert model.output is None
-    # The call happened; its result was never recorded. Both facts are kept.
-    assert call.kind is SpanKind.TOOL
-    assert call.name == "lookup"
-    assert call.arguments == {"id": 7}
-    assert call.output is None
-    assert not any(
-        m.role == "assistant" and m.content and "tool_calls" in m.content for m in messages
-    )
-    assert any("no recorded result" in d for d in defects)
-
-
-def test_pipeline_steps_are_left_out_of_a_transcript_not_fatal_to_it(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    spans = [
-        _span("root", "answer", {"langfuse.observation.type": "SPAN"}),
-        _span(
-            "search",
-            "lookup_step",
-            {
-                "langfuse.observation.type": "CHAIN",
-                "input.value": '{"q": "leave"}',
-                "output.value": '{"docs": ["20 days"]}',
-            },
-            parent="root",
-        ),
-        _span(
-            "gen",
-            "ANSWER",
-            {
-                "langfuse.observation.type": "GENERATION",
-                "input.value": json.dumps([{"role": "user", "content": "Leave? Docs: 20 days"}]),
-                "output.value": "20 days.",
-            },
-            parent="root",
-            at=1,
-        ),
-    ]
-    path = _write(tmp_path / "rag.jsonl", _request(spans))
-
-    trace = _only_trace(load_otlp_standard(path))
-    messages, defects, warnings = build_transcript(trace)
-
-    assert [s.span_id for s in trace.spans] == ["search", "gen"]
-    assert defects == ()
-    assert [m.role for m in messages] == ["user", "assistant"]
-    assert any("lookup_step" in w for w in warnings)
 
 
 @pytest.mark.parametrize("nanos", ["9" * 30, str(10**22), "-5", "1e18"])
@@ -940,132 +760,6 @@ def test_truncated_json_messages_are_not_read_as_user_text(tmp_path) -> None:
 # ---------- review round 3 ----------
 
 
-def test_an_id_less_execution_is_not_recovered_again_from_history(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    first_in = [{"role": "user", "content": "Find leave policy"}]
-    first_out = {
-        "role": "assistant",
-        "tool_calls": [{"id": "c1", "function": {"name": "search", "arguments": "{}"}}],
-    }
-    second_in = [
-        *first_in,
-        first_out,
-        {"role": "tool", "tool_call_id": "c1", "content": "20 days"},
-    ]
-    spans = [
-        _span(
-            "m1",
-            "chat",
-            {
-                "gen_ai.operation.name": "chat",
-                "input.value": json.dumps(first_in),
-                "output.value": json.dumps(first_out),
-            },
-        ),
-        _span(
-            "t1",
-            "search",
-            {
-                "gen_ai.operation.name": "execute_tool",
-                "gen_ai.tool.name": "search",
-                "output.value": "20 days",
-            },
-            parent="m1",
-            at=1,
-        ),
-        _span(
-            "m2",
-            "chat",
-            {
-                "gen_ai.operation.name": "chat",
-                "input.value": json.dumps(second_in),
-                "output.value": "20 days.",
-            },
-            at=2,
-        ),
-    ]
-    path = _write(tmp_path / "noid.jsonl", _request(spans))
-
-    trace = _only_trace(load_otlp_standard(path))
-    messages, _, _ = build_transcript(trace)
-
-    assert [s.span_id for s in trace.spans if s.kind is SpanKind.TOOL] == ["t1"]
-    assert [m.role for m in messages].count("tool") == 1
-
-
-def test_input_the_transcript_cannot_show_refuses_the_row(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    # Retrieval evidence handed to the model as a tool-role message with no call
-    # to answer. The transcript has nowhere to put it, so the row must go.
-    answer_in = [
-        {"role": "user", "content": "How many days?"},
-        {"role": "tool", "content": "Policy: employees get 20 days."},
-    ]
-    spans = [
-        _span("root", "rag", {"langfuse.observation.type": "SPAN"}),
-        _span(
-            "search",
-            "retrieve",
-            {
-                "langfuse.observation.type": "RETRIEVER",
-                "input.value": "days",
-                "output.value": "Policy: employees get 20 days.",
-            },
-            parent="root",
-        ),
-        _span(
-            "gen",
-            "answer",
-            {
-                "langfuse.observation.type": "GENERATION",
-                "input.value": json.dumps(answer_in),
-                "output.value": "20 days.",
-            },
-            parent="root",
-            at=1,
-        ),
-    ]
-    path = _write(tmp_path / "evidence.jsonl", _request(spans))
-
-    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
-
-    assert any("input" in d and "does not show" in d for d in defects)
-
-
-def test_evidence_the_transcript_carries_keeps_the_row(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    answer_in = [{"role": "user", "content": "How many days?\nDocs: employees get 20 days."}]
-    spans = [
-        _span("root", "rag", {"langfuse.observation.type": "SPAN"}),
-        _span(
-            "search",
-            "retrieve",
-            {"langfuse.observation.type": "RETRIEVER", "output.value": "20 days"},
-            parent="root",
-        ),
-        _span(
-            "gen",
-            "answer",
-            {
-                "langfuse.observation.type": "GENERATION",
-                "input.value": json.dumps(answer_in),
-                "output.value": "20 days.",
-            },
-            parent="root",
-            at=1,
-        ),
-    ]
-    path = _write(tmp_path / "carried.jsonl", _request(spans))
-
-    messages, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
-
-    assert defects == ()
-    assert messages[0].content == "How many days?\nDocs: employees get 20 days."
-
-
 # ---------- review round 4 ----------
 
 
@@ -1080,80 +774,6 @@ def _chat_call(span_id: str, messages: list[dict], output: object, at: int) -> d
         },
         at=at,
     )
-
-
-def test_an_omitted_example_is_not_excused_by_matching_words(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    # A few-shot assistant turn no span produced. Its text also occurs inside
-    # the user's question, which must not count as the example being shown.
-    call = [
-        {"role": "assistant", "content": "20 days"},
-        {"role": "user", "content": "Is it 20 days of leave?"},
-    ]
-    path = _write(tmp_path / "fewshot.jsonl", _request([_chat_call("m", call, "Yes.", 0)]))
-
-    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
-
-    assert any("does not show" in d for d in defects)
-
-
-def test_a_repeated_turn_must_appear_as_often_as_recorded(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    second = [
-        {"role": "user", "content": "go"},
-        {"role": "assistant", "content": "done"},
-        {"role": "user", "content": "go"},
-        {"role": "assistant", "content": "done"},
-        {"role": "user", "content": "go"},
-    ]
-    spans = [
-        _chat_call("m1", [{"role": "user", "content": "go"}], "done", 0),
-        _chat_call("m2", second, "done", 1),
-    ]
-    path = _write(tmp_path / "repeat.jsonl", _request(spans))
-
-    _, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
-
-    assert any("does not show" in d for d in defects)
-
-
-def test_a_faithful_agent_loop_keeps_its_row(tmp_path) -> None:
-    from bandits.export import build_transcript
-
-    system = {"role": "system", "content": "Use tools."}
-    first_in = [system, {"role": "user", "content": "Weather in Paris?"}]
-    first_out = {
-        "role": "assistant",
-        "content": "Checking.",
-        "tool_calls": [
-            {"id": "c1", "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}
-        ],
-    }
-    second_in = [
-        *first_in,
-        first_out,
-        {"role": "tool", "tool_call_id": "c1", "content": "18C"},
-        {"role": "user", "content": "And tomorrow?"},
-    ]
-    spans = [
-        _chat_call("m1", first_in, first_out, 0),
-        _chat_call("m2", second_in, "Also mild.", 1),
-    ]
-    path = _write(tmp_path / "loop.jsonl", _request(spans))
-
-    messages, defects, _ = build_transcript(_only_trace(load_otlp_standard(path)))
-
-    assert defects == ()
-    assert [m.role for m in messages] == [
-        "system",
-        "user",
-        "assistant",
-        "tool",
-        "user",
-        "assistant",
-    ]
 
 
 def test_gemini_request_contents_become_messages() -> None:

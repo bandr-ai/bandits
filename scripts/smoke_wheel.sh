@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install a built wheel into a fresh environment and run it away from the
-# checkout, the way a user would after `pip install bandits-cli`.
+# Install a built wheel into a fresh environment and ingest a fixture away
+# from the checkout, the way a user would after `pip install bandits-cli`.
 #
 #   scripts/smoke_wheel.sh dist/bandits_cli-*.whl
 set -euo pipefail
@@ -12,15 +12,23 @@ trap 'rm -rf "$work"' EXIT
 
 uv venv --quiet "$work/venv"
 uv pip install --quiet --python "$work/venv/bin/python" "$wheel"
-bandits="$work/venv/bin/bandits"
 
 cd "$work"
-expected="$("$work/venv/bin/python" -c 'import importlib.metadata as m; print(m.version("bandits-cli"))')"
-"$bandits" --version | grep -qx "bandits $expected"
-"$bandits" --help >/dev/null
-"$bandits" ingest "$fixture" --source otlp | tee ingest.log
-corpus="$(sed -n 's/^artifact_id: //p' ingest.log)"
-test -n "$corpus"
-"$bandits" show "$corpus" >/dev/null
-"$bandits" list | grep -q "$corpus"
-echo "wheel smoke test passed: bandits $expected"
+"$work/venv/bin/python" - "$fixture" <<'PY'
+import importlib.metadata
+import sys
+from pathlib import Path
+
+import bandits
+from bandits.ingest import load_corpus
+from bandits.store import ArtifactStore
+
+assert bandits.__version__ == importlib.metadata.version("bandits-cli"), bandits.__version__
+corpus = load_corpus(Path(sys.argv[1]), source="otlp")
+assert corpus.traces, "no traces read from the fixture"
+store = ArtifactStore(Path("project"))
+envelope = store.write(corpus, source_path=sys.argv[1])
+assert [e.artifact_id for e in store.list()] == [envelope.artifact_id]
+assert len(store.read(envelope.artifact_id).traces) == len(corpus.traces)
+print(f"wheel smoke test passed: bandits {bandits.__version__}, {len(corpus.traces)} traces")
+PY

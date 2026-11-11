@@ -3,20 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
-from typer.testing import CliRunner
 
-from bandits.analyze.rlm_corpus import build_view
-from bandits.analyze.rlm_models import TraceView
-from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.otlp_standard import load_otlp_standard
 from bandits.ingest.workflow import delivery_status, resolve_task
 from bandits.traces import SpanStatus, WorkflowDeclaration
-from bandits.verify.turns import WorkflowTurnsError, extract_turns
-from tests.cli_test import plain
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
 QUESTION = "If my order arrives after the promised date, is the delivery fee refunded?"
@@ -404,79 +397,6 @@ def test_upstream_truncated_output_is_kept_and_not_matched(tmp_path) -> None:
     )
 
 
-def test_turn_extraction_refuses_a_workflow(tmp_path) -> None:
-    _, trace = _load(tmp_path, _workflow())
-    with pytest.raises(WorkflowTurnsError):
-        extract_turns(trace)
-
-
-def test_request_view_reads_the_request_never_prompts(tmp_path) -> None:
-    _, trace = _load(tmp_path, _workflow())
-    view = build_view(trace, TraceView.REQUEST)
-    assert view.messages == (QUESTION,)
-    assert not build_view(trace, TraceView.USER_MESSAGES).readable
-
-    _, unresolved = _load(tmp_path, _workflow(), WorkflowDeclaration())
-    (raw,) = build_view(unresolved, TraceView.REQUEST).messages
-    assert raw.startswith("[raw request record, task unresolved]") and QUESTION in raw
-
-
-def test_request_view_is_unreadable_on_a_conversation(tmp_path) -> None:
-    trace = load_otlp_standard(_write(tmp_path / "c.jsonl", _request(_workflow()))).traces[0]
-    assert not build_view(trace, TraceView.REQUEST).readable
-
-
-def test_cli_ingests_a_workflow_and_refuses_turn_judging(tmp_path) -> None:
-    path = _write(tmp_path / "wf.jsonl", _request(_workflow()))
-    runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "ingest",
-            str(path),
-            "--source",
-            "otlp-std",
-            "--mode",
-            "workflow",
-            "--task-field",
-            "input.query",
-            "--delivered-field",
-            "output.answer",
-            "--project",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    corpus_id = re.search(r"artifact_id: (\S+)", result.output).group(1)
-
-    judged = runner.invoke(
-        app, ["judge-turns", corpus_id, "--archetype", "generic", "--project", str(tmp_path)]
-    )
-    assert judged.exit_code == 1
-    assert "ingested as a workflow" in judged.output
-
-
-def test_cli_rejects_workflow_options_without_workflow_mode(tmp_path) -> None:
-    path = _write(tmp_path / "wf.jsonl", _request(_workflow()))
-    result = CliRunner().invoke(
-        app,
-        [
-            "ingest",
-            str(path),
-            "--source",
-            "otlp-std",
-            "--mode",
-            "conversation",
-            "--task-field",
-            "input.query",
-            "--project",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 1
-    assert "only apply to workflows" in plain(result.output)
-
-
 def test_workflow_mode_is_otlp_std_only(tmp_path) -> None:
     with pytest.raises(ValueError, match="otlp-std"):
         load_corpus(tmp_path / "x.jsonl", "chat-json", workflow=DECLARED)
@@ -527,15 +447,6 @@ def test_every_recorded_span_is_kept_somewhere(tmp_path) -> None:
     assert {span["spanId"] for span in spans} <= kept
 
 
-def test_request_view_never_cuts_the_request(tmp_path) -> None:
-    padded = {"payload": {"config": "x" * 5000, "query": QUESTION}}
-    _, trace = _load(tmp_path, _workflow(invocation=padded), WorkflowDeclaration())
-
-    (raw,) = build_view(trace, TraceView.REQUEST).messages
-    assert QUESTION in raw
-    assert "[truncated]" not in raw
-
-
 def test_a_code_only_invocation_is_the_request_not_an_action(tmp_path) -> None:
     # The answer call sits beside the invocation (its parent was never exported),
     # so nothing beneath the invocation is a model call.
@@ -567,16 +478,6 @@ def test_a_cut_off_invocation_input_is_reported(tmp_path) -> None:
     assert any(
         issue.kind == "unparsed_value" and "input.value" in issue.detail for issue in corpus.issues
     )
-
-
-def test_an_invocation_with_no_recorded_input_is_unreadable(tmp_path) -> None:
-    spans = _workflow()
-    _set(spans[1], "input.value", None)
-    _, trace = _load(tmp_path, spans, WorkflowDeclaration())
-    assert trace.request.source_span_id == "inv"
-    view = build_view(trace, TraceView.REQUEST)
-    assert not view.readable
-    assert view.unreadable_reason == "the request record is empty"
 
 
 def test_workflow_policy_and_structured_outputs_stay_on_calls(tmp_path) -> None:

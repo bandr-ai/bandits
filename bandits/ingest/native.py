@@ -21,10 +21,10 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from bandits.ingest.jsonarray import iter_array
 from bandits.ingest.mapping import IngestMapping
 from bandits.ingest.otlp_standard import TRACE_RECORD, iter_otlp_standard, load_otlp_standard
 from bandits.ingest.report import EXAMPLES, IngestReport, aggregate_issues
-from bandits.jsonarray import iter_array
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_bytes
 from bandits.traces import Trace, TraceCorpus, TraceIssue, WorkflowDeclaration
 
@@ -356,8 +356,7 @@ attributes above; every other field is kept in ``bandits.unmapped``."""
 
 _PROMOTED_METADATA = {"resourceAttributes": "resource", "scope": "scope"}
 """Langfuse metadata keys holding the span's OTel resource and scope: they
-become the span's resource and scope, read back as ``metadata.*`` by
-``bandits.fields``."""
+become the span's resource and scope."""
 
 
 def langfuse_used(observation: dict[str, Any]) -> Used:
@@ -751,8 +750,7 @@ def _failproofai_pairs(
             reason = unpaired.get(position[id(event)])
             if reason is None:
                 unpaired[position[id(event)]] = (
-                    f"no {opener if event['event_type'] == closer else closer} "
-                    f"shares an id with it"
+                    f"no {opener if event['event_type'] == closer else closer} shares an id with it"
                 )
     return pairs, {i: r for i, r in unpaired.items() if r}
 
@@ -944,7 +942,9 @@ def _failproofai_session(
             )
         )
         parent = (
-            f"agent_start:{owner['id']}" if owner is not None and owner is not opener else session_span
+            f"agent_start:{owner['id']}"
+            if owner is not None and owner is not opener
+            else session_span
         )
         name = (
             attributes.get("gen_ai.request.model")
@@ -1103,7 +1103,7 @@ class NativeConversion:
         if path.is_dir():
             raise ValueError(
                 f"{source_name} reads one export file; {path} is a directory — join it with "
-                "bandits.ingest.bundle.bundle_json_documents (bandits ingest does)"
+                "bandits.ingest.bundle.bundle_json_documents first"
             )
         self.path, self.source_name, self.ruleset = path, source_name, ruleset
         self.scratch_dir = scratch_dir

@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 
-from typer.testing import CliRunner
-
-from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.ingest.discovery import discover, discover_requests
 from bandits.traces import WorkflowDeclaration
-from tests.cli_test import plain
 from tests.ingest.otlp_standard_test import _request, _span, _write
 
 QUESTION = "Can I change the delivery address after checkout?"
@@ -175,50 +169,3 @@ def test_native_discovery_reads_the_same_candidates(tmp_path) -> None:
     path.write_text(json.dumps(trace) + "\n")
     found = discover(discover_requests(path, "langfuse"))
     assert (found.task_fields, found.delivered_field) == (("input.payload.query",), "output.answer")
-
-
-def test_cli_builds_the_corpus_once_and_prints_the_options(tmp_path, monkeypatch) -> None:
-    import bandits.cli
-
-    calls = []
-    real = bandits.cli.iter_corpus
-    monkeypatch.setattr(
-        bandits.cli, "iter_corpus", lambda *a, **k: calls.append(1) or real(*a, **k)
-    )
-    path = _write(tmp_path / "new.jsonl", *(_request(_new(c * 32)) for c in "56"))
-    result = CliRunner().invoke(app, ["ingest", str(path), "--source", "otlp-std", "--dry-run"])
-    out = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
-    assert result.exit_code == 0, out
-    assert len(calls) == 1
-    assert "task:     input.payload.query, input.question (found" in out
-    assert "problems: none" in out
-
-
-def test_temporary_files_go_in_the_project_not_the_working_directory(
-    tmp_path: Path, monkeypatch
-) -> None:
-    fixture = (
-        Path(__file__).resolve().parents[1]
-        / "fixtures/upstream/langfuse/agno-2025-06-11.trace.json"
-    )
-    readonly = tmp_path / "readonly"
-    readonly.mkdir()
-    readonly.chmod(0o555)
-    monkeypatch.chdir(readonly)
-    try:
-        for args in (
-            ["ingest", str(fixture), "--source", "langfuse"],
-            ["mapping", "propose", str(fixture), "--source", "langfuse", "--name", "m"],
-        ):
-            result = CliRunner().invoke(app, [*args, "--project", str(tmp_path / "project")])
-            assert result.exit_code == 0, (result.output, result.exception)
-        assert list(readonly.iterdir()) == []
-        assert [p.name for p in (tmp_path / "project").iterdir()] == [".bandits"]
-
-        result = CliRunner().invoke(
-            app, ["ingest", str(fixture), "--source", "langfuse", "--project", str(readonly)]
-        )
-        assert result.exit_code == 1, result.output
-        assert "cannot write to" in plain(result.output)
-    finally:
-        readonly.chmod(0o755)

@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from bandits.genai import system_instructions, system_prompt_of
+from bandits.ingest.genai import system_instructions, system_prompt_of
 from bandits.ingest.toolsets import parse_toolset
 from bandits.redact import DEFAULT_RULESET, RedactionRuleset, redact_source
 from bandits.traces import Span, SpanKind, SpanStatus, Trace, TraceCorpus, TraceIssue, UserTurn

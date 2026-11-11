@@ -385,8 +385,8 @@ def aggregate_issues(
             TraceIssue(
                 kind="shape_not_in_mapping",
                 detail=f"{report.unmapped_shapes} trace(s) have shapes mapping {mapping_name} "
-                "wasn't confirmed on; they were ingested with its rules. Review with "
-                "`bandits mapping propose ... --force`",
+                "wasn't confirmed on; they were ingested with its rules. Review "
+                "the mapping and save it again with `bandits.ingest.mapping.save_mapping(..., overwrite=True)`",
                 location=location,
             )
         )

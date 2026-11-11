@@ -6,15 +6,9 @@ import time
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from bandits.cli import app
 from bandits.ingest import load_corpus
 from bandits.redact import SECRETS_ONLY_RULESET, redact_source, ruleset_by_name
-from bandits.store import ArtifactStore
-from tests.cli_test import plain
-
-runner = CliRunner()
 
 
 def _otlp(task: str, attributes: str = "") -> str:
@@ -36,24 +30,6 @@ def test_redaction_marks_corpus_and_preserves_original_digest(tmp_path: Path) ->
     assert "[REDACTED:openai_api_key]" in corpus.model_dump_json()
     assert any(issue.kind == "redaction" for issue in corpus.issues)
     assert corpus.traces[0].source_digest == hashlib.sha256(source.read_bytes()).hexdigest()
-
-
-def test_cli_never_persists_nested_named_secret(tmp_path: Path) -> None:
-    source = tmp_path / "trace.jsonl"
-    secret = "super-secret-value"
-    source.write_text(_otlp("Safe task", f',"metadata":{{"password":"{secret}"}}'))
-    project = tmp_path / "project"
-
-    result = runner.invoke(
-        app, ["ingest", str(source), "--source", "otlp", "--project", str(project)]
-    )
-
-    assert result.exit_code == 0
-    persisted = b"".join(path.read_bytes() for path in project.rglob("*") if path.is_file())
-    assert secret.encode() not in persisted
-    store = ArtifactStore(project / ".bandits")
-    artifact_id = store.list()[0].artifact_id
-    assert any(issue.kind == "redaction" for issue in store.read(artifact_id).issues)
 
 
 def test_location_survives_an_earlier_multiline_replacement(tmp_path: Path) -> None:
@@ -99,56 +75,6 @@ def test_secrets_only_ruleset_keeps_a_task_identifying_email(tmp_path: Path) -> 
     assert corpus.traces[0].task == "Refund the order for alice@realmail.io"
     assert corpus.redaction_ruleset == "secrets-only-v2"
     assert load_corpus(source, "otlp").redaction_ruleset == "default-v2"
-
-
-def test_ingest_records_the_ruleset_that_produced_the_corpus(tmp_path: Path) -> None:
-    source = tmp_path / "trace.jsonl"
-    source.write_text(_otlp("Refund the order for alice@realmail.io"))
-    project = tmp_path / "project"
-
-    result = runner.invoke(
-        app,
-        # fmt: off
-        [
-            "ingest",
-            str(source),
-            "--source",
-            "otlp",
-            "--redaction",
-            "secrets-only-v2",
-            "--project",
-            str(project),
-        ],
-        # fmt: on
-    )
-
-    assert result.exit_code == 0
-    assert "redaction: secrets-only-v2" in plain(result.stdout)
-    store = ArtifactStore(project / ".bandits")
-    assert store.read(store.list()[0].artifact_id).redaction_ruleset == "secrets-only-v2"
-
-
-def test_unknown_ruleset_exits_nonzero(tmp_path: Path) -> None:
-    source = tmp_path / "trace.jsonl"
-    source.write_text(_otlp("Safe task"))
-
-    result = runner.invoke(
-        app,
-        # fmt: off
-        [
-            "ingest",
-            str(source),
-            "--source",
-            "otlp",
-            "--redaction",
-            "nope",
-            "--project",
-            str(tmp_path / "p"),
-        ],
-        # fmt: on
-    )
-
-    assert result.exit_code == 1
 
 
 def test_redaction_never_orphans_a_json_escape(tmp_path: Path) -> None:
