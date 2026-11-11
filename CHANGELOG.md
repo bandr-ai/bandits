@@ -7,6 +7,15 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+### Added
+
+- `l2h`: a standalone logs-to-Harbor tool (library plus CLI, no dependency on
+  `bandits`). It samples and queries agent logs, runs agent-written parse,
+  check and task-type code over the whole corpus, writes Harbor task packages,
+  scans them for answer leaks, and validates them with oracle, no-op and
+  wrong-answer gates. Ships its own skill and guides (`l2h docs`). Plan:
+  `docs/plans/logs-to-harbor.md`.
+
 ## [0.3.0] - unreleased
 
 `bandits` is now ingest only. Everything else was removed, to be rebuilt from

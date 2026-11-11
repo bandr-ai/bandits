@@ -1,0 +1,533 @@
+"""`l2h run parse|checks|generate`: run agent-written code over the corpus."""
+
+from __future__ import annotations
+
+import re
+import tempfile
+import traceback
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+from . import harbor, leak
+from .models import (
+    Blocked,
+    BuildResult,
+    ContractError,
+    ParseError,
+    normalize_finding,
+    normalize_trajectory,
+)
+from .output import L2HError, progress
+from .results import check_invariants, finalize, new_row
+from .scripts import load_checks, load_parser, load_tasktypes
+from .workspace import (
+    Workspace,
+    atomic_write,
+    clear_dir,
+    iter_records,
+    list_log_files,
+    read_json,
+    read_jsonl,
+    rel,
+    sha,
+    write_json,
+    write_jsonl,
+)
+
+
+def inputs_digest(*paths: Path) -> str:
+    """Digest of the files a stage consumed, to detect a stale downstream stage."""
+    return sha("|".join(sha(p.read_bytes()) if p.exists() else "-" for p in paths))
+
+
+def cause_of(msg: str) -> str:
+    """Normalise an error message so errors with one root cause group together."""
+    s = re.sub(r"0x[0-9a-fA-F]+|\b[0-9a-f]{8,}\b", "<hex>", msg)
+    s = re.sub(r"'[^']{0,80}'|\"[^\"]{0,80}\"", "<str>", s)
+    s = re.sub(r"\d+", "N", s)
+    return s.strip()[:200]
+
+
+def group_errors(items: list[tuple[str, str]], examples: int = 3) -> list[dict]:
+    """items = [(message, example_id)] -> [{cause, count, examples}] biggest first."""
+    by: dict[str, list[str]] = defaultdict(list)
+    for msg, ex in items:
+        by[cause_of(msg)].append(ex)
+    out = [{"cause": c, "count": len(v), "examples": v[:examples]} for c, v in by.items()]
+    return sorted(out, key=lambda d: (-d["count"], d["cause"]))
+
+
+def _stored(summary: dict) -> dict:
+    """What we persist: the summary minus the diff, so identical reruns write identical state."""
+    return {k: v for k, v in summary.items() if k != "changed_since_last_run"}
+
+
+def delta(prev: dict | None, cur: dict) -> dict:
+    """Numeric differences vs the previous run summary (what changed)."""
+    if not prev:
+        return {"first_run": True}
+    return {
+        k: cur[k] - prev.get(k, 0)
+        for k in cur
+        if isinstance(cur[k], int) and cur[k] != prev.get(k, 0)
+    }
+
+
+# ------------------------------------------------------------------- parse
+
+
+def raw_inventory(ws: Workspace) -> dict[str, int]:
+    logs = ws.logs_root()
+    return {rel(logs, p): sum(1 for _ in iter_records(p)) for p in list_log_files(logs)}
+
+
+def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> dict:
+    logs = ws.logs_root()
+    ld = load_parser(ws)
+    files = list_log_files(logs)
+    fp = sha(
+        ld.digest
+        + "|".join(f"{rel(logs, p)}:{p.stat().st_size}:{p.stat().st_mtime_ns}" for p in files)
+    )
+    st = ws.state().get("parse", {})
+    if not no_cache and limit is None and st.get("fingerprint") == fp and ws.trajectories.exists():
+        return {
+            **st["summary"],
+            "cached": True,
+            "changed_since_last_run": {"none": "cached: inputs unchanged"},
+        }
+
+    inv = raw_inventory(ws)
+    trajs, errors, seen = [], [], set()
+    n_seen = 0
+    try:
+        for item in ld.module.parse(files):
+            n_seen += 1
+            if n_seen % 1000 == 0:
+                progress(f"parse: {n_seen} items")
+            if isinstance(item, ParseError):
+                errors.append((item.error, f"{item.file}#{item.offset}"))
+                continue
+            try:
+                t = normalize_trajectory(item)
+                if t["id"] in seen:
+                    raise ContractError(f"duplicate trajectory id {t['id']!r}")
+                for r in t["source_refs"]:
+                    f = r["file"]
+                    if f not in inv:
+                        raise ContractError(f"source_ref file {f!r} is not under the logs folder")
+                    off = r.get("offset")
+                    if isinstance(off, int) and not 0 <= off < inv[f]:
+                        raise ContractError(
+                            f"source_ref {f}#{off} is out of range (file has {inv[f]} records)"
+                        )
+            except ContractError as e:
+                errors.append((str(e), str(item.get("id")) if isinstance(item, dict) else "?"))
+                continue
+            seen.add(t["id"])
+            trajs.append(t)
+            if limit and len(trajs) >= limit:
+                break
+    except L2HError:
+        raise
+    except Exception as e:
+        raise L2HError(
+            f"parse() crashed after {n_seen} items: {type(e).__name__}: {e}",
+            "fix parse.py; the traceback tail is: "
+            + traceback.format_exc().strip().splitlines()[-3:][0],
+        ) from e
+
+    covered: set[tuple[str, int]] = set()
+    key_files: set[str] = set()
+    for t in trajs:
+        for r in t["source_refs"]:
+            off = r.get("offset")
+            if isinstance(off, int):
+                covered.add((r["file"], off))
+            elif isinstance(off, list):
+                covered.update((r["file"], o) for o in off if isinstance(o, int))
+            else:
+                key_files.add(r["file"])
+    orphans = [
+        f"{f}#{i}"
+        for f, n in inv.items()
+        if f not in key_files
+        for i in range(n)
+        if (f, i) not in covered
+    ]
+    total = sum(inv.values())
+    summary = {
+        "files": len(inv),
+        "raw_records": total,
+        "trajectories": len(trajs),
+        "parse_errors": len(errors),
+        "records_in_no_trajectory": len(orphans),
+        "orphan_examples": orphans[:5],
+        "key_ref_files_not_counted": sorted(key_files),
+        "ended": dict(Counter(t["ended"] for t in trajs)),
+        "error_groups": group_errors(errors),
+        "limited": limit is not None,
+    }
+    summary["changed_since_last_run"] = delta(
+        {k: v for k, v in st.get("summary", {}).items() if isinstance(v, int)},
+        {k: v for k, v in summary.items() if isinstance(v, int)},
+    )
+    if not dry:
+        write_jsonl(ws.trajectories, trajs)
+        ws.update_state(parse={"fingerprint": fp, "script": ld.digest, "summary": _stored(summary)})
+    return summary
+
+
+# ------------------------------------------------------------------ checks
+
+
+def load_trajectories(ws: Workspace) -> list[dict]:
+    if not ws.trajectories.exists():
+        raise L2HError("out/trajectories.jsonl not found", "run `l2h run parse` first")
+    return read_jsonl(ws.trajectories)
+
+
+def run_checks(ws: Workspace, limit: int | None, dry: bool) -> dict:
+    trajs = load_trajectories(ws)
+    if limit:
+        trajs = trajs[:limit]
+    ld, checks = load_checks(ws)
+    rows, errs = [], []
+    for t in trajs:
+        from .models import Trajectory
+
+        tt = Trajectory(t)
+        for c in checks:
+            try:
+                f = normalize_finding(c.fn(tt))
+            except Exception as e:  # a crashing check is an observation gap, not a verdict
+                msg = f"{type(e).__name__}: {e}"
+                errs.append((f"check {c.id}: {msg}", t["id"]))
+                from .models import Finding
+
+                f = Finding("unknown", [], f"check crashed: {msg}")
+            rows.append(
+                {
+                    "trajectory_id": t["id"],
+                    "check": c.id,
+                    "version": c.version,
+                    "result": f.result,
+                    "evidence": f.evidence,
+                    "note": f.note,
+                }
+            )
+    per: dict[str, Any] = {}
+    for c in checks:
+        cnt = Counter(r["result"] for r in rows if r["check"] == c.id)
+        n = sum(cnt.values())
+        per[c.id] = {
+            "version": c.version,
+            "pass": cnt["pass"],
+            "fail": cnt["fail"],
+            "unknown": cnt["unknown"],
+            "fail_rate": round(cnt["fail"] / n, 4) if n else 0.0,
+        }
+    prev = ws.state().get("checks", {}).get("summary", {})
+    changed = {}
+    for cid, v in per.items():
+        p = prev.get("per_check", {}).get(cid)
+        if p is None:
+            changed[cid] = "new check"
+        elif p["fail"] != v["fail"] or p["version"] != v["version"]:
+            changed[cid] = f"fail {p['fail']} -> {v['fail']}"
+    summary = {
+        "trajectories": len(trajs),
+        "checks": len(checks),
+        "findings": len(rows),
+        "per_check": per,
+        "error_groups": group_errors(errs),
+        "changed_since_last_run": changed or {"none": "same results as last run"},
+        "limited": limit is not None,
+    }
+    if not dry:
+        write_jsonl(ws.findings, rows)
+        ws.update_state(
+            checks={
+                "script": ld.digest,
+                "summary": _stored(summary),
+                "inputs": inputs_digest(ws.trajectories),
+            }
+        )
+    return summary
+
+
+# ---------------------------------------------------------------- generate
+
+
+def findings_by_traj(ws: Workspace) -> dict[str, dict]:
+    out: dict[str, dict] = defaultdict(dict)
+    for r in read_jsonl(ws.findings):
+        out[r["trajectory_id"]][r["check"]] = {k: r[k] for k in ("result", "evidence", "note")}
+    return out
+
+
+def source_strings(group: list[dict]) -> list[str]:
+    out = []
+    for t in group:
+        for r in t["source_refs"]:
+            off = r.get("offset", r.get("key"))
+            out.append(f"{r['file']}#{off}")
+    return sorted(set(out))
+
+
+def package_hash(task_dir: Path) -> str:
+    h = []
+    for p in sorted(task_dir.rglob("*")):
+        if p.is_file():
+            h.append(f"{p.relative_to(task_dir).as_posix()}:{sha(p.read_bytes())}")
+    return sha("\n".join(h))
+
+
+def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | None) -> dict:
+    trajs = load_trajectories(ws)
+    if limit:
+        trajs = trajs[:limit]
+    if not ws.findings.exists():
+        progress("note: no findings yet; applies() will see empty findings")
+    fmap = findings_by_traj(ws)
+    types = load_tasktypes(ws)
+    cfg = ws.config()
+    old_rows = ws.result_rows()
+    old_by_id = {r["task_id"]: r for r in old_rows}
+    built_types = [t for t in types if not only_type or t.name == only_type]
+    if only_type and not built_types:
+        raise L2HError(f"no task type {only_type!r}", "list task types with `l2h status`")
+
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="l2h-gen-") if dry else None
+    tasks_root = Path(tmp_ctx.name) / "tasks" if dry else ws.tasks
+    staging_root = Path(tempfile.mkdtemp(prefix="l2h-stage-"))
+    new_rows, queue, excluded_reasons = [], [], {}
+    applied_any: set[str] = set()
+    ids_seen: dict[str, str] = {}
+    taskmeta: dict[str, dict] = {}
+
+    try:
+        for tt in types:
+            reasons: dict[str, str] = {}
+            groups: dict[str, list[dict]] = defaultdict(list)
+            for t in trajs:
+                try:
+                    res = tt.loaded.module.applies(t, fmap.get(t["id"], {}))
+                    ok, why = res if isinstance(res, tuple) else (bool(res), "")
+                except Exception as e:
+                    queue.append(
+                        _q(
+                            tt.name,
+                            t["id"],
+                            "exception",
+                            f"applies() crashed: {type(e).__name__}: {e}",
+                            [t["id"]],
+                        )
+                    )
+                    continue
+                if ok:
+                    applied_any.add(t["id"])
+                    try:
+                        groups[str(tt.loaded.module.group_key(t))].append(t)
+                    except Exception as e:
+                        queue.append(
+                            _q(
+                                tt.name,
+                                t["id"],
+                                "exception",
+                                f"group_key() crashed: {type(e).__name__}: {e}",
+                                [t["id"]],
+                            )
+                        )
+                elif why:
+                    reasons[t["id"]] = why
+            for tid, why in reasons.items():
+                excluded_reasons.setdefault(tid, []).append(f"{tt.name}: {why}")
+            if only_type and tt.name != only_type:
+                continue
+            progress(f"generate {tt.name}: {len(groups)} group(s)")
+            for gk in sorted(groups):
+                group = groups[gk]
+                srcs = source_strings(group)
+                stage = staging_root / tt.name / sha(gk)[:12]
+                stage.mkdir(parents=True, exist_ok=True)
+                try:
+                    res = tt.loaded.module.build(group, stage)
+                    if isinstance(res, Blocked):
+                        queue.append(
+                            _q(
+                                tt.name,
+                                gk,
+                                "blocked",
+                                res.reason,
+                                [t["id"] for t in group],
+                                res.missing,
+                            )
+                        )
+                        continue
+                    if not isinstance(res, BuildResult):
+                        raise ContractError(
+                            f"build() returned {type(res).__name__}; expected BuildResult or Blocked"
+                        )
+                    if res.task_id in ids_seen:
+                        raise ContractError(
+                            f"task_id {res.task_id!r} already produced by {ids_seen[res.task_id]}"
+                        )
+                    ids_seen[res.task_id] = tt.name
+                    dest = tasks_root / tt.name / res.task_id
+                    # generator-written files in the stage dir are carried over
+                    extra = {}
+                    for p in sorted(stage.rglob("*")):
+                        if p.is_file():
+                            extra[p.relative_to(stage).as_posix()] = p.read_bytes()
+                    res.files = {**extra, **res.files}
+                    harbor.materialize(res, dest, tt.name, tt.generator, srcs)
+                except Exception as e:
+                    detail = f"{type(e).__name__}: {e}"
+                    queue.append(
+                        _q(
+                            tt.name,
+                            gk,
+                            "exception",
+                            f"build() failed: {detail}",
+                            [t["id"] for t in group],
+                        )
+                    )
+                    continue
+                row = new_row(res.task_id, tt.name, srcs, tt.generator, res.gold_type)
+                row["assumptions"] = list(res.assumptions)
+                row["content_hash"] = package_hash(dest)
+                hidden = [str(h) for h in res.hidden] + [res.answer.canonical()]
+                if isinstance(res.answer.expected, list):
+                    hidden += [str(x) for x in res.answer.expected]
+                hidden += [str(a) for a in res.alternatives]
+                lk = leak.scan(
+                    dest,
+                    hidden,
+                    res.leak_allow,
+                    cfg["leak"]["min_len"],
+                    cfg["leak"]["run_len"],
+                )
+                probs = harbor.structure_check(dest)
+                row["gates"]["structure"] = "fail" if probs else "pass"
+                row["gates"]["leak"] = "fail" if lk else "pass"
+                if probs or lk:
+                    row["problems"] = probs + [
+                        f"leak: {x.kind} in {x.where}: {x.detail}" for x in lk
+                    ]
+                old = old_by_id.get(res.task_id)
+                if (
+                    old
+                    and old.get("content_hash") == row["content_hash"]
+                    and not old.get("blocked_reason")
+                ):
+                    row = old  # unchanged: keep gates/status (idempotent rerun)
+                    row["sources"], row["generator"] = srcs, tt.generator
+                elif old:
+                    row["changed"] = True  # same id, new content: revalidate
+                taskmeta[res.task_id] = {
+                    "wrong_answers": [str(w) for w in res.wrong_answers],
+                    "alternatives": [str(a) for a in res.alternatives],
+                    "hidden": hidden,
+                    "leak_allow": list(res.leak_allow),
+                }
+                new_rows.append(finalize(row))
+    finally:
+        clear_dir(staging_root)
+
+    kept = [r for r in old_rows if only_type and r["type"] != only_type]
+    all_rows = kept + new_rows
+    check_invariants(all_rows)
+
+    used = {s for r in new_rows for s in r["sources"]}
+    queued_ids = {i for q in queue for i in q["trajectory_ids"]}
+    excluded = []
+    if not only_type:
+        for t in trajs:
+            if t["id"] not in applied_any:
+                excluded.append(
+                    {
+                        "trajectory_id": t["id"],
+                        "sources": source_strings([t]),
+                        "reason": "; ".join(excluded_reasons.get(t["id"], []))
+                        or "no task type applies (applies() returned False for every type)",
+                    }
+                )
+    counts = Counter(r["status"] for r in new_rows)
+    by_type = Counter(r["type"] for r in new_rows)
+    prev = ws.state().get("generate", {}).get("summary", {})
+    summary = {
+        "trajectories": len(trajs),
+        "tasks": len(new_rows),
+        "by_status": dict(counts),
+        "by_type": dict(by_type),
+        "excluded": len(excluded),
+        "queued": len(queue),
+        "queue_groups": group_errors([(q["reason"], q["group"]) for q in queue]),
+        "structure_or_leak_failures": [
+            {"task_id": r["task_id"], "problems": r.get("problems", [])}
+            for r in new_rows
+            if r["gates"]["structure"] == "fail" or r["gates"]["leak"] == "fail"
+        ][:20],
+        "sources_used": len(used),
+        "trajectories_in_queue": len(queued_ids),
+        "limited": limit is not None or bool(only_type),
+    }
+    summary["changed_since_last_run"] = delta(
+        {k: v for k, v in prev.items() if isinstance(v, int)},
+        {k: v for k, v in summary.items() if isinstance(v, int)},
+    )
+    if dry:
+        tmp_ctx.cleanup()
+        return summary
+
+    # persist: swap in new task dirs, drop stale ones for rebuilt types
+    for tt in built_types:
+        keep = {r["task_id"] for r in new_rows if r["type"] == tt.name}
+        tdir = ws.tasks / tt.name
+        if tdir.is_dir():
+            for d in tdir.iterdir():
+                if d.is_dir() and d.name not in keep:
+                    clear_dir(d)
+    ws.write_results(all_rows)
+    meta_dir = ws.internal / "taskmeta"
+    for tid, m in taskmeta.items():
+        write_json(meta_dir / f"{tid}.json", m)
+    if not only_type:
+        write_jsonl(ws.excluded, excluded)
+        write_jsonl(ws.queue, queue)
+    else:
+        old_q = [q for q in read_jsonl(ws.queue) if q["type"] != only_type]
+        write_jsonl(ws.queue, old_q + queue)
+    ws.update_state(
+        generate={
+            "summary": _stored(summary),
+            "inputs": inputs_digest(ws.trajectories, ws.findings, *[t.loaded.path for t in types]),
+        }
+    )
+    return summary
+
+
+def _q(
+    ttype: str, group: str, kind: str, reason: str, tids: list[str], missing: list | None = None
+) -> dict:
+    return {
+        "type": ttype,
+        "group": group,
+        "kind": kind,
+        "reason": reason,
+        "missing": missing or [],
+        "trajectory_ids": tids,
+    }
+
+
+__all__ = [
+    "run_parse",
+    "run_checks",
+    "run_generate",
+    "group_errors",
+    "cause_of",
+    "atomic_write",
+    "read_json",
+]

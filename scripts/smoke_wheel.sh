@@ -32,3 +32,8 @@ assert [e.artifact_id for e in store.list()] == [envelope.artifact_id]
 assert len(store.read(envelope.artifact_id).traces) == len(corpus.traces)
 print(f"wheel smoke test passed: bandits {bandits.__version__}, {len(corpus.traces)} traces")
 PY
+
+# l2h ships its skill, guides and grader inside the wheel and runs from the entry point.
+"$work/venv/bin/l2h" docs --topic harbor >/dev/null
+"$work/venv/bin/l2h" schema --json >/dev/null
+echo "wheel smoke test passed: l2h"

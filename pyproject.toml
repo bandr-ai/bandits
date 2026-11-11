@@ -30,6 +30,9 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.scripts]
+l2h = "l2h.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/bandr-ai/bandits"
 Source = "https://github.com/bandr-ai/bandits"
@@ -44,10 +47,10 @@ build-backend = "hatchling.build"
 path = "bandits/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["bandits"]
+packages = ["bandits", "l2h"]
 
 [tool.hatch.build.targets.sdist]
-include = ["bandits", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
+include = ["bandits", "l2h", "docs/plans", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
 
 # PyPI renders the README away from the repo, so relative links and images
 # would break there. Point them at GitHub in the published copy only.
@@ -82,5 +85,5 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["bandits"]
+source = ["bandits", "l2h"]
 omit = ["*/*_test.py"]
