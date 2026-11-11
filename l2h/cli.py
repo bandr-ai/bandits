@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__, explore, stages
 from . import report as report_mod
 from . import validate as validate_mod
-from .gates import LocalRunner
+from .gates import LocalRunner, pick_runner
 from .harbor import ANSWER_DIR
 from .leak import scan as leak_scan
 from .models import (
@@ -492,9 +492,21 @@ def cmd_validate(a, ws: Workspace) -> Result:
             f"--level {a.level!r} must be a comma list from 1,2,3", "e.g. --level 1,2"
         ) from None
     s = validate_mod.run_validate(
-        ws, a.type, a.sample_size, a.max_fix_attempts, levels, a.task or [], a.dry_run
+        ws,
+        a.type,
+        a.sample_size,
+        a.max_fix_attempts,
+        levels,
+        a.task or [],
+        a.dry_run,
+        runner=pick_runner(a.runner, ws.config()),
     )
     lines = [f"runner: {s['runner']}  levels: {s['levels']}"]
+    if s["runner"] == "local":
+        lines.append(
+            "note: host-local runner (no Harbor+Docker): passes keep tasks `generated`; "
+            "`validated` needs a Harbor run (install harbor, start Docker, or --runner harbor)"
+        )
     if "level1" in s:
         lines.append(f"level 1: {s['level1']['checked']} checked, {s['level1']['failed']} failed")
         for f in s["level1"]["failures"][:5]:
@@ -802,6 +814,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sample-size", type=int)
     sp.add_argument("--max-fix-attempts", type=int)
     sp.add_argument("--level", default="1,2", help="comma list of 1,2,3 (default 1,2)")
+    sp.add_argument(
+        "--runner",
+        default="auto",
+        choices=["auto", "harbor", "local"],
+        help="auto = Harbor if harbor+docker are installed, else host-local (tasks stay `generated`)",
+    )
 
     sp = add("decide", cmd_decide, "log a decision with its evidence")
     sp.add_argument("what")

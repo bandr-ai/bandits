@@ -18,7 +18,7 @@ Every command ends with a `next:` hint. After any interruption, run `l2h status`
 1. Raw logs are read-only. Never copy them into good/bad folders. Reference them.
 2. Every exclusion and every task traces back to source records (`file#offset`).
 3. Make nothing up: no timestamps, labels, boundaries, pairings or success values. Unknown is valid.
-4. A task is `validated` only if the execution gates passed in a real Harbor run; host-local gate passes (the default fast runner) stay `generated`. `l2h` enforces it; never edit results.jsonl by hand.
+4. A task is `validated` only if the execution gates passed in a real Harbor run; host-local gate passes (the default fast runner) stay `generated`. Run `l2h validate` with Harbor and Docker installed (`--runner harbor` to insist) to reach `validated`. `l2h` enforces it; never edit results.jsonl by hand.
 5. Log every decision with its evidence: `l2h decide "<what>" --why "<evidence>"`.
 
 Everything else is yours: reorder steps, loop back (a bad generator may mean a wrong parser),

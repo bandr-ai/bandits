@@ -224,6 +224,7 @@ def local_runner():
 @pytest.fixture(autouse=True)
 def _harbor_grade_runner(request, monkeypatch):
     if "local_runner" not in request.fixturenames:
-        from l2h import validate as v
+        from l2h import gates
 
-        monkeypatch.setattr(v, "LocalRunner", _HarborSim)
+        monkeypatch.setattr(gates, "LocalRunner", _HarborSim)
+    monkeypatch.setattr("l2h.gates.harbor_available", lambda: False)

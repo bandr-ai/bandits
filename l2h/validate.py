@@ -6,7 +6,7 @@ import random
 from collections import defaultdict
 
 from . import harbor, leak
-from .gates import LocalRunner, Runner, derive_wrong, run_exec_gates
+from .gates import Runner, derive_wrong, pick_runner, run_exec_gates
 from .output import L2HError, progress
 from .results import check_invariants, finalize
 from .stages import group_errors, package_hash
@@ -119,7 +119,7 @@ def run_validate(
     rows = ws.result_rows()
     if not rows:
         raise L2HError("no tasks to validate", "run `l2h run generate` first")
-    runner = runner or LocalRunner(timeout=cfg["gate_timeout_sec"])
+    runner = runner or pick_runner("auto", cfg)
     targets = [
         r
         for r in rows

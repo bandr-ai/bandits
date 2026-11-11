@@ -8,6 +8,8 @@ without writing a reward are INFRA ERRORS, never task failures.
 
 from __future__ import annotations
 
+import json
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -126,6 +128,105 @@ class LocalRunner(Runner):
                     "ok", reward=0.0, detail=f"solve.sh exited {cp.returncode}", log=cp.stderr or ""
                 )
             return self._verify(task_dir, scratch)
+
+
+@dataclass
+class HarborRunner(Runner):
+    """Real execution: `harbor run` builds the task's images and runs the
+    oracle/nop agent plus the (separate) verifier in containers. Only passes
+    from this runner may make a task `validated`.
+
+    Gates map to Harbor agents: oracle -> `-a oracle` (runs solution/solve.sh);
+    no-op -> `-a nop`; a specific answer -> `-a oracle` on a scratch copy whose
+    solve.sh just writes that answer, so the real artifact hand-off to the
+    verifier is exercised. Anything that stops the run from producing a
+    verifier reward (harbor missing, timeout, build failure, agent exception)
+    is an INFRA ERROR, never a task failure.
+    """
+
+    timeout: float = 1800.0
+    name: str = "harbor"
+    binary: str = field(default_factory=lambda: shutil.which("harbor") or "harbor")
+
+    def _harbor(self, task_dir: Path, agent: str) -> RunOutcome:
+        with tempfile.TemporaryDirectory(prefix="l2h-harbor-") as tmp:
+            jobs = Path(tmp) / "jobs"
+            cmd = [
+                self.binary, "run", "-p", str(task_dir), "-a", agent, "-o", str(jobs),
+                "--job-name", "gate", "-n", "1", "-k", "1", "-q", "--delete",
+            ]  # fmt: skip
+            try:
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                return RunOutcome("infra_error", detail=f"harbor timed out after {self.timeout}s")
+            except OSError as e:
+                return RunOutcome("infra_error", detail=f"could not start harbor: {e}")
+            log = (cp.stdout or "") + (cp.stderr or "")
+            results = sorted((jobs / "gate").glob("*/result.json"))
+            if not results:
+                return RunOutcome(
+                    "infra_error",
+                    detail=f"harbor exited {cp.returncode} without a trial result (Docker running? image build ok?)",
+                    log=log,
+                )
+            try:
+                res = json.loads(results[0].read_text())
+            except (OSError, ValueError):
+                return RunOutcome("infra_error", detail="trial result.json is unreadable", log=log)
+            exc = res.get("exception_info")
+            if exc:
+                kind = exc.get("exception_type") or "exception"
+                msg = str(exc.get("exception_message") or "")[:300]
+                return RunOutcome("infra_error", detail=f"trial raised {kind}: {msg}", log=log)
+            rewards = (res.get("verifier_result") or {}).get("rewards")
+            if not rewards:
+                return RunOutcome("infra_error", detail="verifier produced no reward", log=log)
+            reward = rewards.get("reward", next(iter(rewards.values())))
+            try:
+                reward = float(reward)
+            except (TypeError, ValueError):
+                return RunOutcome("infra_error", detail="reward is not a number", log=log)
+            if not 0.0 <= reward <= 1.0:
+                return RunOutcome("infra_error", detail=f"reward {reward} outside 0..1", log=log)
+            return RunOutcome("ok", reward=reward, log=log)
+
+    def run_solution(self, task_dir: Path) -> RunOutcome:
+        return self._harbor(task_dir, "oracle")
+
+    def run_verifier(self, task_dir: Path, answer: dict[str, str] | None) -> RunOutcome:
+        if not answer:
+            return self._harbor(task_dir, "nop")
+        with tempfile.TemporaryDirectory(prefix="l2h-harbor-copy-") as tmp:
+            copy = Path(tmp) / task_dir.name
+            shutil.copytree(task_dir, copy)
+            lines = ["#!/bin/bash", "set -e", f"mkdir -p {shlex.quote(ANSWER_DIR)}"]
+            for fname, content in answer.items():
+                dest = shlex.quote(f"{ANSWER_DIR}/{fname}")
+                lines.append(f"printf '%s' {shlex.quote(content)} > {dest}")
+            solve = copy / "solution" / "solve.sh"
+            solve.parent.mkdir(exist_ok=True)
+            solve.write_text("\n".join(lines) + "\n")
+            solve.chmod(0o755)
+            return self._harbor(copy, "oracle")
+
+
+def harbor_available() -> bool:
+    return bool(shutil.which("harbor") and shutil.which("docker"))
+
+
+def pick_runner(choice: str, cfg: dict) -> Runner:
+    """auto: Harbor when it and Docker are installed, otherwise the host-local
+    runner (whose passes leave tasks `generated`, never `validated`)."""
+    from .output import L2HError
+
+    if choice == "harbor" or (choice == "auto" and harbor_available()):
+        if not harbor_available():
+            raise L2HError(
+                "--runner harbor needs both `harbor` and `docker` on PATH",
+                "install Harbor (`uv tool install harbor`) and start Docker, or use --runner local",
+            )
+        return HarborRunner(timeout=cfg.get("harbor_timeout_sec", 1800))
+    return LocalRunner(timeout=cfg["gate_timeout_sec"])
 
 
 def verdict(outcome: RunOutcome, want_reward: bool) -> str:

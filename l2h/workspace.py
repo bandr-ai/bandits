@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "max_field_chars": 500,
     "leak": {"min_len": 12, "run_len": 60},
     "gate_timeout_sec": 60,
+    "harbor_timeout_sec": 1800,
 }
 TEXT_EXTS = {".txt", ".md", ".log", ".out", ".text"}
 RECORD_EXTS = {".jsonl", ".ndjson", ".json", ".csv", ".tsv"} | TEXT_EXTS

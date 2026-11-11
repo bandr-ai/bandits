@@ -21,3 +21,9 @@ answer can really be derived from the visible inputs.
 
 Status: `validated` = exec gates passed in a real Harbor run (host-local passes stay `generated`); `generated` = structure+leak passed;
 `blocked` = reason in results.jsonl.
+
+Runners (`l2h validate --runner auto|harbor|local`): `harbor` runs each gate with `harbor run`
+(oracle agent, nop agent, and an oracle on a scratch copy whose solve.sh writes the wrong or
+alternative answer), so images are built and the answer reaches the separate verifier. `auto`
+uses it when `harbor` and `docker` are on PATH, otherwise the fast host-local runner, whose passes
+leave tasks `generated`. Harbor build/timeout/agent errors are infra errors, not task failures.
