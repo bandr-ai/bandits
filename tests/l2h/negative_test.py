@@ -7,7 +7,7 @@ from .validate_test import rows
 NEG_PY = """
 from l2h import Answer, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "check": "forbidden", "gold": "negative",
+SPEC = {"unit": "episode", "env": "static", "task_scope": "decision", "check": "forbidden", "gold": "negative",
         "hidden": [], "applies_when": "any"}
 VERSION = 1
 KW = {}
@@ -63,7 +63,10 @@ def test_negative_task_gates_and_verifier(env):
     assert not any("alternatives:" in w for r in rows(env).values() for w in r.get("warnings", []))
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert "| negative |" in md and "| neg | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 4 |" in md
+    assert (
+        "| negative |" in md
+        and "| neg | decision-from-evidence | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 4 |" in md
+    )
     assert "validated (negative): 4" in md
 
 

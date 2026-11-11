@@ -16,6 +16,7 @@ from .models import (
     BuildResult,
     ContractError,
     ParseError,
+    Trajectory,
     normalize_finding,
     normalize_trajectory,
 )
@@ -130,7 +131,9 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
                             f"source_ref {f}#{off} is out of range (file has {inv[f]} records)"
                         )
             except ContractError as e:
-                errors.append((str(e), str(item.get("id")) if isinstance(item, dict) else "?"))
+                errors.append(
+                    (str(e), str(Trajectory(item).get("id")) if isinstance(item, dict) else "?")
+                )
                 continue
             seen.add(t["id"])
             trajs.append(t)
@@ -199,7 +202,7 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
 def load_trajectories(ws: Workspace) -> list[dict]:
     if not ws.trajectories.exists():
         raise L2HError("out/trajectories.jsonl not found", "run `l2h run parse` first")
-    return read_jsonl(ws.trajectories)
+    return [Trajectory(t) for t in read_jsonl(ws.trajectories)]
 
 
 def run_checks(ws: Workspace, limit: int | None, dry: bool) -> dict:
@@ -209,12 +212,9 @@ def run_checks(ws: Workspace, limit: int | None, dry: bool) -> dict:
     ld, checks = load_checks(ws)
     rows, errs = [], []
     for t in trajs:
-        from .models import Trajectory
-
-        tt = Trajectory(t)
         for c in checks:
             try:
-                f = normalize_finding(c.fn(tt))
+                f = normalize_finding(c.fn(t))
             except Exception as e:  # a crashing check is an observation gap, not a verdict
                 msg = f"{type(e).__name__}: {e}"
                 errs.append((f"check {c.id}: {msg}", t["id"]))

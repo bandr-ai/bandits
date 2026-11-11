@@ -4,11 +4,13 @@ from .models import (
     Answer,
     Blocked,
     BuildResult,
+    Call,
     Check,
     ContractError,
     Finding,
     ParseError,
     Trajectory,
+    message_text,
 )
 
 __version__ = "0.1.0"
@@ -16,10 +18,12 @@ __all__ = [
     "Answer",
     "Blocked",
     "BuildResult",
+    "Call",
     "Check",
     "ContractError",
     "Finding",
     "ParseError",
     "Trajectory",
     "__version__",
+    "message_text",
 ]

@@ -88,9 +88,7 @@ def test_query_count_group_grep_and_no_silent_cut(env):
     assert r["source"] == "trajectories" and r["matched"] == 5 and "ids" not in r
     r = env.run("query", "True", "--group-by", "ended", "--json")[3]["data"]
     assert r["groups"] == {"done": 4, "error": 1}  # q4 is an error; others done
-    r = env.run("query", "len(r.events) == 2 and r.meta.answer", "--json", "--limit", "2")[3][
-        "data"
-    ]
+    r = env.run("query", "len(r.steps) == 3 and r.meta.answer", "--json", "--limit", "2")[3]["data"]
     assert r["matched"] == 4 and r["shown"] == 2 and r["cut"] is True
     _, out, _, _ = env.run("query", "True", "--limit", "2")
     assert "CUT: showed 2 of 5" in out

@@ -16,12 +16,14 @@ from . import validate as validate_mod
 from .gates import LocalRunner, pick_runner
 from .harbor import ANSWER_DIR
 from .models import (
+    ATIF_VERSION,
     CHECK_KINDS,
     ENDED,
     GATE_STATES,
     GOLD_TYPES,
     NORMALIZERS,
     STATUSES,
+    TASK_SCOPES,
     ContractError,
 )
 from .output import (
@@ -658,12 +660,22 @@ def schema_data() -> dict:
         "parse.py": {
             "signature": "def parse(paths: list[Path]) -> Iterator[Trajectory | ParseError]",
             "Trajectory": {
-                "id": "str, unique",
-                "source_refs": "[{file: path relative to logs, offset: int (record ordinal, see `l2h sample` ids) | key: str}], non-empty",
-                "events": "list (free shape)",
-                "attachments": "[{name, path | text | data_b64}]",
-                "meta": "object; unknown values stay None, unfamiliar fields kept here",
-                "ended": list(ENDED),
+                "format": f"an ATIF trajectory (Harbor's Agent Trajectory Interchange Format, {ATIF_VERSION}; validated against Harbor's model when importable) plus extra['l2h']. Build with Trajectory.from_atif(doc, id=, source_refs=, ended=, meta=, attachments=)",
+                "ATIF": {
+                    "schema_version": f"default {ATIF_VERSION}",
+                    "agent": "{name, version, model_name?, tool_definitions?}; both name and version are required (version 'unknown' if unrecorded)",
+                    "steps": "non-empty [{step_id (auto-numbered from 1), source: system|user|agent, message: str | [parts], timestamp?, model_name?, reasoning_content?, tool_calls?: [{tool_call_id, function_name, arguments}], observation?: {results: [{source_call_id, content, subagent_trajectory_ref?}]}, extra?}]; tool_calls, model_name, reasoning_content, metrics only on agent steps",
+                    "subagent_trajectories": "optional [full ATIF trajectory with trajectory_id]; referenced by observation results via subagent_trajectory_ref",
+                    "extra": "free; l2h keeps its own block under extra['l2h']",
+                },
+                "extra.l2h": {
+                    "id": "str, unique",
+                    "source_refs": "[{file: path relative to logs, offset: int (record ordinal, see `l2h sample` ids) | key: str}], non-empty",
+                    "ended": list(ENDED),
+                    "meta": "object; unknown values stay None, unfamiliar fields kept here",
+                    "attachments": "[{name, path | text | data_b64}]",
+                },
+                "accessors": "t['id'|'source_refs'|'ended'|'meta'|'attachments'] and t.meta etc.; t['steps']; t.calls() -> [Call(step, id, name, arguments, result, .output)]; t.final_message; t.subagents; message_text(msg). In query/sample, r is flat: r.steps, r.meta, r.ended, r.id",
             },
             "ParseError": "ParseError(file, error, offset=None)",
         },
@@ -673,7 +685,7 @@ def schema_data() -> dict:
             "note": "findings are observations, not exclusions",
         },
         "tasktypes/<type>.py": {
-            "SPEC": "{unit, env, check, gold, hidden, applies_when}",
+            "SPEC": f"{{unit, env, task_scope in {list(TASK_SCOPES)}, check, gold, hidden, applies_when}}; task_scope is required: full_job = the logged agent's whole job rebuilt, decision = evidence given, its decision asked",
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
             "group_key": "def group_key(t) -> str  # attempts sharing a key become one task",

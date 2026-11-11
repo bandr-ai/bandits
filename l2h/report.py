@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 
-from .stages import source_strings
+from .output import L2HError
+from .scripts import load_tasktypes
+from .stages import load_trajectories, source_strings
 from .validate import seeded_sample
 from .workspace import Workspace, read_json, read_jsonl
 
 
 def outcomes(ws: Workspace) -> dict:
-    trajs = read_jsonl(ws.trajectories)
+    trajs = load_trajectories(ws)
     used_src = {s for r in ws.result_rows() for s in r["sources"]}
     excluded = {e["trajectory_id"]: e["reason"] for e in read_jsonl(ws.excluded)}
     queued = {i for q in read_jsonl(ws.queue) for i in q["trajectory_ids"]}
@@ -33,6 +35,13 @@ def outcomes(ws: Workspace) -> dict:
 VALIDATED_NOTE = (
     "`validated` means the gates passed (oracle accepted, no-op and wrong answers rejected, "
     "in a real Harbor run); it does not mean the answer is correct."
+)
+
+SCOPE_LABEL = {"full_job": "full job", "decision": "decision-from-evidence"}
+SCOPE_NOTE = (
+    "scope: `full job` rebuilds the logged agent's whole job (inputs, tools, output format) and grades "
+    "its real output; `decision-from-evidence` gives the evidence the agent gathered and asks for its "
+    "decision, not the full job."
 )
 
 
@@ -114,16 +123,21 @@ def build_report(ws: Workspace) -> str:
     for r in rows:
         by[r["type"]].append(r)
     if rows:
+        try:
+            scopes = {t.name: t.spec.get("task_scope") for t in load_tasktypes(ws)}
+        except L2HError:
+            scopes = {}
         L += [
-            "| type | tasks | validated | generated | blocked | verified | solved | imitation | negative |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| type | scope | tasks | validated | generated | blocked | verified | solved | imitation | negative |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for t, rs in sorted(by.items()):
             sc, gc = Counter(r["status"] for r in rs), Counter(r["gold"] for r in rs)
+            scope = SCOPE_LABEL.get(scopes.get(t), "unknown")
             L.append(
-                f"| {t} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} | {gc['negative']} |"
+                f"| {t} | {scope} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} | {gc['negative']} |"
             )
-        L += ["", VALIDATED_NOTE, ""]
+        L += ["", SCOPE_NOTE, "", VALIDATED_NOTE, ""]
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
     else:
         L.append("- no tasks generated")

@@ -26,6 +26,15 @@ change the command line or the artifact format; such changes are called out.
   Follow-up: `Answer.choices` declares a label vocabulary (leak scan, giveaway and
   alternatives warnings use it; files that define the labels are not leaks), negative
   tasks need `pattern` or `choices`, and the secret scan ignores code expressions.
+  ATIF: a parsed trajectory is now an ATIF (Agent Trajectory Interchange Format,
+  ATIF-v1.8) document plus an `extra["l2h"]` block (`id`, `source_refs`, `ended`, `meta`,
+  `attachments`), built with `Trajectory.from_atif`. It is validated against Harbor's own ATIF
+  model when `harbor` is importable (violations are parse errors grouped by cause); logs that are
+  already ATIF need a few lines. New accessors `t.calls()`, `t.final_message`, `t.subagents`;
+  `t["meta"]`, `r.meta` etc. keep working, but `events` is gone (use `steps`; breaking for
+  existing `parse.py`). Task types must set `SPEC["task_scope"]` (`full_job` | `decision`), shown
+  per type in `l2h report`; the skill gains a rule to prefer rebuilding the agent's whole job and to
+  label decision-from-evidence tasks as such.
 
 ## [0.3.0] - unreleased
 

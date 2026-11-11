@@ -30,7 +30,9 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    `l2h show <id>`, `l2h query '<expr>' --count`. Work out the *requested work* separately from
    what the logged agent *did*; how sessions, calls, tools, sub-agents, attachments relate; what is
    recorded vs missing. Write `source_notes.md` (include which samples you read) and `parse.py`
-   (`l2h new parser`). Record how each run actually ended (done / cut_off / error / unknown). A clean
+   (`l2h new parser`): each trajectory is an ATIF document (Harbor's trajectory format: steps with
+   source/message/tool_calls/observation; logs that already are ATIF just get wrapped) plus l2h's id,
+   source_refs, ended and meta. Record how each run actually ended (done / cut_off / error / unknown). A clean
    exit is never success. `l2h run parse`; investigate dropped records and parse-error groups.
    Guide: `l2h docs --topic parsing`.
 2. **Findings.** `l2h new check <name>`, `l2h run checks`. Findings are observations, not exclusions.
@@ -58,6 +60,11 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 
 ## Judgment
 
+- Prefer rebuilding the logged agent's whole job: its starting inputs, its tools/action space, and its
+  output format, graded on its real output. When the starting inputs or tools can't be rebuilt from the
+  logs (or a provided harness), a decision task is still valuable: give the evidence the agent gathered
+  and ask for its decision. Name and describe it as a decision-from-evidence task, not as the full job,
+  and record which one each task type is (`SPEC["task_scope"]`: `full_job` | `decision`).
 - Gold: `verified` only with an independent verdict matching this task's exact scope; `imitation` = the
   logged answer; logged success, confidence and model agreement are not ground truth. Label honestly.
 - Instructions describe the task and never include the recorded answer. Gold lives only in `tests/`.

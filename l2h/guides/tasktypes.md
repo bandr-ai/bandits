@@ -5,6 +5,12 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`l2h new tas
 - `applies(t, findings)` decides if a record can feed this type. Return `(False, "reason")` to leave a
   recorded exclusion reason. Records no type applies to land in `out/excluded.jsonl`.
 - `group_key(t)`: attempts sharing a key become one task. Merge repeated attempts here.
+- `SPEC["task_scope"]` (required): `full_job` or `decision`. Prefer rebuilding the logged agent's whole
+  job: starting inputs, tools/action space, output format, graded on its real output (`full_job`). When
+  inputs or tools cannot be rebuilt from the logs (or a provided harness), a decision task is still
+  valuable: give the evidence the agent gathered and ask for its decision (`decision`). Name and
+  describe it as a decision-from-evidence task, not the full job (instruction, `description`). `l2h report`
+  shows the scope per type.
 - `build(group, out)` returns `BuildResult` or `Blocked(reason, missing)`. Needing a live system,
   missing evidence, or no independent gold means `Blocked`, not a made-up task.
 - Always give `wrong_answers` that are *meaningful* (a plausible mistake, not noise) and `alternatives`

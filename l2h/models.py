@@ -11,6 +11,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+ATIF_SOURCES = ("system", "user", "agent")
+TASK_SCOPES = ("full_job", "decision")
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
 GOLD_TYPES = ("verified", "solved", "imitation", "negative", "none")
@@ -35,17 +37,127 @@ def safe_id(value: str) -> str:
     return value
 
 
-class Trajectory(dict):
-    """A parsed trajectory. A dict with attribute access for convenience.
+# The ATIF (Agent Trajectory Interchange Format) version l2h targets. Harbor's model
+# accepts ATIF-v1.0 .. v1.8; documents without a schema_version get this one.
+ATIF_VERSION = "ATIF-v1.8"
+EXT_KEY = "l2h"  # extra["l2h"]: what l2h needs and ATIF lacks
+_EXT_FIELDS = ("id", "source_refs", "ended", "meta", "attachments")
 
-    Keys: id, source_refs, events, attachments, meta, ended.
+
+def message_text(msg: Any) -> str:
+    """Text of an ATIF message / observation content: a string, or the text parts of a list."""
+    if isinstance(msg, str):
+        return msg
+    if isinstance(msg, list):
+        return "\n".join(p["text"] for p in msg if isinstance(p, dict) and p.get("text"))
+    return ""
+
+
+@dataclass
+class Call:
+    """A tool call and the observation result matched to it by tool_call_id."""
+
+    step: dict
+    id: str
+    name: str
+    arguments: dict
+    result: dict | None  # the matching observation result, None when never answered
+
+    @property
+    def output(self) -> str | None:
+        return None if self.result is None else message_text(self.result.get("content"))
+
+
+class Trajectory(dict):
+    """A parsed trajectory: an ATIF trajectory dict plus the l2h block in extra["l2h"].
+
+    ATIF keys (schema_version, agent, steps, subagent_trajectories, ...) are plain dict keys.
+    The l2h fields id, source_refs, ended, meta, attachments also read as t["meta"], t.meta.
     """
+
+    def _ext(self) -> dict:
+        extra = dict.get(self, "extra")
+        ext = extra.get(EXT_KEY) if isinstance(extra, dict) else None
+        return ext if isinstance(ext, dict) else {}
+
+    def __missing__(self, key: str) -> Any:
+        ext = self._ext()
+        if key in _EXT_FIELDS and key in ext:
+            return ext[key]
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
     def __getattr__(self, name: str) -> Any:
         try:
             return self[name]
         except KeyError as e:
             raise AttributeError(name) from e
+
+    @classmethod
+    def from_atif(
+        cls,
+        doc: dict,
+        *,
+        id: str,
+        source_refs: list,
+        ended: str = "unknown",
+        meta: dict | None = None,
+        attachments: list | None = None,
+    ) -> Trajectory:
+        """Wrap an ATIF document (e.g. a Harbor agent/trajectory.json) with the l2h block."""
+        t = cls(doc)
+        t.setdefault("schema_version", ATIF_VERSION)
+        for i, s in enumerate(t.get("steps") or [], 1):
+            if isinstance(s, dict):
+                s.setdefault("step_id", i)
+        extra = dict(t.get("extra") or {})
+        extra[EXT_KEY] = {
+            "id": id,
+            "source_refs": source_refs,
+            "ended": ended,
+            "meta": meta or {},
+            "attachments": attachments or [],
+        }
+        t["extra"] = extra
+        return t
+
+    def flat(self) -> dict:
+        """ATIF keys plus the l2h fields at top level: the view `r` has in query/sample."""
+        return {**self, **self._ext()}
+
+    def calls(self) -> list[Call]:
+        """Every tool call in step order, each with its matched observation result."""
+        out = []
+        for s in self.get("steps") or []:
+            results = {
+                r.get("source_call_id"): r
+                for r in (s.get("observation") or {}).get("results") or []
+                if r.get("source_call_id")
+            }
+            for c in s.get("tool_calls") or []:
+                cid = c.get("tool_call_id")
+                out.append(
+                    Call(s, cid, c.get("function_name"), c.get("arguments") or {}, results.get(cid))
+                )
+        return out
+
+    @property
+    def final_message(self) -> str | None:
+        """Text of the last agent step if it made no tool call (the run's final answer)."""
+        agent = [s for s in self.get("steps") or [] if s.get("source") == "agent"]
+        if not agent or agent[-1].get("tool_calls"):
+            return None
+        return message_text(agent[-1].get("message")) or None
+
+    @property
+    def subagents(self) -> list[Trajectory]:
+        """Embedded subagent trajectories (ATIF subagent_trajectories), same accessors."""
+        return [Trajectory(s) for s in self.get("subagent_trajectories") or []]
 
 
 @dataclass
@@ -61,31 +173,68 @@ class ParseError:
         return {"file": self.file, "offset": self.offset, "error": self.error, "kind": self.kind}
 
 
+def _atif_model():
+    """Harbor's ATIF pydantic model, or None when harbor is not importable."""
+    try:
+        from harbor.models.trajectories import Trajectory as AtifTrajectory
+    except Exception:
+        return None
+    return AtifTrajectory
+
+
+def validate_atif(doc: dict) -> None:
+    """Raise ContractError unless doc is a valid ATIF trajectory.
+
+    Always checks the basics; additionally runs Harbor's own model when it is importable.
+    """
+    steps = doc.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ContractError("not ATIF: 'steps' must be a non-empty list")
+    if not all(isinstance(s, dict) and s.get("source") in ATIF_SOURCES for s in steps):
+        raise ContractError(f"not ATIF: every step needs a dict with source in {ATIF_SOURCES}")
+    model = _atif_model()
+    if model is None:
+        return
+    try:
+        model.model_validate(doc)
+    except Exception as e:
+        errs = getattr(e, "errors", None)
+        if not errs:
+            raise ContractError(f"not ATIF: {e}") from e
+        first = errs()[0]
+        loc = ".".join(str(x) for x in first["loc"])
+        raise ContractError(f"not ATIF: {loc}: {first['msg']}") from e
+
+
 def normalize_trajectory(obj: Any) -> Trajectory:
-    """Validate a parse() result against the Trajectory contract."""
+    """Validate a parse() result: a valid ATIF trajectory carrying the l2h block."""
     if not isinstance(obj, dict):
         raise ContractError(f"parse() yielded {type(obj).__name__}; expected Trajectory or dict")
     t = Trajectory(obj)
-    if "id" not in t or t["id"] in (None, ""):
-        raise ContractError("trajectory is missing 'id'")
-    t["id"] = str(t["id"])
-    for key, typ in (("source_refs", list), ("events", list), ("attachments", list)):
-        t.setdefault(key, [])
-        if not isinstance(t[key], typ):
-            raise ContractError(f"trajectory {t['id']}: '{key}' must be a list")
-    if not isinstance(t.setdefault("meta", {}), dict):
-        raise ContractError(f"trajectory {t['id']}: 'meta' must be an object")
-    if t.setdefault("ended", "unknown") not in ENDED:
-        raise ContractError(f"trajectory {t['id']}: 'ended' must be one of {ENDED}")
-    if not t["source_refs"]:
+    ext = t._ext()
+    if not isinstance(ext, dict) or ext.get("id") in (None, ""):
         raise ContractError(
-            f"trajectory {t['id']}: 'source_refs' is empty; every trajectory must trace to the raw logs"
+            f"trajectory is missing extra['{EXT_KEY}']['id'] (Trajectory.from_atif)"
         )
-    for ref in t["source_refs"]:
+    ext["id"] = str(ext["id"])
+    tid = ext["id"]
+    for key in ("source_refs", "attachments"):
+        if not isinstance(ext.setdefault(key, []), list):
+            raise ContractError(f"trajectory {tid}: '{key}' must be a list")
+    if not isinstance(ext.setdefault("meta", {}), dict):
+        raise ContractError(f"trajectory {tid}: 'meta' must be an object")
+    if ext.setdefault("ended", "unknown") not in ENDED:
+        raise ContractError(f"trajectory {tid}: 'ended' must be one of {ENDED}")
+    if not ext["source_refs"]:
+        raise ContractError(
+            f"trajectory {tid}: 'source_refs' is empty; every trajectory must trace to the raw logs"
+        )
+    for ref in ext["source_refs"]:
         if not isinstance(ref, dict) or "file" not in ref or not ("offset" in ref or "key" in ref):
             raise ContractError(
-                f"trajectory {t['id']}: each source_ref needs 'file' and 'offset' or 'key', got {ref!r}"
+                f"trajectory {tid}: each source_ref needs 'file' and 'offset' or 'key', got {ref!r}"
             )
+    validate_atif(t)
     return t
 
 

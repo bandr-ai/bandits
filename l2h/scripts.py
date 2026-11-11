@@ -8,13 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import Check, ContractError, safe_id
+from .models import TASK_SCOPES, Check, ContractError, safe_id
 from .output import L2HError, UsageError
 from .workspace import Workspace, sha
 
 PARSER_TEMPLATE = '''"""parse.py: turn the raw logs into trajectories. Contract: `l2h schema`.
 
 Run with `l2h run parse`. Keep unknown values as None; keep unfamiliar fields in meta.
+A trajectory is an ATIF document (agent, steps with source/message/tool_calls/observation)
+wrapped by Trajectory.from_atif, which adds the l2h block (id, source_refs, ended, meta).
 """
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,9 +25,16 @@ from l2h import ParseError, Trajectory
 
 
 def parse(paths: list[Path]) -> Iterator[Trajectory | ParseError]:
-    # Every trajectory needs: id, source_refs=[{"file": <path relative to logs>, "offset": <record #>}],
-    # events, attachments, meta, and ended in {"done","cut_off","error","unknown"}.
+    # yield Trajectory.from_atif(
+    #     {"agent": {"name": "...", "version": "unknown"},
+    #      "steps": [{"source": "user", "message": "..."},
+    #                {"source": "agent", "message": "...",
+    #                 "tool_calls": [{"tool_call_id": "c1", "function_name": "...", "arguments": {}}],
+    #                 "observation": {"results": [{"source_call_id": "c1", "content": "..."}]}}]},
+    #     id="...", source_refs=[{"file": <path relative to logs>, "offset": <record #>}],
+    #     ended="done" | "cut_off" | "error" | "unknown", meta={})
     # Never treat a clean exit as success: record how the run actually ended.
+    # Logs that already are ATIF (Harbor agent/trajectory.json): see `l2h docs --topic parsing`.
     raise NotImplementedError("write the parser after reading samples (`l2h sample`)")
     yield  # pragma: no cover
 '''
@@ -57,6 +66,7 @@ from l2h import Answer, Blocked, BuildResult, Trajectory
 SPEC = {{
     "unit": "episode",            # episode | subtask
     "env": "static",              # static evidence files in v1
+    "task_scope": "decision",     # full_job | decision (see `l2h docs --topic tasktypes`)
     "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
     "gold": "imitation",          # verified | solved | imitation | negative | none
     "hidden": ["answer key", "original final response"],
@@ -195,6 +205,13 @@ def load_tasktypes(ws: Workspace, only: str | None = None) -> list[TaskType]:
                 raise L2HError(f"tasktypes/{p.name} is missing {fn}()", "see `l2h schema`")
         if not isinstance(getattr(ld.module, "SPEC", None), dict):
             raise L2HError(f"tasktypes/{p.name} is missing SPEC", "see `l2h schema`")
+        if ld.module.SPEC.get("task_scope") not in TASK_SCOPES:
+            raise L2HError(
+                f"tasktypes/{p.name}: SPEC['task_scope'] must be one of {list(TASK_SCOPES)}, "
+                f"got {ld.module.SPEC.get('task_scope')!r}",
+                "full_job = the logged agent's whole job rebuilt; decision = evidence given, "
+                "decision asked (`l2h docs --topic tasktypes`)",
+            )
         out.append(TaskType(p.stem, ld))
     if only and not out:
         raise L2HError(f"no task type {only!r}", "list them with `l2h status`")

@@ -35,11 +35,19 @@ def parse(paths):
                     if "prompt" not in rec:
                         yield ParseError(p.name, f"record {n} has no prompt", n)
                     else:
-                        yield Trajectory(
+                        yield Trajectory.from_atif(
+                            {"agent": {"name": "qa-bot", "version": "unknown"},
+                             "steps": [
+                                 {"source": "user", "message": rec["prompt"]},
+                                 {"source": "agent", "message": "reading",
+                                  "tool_calls": [{"tool_call_id": "c1", "function_name": "read",
+                                                  "arguments": {"path": "nums.txt"}}],
+                                  "observation": {"results": [
+                                      {"source_call_id": "c1", "content": rec["nums"]}]}},
+                                 {"source": "agent", "message": rec.get("answer") or ""},
+                             ]},
                             id=rec["sid"],
                             source_refs=[{"file": p.name, "offset": n}],
-                            events=[{"role": "user", "text": rec["prompt"]},
-                                    {"role": "assistant", "text": rec.get("answer")}],
                             attachments=[{"name": "nums.txt", "text": rec["nums"]}],
                             meta={"nums": rec["nums"], "answer": rec.get("answer")},
                             ended="done" if rec.get("outcome") == "ok" else "error",
@@ -63,7 +71,7 @@ CHECKS = [Check("has_answer", 1, has_answer), Check("boom", 1, boom)]
 TASKTYPE_PY = """
 from l2h import Answer, Blocked, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "check": "numeric", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "task_scope": "decision", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 LEAK = False

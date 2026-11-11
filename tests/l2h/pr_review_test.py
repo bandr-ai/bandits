@@ -2,6 +2,8 @@
 
 import json
 
+from l2h import Trajectory
+
 from .conftest import TASKTYPE_PY
 from .validate_test import rows
 
@@ -77,14 +79,13 @@ def test_status_ignores_underscore_helpers_in_tasktypes(env):
 
 def test_attachment_ids_cannot_escape_attachments_dir(env):
     env.build_pipeline()
-    traj = {
-        "id": "..",
-        "source_refs": [{"file": "a.jsonl", "offset": 0}],
-        "events": [],
-        "meta": {},
-        "ended": "done",
-        "attachments": [{"name": "x", "text": "t"}, {"name": "..", "text": "u"}],
-    }
+    traj = Trajectory.from_atif(
+        {"agent": {"name": "a", "version": "1"}, "steps": [{"source": "user", "message": "hi"}]},
+        id="..",
+        source_refs=[{"file": "a.jsonl", "offset": 0}],
+        ended="done",
+        attachments=[{"name": "x", "text": "t"}, {"name": "..", "text": "u"}],
+    )
     (env.ws / "out/trajectories.jsonl").write_text(json.dumps(traj) + "\n")
     code, *_ = env.run("show", "..", "--attachments")
     assert code == 0
@@ -100,21 +101,21 @@ def test_query_expression_sees_r_inside_comprehensions(env):
     env.build_pipeline()
     code, _, _, res = env.run(
         "query",
-        "any(e['role'] == 'user' and len(r.events) == 2 for e in r.events)",
+        "any(s['source'] == 'user' and len(r.steps) == 3 for s in r.steps)",
         "--count",
         "--json",
     )
     assert code == 0 and res["data"]["matched"] == 5 and "expression_errors" not in res["data"]
     code, _, _, res = env.run(
-        "query", "True", "--group-by", "len([e for e in r.events if len(r.events)])", "--json"
+        "query", "True", "--group-by", "len([s for s in r.steps if len(r.steps)])", "--json"
     )
-    assert res["data"]["groups"] == {"2": 5} or list(res["data"]["groups"]) == ["2"]
+    assert res["data"]["groups"] == {"3": 5}
 
 
 def test_show_field_index_out_of_range_is_a_clean_error(env):
     env.build_pipeline()
-    code, _, _, res = env.run("show", "q1", "--field", "events.5", "--json")
-    assert code == 1 and "no field 'events.5'" in res["error"]["message"]
+    code, _, _, res = env.run("show", "q1", "--field", "steps.5", "--json")
+    assert code == 1 and "no field 'steps.5'" in res["error"]["message"]
 
 
 def test_invalid_grep_regex_is_a_usage_error(env):

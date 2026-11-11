@@ -205,7 +205,7 @@ def sample_stratified(ws: Workspace, expr: str, n: int, unseen: bool, dry: bool)
         if rid in seen:
             continue
         try:
-            key = eval(code, {**_scope(), "r": _R(rec) if isinstance(rec, dict) else rec})
+            key = eval(code, {**_scope(), "r": _R(_view(rec)) if isinstance(rec, dict) else rec})
         except Exception as e:
             key = f"<error: {type(e).__name__}>"
         groups[key if isinstance(key, str) else json.dumps(key, default=str)].append((rid, rec))
@@ -260,7 +260,7 @@ def show_record(
         )
     cmd = f"l2h show {rid}"
     if field:
-        rec = dotted(rec, field)
+        rec = dotted(_view(rec), field)
     out: dict[str, Any] = {
         "id": rid,
         "kind": kind,
@@ -274,7 +274,7 @@ def show_record(
         files = []
         att_root = (ws.out / "attachments").resolve()
         base = att_root / _safe_part(rid)
-        for i, a in enumerate(traj.get("attachments", [])):
+        for i, a in enumerate(traj["attachments"]):
             if not isinstance(a, dict):
                 continue
             name = _safe_part(str(a.get("name") or f"attachment_{i}"))
@@ -312,6 +312,11 @@ def show_record(
 
 
 # --------------------------------------------------------------------- query
+
+
+def _view(rec: Any) -> Any:
+    """Parsed trajectories are seen flat: ATIF keys plus id, meta, ended, source_refs, attachments."""
+    return rec.flat() if isinstance(rec, Trajectory) else rec
 
 
 class _R(dict):
@@ -354,7 +359,7 @@ def _compile(expr: str):
     except SyntaxError as e:
         raise UsageError(
             f"bad expression {expr!r}: {e.msg}",
-            "use Python: e.g. 'len(r.events) > 10', r is the record",
+            "use Python: e.g. 'len(r.steps) > 10', r is the record",
         ) from e
 
 
@@ -406,7 +411,7 @@ def query_corpus(
             continue
         try:
             # r goes in globals: names in comprehensions don't see eval's locals
-            ok = eval(code, {**scope, "r": _R(rec) if isinstance(rec, dict) else rec})
+            ok = eval(code, {**scope, "r": _R(_view(rec)) if isinstance(rec, dict) else rec})
         except Exception as e:
             errors[f"{type(e).__name__}: {e}"] += 1
             continue
@@ -416,9 +421,9 @@ def query_corpus(
         if group_by:
             try:
                 key = (
-                    eval(gcode, {**scope, "r": _R(rec) if isinstance(rec, dict) else rec})
+                    eval(gcode, {**scope, "r": _R(_view(rec)) if isinstance(rec, dict) else rec})
                     if gcode
-                    else _get(rec, group_by)
+                    else _get(_view(rec), group_by)
                 )
             except Exception as e:
                 key = f"<error: {type(e).__name__}>"

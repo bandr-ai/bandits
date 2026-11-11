@@ -8,11 +8,17 @@ from l2h.stages import cause_of, group_errors
 def test_parse_contract_roundtrip_and_error_grouping(env):
     env.build_pipeline()
     traj = [json.loads(x) for x in (env.ws / "out/trajectories.jsonl").read_text().splitlines()]
-    assert [t["id"] for t in traj] == ["q1", "q2", "q3", "q4", "q6"]
+    assert [t["extra"]["l2h"]["id"] for t in traj] == ["q1", "q2", "q3", "q4", "q6"]
     t = traj[0]
-    assert set(t) >= {"id", "source_refs", "events", "attachments", "meta", "ended"}
-    assert t["source_refs"] == [{"file": "a.jsonl", "offset": 0}]
-    assert traj[3]["ended"] == "error"
+    assert set(t) == {
+        "schema_version",
+        "agent",
+        "steps",
+        "extra",
+    }  # pure ATIF, no l2h top-level keys
+    assert set(t["extra"]["l2h"]) == {"id", "source_refs", "ended", "meta", "attachments"}
+    assert t["extra"]["l2h"]["source_refs"] == [{"file": "a.jsonl", "offset": 0}]
+    assert traj[3]["extra"]["l2h"]["ended"] == "error"
     code, _, _, res = env.run("run", "parse", "--no-cache", "--json")
     d = res["data"]
     assert d["parse_errors"] == 2  # bad json line + record without prompt

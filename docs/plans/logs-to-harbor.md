@@ -50,7 +50,7 @@ Raw logs are never modified or copied into good/bad folders. Everything referenc
 ```python
 # parse.py
 def parse(paths: list[Path]) -> Iterator[Trajectory | ParseError]
-# Trajectory: {id, source_refs:[{file, offset|key}], events:[...], attachments:[...], meta:{}}
+# Trajectory: an ATIF document (agent, steps[source/message/tool_calls/observation]) + extra.l2h {id, source_refs:[{file, offset|key}], ended, attachments:[...], meta:{}}
 # Unknown values stay None. Unfamiliar fields are kept under meta.
 
 # checks.py
@@ -58,7 +58,7 @@ CHECKS = [Check(id, version, fn)]
 def fn(t: Trajectory) -> Finding  # {result: pass|fail|unknown, evidence:[refs], note}
 
 # tasktypes/<type>.py
-SPEC = {unit, env, check, gold, hidden, applies_when}
+SPEC = {unit, env, task_scope (full_job|decision), check, gold, hidden, applies_when}
 def applies(t: Trajectory, findings) -> bool
 def group_key(t: Trajectory) -> str           # attempts sharing a key become one task
 def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked
