@@ -1,5 +1,10 @@
 # Trace inputs
 
+> The `bandits` command line was removed in 0.3.0. Where this page says
+> `bandits ingest PATH --source NAME`, call
+> `bandits.ingest.load_corpus(PATH, source=NAME)`. The CLI-only parts
+> (`--dry-run`, `inspect.html`, `bandits inspect`) no longer exist.
+
 All readers produce the same `TraceCorpus`. `bandits ingest PATH` recognizes
 known source shapes automatically. `bandits ingest PATH --dry-run` checks recognition
 and runs the reader without writing an artifact; it reports missing model input,

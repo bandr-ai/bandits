@@ -24,7 +24,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 import bandits
-from bandits.jsonarray import iter_array
+from bandits.ingest.jsonarray import iter_array
 from bandits.redact import redact_bytes, ruleset_by_name
 from bandits.traces import Trace, TraceCorpus
 

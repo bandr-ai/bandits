@@ -5,12 +5,8 @@ import json
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from bandits.cli import app
 from bandits.ingest.bundle import bundle_json_documents
-from bandits.inspect import check_fidelity
-from bandits.store import ArtifactStore
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "failproofai.session.json"
 
@@ -61,24 +57,3 @@ def test_refuses_what_is_not_one_document_per_file(
     (folder / name).write_text(content)
     with pytest.raises(ValueError, match=reason):
         bundle_json_documents(folder, tmp_path / "out.jsonl")
-
-
-def test_ingesting_a_folder_saves_one_corpus_whose_pointers_resolve(tmp_path: Path) -> None:
-    _sessions(tmp_path / "export")
-    project = tmp_path / "project"
-    result = CliRunner().invoke(
-        app, ["ingest", str(tmp_path / "export"), "--project", str(project)]
-    )
-    assert result.exit_code == 0, result.output
-    assert "bundled:  2 file(s)" in result.output
-    assert not list(project.glob(".bandits-bundle-*"))  # the joined file is not kept
-    store = ArtifactStore(project / ".bandits")
-    (envelope,) = store.list()
-    assert envelope.source_path == str(tmp_path / "export")
-    (entry,) = store.source_manifest(envelope.artifact_id)
-    assert [b["path"] for b in entry["bundled_from"]] == ["session-a.json", "session-b.json"]
-    corpus = store.read(envelope.artifact_id)
-    assert len(corpus.traces) == 2
-    fidelity = check_fidelity(store, envelope.artifact_id, corpus.traces, "failproofai")
-    assert fidelity["steps"] > 0
-    assert fidelity["carried_wrong"] == 0, fidelity["mismatches"]

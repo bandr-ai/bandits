@@ -11,7 +11,6 @@ from bandits.ingest.report import IngestReport
 from bandits.redact import DEFAULT_RULESET
 from bandits.store import ArtifactStore, StreamingWrite, compute_artifact_id
 from bandits.traces import TraceCorpus, WorkflowDeclaration
-from tests.cli_test import plain
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "upstream"
 
@@ -306,47 +305,6 @@ def test_otlp_directory_duplicates_malformed_and_redactions_preserve_bytes(tmp_p
     assert not report.accounting_errors
 
 
-@pytest.mark.parametrize("source", ["otlp-std", "langsmith", "phoenix"])
-def test_cli_discovery_and_archive_never_read_entire_jsonl(tmp_path, monkeypatch, source):
-    from typer.testing import CliRunner
-
-    from bandits.cli import app
-
-    factory = (
-        _otlp_record if source == "otlp-std" else lambda *a, **k: _native_record(source, *a, **k)
-    )
-    path = tmp_path / "export.jsonl"
-    path.write_text(
-        "\n"
-        + json.dumps(factory("a" * 32, "2" * 16, "1" * 16, model=True))
-        + "\n"
-        + json.dumps(factory("a" * 32, "1" * 16))
-        + "\n"
-    )
-    original = Path.read_bytes
-
-    def guarded(file):
-        if file.suffix == ".jsonl":
-            raise AssertionError("the JSONL export was read into one byte buffer")
-        return original(file)
-
-    monkeypatch.setattr(Path, "read_bytes", guarded)
-    result = CliRunner().invoke(
-        app, ["ingest", str(path), "--source", source, "--project", str(tmp_path / "project")]
-    )
-    assert result.exit_code == 0, (result.stdout, result.exception)
-    assert "problems: none" in plain(result.stdout)
-    store = ArtifactStore(tmp_path / "project" / ".bandits")
-    (envelope,) = store.list()
-    corpus = store.read(envelope.artifact_id)
-    assert corpus.traces[0].task == "hello"
-    assert store.read_report(envelope.artifact_id)["spans_seen"] == 2
-    if source != "otlp-std":
-        pointer = corpus.traces[0].spans[0].attributes["bandits.source.record"]
-        assert json.loads(pointer)["line"] == 2
-        assert store.read_native_record(envelope.artifact_id, pointer)["name"] == "model"
-
-
 @pytest.mark.parametrize("content", ["\ninvalid\n", "\n{}\n", "\n[]\n", "\n42\n"])
 def test_single_record_and_invalid_first_line_locations_match_legacy(tmp_path, content):
     path = tmp_path / "input.jsonl"
@@ -381,27 +339,3 @@ def test_source_changed_between_disk_passes_is_rejected_and_spool_removed(tmp_pa
     with pytest.raises(ValueError, match="source file changed during ingest"):
         list(iter_corpus(path, "otlp-std", scratch_dir=tmp_path))
     assert not list(tmp_path.glob(".bandits-read-*"))
-
-
-@pytest.mark.parametrize("source", ["langsmith", "phoenix"])
-def test_native_jsonl_array_records_are_streamed_and_pointers_resolve(tmp_path, source):
-    from typer.testing import CliRunner
-
-    from bandits.cli import app
-
-    path = tmp_path / "arrays.jsonl"
-    child = _native_record(source, "a" * 32, "2" * 16, "1" * 16, model=True)
-    root = _native_record(source, "a" * 32, "1" * 16)
-    path.write_text(json.dumps([child]) + "\n" + json.dumps([root]) + "\n")
-    result = CliRunner().invoke(
-        app, ["ingest", str(path), "--source", source, "--project", str(tmp_path)]
-    )
-    assert result.exit_code == 0, (result.stdout, result.exception)
-    store = ArtifactStore(tmp_path / ".bandits")
-    (envelope,) = store.list()
-    trace = store.read(envelope.artifact_id).traces[0]
-    assert trace.task == "hello"
-    pointer = trace.spans[0].attributes["bandits.source.record"]
-    assert json.loads(pointer)["line"] == 1
-    assert json.loads(pointer)["index"] == 0
-    assert store.read_native_record(envelope.artifact_id, pointer) == child

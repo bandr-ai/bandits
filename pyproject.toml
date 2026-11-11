@@ -3,13 +3,12 @@
 # `bandits` belongs to an unrelated project.
 name = "bandits-cli"
 dynamic = ["version", "readme"]
-description = "Turn agent traces into training data you can trust: ingest, judge, verify, and export SFT and RL data."
+description = "Read agent traces from any format into one trace model."
 requires-python = ">=3.11"
 authors = [{ name = "Bandr" }]
-keywords = ["agents", "traces", "llm", "evaluation", "verifiers", "sft", "rl", "opentelemetry"]
+keywords = ["agents", "traces", "llm", "opentelemetry", "ingest"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
@@ -22,29 +21,9 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.7",
-    "typer>=0.12",
-    "rich>=13.7",
 ]
 
 [project.optional-dependencies]
-llm = [
-    # Every model call goes through LiteLLM (see bandits/providers.py). Optional
-    # so the core install and the Jev recipe's environment never pull it in.
-    "litellm>=1.100",
-]
-audit = [
-    # RLM mining and its advisory audit only. Kept out of the core install so the
-    # pipeline keeps its three runtime dependencies and CI never needs a model
-    # or a REPL sandbox; their tests inject a predictor instead.
-    "dspy[deno]>=3.3.1",
-    "litellm>=1.100",
-]
-emulate = [
-    # Prompt optimization and schema-checked trace-grounded world simulation.
-    "dspy[deno]>=3.3.1",
-    "jsonschema>=4.23",
-    "litellm>=1.100",
-]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -56,9 +35,6 @@ Homepage = "https://github.com/bandr-ai/bandits"
 Source = "https://github.com/bandr-ai/bandits"
 Issues = "https://github.com/bandr-ai/bandits/issues"
 Changelog = "https://github.com/bandr-ai/bandits/blob/main/CHANGELOG.md"
-
-[project.scripts]
-bandits = "bandits.cli:app"
 
 [build-system]
 requires = ["hatchling", "hatch-fancy-pypi-readme>=24.1"]

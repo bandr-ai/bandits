@@ -168,10 +168,10 @@ def applicable(mapping: IngestMapping, name: str, source: str) -> IngestMapping:
         raise MappingError(f"mapping {name!r} was made for --source {mapping.source}, not {source}")
     if not mapping.confirmed:
         raise MappingError(
-            f"mapping {name!r} is not confirmed; run `bandits mapping confirm {name}`"
+            f"mapping {name!r} is not confirmed; confirm it with `bandits.ingest.mapping.confirm` and save it"
         )
     if not mapping.unmodified:
         raise MappingError(
-            f"mapping {name} changed since it was confirmed; run `bandits mapping confirm {name}`"
+            f"mapping {name} changed since it was confirmed; confirm it with `bandits.ingest.mapping.confirm` and save it"
         )
     return mapping
