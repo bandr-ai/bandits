@@ -193,6 +193,30 @@ This matches how agent tooling commonly ships today: an agent-friendly CLI plus 
 
 **Standalone:** this does not depend on any existing Bandits code. Bandits is being rebuilt, and where this lives will be decided then.
 
+## Testing
+
+The plan is proven by converting real logs and running the tasks, not by more planning.
+
+**Unit tests (in repo, synthetic fixtures only):**
+- Script contracts: parse, check and generator results round-trip, and errors are grouped correctly.
+- Leak scan: catches an answer placed in `instruction.md` or `environment/`, and does not flag legitimate evidence.
+- Gates on a tiny fixture task: the oracle passes, a no-op fails, a wrong answer fails, and an infrastructure error is recorded as an error.
+- Status: a task is never marked `validated` without its execution gates having run.
+- CLI: `--json` shape, exit codes, `--dry-run` writes nothing, and reruns are idempotent.
+
+**End-to-end pilots (each run separately, nothing changed in the harness between sources):**
+1. **Public source:** a public set of agent trajectories, run end to end. The result can be committed as `examples/`.
+2. **Private source A:** a large, messy production log export (multi-agent sessions with attachments). Data and results stay outside this repo.
+3. **Private source B:** a structurally different private source, run once with nothing tuned, to test that the method generalizes.
+
+**What a pilot must show:**
+- At least one task type end to end: real logs → tasks that run in Harbor and pass the oracle, no-op and wrong-answer gates.
+- Every sampled record has a recorded outcome (used, excluded with a reason, or blocked).
+- The report shows counts per stage, exclusion rates per check, gold and status splits, and blocked items with what is missing.
+- A manual audit of about 20 generated tasks per type for fidelity, leaks and solvability, recording what the gates missed.
+- An interrupted run resumes from `l2h status`.
+- Reported numbers: task yield, gate pass rate, agent time and tokens, and the number of human interventions.
+
 ## Rules
 
 - Every exclusion and every task traces back to source records.
