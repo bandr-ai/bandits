@@ -34,8 +34,8 @@ def refresh_evidence(ws: Workspace, row: dict) -> None:
     now = package_hash(d)
     if row.get("content_hash") and now != row["content_hash"]:
         row["gates"]["exec"] = "not_run"
-        row["gates"].pop("runner", None)
-        row["gates"].pop("exec_detail", None)
+        for k in ("runner", "trials", "exec_detail"):
+            row["gates"].pop(k, None)
         row["changed"] = True
         finalize(row)
     row["content_hash"] = now
@@ -176,21 +176,23 @@ def run_validate(
             if task_ids:
                 sample = ok_rows
             else:
-                validated = [r for r in ok_rows if r["gates"]["exec"] == "pass"]
-                pending = [r["task_id"] for r in ok_rows if r["gates"]["exec"] != "pass"]
+                # only passes made by the selected runner count; e.g. earlier
+                # host-local passes are re-run when Harbor is selected
+                def counts(r):
+                    return r["gates"]["exec"] == "pass" and r["gates"].get("runner") == runner.name
+
+                validated = [r for r in ok_rows if counts(r)]
+                pending = [r["task_id"] for r in ok_rows if not counts(r)]
                 need = max(0, sample_size - len(validated))
                 pick = set(seeded_sample(pending, need, cfg["seed"], ttype))
-                pick |= {
-                    r["task_id"]
-                    for r in ok_rows
-                    if r.get("changed") and r["gates"]["exec"] != "pass"
-                }
+                pick |= {r["task_id"] for r in ok_rows if r.get("changed") and not counts(r)}
                 sample = [r for r in ok_rows if r["task_id"] in pick]
             res_here: list[tuple[str, dict]] = []
             for r in sample:
                 progress(f"validate {ttype}/{r['task_id']}")
                 res = level2_task(ws, r, runner)
                 r["gates"]["exec"], r["gates"]["runner"] = res["exec"], res["runner"]
+                r["gates"]["trials"] = res.get("trials", [])
                 r["gates"]["exec_detail"] = {k: v["gate"] for k, v in res["detail"].items()}
                 r.pop("changed", None)
                 finalize(r)

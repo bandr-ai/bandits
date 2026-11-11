@@ -25,12 +25,14 @@ class RunOutcome:
     reward: float | None = None
     detail: str = ""
     log: str = ""
+    trial: str = ""  # Harbor trial id; only a real Harbor run sets it (evidence for `validated`)
 
     def to_dict(self) -> dict:
         return {
             "state": self.state,
             "reward": self.reward,
             "detail": self.detail,
+            "trial": self.trial,
             "log": self.log[-2000:],
         }
 
@@ -188,7 +190,8 @@ class HarborRunner(Runner):
                 return RunOutcome("infra_error", detail="reward is not a number", log=log)
             if not 0.0 <= reward <= 1.0:
                 return RunOutcome("infra_error", detail=f"reward {reward} outside 0..1", log=log)
-            return RunOutcome("ok", reward=reward, log=log)
+            trial = str(res.get("trial_name") or results[0].parent.name)
+            return RunOutcome("ok", reward=reward, log=log, trial=trial)
 
     def run_solution(self, task_dir: Path) -> RunOutcome:
         return self._harbor(task_dir, "oracle")
@@ -258,13 +261,17 @@ def run_exec_gates(
     """Run oracle / no-op / wrong-answer / alternatives. Value = gate satisfied?"""
     detail: dict[str, dict] = {}
 
+    outs: list[RunOutcome] = []
     o = runner.run_solution(task_dir)
+    outs.append(o)
     detail["oracle"] = {"gate": verdict(o, True), **o.to_dict()}
     n = runner.run_verifier(task_dir, {})
+    outs.append(n)
     detail["noop"] = {"gate": verdict(n, False), **n.to_dict()}
     wrongs = []
     for w in wrong:
         r = runner.run_verifier(task_dir, {answer_file: str(w)})
+        outs.append(r)
         wrongs.append({"answer": str(w), "gate": verdict(r, False), **r.to_dict()})
     detail["wrong"] = {
         "gate": _combine([w["gate"] for w in wrongs]) if wrongs else "error",
@@ -274,6 +281,7 @@ def run_exec_gates(
     alts = []
     for a in alternatives:
         r = runner.run_verifier(task_dir, {answer_file: str(a)})
+        outs.append(r)
         alts.append({"answer": str(a), "gate": verdict(r, True), **r.to_dict()})
     detail["alternatives"] = {
         "gate": _combine([a["gate"] for a in alts]) if alts else "not_run",
@@ -286,7 +294,8 @@ def run_exec_gates(
         exec_state = "error"
     else:
         exec_state = "pass"
-    return {"exec": exec_state, "detail": detail, "runner": runner.name}
+    trials = sorted({x.trial for x in outs if x.trial}) if all(x.trial for x in outs) else []
+    return {"exec": exec_state, "detail": detail, "runner": runner.name, "trials": trials}
 
 
 def _combine(states: list[str]) -> str:

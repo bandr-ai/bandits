@@ -299,8 +299,10 @@ def package_hash(task_dir: Path) -> str:
 
 def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | None) -> dict:
     trajs = load_trajectories(ws)
-    if limit:
-        trajs = trajs[:limit]
+    # --limit picks records, but a task is always rebuilt from its WHOLE group:
+    # groups touching a selected record are built with every member.
+    selected = {t["id"] for t in trajs[:limit]} if limit else None
+    scope_ids = set(selected) if selected is not None else None
     if not ws.findings.exists():
         progress("note: no findings yet; applies() will see empty findings")
     fmap = findings_by_traj(ws)
@@ -362,6 +364,10 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
             progress(f"generate {tt.name}: {len(groups)} group(s)")
             for gk in sorted(groups):
                 group = groups[gk]
+                if selected is not None:
+                    if not any(t["id"] in selected for t in group):
+                        continue
+                    scope_ids.update(t["id"] for t in group)
                 srcs = source_strings(group)
                 stage = staging_root / tt.name / sha(gk)[:12]
                 stage.mkdir(parents=True, exist_ok=True)
@@ -435,8 +441,16 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     and old.get("content_hash") == row["content_hash"]
                     and not old.get("blocked_reason")
                 ):
-                    row = old  # unchanged: keep gates/status (idempotent rerun)
+                    fresh = row
+                    row = old  # unchanged: keep exec evidence (idempotent rerun)...
                     row["sources"], row["generator"] = srcs, tt.generator
+                    # ...but structure/leak are re-judged now (hidden values may have changed)
+                    row["gates"]["structure"] = fresh["gates"]["structure"]
+                    row["gates"]["leak"] = fresh["gates"]["leak"]
+                    if fresh.get("problems"):
+                        row["problems"] = fresh["problems"]
+                    else:
+                        row.pop("problems", None)
                 elif old:
                     row["changed"] = True  # same id, new content: revalidate
                 taskmeta[res.task_id] = {
@@ -449,12 +463,34 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     finally:
         clear_dir(staging_root)
 
-    partial = limit is not None
+    partial = bool(limit)
+    scope = trajs if scope_ids is None else [t for t in trajs if t["id"] in scope_ids]
+    built_names = {tt.name for tt in built_types}
     new_ids = {r["task_id"] for r in new_rows}
-    if partial:  # a limited run updates its slice and never prunes the rest
-        kept = [r for r in old_rows if r["task_id"] not in new_ids]
+    dropped: list[dict] = []
+    if partial:
+        # a limited run replaces only its own slice; but a selected group whose rebuild
+        # failed or was blocked must not keep its old (possibly validated) row
+        scope_src = {x for t in scope for x in source_strings([t])}
+        dropped = [
+            r
+            for r in old_rows
+            if r["type"] in built_names
+            and r["task_id"] not in new_ids
+            and set(r["sources"]) & scope_src
+        ]
+        gone = new_ids | {r["task_id"] for r in dropped}
+        kept = [r for r in old_rows if r["type"] not in built_names or r["task_id"] not in gone]
     else:
         kept = [r for r in old_rows if only_type and r["type"] != only_type]
+    clash = sorted(new_ids & {r["task_id"] for r in kept})
+    if clash:
+        owners = {r["task_id"]: r["type"] for r in kept}
+        raise L2HError(
+            f"task id(s) {clash[:3]} are produced by this run but already owned by another type "
+            f"({owners[clash[0]]!r}); ids must be unique across types",
+            "include the type or a stable prefix in the task_id your generator returns",
+        )
     all_rows = kept + new_rows
     check_invariants(all_rows)
 
@@ -462,7 +498,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     queued_ids = {i for q in queue for i in q["trajectory_ids"]}
     excluded = []
     if not only_type:
-        for t in trajs:
+        for t in scope:
             if t["id"] not in applied_any:
                 excluded.append(
                     {
@@ -476,7 +512,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     by_type = Counter(r["type"] for r in new_rows)
     prev = ws.state().get("generate", {}).get("summary", {})
     summary = {
-        "trajectories": len(trajs),
+        "trajectories": len(scope),
         "tasks": len(new_rows),
         "by_status": dict(counts),
         "by_type": dict(by_type),
@@ -491,6 +527,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         "sources_used": len(used),
         "trajectories_in_queue": len(queued_ids),
         "limited": limit is not None or bool(only_type),
+        "dropped_stale": len(dropped),
     }
     summary["changed_since_last_run"] = delta(
         {k: v for k, v in prev.items() if isinstance(v, int)},
@@ -501,6 +538,8 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         return summary
 
     # persist: swap in new task dirs, drop stale ones for rebuilt types
+    for r in dropped:
+        clear_dir(ws.tasks / r["type"] / r["task_id"])
     for tt in [] if partial else built_types:
         keep = {r["task_id"] for r in new_rows if r["type"] == tt.name}
         tdir = ws.tasks / tt.name
@@ -512,11 +551,17 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     meta_dir = ws.internal / "taskmeta"
     for tid, m in taskmeta.items():
         write_json(meta_dir / f"{tid}.json", m)
-    seen_t = {t["id"] for t in trajs}
+    seen_t = {t["id"] for t in scope}
     if partial:
-        old_ex = [e for e in read_jsonl(ws.excluded) if e["trajectory_id"] not in seen_t]
+        old_ex = [
+            e for e in read_jsonl(ws.excluded) if only_type or e["trajectory_id"] not in seen_t
+        ]
         write_jsonl(ws.excluded, old_ex + excluded)
-        old_q = [q for q in read_jsonl(ws.queue) if not (set(q["trajectory_ids"]) & seen_t)]
+        old_q = [
+            q
+            for q in read_jsonl(ws.queue)
+            if not (set(q["trajectory_ids"]) & seen_t and q["type"] in built_names)
+        ]
         write_jsonl(ws.queue, old_q + queue)
     elif not only_type:
         write_jsonl(ws.excluded, excluded)

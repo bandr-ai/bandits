@@ -25,6 +25,11 @@ def new_row(task_id: str, ttype: str, sources: list, generator: str, gold: str) 
     }
 
 
+def has_harbor_evidence(g: dict) -> bool:
+    """Only a real Harbor run leaves trial ids; a runner's name alone proves nothing."""
+    return g.get("runner") == "harbor" and bool(g.get("trials"))
+
+
 def derive_status(row: dict) -> tuple[str, str]:
     g = row["gates"]
     if row.get("blocked_reason"):
@@ -39,7 +44,7 @@ def derive_status(row: dict) -> tuple[str, str]:
         g["exec"] == "pass"
         and g["structure"] == "pass"
         and g["leak"] == "pass"
-        and g.get("runner") not in (None, "local")
+        and has_harbor_evidence(g)
     ):
         return "validated", ""
     return "generated", ""
@@ -62,7 +67,7 @@ def check_invariants(rows: list[dict]) -> None:
             g["exec"] == "pass"
             and g["structure"] == "pass"
             and g["leak"] == "pass"
-            and g.get("runner") not in (None, "local")
+            and has_harbor_evidence(g)
         ):
             raise ContractError(
                 f"task {r['task_id']} would be 'validated' without its execution gates having run and passed"

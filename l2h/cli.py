@@ -195,7 +195,10 @@ def _stage_report(ws: Workspace) -> dict:
             "tasks": len(rows),
         },
         "5_validate": {
-            "done": bool(rows) and any(r["gates"]["exec"] == "pass" for r in rows),
+            "done": bool(rows) and any(r["status"] == "validated" for r in rows),
+            "local_only": bool(rows)
+            and not any(r["status"] == "validated" for r in rows)
+            and any(r["gates"]["exec"] == "pass" for r in rows),
             "by_status": dict(sc),
         },
         "6_report": {"done": ws.report.exists()},
@@ -241,6 +244,11 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
     if not s["4_generate"]["done"]:
         return ["l2h run generate --limit 5  # build a few varied instances first"]
     if not s["5_validate"]["done"]:
+        if s["5_validate"].get("local_only"):
+            return [
+                "install Harbor and start Docker, then `l2h validate --runner harbor` "
+                "(host-local passes leave tasks `generated`)"
+            ]
         return ["l2h validate"]
     if not s["6_report"]["done"]:
         return ["l2h report"]
@@ -658,10 +666,11 @@ def schema_data() -> dict:
                 "structure": list(GATE_STATES),
                 "leak": list(GATE_STATES),
                 "exec": list(GATE_STATES),
-                "runner": "local",
+                "runner": ["local", "harbor"],
+                "trials": "Harbor trial ids; required (with runner=harbor) for `validated`",
             },
             "status": list(STATUSES),
-            "rule": "validated only if gates.exec == pass (exec gates actually ran and passed)",
+            "rule": "validated only if gates.exec == pass from a real Harbor run (runner=harbor with trial ids); host-local passes stay generated",
         },
         "task package": [
             "task.toml",

@@ -113,3 +113,19 @@ def test_auto_without_harbor_falls_back_to_local_and_says_so(env, local_runner):
     code, out, _, _ = env.run("validate", "--sample-size", "1")
     assert code == 0 and "host-local runner" in out
     assert {r["status"] for r in rows(env).values()} == {"generated"}
+
+
+def test_local_passes_do_not_count_when_harbor_is_selected(env, local_runner, fake_harbor):
+    env.build_pipeline()
+    env.run("run", "generate")
+    env.run("validate", "--sample-size", "3", "--runner", "local")
+    assert {r["gates"]["runner"] for r in rows(env).values()} == {"local"}
+    assert {r["status"] for r in rows(env).values()} == {"generated"}
+    _, _, _, st = env.run("status", "--json")
+    v = st["data"]["stages"]["5_validate"]
+    assert v["done"] is False and v["local_only"] is True  # local-only is not "validation done"
+    assert fake_harbor.read_text() == ""
+    env.run("validate", "--sample-size", "3", "--runner", "harbor")
+    assert fake_harbor.read_text().split()  # Harbor really ran
+    assert {r["status"] for r in rows(env).values()} == {"validated"}
+    assert {r["gates"]["runner"] for r in rows(env).values()} == {"harbor"}

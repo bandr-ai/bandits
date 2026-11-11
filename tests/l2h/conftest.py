@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -211,9 +211,16 @@ def env(tmp_path, capsys):
 
 @dataclass
 class _HarborSim(LocalRunner):
-    """Stands in for a real Harbor run in tests (host execution, Harbor-grade name)."""
+    """Stands in for a real Harbor run in tests: host execution, but its outcomes carry
+    trial ids the way Harbor's result.json does (the evidence `validated` requires)."""
 
-    name: str = "harbor-sim"
+    name: str = "harbor"
+
+    def run_solution(self, task_dir):
+        return replace(super().run_solution(task_dir), trial="sim-trial")
+
+    def run_verifier(self, task_dir, answer):
+        return replace(super().run_verifier(task_dir, answer), trial="sim-trial")
 
 
 @pytest.fixture
