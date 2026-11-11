@@ -56,7 +56,9 @@ def test_editing_a_generated_task_invalidates_exec_evidence(env):
 def test_limited_type_run_keeps_unrelated_queue_entries(env):
     env.build_pipeline()
     env.run("run", "generate")
-    q = lambda: [json.loads(x) for x in (env.ws / "out/queue.jsonl").read_text().splitlines()]
+    def q():
+        return [json.loads(x) for x in (env.ws / "out/queue.jsonl").read_text().splitlines()]
+
     before = q()
     assert before
     env.run("run", "generate", "--type", "addnums", "--limit", "1")
