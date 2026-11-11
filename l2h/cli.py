@@ -166,7 +166,11 @@ def _stage_report(ws: Workspace) -> dict:
             or stages.inputs_digest(ws.trajectories) != chk.get("inputs")
         )
     )
-    types = sorted(p.stem for p in ws.tasktypes.glob("*.py")) if ws.tasktypes.is_dir() else []
+    types = (
+        sorted(p.stem for p in ws.tasktypes.glob("*.py") if not p.name.startswith("_"))
+        if ws.tasktypes.is_dir()
+        else []
+    )
     gen = st.get("generate")
     stale_gen = False
     if gen:
@@ -524,6 +528,8 @@ def cmd_validate(a, ws: Workspace) -> Result:
             f"level 2 {t}: {v['state']} (sampled {len(v['sampled'])}, passed {len(v['passed'])}, failed {len(v['failed'])}, infra errors {len(v['infra_error'])}; attempts {v['attempts']}/{v['max_fix_attempts']})"
         )
         lines += _group_lines(v["causes"])
+        if v.get("message"):
+            lines.append(f"  {v['message']}")
     if "level3_audit_sample" in s:
         lines.append(
             "level 3 audit sample (read these; record the verdict with `l2h decide --kind audit`):"

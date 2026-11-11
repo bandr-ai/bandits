@@ -1,6 +1,6 @@
 # Logs → Harbor: final plan
 
-Status: plan, not yet built. Updated 2026-11-11.
+Status: implemented in `l2h/`; this is the design record. Updated 2026-11-11.
 
 ## Goal
 

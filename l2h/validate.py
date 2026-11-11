@@ -27,13 +27,14 @@ def seeded_sample(items: list, k: int, seed: int, salt: str) -> list:
 
 
 def refresh_evidence(ws: Workspace, row: dict) -> None:
-    """Drop exec evidence if the package on disk no longer matches what was gated."""
+    """Drop gate evidence if the package on disk no longer matches what was gated."""
     d = ws.tasks / row["type"] / row["task_id"]
     if not d.is_dir():
         return
     now = package_hash(d)
     if row.get("content_hash") and now != row["content_hash"]:
-        row["gates"]["exec"] = "not_run"
+        # structure/leak were judged on the old content too: level 1 must re-run
+        row["gates"].update(structure="not_run", leak="not_run", exec="not_run")
         for k in ("runner", "trials", "exec_detail"):
             row["gates"].pop(k, None)
         row["changed"] = True
@@ -140,10 +141,11 @@ def run_validate(
 
     for r in targets:
         refresh_evidence(ws, r)
-    if 1 in levels:
-        for r in targets:
-            level1(ws, r)
+    for r in targets:
+        if 1 in levels or "not_run" in (r["gates"]["structure"], r["gates"]["leak"]):
+            level1(ws, r)  # also for edited packages, whatever --level says
             finalize(r)
+    if 1 in levels:
         bad = [
             r for r in targets if r["gates"]["structure"] == "fail" or r["gates"]["leak"] == "fail"
         ]
@@ -169,10 +171,20 @@ def run_validate(
                 and not r.get("blocked_reason")
             ]
             if attempts.get(ttype, 0) >= max_fix and not task_ids:
-                raise L2HError(
-                    f"type {ttype!r} already used {attempts[ttype]}/{max_fix} fix attempts",
-                    "stop fixing it: `l2h decide` why, leave it blocked in the report, or raise --max-fix-attempts deliberately",
-                )
+                summary["types"][ttype] = {
+                    "state": "exhausted",
+                    "sampled": [],
+                    "passed": [],
+                    "failed": [],
+                    "infra_error": [],
+                    "attempts": attempts.get(ttype, 0),
+                    "max_fix_attempts": max_fix,
+                    "causes": [],
+                    "message": f"type {ttype!r} already used {attempts.get(ttype, 0)}/{max_fix} fix attempts; "
+                    "stop fixing it: `l2h decide` why, leave it blocked in the report, "
+                    "or raise --max-fix-attempts deliberately",
+                }
+                continue
             if task_ids:
                 sample = ok_rows
             else:
@@ -214,8 +226,14 @@ def run_validate(
                         finalize(r)
             elif errs:
                 type_state = "infra_error"
-            elif res_here or any(r["gates"]["exec"] == "pass" for r in ok_rows):
+            elif any(r.get("blocked_reason") for r in trs):
+                # nothing was sampled this run, but rows are still blocked by an earlier
+                # failure: not "passed", and no attempt is spent or refunded
+                type_state = "failed"
+            elif passed:
                 attempts[ttype] = 0
+            elif any(r["gates"]["exec"] == "pass" for r in ok_rows):
+                pass  # already validated earlier; the budget is only refunded by a fresh pass
             else:
                 type_state = "nothing_to_validate"
             summary["types"][ttype] = {
@@ -245,8 +263,8 @@ def run_validate(
     summary["review_for_derivability"] = sorted(
         {t for v in summary["types"].values() for t in v["sampled"]}
     )
-    summary["any_failure"] = any(v["state"] == "failed" for v in summary["types"].values()) or bool(
-        summary.get("level1", {}).get("failed")
-    )
+    summary["any_failure"] = any(
+        v["state"] in ("failed", "exhausted") for v in summary["types"].values()
+    ) or bool(summary.get("level1", {}).get("failed"))
     summary["any_infra_error"] = bool(summary["infra_errors"])
     return summary

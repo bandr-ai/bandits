@@ -7,5 +7,5 @@
 - Bump `version` when logic changes; the run output shows what changed since last time.
 - A crashing check is recorded as `unknown` and grouped by cause; fix the crash.
 - Before trusting a check: `l2h sample --matching <id>` shows fresh fails and passes. Read them, then
-  `l2h decide --kind spot_check --check <id> --verdict pass --why "<what you saw>"`. The report flags
+  `l2h decide "<what>" --kind spot_check --check <id> --verdict pass --why "<what you saw>"`. The report flags
   unchecked checks.

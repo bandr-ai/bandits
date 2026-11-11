@@ -57,7 +57,7 @@ def truncate(obj: Any, max_chars: int, cmd: str, path: str = "") -> Any:
 def dotted(obj: Any, path: str) -> Any:
     cur = obj
     for part in [p for p in path.split(".") if p]:
-        if isinstance(cur, list) and part.isdigit():
+        if isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
             cur = cur[int(part)]
         elif isinstance(cur, dict) and part in cur:
             cur = cur[part]
@@ -186,6 +186,12 @@ def sample_matching(ws: Workspace, check_id: str, n: int, unseen: bool, dry: boo
 # ---------------------------------------------------------------------- show
 
 
+def _safe_part(s: str) -> str:
+    """One path component: sanitised, and never `.`/`..`/empty."""
+    s = re.sub(r"[^\w.\-]", "_", s)
+    return f"_{s}" if s in ("", ".", "..") else s
+
+
 def show_record(
     ws: Workspace, rid: str, field: str | None, attachments: bool, full: bool, dry: bool
 ) -> dict:
@@ -216,12 +222,15 @@ def show_record(
                 "--attachments applies to parsed trajectories", "parse first, or omit --attachments"
             )
         files = []
-        base = ws.out / "attachments" / re.sub(r"[^\w.\-]", "_", rid)
+        att_root = (ws.out / "attachments").resolve()
+        base = att_root / _safe_part(rid)
         for i, a in enumerate(traj.get("attachments", [])):
             if not isinstance(a, dict):
                 continue
-            name = re.sub(r"[^\w.\-]", "_", str(a.get("name") or f"attachment_{i}"))
+            name = _safe_part(str(a.get("name") or f"attachment_{i}"))
             target = base / name
+            if att_root not in target.resolve().parents:
+                raise L2HError(f"attachment path for {rid!r}/{name!r} escapes out/attachments/")
             if "path" in a:
                 files.append(
                     {"name": name, "path": str(a["path"]), "source": "original (read-only)"}
@@ -329,7 +338,12 @@ def query_corpus(
     gcode = None
     if group_by:
         gcode = None if re.fullmatch(r"[\w.]+", group_by) else _compile(group_by)
-    rx = re.compile(grep) if grep else None
+    try:
+        rx = re.compile(grep) if grep else None
+    except re.error as e:
+        raise UsageError(
+            f"bad --grep regex {grep!r}: {e}", "use a Python regular expression"
+        ) from e
     scope = {"re": re, "get": _get, "__builtins__": _SAFE}
     matched, groups, scanned, errors = [], Counter(), 0, Counter()
     for rid, rec in records:
@@ -337,7 +351,8 @@ def query_corpus(
         if rx and not rx.search(json.dumps(rec, default=str)):
             continue
         try:
-            ok = eval(code, scope, {"r": _R(rec) if isinstance(rec, dict) else rec})
+            # r goes in globals: names in comprehensions don't see eval's locals
+            ok = eval(code, {**scope, "r": _R(rec) if isinstance(rec, dict) else rec})
         except Exception as e:
             errors[f"{type(e).__name__}: {e}"] += 1
             continue
@@ -347,7 +362,7 @@ def query_corpus(
         if group_by:
             try:
                 key = (
-                    eval(gcode, scope, {"r": _R(rec) if isinstance(rec, dict) else rec})
+                    eval(gcode, {**scope, "r": _R(rec) if isinstance(rec, dict) else rec})
                     if gcode
                     else _get(rec, group_by)
                 )

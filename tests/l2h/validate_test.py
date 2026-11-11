@@ -118,8 +118,9 @@ def test_verifier_fault_blocks_type_with_cause_and_attempt_budget(env):
     assert env.run("validate", "--max-fix-attempts", "2")[0] == 1  # attempt 2
     env.run("run", "generate")
     code, _, err, res = env.run("validate", "--max-fix-attempts", "2", "--json")
-    assert code == 1 and "fix attempts" in res["error"]["message"]  # budget spent: stop and report
-    assert "decide" in res["error"]["fix"]
+    t = res["data"]["types"]["addnums"]  # budget spent: recorded, not raised
+    assert code == 1 and t["state"] == "exhausted" and "fix attempts" in t["message"]
+    assert "decide" in t["message"]
 
 
 def test_infra_error_is_error_not_failure(env):

@@ -36,7 +36,7 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 2. **Findings.** `l2h new check <name>`, `l2h run checks`. Findings are observations, not exclusions.
    Ask three separate questions: recording quality, execution outcome, usefulness for a task.
    Failed and partial runs stay usable. Spot-check each check on fresh data:
-   `l2h sample --matching <check>`, then `l2h decide --kind spot_check --check <id> --verdict pass --why ...`.
+   `l2h sample --matching <check>`, then `l2h decide "<what>" --kind spot_check --check <id> --verdict pass --why "..."`.
    Guide: `l2h docs --topic checks`.
 3. **Task types.** `l2h new tasktype <name>`. Group by prompt/job and output shape, then refine by
    evidence access and completion requirements (one episode can yield several subtasks; many
