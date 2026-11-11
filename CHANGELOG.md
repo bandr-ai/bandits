@@ -7,6 +7,41 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+## [0.3.0] - unreleased
+
+`bandits` is now ingest only. Everything else was removed, to be rebuilt from
+scratch on top of ingest.
+
+### Kept
+
+- `bandits.ingest` (every reader, detection, discovery, health, mappings),
+  `bandits.traces`, `bandits.redact` and `bandits.store`.
+
+### Removed (breaking)
+
+- **The `bandits` command line**, with all of its commands. Use the Python API
+  (`bandits.ingest.load_corpus`, `bandits.store.ArtifactStore`) instead.
+- **`bandits.verify`**: the turn judge (`judge-turns`), check proposal
+  (`propose-verifier`, `review-checks`) and scoring (`score-traces`).
+- **`bandits.export`**: SFT exports (`build-sft`, `export-nextstate`).
+- **`bandits.analyze`**: task candidates, task families and RLM mining
+  (`analyze`, `families`, `mine-rlm`, `audit-rlm`, `materialize-rlm-taskset`,
+  `rlm-session`, `rlm-families`).
+- **`bandits.emulate`**: AWM / trace-grounded world simulation.
+- `bandits.inspect` (the HTML trace page), `bandits.fields`, `bandits.ledger`,
+  `bandits.providers` and `bandits.transport`.
+- The `llm`, `audit` and `emulate` extras, and the `typer` and `rich`
+  dependencies.
+- The scripts and docs for the removed code (AWM, RLM, the tau2 and TRAIL judge
+  evals, the paper figures).
+
+### Changed
+
+- `bandits.genai` and `bandits.jsonarray` moved to `bandits.ingest.genai` and
+  `bandits.ingest.jsonarray`.
+- `recipes/` is left as it was and is no longer tested in CI. It imports
+  modules removed here.
+
 ## [0.2.0] - unreleased
 
 The first release on PyPI.
