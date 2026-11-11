@@ -26,6 +26,21 @@ def seeded_sample(items: list, k: int, seed: int, salt: str) -> list:
     return sorted(rng.sample(pool, min(k, len(pool))))
 
 
+def refresh_evidence(ws: Workspace, row: dict) -> None:
+    """Drop exec evidence if the package on disk no longer matches what was gated."""
+    d = ws.tasks / row["type"] / row["task_id"]
+    if not d.is_dir():
+        return
+    now = package_hash(d)
+    if row.get("content_hash") and now != row["content_hash"]:
+        row["gates"]["exec"] = "not_run"
+        row["gates"].pop("runner", None)
+        row["gates"].pop("exec_detail", None)
+        row["changed"] = True
+        finalize(row)
+    row["content_hash"] = now
+
+
 def level1(ws: Workspace, row: dict) -> None:
     """Structure + leak for one task row (mutates row)."""
     cfg = ws.config()
@@ -34,14 +49,6 @@ def level1(ws: Workspace, row: dict) -> None:
         row["gates"]["structure"] = "fail"
         row["problems"] = ["task directory is missing; re-run `l2h run generate`"]
         return
-    now = package_hash(d)
-    if row.get("content_hash") and now != row["content_hash"]:
-        # files changed since generation: earlier exec evidence no longer applies
-        row["gates"]["exec"] = "not_run"
-        row["gates"].pop("runner", None)
-        row["gates"].pop("exec_detail", None)
-        row["changed"] = True
-    row["content_hash"] = now
     probs = harbor.structure_check(d)
     m = _meta(ws, row["task_id"])
     lk = leak.scan(d, m["hidden"], m["leak_allow"], cfg["leak"]["min_len"], cfg["leak"]["run_len"])
@@ -131,6 +138,8 @@ def run_validate(
         "infra_errors": [],
     }
 
+    for r in targets:
+        refresh_evidence(ws, r)
     if 1 in levels:
         for r in targets:
             level1(ws, r)

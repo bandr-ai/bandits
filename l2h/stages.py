@@ -516,12 +516,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     if partial:
         old_ex = [e for e in read_jsonl(ws.excluded) if e["trajectory_id"] not in seen_t]
         write_jsonl(ws.excluded, old_ex + excluded)
-        old_q = [
-            q
-            for q in read_jsonl(ws.queue)
-            if not (set(q["trajectory_ids"]) & seen_t)
-            and not (only_type and q["type"] == only_type)
-        ]
+        old_q = [q for q in read_jsonl(ws.queue) if not (set(q["trajectory_ids"]) & seen_t)]
         write_jsonl(ws.queue, old_q + queue)
     elif not only_type:
         write_jsonl(ws.excluded, excluded)
