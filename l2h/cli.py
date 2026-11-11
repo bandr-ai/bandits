@@ -676,7 +676,7 @@ def schema_data() -> dict:
                 "task_id": "str [A-Za-z0-9._-]",
                 "instruction": "str; never the recorded answer",
                 "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>; binary files are skipped by the leak and secret scans",
-                "answer": f"Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance)",
+                "answer": f"Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, pattern); forbidden = negative gold: expected is the known-wrong answers, any other well-formed answer passes (needs alternatives)",
                 "wrong_answers": "meaningful wrong answers the verifier must reject (else an auto one is used and flagged)",
                 "alternatives": "other valid answers the verifier must accept",
                 "leak_allow": "[task-relative path] skipped by the leak scan (recorded in results)",

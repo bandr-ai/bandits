@@ -63,7 +63,9 @@ def level2_task(ws: Workspace, row: dict, runner: Runner) -> dict:
     m = _meta(ws, row["task_id"])
     spec = read_json(d / "tests" / "expected.json", {})
     wrong, auto = m["wrong_answers"], False
-    if not wrong:
+    if spec.get("check") == "forbidden":
+        wrong = [str(x) for x in spec["expected"]]  # the known-wrong answers must fail
+    elif not wrong:
         canon = (
             spec["expected"][0] if isinstance(spec.get("expected"), list) else spec.get("expected")
         )

@@ -13,8 +13,8 @@ from typing import Any
 
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
-GOLD_TYPES = ("verified", "solved", "imitation", "none")
-CHECK_KINDS = ("exact", "allowed_set", "numeric")
+GOLD_TYPES = ("verified", "solved", "imitation", "negative", "none")
+CHECK_KINDS = ("exact", "allowed_set", "numeric", "forbidden")
 NORMALIZERS = ("strip", "lower", "collapse_ws", "percent", "thousands", "sorted_list")
 STATUSES = ("validated", "generated", "blocked")
 GATE_STATES = ("pass", "fail", "error", "not_run")
@@ -128,6 +128,7 @@ class Answer:
     normalize: list = field(default_factory=lambda: ["strip"])
     tolerance: float = 0.0
     rel_tolerance: float = 0.0
+    pattern: str = ""  # forbidden only: regex a well-formed answer must fully match ("" = any)
 
     def validate(self) -> None:
         if self.check not in CHECK_KINDS:
@@ -137,6 +138,15 @@ class Answer:
             raise ContractError(f"unknown normalizers {bad}; allowed {NORMALIZERS}")
         if self.check == "allowed_set" and not (isinstance(self.expected, list) and self.expected):
             raise ContractError("allowed_set needs a non-empty list as answer.expected")
+        if self.check == "forbidden":
+            if not (isinstance(self.expected, list) and self.expected):
+                raise ContractError(
+                    "forbidden needs a non-empty list of known-wrong answers as answer.expected"
+                )
+            try:
+                re.compile(self.pattern)
+            except re.error as e:
+                raise ContractError(f"answer.pattern is not a valid regex: {e}") from e
         if self.check == "exact" and isinstance(self.expected, list | dict):
             raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
         if "/" in self.file or self.file.startswith("."):
@@ -150,10 +160,11 @@ class Answer:
             "normalize": list(self.normalize),
             "tolerance": self.tolerance,
             "rel_tolerance": self.rel_tolerance,
+            "pattern": self.pattern,
         }
 
     def canonical(self) -> str:
-        """The single value an oracle writes."""
+        """The single value an oracle writes (for `forbidden`, a known-wrong one: see alternatives)."""
         return str(self.expected[0] if isinstance(self.expected, list) else self.expected)
 
 

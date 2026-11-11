@@ -115,13 +115,13 @@ def build_report(ws: Workspace) -> str:
         by[r["type"]].append(r)
     if rows:
         L += [
-            "| type | tasks | validated | generated | blocked | verified | solved | imitation |",
-            "|---|---|---|---|---|---|---|---|",
+            "| type | tasks | validated | generated | blocked | verified | solved | imitation | negative |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for t, rs in sorted(by.items()):
             sc, gc = Counter(r["status"] for r in rs), Counter(r["gold"] for r in rs)
             L.append(
-                f"| {t} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} |"
+                f"| {t} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} | {gc['negative']} |"
             )
         L += ["", VALIDATED_NOTE, ""]
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]

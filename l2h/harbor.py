@@ -15,7 +15,7 @@ import tomllib
 from importlib import resources
 from pathlib import Path
 
-from .models import Answer, BuildResult, ContractError, safe_id
+from .models import GOLD_TYPES, Answer, BuildResult, ContractError, safe_id
 
 ANSWER_DIR = "/app/answer"
 SCHEMA_VERSION = "1.4"
@@ -102,14 +102,15 @@ COPY --chmod=755 . /tests/
 """
 
 
-def solve_sh(ans: Answer) -> str:
+def solve_sh(ans: Answer, value: str | None = None) -> str:
+    value = ans.canonical() if value is None else value
     return (
         "#!/bin/bash\n"
         "# Oracle: writes the logged answer. It proves the verifier is wired up,\n"
         "# not that the answer is derivable from the inputs.\n"
         'ANSWER_DIR="${L2H_ANSWER_DIR:-/app/answer}"\n'
         'mkdir -p "$ANSWER_DIR"\n'
-        f"printf '%s\\n' {shlex.quote(ans.canonical())} > \"$ANSWER_DIR/{ans.file}\"\n"
+        f"printf '%s\\n' {shlex.quote(value)} > \"$ANSWER_DIR/{ans.file}\"\n"
     )
 
 
@@ -125,12 +126,23 @@ def materialize(
 ) -> list[str]:
     """Write the task package to dest. Returns relative paths written."""
     safe_id(b.task_id)
-    if b.gold_type not in ("verified", "solved", "imitation", "none"):
-        raise ContractError(f"gold_type {b.gold_type!r} is not valid")
+    if b.gold_type not in GOLD_TYPES:
+        raise ContractError(f"gold_type {b.gold_type!r} must be one of {GOLD_TYPES}")
     files: dict[str, str | bytes] = {}
     if b.answer is None:
         raise ContractError("BuildResult.answer is required: the verifier needs an expected answer")
     b.answer.validate()
+    oracle_value = None
+    if (b.gold_type == "negative") != (b.answer.check == "forbidden"):
+        raise ContractError("gold_type 'negative' and answer.check 'forbidden' go together")
+    if b.gold_type == "negative":
+        if not b.alternatives:
+            raise ContractError(
+                "a negative task needs `alternatives`: valid answers (the oracle writes the first)"
+            )
+        oracle_value = str(b.alternatives[0])
+        if oracle_value.strip() in [str(x).strip() for x in b.answer.expected]:
+            raise ContractError("the oracle's valid answer must differ from the known-wrong ones")
     ans_path = f"{ANSWER_DIR}/{b.answer.file}"
 
     if b.instruction is not None:
@@ -149,7 +161,7 @@ def materialize(
     files.setdefault("tests/grade.py", grade_source())
     files.setdefault("tests/test.sh", TEST_SH)
     files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
-    files.setdefault("solution/solve.sh", solve_sh(b.answer))
+    files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
 
@@ -234,7 +246,11 @@ def structure_check(task_dir: Path) -> list[str]:
         try:
             spec = json.loads(exp.read_text())
             Answer(
-                **{k: spec[k] for k in ("expected", "check", "file", "normalize") if k in spec}
+                **{
+                    k: spec[k]
+                    for k in ("expected", "check", "file", "normalize", "pattern")
+                    if k in spec
+                }
             ).validate()
             instr = (
                 (task_dir / "instruction.md").read_text()

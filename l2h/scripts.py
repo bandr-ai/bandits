@@ -57,8 +57,8 @@ from l2h import Answer, Blocked, BuildResult, Trajectory
 SPEC = {{
     "unit": "episode",            # episode | subtask
     "env": "static",              # static evidence files in v1
-    "check": "exact",             # exact | allowed_set | numeric
-    "gold": "imitation",          # verified | solved | imitation | none
+    "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
+    "gold": "imitation",          # verified | solved | imitation | negative | none
     "hidden": ["answer key", "original final response"],
     "applies_when": "describe which records and findings this type can use",
 }}

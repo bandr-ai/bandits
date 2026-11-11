@@ -15,6 +15,12 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`l2h new tas
   binary files, so a secret or answer inside an image is not caught: review those by eye.
   The solver writes its answer to `/app/answer/<answer.file>`.
 - Gold: `verified` (independent verdict for this exact scope), `solved` (not in this version),
-  `imitation` (logged answer), `none` (blocked).
+  `imitation` (logged answer), `negative` (see below), `none` (blocked).
+- Negative tasks: the logs show a known-wrong answer and no known-right one. Use
+  `gold_type="negative"` with `Answer(expected=[<known-wrong answers>], check="forbidden", pattern=<optional regex a well-formed answer must fully match>)`
+  and at least one valid answer in `alternatives` (the oracle writes the first). The verifier rewards
+  any non-empty, well-formed answer except the known-wrong ones. Level 2 checks: the oracle's
+  different valid answer passes, each known-wrong answer fails, an empty answer fails. The instruction
+  must say what a well-formed answer looks like; the known-wrong answers are not hidden from the scan.
 - Bump `VERSION` when the generator changes so changed instances are revalidated.
 - Idempotence: unchanged packages keep their validation state across `l2h run generate` reruns.

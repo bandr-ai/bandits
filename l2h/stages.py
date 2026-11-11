@@ -417,10 +417,12 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 row = new_row(res.task_id, tt.name, srcs, tt.generator, res.gold_type)
                 row["assumptions"] = list(res.assumptions)
                 row["content_hash"] = package_hash(dest)
-                hidden = [str(h) for h in res.hidden] + [res.answer.canonical()]
-                if isinstance(res.answer.expected, list):
-                    hidden += [str(x) for x in res.answer.expected]
-                hidden += [str(a) for a in res.alternatives]
+                hidden = [str(h) for h in res.hidden]
+                if res.answer.check != "forbidden":  # a negative task has no answer to hide
+                    hidden.append(res.answer.canonical())
+                    if isinstance(res.answer.expected, list):
+                        hidden += [str(x) for x in res.answer.expected]
+                    hidden += [str(a) for a in res.alternatives]
                 meta = {
                     "wrong_answers": [str(w) for w in res.wrong_answers],
                     "alternatives": [str(a) for a in res.alternatives],
