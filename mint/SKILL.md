@@ -98,13 +98,29 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
   environment), then `fresh` (ask first), then `reference`; `answer` proves wiring only; else `none`.
   Say where it came from in `oracle_source`. **Wrong outcomes are real mistakes:** `Outcome(script=...,
   source=...)` doing plausible bad work (a broken build, a stub printing the expected text); alternatives differ.
-- Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Grading is deterministic, no LLM.
+- Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Grading is deterministic; a model grades only through a justified `judge` check (see Choosing the verifier).
 - **Conversations stay conversations.** A dialogue job keeps its user: the solver gets only the opening
   message; a user simulator answers at run time (reuse a supplied one; model/key from env vars, never
   called during conversion); the user's goal, facts and choices live in its spec, never in
   `instruction.md`. Grade end state + required statements; oracle replays a passing attempt's tool
   actions (no model). No simulator buildable → `Candidate`; never a version without the user.
 - Reassess every exclusion for this task (no inherited filters); ask the user only for their decisions.
+
+## Choosing the verifier
+
+The verifier encodes what success means for the job, worked out from the request, the harness and its
+policies: what an outside checker (the requester, a downstream system, an expert, a rule) would accept.
+The logged agent's final output is one candidate answer, never the definition of correct, and is graded
+like any other. Force a deterministic check first, in this order:
+1. outside labels for this job (attach them through a connection point when the logs lack them);
+2. rules or reference code the harness supplies, applied to the evidence;
+3. tests that run the answer, or the end state;
+4. an exact value / allowed set / numeric tolerance; required elements checked by code;
+5. `alternatives` for other valid answers.
+
+Use the `judge` check only when none of these can work (e.g. a free-text analysis), and record why in
+`SPEC["judge_reason"]`. Judged tasks are never `validated`; calibrate first: `mint judge-calibrate`.
+The logged answer as gold (`imitation`) is a labelled last resort, never the default.
 
 ## Harbor
 
@@ -121,7 +137,8 @@ Use Harbor's `create-task` / `create-adapter` skills; tasks follow its conventio
 | Scaffold code | `mint new parser`, `mint new jobs`, `mint new check <n>`, `mint new tasktype <n>` |
 | Run it on everything | `mint run parse`, `mint run checks`, `mint run generate [--limit N] [--type T]` |
 | See what the solver sees | `mint task show <id>`; fast verifier loop: `mint task try <id> --answer x` |
-| Gates | `mint validate [--type T] [--task ID] [--level 1,2,3]` |
+| Gates | `mint validate [--type T] [--task ID] [--level 1,2,3] [--judge]` |
+| Trust a judge | `mint judge-calibrate --type T [--n 20] [--answers f.jsonl]` (costs calls) |
 | Remember / report | `mint decide "<what>" --why "<evidence>"`, `mint report` |
 | Contracts / guides | `mint schema`, `mint docs [--topic parsing\|checks\|tasktypes\|validation\|harbor]` |
 

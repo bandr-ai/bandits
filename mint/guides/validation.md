@@ -39,6 +39,17 @@ infrastructure errors (no reward is written). With Harbor the key reaches the ve
 network access (`network_mode = "public"`, set for judge tasks). Whatever the gates say, judge tasks
 end `judged`, never `validated`: the judge is a model opinion, not ground truth.
 
+`mint judge-calibrate --type T [--n 20]` measures the judge before you trust it: for a sample of
+T's tasks that have a deterministic verifier it judges the reference, alternative and wrong answers
+with a generic rubric (the reference is not shown), compares the judge's pass/fail (all criteria
+supported) with the deterministic verdict, and records the agreement %, false accepts and false
+rejects as a `judge_calibration` decision shown per type in the report. `--answers f.jsonl` takes
+externally graded `{"task_id", "answer", "true_reward"}` lines instead (any task, judged ones use
+their own rubric). It needs `MINT_JUDGE_BASE_URL`, `MINT_JUDGE_API_KEY` and a model
+(`MINT_JUDGE_MODEL` or `judge_model` in `mint.json`); endpoint errors are never counted as disagreement.
+The per-call limit is `MINT_JUDGE_TIMEOUT` (default 30 s); raise `gate_timeout_sec` in `mint.json` if
+`validate --judge` times out.
+
 A type whose sample fails marks its unvalidated tasks `exec_failed` and uses one fix attempt
 (`--max-fix-attempts`, default 3). After that, stop and report. Fix, `mint run generate`, `mint validate`.
 

@@ -6,7 +6,8 @@ criteria (tests/rubric.json) using an OpenAI-compatible chat endpoint. Reward = 
 criteria judged "supported". The judge is a model opinion, not ground truth.
 
 Configuration comes only from the environment: MINT_JUDGE_BASE_URL, MINT_JUDGE_API_KEY and
-MINT_JUDGE_MODEL (default: the model pinned in rubric.json). Missing configuration, an endpoint
+MINT_JUDGE_MODEL (default: the model pinned in rubric.json); optional MINT_JUDGE_TIMEOUT (s) and
+MINT_JUDGE_BACKOFF (s between the 3 attempts). Missing configuration, an endpoint
 error or an unparseable reply exits non-zero WITHOUT writing a reward, so it is reported as an
 infrastructure error and never as a 0 or a 1. An empty or missing answer is a plain 0.
 """
@@ -61,7 +62,7 @@ def call(base, key, model, messages, timeout):
         data=body,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )
-    last = ""
+    last, backoff = "", float(os.environ.get("MINT_JUDGE_BACKOFF", "1"))
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -74,7 +75,8 @@ def call(base, key, model, messages, timeout):
             last = f"{type(e).__name__}: {e}"
         except (ValueError, KeyError, IndexError, TypeError):
             raise Infra("judge endpoint returned an unexpected response shape") from None
-        time.sleep(1 + attempt)
+        if attempt < 2:
+            time.sleep(backoff * (1 + attempt))
     raise Infra(f"judge endpoint error: {last}")
 
 
@@ -121,7 +123,7 @@ def main():
         ]
         if missing:
             raise Infra("judge is not configured: missing " + ", ".join(missing))
-        timeout = float(os.environ.get("MINT_JUDGE_TIMEOUT", "90"))
+        timeout = float(os.environ.get("MINT_JUDGE_TIMEOUT", "30"))
         msgs = build_messages(
             rubric, evidence_text(tests / "evidence"), answer, spec.get("expected", "")
         )

@@ -250,3 +250,25 @@ def _harbor_grade_runner(request, monkeypatch):
 
         monkeypatch.setattr(gates, "LocalRunner", _HarborSim)
     monkeypatch.setattr("mint.gates.harbor_available", lambda: False)
+
+
+KEY = "fake-key-not-real"
+
+
+@pytest.fixture
+def judge(monkeypatch):
+    from .fake_judge import FakeJudge
+
+    fj = FakeJudge()
+    monkeypatch.setenv("MINT_JUDGE_BASE_URL", fj.url)
+    monkeypatch.setenv("MINT_JUDGE_API_KEY", KEY)
+    monkeypatch.delenv("MINT_JUDGE_MODEL", raising=False)
+    monkeypatch.setenv("MINT_JUDGE_BACKOFF", "0")
+    yield fj
+    fj.close()
+
+
+@pytest.fixture
+def no_judge_env(monkeypatch):
+    for v in ("MINT_JUDGE_BASE_URL", "MINT_JUDGE_API_KEY", "MINT_JUDGE_MODEL"):
+        monkeypatch.delenv(v, raising=False)

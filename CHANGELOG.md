@@ -92,6 +92,15 @@ change the command line or the artifact format; such changes are called out.
   `task_scope` as `TODO` (choose `full_job` | `subtask` | `decision`); only the `jobs.json`
   scaffold's own placeholders are rejected; `solve.sh` comments name the gold kind.
 
+- Mint: LLM judge as a last-resort check (ported from the judge branch): `check="judge"` with 3-6
+  yes/no criteria graded against copied task evidence by an OpenAI-compatible endpoint configured
+  only through `MINT_JUDGE_*` env vars; temperature 0, pinned model and rubric version in
+  `task.toml`, `verifiable = false`, required `SPEC["judge_reason"]`. New `judged` status, never
+  `validated`; judge failures are infra errors. `mint validate --judge` adds opt-in gates (reference
+  passes, empty/wrong fail, alternatives pass, 3x stability, run in parallel with the other gates)
+  and `mint judge-calibrate` records judge-vs-deterministic agreement per type. Skill: verifier
+  comes from what success means for the job, never from the logged agent's final output.
+
 ## [0.3.0] - unreleased
 
 `bandits` is now ingest only. Everything else was removed, to be rebuilt from

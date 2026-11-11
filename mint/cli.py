@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import __version__, explore, stages
 from . import evidence as evidence_mod
+from . import judge as judge_mod
 from . import report as report_mod
 from . import validate as validate_mod
 from .gates import LocalRunner, pick_runner
@@ -687,6 +688,20 @@ def cmd_validate(a, ws: Workspace) -> Result:
     return Result(s, "\n".join(lines), nxt, exit=code)
 
 
+def cmd_judge_calibrate(a, ws: Workspace) -> Result:
+    ws.config()
+    res = judge_mod.calibrate(
+        ws, a.type, a.n, Path(a.answers).expanduser() if a.answers else None, a.dry_run
+    )
+    lines = [e["what"] + f"; {e['why']}" for e in res["types"].values()]
+    lines.append(
+        "recorded as a decision (shown per type in `mint report`)"
+        if not a.dry_run
+        else "(dry-run: not recorded)"
+    )
+    return Result(res, "\n".join(lines), ["mint report"])
+
+
 def cmd_decide(a, ws: Workspace) -> Result:
     ws.config()
     entry = {
@@ -1012,6 +1027,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--judge",
         action="store_true",
         help="also run level 2 on judge tasks (costs model calls; needs MINT_JUDGE_* env vars)",
+    )
+
+    sp = add(
+        "judge-calibrate",
+        cmd_judge_calibrate,
+        "measure how often the judge agrees with a known verdict (costs model calls)",
+    )
+    sp.add_argument("--type", help="deterministic type to calibrate on (its tasks have a verifier)")
+    sp.add_argument("--n", type=int, default=20, help="tasks (or answers with --answers) to sample")
+    sp.add_argument(
+        "--answers", metavar="JSONL", help="externally graded {task_id, answer, true_reward}"
     )
 
     sp = add("decide", cmd_decide, "log a decision with its evidence")
