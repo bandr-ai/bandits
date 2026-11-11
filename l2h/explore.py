@@ -167,12 +167,15 @@ def sample_matching(ws: Workspace, check_id: str, n: int, unseen: bool, dry: boo
             r = "unknown"
         groups[r].append(t)
     rng = random.Random(f"{ws.config()['seed']}:matching:{check_id}:{len(seen)}")
-    half = max(1, n // 2)
-    chosen = []
+    pools = {}
     for label in ("fail", "pass"):
-        pool = list(groups[label])
-        rng.shuffle(pool)
-        chosen += [(label, t) for t in pool[:half]]
+        pools[label] = list(groups[label])
+        rng.shuffle(pools[label])
+    # n split across fails and passes (fails first), topped up from the other side
+    take = {"fail": min(len(pools["fail"]), (n + 1) // 2)}
+    take["pass"] = min(len(pools["pass"]), n - take["fail"])
+    take["fail"] = min(len(pools["fail"]), n - take["pass"])
+    chosen = [(label, t) for label in ("fail", "pass") for t in pools[label][: take[label]]]
     if not dry:
         _mark_seen(ws, [t["id"] for _, t in chosen])
     return {

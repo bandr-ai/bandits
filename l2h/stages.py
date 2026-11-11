@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import traceback
@@ -289,11 +290,16 @@ def source_strings(group: list[dict]) -> list[str]:
     return sorted(set(out))
 
 
-def package_hash(task_dir: Path) -> str:
+def package_hash(task_dir: Path, meta: dict | None = None) -> str:
+    """Fingerprint of what the gates judged: the package bytes plus the wrong answers and
+    alternatives the exec gates try (they live outside the package)."""
     h = []
     for p in sorted(task_dir.rglob("*")):
         if p.is_file():
             h.append(f"{p.relative_to(task_dir).as_posix()}:{sha(p.read_bytes())}")
+    if meta and (meta.get("wrong_answers") or meta.get("alternatives")):
+        h.append("wrong:" + json.dumps(meta.get("wrong_answers", [])))
+        h.append("alt:" + json.dumps(meta.get("alternatives", [])))
     return sha("\n".join(h))
 
 
@@ -416,7 +422,6 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     continue
                 row = new_row(res.task_id, tt.name, srcs, tt.generator, res.gold_type)
                 row["assumptions"] = list(res.assumptions)
-                row["content_hash"] = package_hash(dest)
                 hidden = [str(h) for h in res.hidden]
                 if res.answer.check != "forbidden":  # a negative task has no answer to hide
                     hidden.append(res.answer.canonical())
@@ -430,6 +435,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     "leak_allow": list(res.leak_allow),
                     "secret_allow": list(res.secret_allow),
                 }
+                row["content_hash"] = package_hash(dest, meta)
                 scan.apply(row, scan.scan_task(dest, meta, cfg))
                 allow = {
                     k: list(v)

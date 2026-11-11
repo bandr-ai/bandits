@@ -161,7 +161,7 @@ class Answer:
             )
         if self.check == "exact" and isinstance(self.expected, list | dict):
             raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
-        if "/" in self.file or self.file.startswith("."):
+        if not self.file.strip() or "/" in self.file or self.file.startswith("."):
             raise ContractError("answer.file must be a plain file name")
 
     def to_dict(self) -> dict:

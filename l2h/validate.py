@@ -35,9 +35,13 @@ def seeded_sample(items: list, k: int, seed: int, salt: str) -> list:
 def refresh_evidence(ws: Workspace, row: dict) -> None:
     """Drop gate evidence if the package on disk no longer matches what was gated."""
     d = ws.tasks / row["type"] / row["task_id"]
-    if not d.is_dir():
+    if not d.is_dir():  # deleted package: nothing it passed still counts
+        row["gates"].update(structure="not_run", leak="not_run", secrets="not_run", exec="not_run")
+        for k in ("runner", "trials", "exec_detail"):
+            row["gates"].pop(k, None)
+        finalize(row)
         return
-    now = package_hash(d)
+    now = package_hash(d, _meta(ws, row["task_id"]))
     if row.get("content_hash") and now != row["content_hash"]:
         # structure/leak were judged on the old content too: level 1 must re-run
         row["gates"].update(structure="not_run", leak="not_run", secrets="not_run", exec="not_run")

@@ -110,7 +110,7 @@ def solve_sh(ans: Answer, value: str | None = None) -> str:
         "# not that the answer is derivable from the inputs.\n"
         'ANSWER_DIR="${L2H_ANSWER_DIR:-/app/answer}"\n'
         'mkdir -p "$ANSWER_DIR"\n'
-        f"printf '%s\\n' {shlex.quote(value)} > \"$ANSWER_DIR/{ans.file}\"\n"
+        f"printf '%s\\n' {shlex.quote(value)} > \"$ANSWER_DIR\"/{shlex.quote(ans.file)}\n"
     )
 
 
