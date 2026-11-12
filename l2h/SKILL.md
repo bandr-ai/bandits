@@ -73,7 +73,7 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
   space, its output, graded on the real outcome. Do it in both input modes: logs only (rebuild the
   environment from what the runs read, wrote, ran and fetched: `l2h evidence <id>`; installs, source
   downloads and image pulls are allowed) and logs + harness (use the supplied harness, fill what it
-  lacks). Subtasks and decisions come after, as extras; they never cover a full job.
+  lacks). Subtasks and decisions come after as extras (`SPEC["task_scope"]`: `full_job` | `subtask` | `decision`).
 - **Never block a full job for being hard.** If a piece is missing, build it with the gap recorded
   (`env_source="partial"`, `gaps=[...]`, `oracle_kind="none"`), or return
   `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only
@@ -95,8 +95,7 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 - **Wrong outcomes are real mistakes.** With a custom verifier give `Outcome(script=...)` wrong
   outcomes that do plausible bad work (a broken build, a server that answers wrong) and valid
   alternatives that do it differently; the gates run them in the environment.
-- Instructions describe the task and never include the recorded answer. Gold lives only in `tests/`.
-- The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
+- Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
 - Earlier dataset-specific filters are not inherited; reassess every exclusion for the task at hand.
 - Stop and ask the user only for decisions that are theirs (scope, what counts as success), not for routine fixes.
 

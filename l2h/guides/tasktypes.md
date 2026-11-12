@@ -8,8 +8,8 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`l2h new tas
 - `applies(t, findings)` decides if a record can feed this type. Return `(False, "reason")` to leave a
   recorded exclusion reason. Records no type applies to land in `out/excluded.jsonl`.
 - `group_key(t)`: attempts sharing a key become one task. Merge repeated attempts here.
-- `SPEC["task_scope"]` (required; the scaffold leaves `TODO` so you choose): `full_job`, `subtask`
-  or `decision`. Build each `full_job` first:
+- `SPEC["task_scope"]` (required; the scaffold leaves `TODO` so you choose):
+  `full_job` | `subtask` | `decision`. Build each `full_job` first:
   the original request, starting state, tools/action space and output, graded on the real outcome.
   Subtasks and decisions are extras with their own honest scope; they never cover a full job.
   `l2h report` lists full jobs first.

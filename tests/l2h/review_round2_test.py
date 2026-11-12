@@ -144,7 +144,8 @@ def test_solve_sh_comment_names_the_gold_kind():
     v = solve_sh(a, gold_type="verified")
     assert "Oracle (verified gold)" in v and "logged answer" not in v
     assert "not that the answer" not in v
-    assert "computed from the task inputs" in solve_sh(a, gold_type="solved")
+    assert "fresh solve" in solve_sh(a, gold_type="solved")
+    assert "recomputed from the task inputs" in solve_sh(a, gold_type="computed")
 
 
 def test_skill_documents_missing_runtime_and_jobs_scaffold():
