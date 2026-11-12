@@ -192,8 +192,10 @@ python3 "$TESTS_DIR/grade.py" --expected "$TESTS_DIR/expected.json" \\
   --answer-dir "$ANSWER_DIR" --reward "$REWARD_DIR/reward.txt"
 """
 
-TESTS_DOCKERFILE = """FROM python:3.12-slim
+TESTS_DOCKERFILE = f"""FROM python:3.12-slim
 
+# Harbor uploads declared artifacts ({ANSWER_DIR}) into this image: the parent must exist
+RUN mkdir -p {ANSWER_DIR}
 COPY --chmod=755 . /tests/
 """
 
@@ -452,7 +454,10 @@ def structure_check(task_dir: Path) -> list[str]:
             m = re.match(r"\s*(COPY|ADD)\s+(.*)", line, re.I)
             if not m:
                 continue
-            toks = [t for t in shlex.split(m.group(2)) if not t.startswith("--")]
+            args = shlex.split(m.group(2))
+            if any(t.startswith("--from") for t in args):
+                continue  # multi-stage copy: the source lives in another build stage
+            toks = [t for t in args if not t.startswith("--")]
             for src in toks[:-1]:
                 if "://" in src or "$" in src or any(c in src for c in "*?["):
                     continue
@@ -520,6 +525,11 @@ def judge_problems(task_dir: Path, cfg: dict) -> list[str]:
             and all(isinstance(c, str) and c.strip() for c in crit)
         ):
             out.append(f"tests/rubric.json needs {RUBRIC_MIN}-{RUBRIC_MAX} non-empty criteria")
+        elif not (rubric_version(crit) == r.get("version") == meta.get("judge_rubric_version")):
+            out.append(
+                "tests/rubric.json criteria do not match the recorded rubric version "
+                "(edited after generation?): regenerate the task"
+            )
         if not str(r.get("model", "")).strip() or meta.get("judge_model") != r.get("model"):
             out.append(
                 "judge model is not pinned (set judge_model in mint.json or BuildResult.judge_model)"

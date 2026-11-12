@@ -399,7 +399,7 @@ def run_validate(
                 attempts[ttype] = attempts.get(ttype, 0) + 1
                 why = f"type failed sampled validation (attempt {attempts[ttype]}/{max_fix}); fix the generator and re-run `mint run generate`"
                 for r in trs:
-                    if r["gates"]["exec"] not in ("pass", "no_oracle"):
+                    if r["status"] != "validated":  # a host-local pass is not validated
                         r["blocked_reason"] = why
                         finalize(r)
             elif errs:

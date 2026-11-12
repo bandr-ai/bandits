@@ -75,6 +75,7 @@ class LocalRunner(Runner):
                 cwd=cwd,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=self.timeout,
             )
             return cp, ""
@@ -175,7 +176,9 @@ class HarborRunner(Runner):
                 "--job-name", "gate", "-n", "1", "-k", "1", "-q", "--delete",
             ]  # fmt: skip
             try:
-                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+                cp = subprocess.run(
+                    cmd, capture_output=True, text=True, errors="replace", timeout=self.timeout
+                )
             except subprocess.TimeoutExpired:
                 return RunOutcome("infra_error", detail=f"harbor timed out after {self.timeout}s")
             except OSError as e:

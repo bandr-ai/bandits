@@ -118,3 +118,16 @@ def test_package_matches_harbor_layout(env):
     assert cfg["task"]["name"] == "mint/addnums-t_q1"
     assert cfg["metadata"]["mint"]["sources"] == ["a.jsonl#0"]  # provenance in task.toml only
     assert (d / "tests/test.sh").stat().st_mode & 0o111
+
+
+def test_limited_parse_and_checks_are_previews(env):
+    """review: a --limit run must not look like a finished stage or drop saved findings."""
+    env.build_pipeline()
+    full = (env.ws / "out" / "findings.jsonl").read_text()
+    assert len(full.splitlines()) > 2
+    _, _, _, res = env.run("run", "checks", "--limit", "1", "--json")
+    assert res["data"]["limited"]
+    assert (env.ws / "out" / "findings.jsonl").read_text() == full  # nothing discarded
+    env.run("run", "parse", "--limit", "1")
+    _, out, _, _ = env.run("status")
+    assert "next: mint run parse" in out

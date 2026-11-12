@@ -170,6 +170,8 @@ def _stage_report(ws: Workspace) -> dict:
     except MINTError as e:
         jobs, jobs_err = {}, e.message
     parse = st.get("parse")
+    if parse and not parse.get("complete", True):
+        parse = None  # a --limit parse is a preview: the corpus is not parsed yet
     stale_parse = bool(
         parse and ws.parse_py.exists() and sha(ws.parse_py.read_text()) != parse["script"]
     )

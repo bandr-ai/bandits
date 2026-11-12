@@ -548,6 +548,12 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     fresh = row
                     row = old  # unchanged: keep exec evidence (idempotent rerun)...
                     row["sources"], row["generator"] = srcs, tt.generator
+                    # descriptive fields follow the current generator (gold, provenance, ...)
+                    for k in ("gold", "provenance", "assumptions", "check", "judge_reason"):
+                        if k in fresh:
+                            row[k] = fresh[k]
+                        else:
+                            row.pop(k, None)
                     # ...but structure/leak are re-judged now (hidden values may have changed)
                     for g in ("structure", "leak", "secrets"):
                         row["gates"][g] = fresh["gates"][g]
