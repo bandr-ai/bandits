@@ -3,7 +3,7 @@
 Status is always derived, never assigned freely:
   blocked     - leak or secret scan failed: the package must not be used as is
   exec_failed - the package is malformed (structure) or its exec gates failed, or its
-                type failed sampled validation (blocked_reason): it does not work yet
+                type failed sampled validation or a batch audit (blocked_reason)
   validated   - ONLY if exec gates ran and passed in a real Harbor run, oracle included
                 (and structure + leak + secrets passed). The host-local runner is a fast
                 verifier check, so its passes stay `generated`.

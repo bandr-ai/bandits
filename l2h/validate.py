@@ -188,7 +188,7 @@ def run_validate(
                     "max_fix_attempts": max_fix,
                     "causes": [],
                     "message": f"type {ttype!r} already used {attempts.get(ttype, 0)}/{max_fix} fix attempts; "
-                    "stop fixing it: `l2h decide` why, leave it blocked in the report, "
+                    "stop fixing it: `l2h decide` why, leave its tasks exec_failed / generated in the report, "
                     "or raise --max-fix-attempts deliberately",
                 }
                 continue
@@ -237,7 +237,7 @@ def run_validate(
             elif errs:
                 type_state = "infra_error"
             elif any(r.get("blocked_reason") for r in trs):
-                # nothing was sampled this run, but rows are still blocked by an earlier
+                # nothing was sampled this run, but rows are still exec_failed from an earlier
                 # failure: not "passed", and no attempt is spent or refunded
                 type_state = "failed"
             elif passed:

@@ -90,6 +90,47 @@ def _fetch_tool(call: Call) -> list[dict] | None:
 # Shell: only shapes whose meaning is unambiguous. Everything else stays a plain command.
 _PARTIAL_READERS = {"head", "tail", "sed", "awk", "grep", "less", "more"}
 _FULL_READERS = {"cat"}
+# programs that never create files: a command made only of these (and no redirect) can't
+# have produced a file a later step reads
+_NO_CREATE = (
+    _PARTIAL_READERS
+    | _FULL_READERS
+    | {
+        "ls",
+        "echo",
+        "printf",
+        "pwd",
+        "cd",
+        "wc",
+        "find",
+        "file",
+        "stat",
+        "which",
+        "type",
+        "diff",
+        "cmp",
+        "test",
+        "[",
+        "true",
+        "false",
+        "env",
+        "whoami",
+        "date",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "nl",
+        "md5sum",
+        "sha256sum",
+        "du",
+        "df",
+        "ps",
+        "id",
+        "uname",
+        "tree",
+    }
+)
 _REDIRECT_RE = re.compile(r"(?<![<>&\d])(>>?)\s*([^\s;&|<>]+)")
 
 
@@ -109,9 +150,12 @@ def _shell(call: Call) -> list[dict] | None:
     cmd = _shell_command(call.arguments)
     if cmd is None:
         return None
-    items: list[dict] = [{"kind": "commands", "command": cmd}]
+    cmd_item: dict = {"kind": "commands", "command": cmd, "opaque": False}
+    items: list[dict] = [cmd_item]
     for url in _URL_RE.findall(cmd):
         items.append({"kind": "sources", "url": url.rstrip(".,;")})
+    if "`" in cmd or "$(" in cmd:
+        cmd_item["opaque"] = True
     for op, target in _REDIRECT_RE.findall(cmd):
         if target.startswith(("/dev/", "&")):
             continue
@@ -133,6 +177,8 @@ def _shell(call: Call) -> list[dict] | None:
                 continue
             prog, rest = words[0].rsplit("/", 1)[-1], words[1:]
             files = [w for w in rest if not w.startswith("-") and w not in (">", ">>", "<")]
+            if prog not in _NO_CREATE or (prog == "sed" and "-i" in rest):
+                cmd_item["opaque"] = True  # may create or change files we can't see
             if prog == "tee":
                 for f in files:
                     items.append({"kind": "writes", "path": f, "complete": None, "note": "tee"})
@@ -165,12 +211,24 @@ def _interpret(call: Call) -> tuple[str | None, list[dict] | None]:
     return None, None
 
 
-def extract(t: Trajectory | dict, *, _prefix: str = "") -> dict:
-    """Evidence lists for one trajectory (and its subagents, refs prefixed `sub<i>/`)."""
+def extract(t: Trajectory | dict, *, _prefix: str = "", _seq: list | None = None) -> dict:
+    """Evidence lists for one trajectory (and its subagents, refs prefixed `sub<i>/`).
+
+    Every item carries `seq`, the call's position in the run (subagents after the parent),
+    so reads and writes can be ordered. Commands that may create or change files l2h can't
+    see are `opaque`; calls to tools without an interpreter are listed under `unknown`.
+    """
     t = t if isinstance(t, Trajectory) else Trajectory(t)
+    seq = _seq if _seq is not None else [0]
     ev: dict = {k: [] for k in KINDS} | {"unknown": []}
     for c in t.calls():
-        ref = {"step": f"{_prefix}{c.step.get('step_id')}", "call": c.id, "tool": c.name}
+        seq[0] += 1
+        ref = {
+            "step": f"{_prefix}{c.step.get('step_id')}",
+            "call": c.id,
+            "tool": c.name,
+            "seq": seq[0],
+        }
         by, items = _interpret(c)
         if not items:
             ev["unknown"].append({**ref, "args": sorted(c.arguments)})
@@ -179,35 +237,49 @@ def extract(t: Trajectory | dict, *, _prefix: str = "") -> dict:
             kind = it.pop("kind")
             ev.setdefault(kind, []).append({**ref, "by": by, **it})
     for i, sub in enumerate(t.subagents):
-        sev = extract(sub, _prefix=f"{_prefix}sub{i}/")
+        sev = extract(sub, _prefix=f"{_prefix}sub{i}/", _seq=seq)
         for k, v in sev.items():
             ev.setdefault(k, []).extend(v)
     return ev
 
 
 def starting_files(ev: dict) -> list[dict]:
-    """Paths read before anything in the run wrote them: candidate starting state.
+    """Paths read before the run was seen writing them: candidate starting state.
 
-    Paths the run wrote first are outputs (they belong in the hidden reference, not the
-    starting environment). Order is by first read; `complete` is the best evidence seen.
+    Within one call, writes count first (`gen > out; cat out` reads its own output).
+    `pre_existing`: True when nothing before the read could have created the file (no earlier
+    opaque command or uninterpreted tool, and the read isn't inside an opaque command);
+    None (unknown) otherwise: e.g. `tar xf a.tgz` then `cat src/x.c`. Paths the run wrote
+    first are outputs and are left out. `complete` is the best evidence seen.
     """
-    order = _ordered(ev)
+    opaque_seqs = sorted(
+        {i["seq"] for i in ev.get("commands", []) if i.get("opaque")}
+        | {i["seq"] for i in ev.get("unknown", [])}
+    )
+    events = [(i["seq"], 0, "writes", i) for i in ev.get("writes", []) if i.get("path")]
+    events += [(i["seq"], 1, "reads", i) for i in ev.get("reads", []) if i.get("path")]
     written: set = set()
     seen: dict[str, dict] = {}
-    for kind, item in order:
-        p = item.get("path")
-        if not p:
-            continue
+    for sq, _, kind, item in sorted(events, key=lambda e: (e[0], e[1])):
+        p = item["path"]
         if kind == "writes":
             written.add(p)
-        elif kind == "reads" and p not in written:
-            best = seen.get(p)
-            if best is None:
-                seen[p] = {"path": p, "complete": item.get("complete"), "refs": [item["step"]]}
-            else:
-                best["refs"].append(item["step"])
-                if item.get("complete") is True:
-                    best["complete"] = True
+            continue
+        if p in written:
+            continue
+        best = seen.get(p)
+        if best is None:
+            opaque_before = any(o < sq for o in opaque_seqs) or sq in opaque_seqs
+            seen[p] = {
+                "path": p,
+                "complete": item.get("complete"),
+                "pre_existing": None if opaque_before else True,
+                "refs": [item["step"]],
+            }
+        else:
+            best["refs"].append(item["step"])
+            if item.get("complete") is True:
+                best["complete"] = True
     return list(seen.values())
 
 
@@ -218,19 +290,6 @@ def outputs(ev: dict) -> list[str]:
         if item.get("path") and item["path"] not in out:
             out.append(item["path"])
     return out
-
-
-def _step_key(step: str) -> tuple:
-    """Natural sort key for step refs like '12' or 'sub0/3' (numbers compare as numbers)."""
-    return tuple(
-        (0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.findall(r"\d+|\D+", step)
-    )
-
-
-def _ordered(ev: dict) -> list[tuple[str, dict]]:
-    """reads/writes in step order (a read and a write in one call: read first)."""
-    pairs = [(k, i) for k in ("reads", "writes") for i in ev.get(k, [])]
-    return sorted(pairs, key=lambda p: (_step_key(str(p[1].get("step"))), p[0] != "reads"))
 
 
 def summary(ev: dict) -> dict:

@@ -96,6 +96,9 @@ def test_full_job_custom_verifier_outcomes_candidates_and_report(env):
     assert "| 2 | 1 | 1 | 1 |" in row  # 2 tasks, 1 validated, 1 ready, 1 candidate
     assert "fidelity: input file seen only in part" in row
     assert "candidate q3: source archive not in the logs" in md
+    assert "| 2 | 1 | 1 | 1 | 0 | 2 |" in row  # ...candidates, blocked, errors (2 bad blocks)
+    # runs whose full job errored are not covered: they show up instead of disappearing
+    assert "Trajectories with no full-job task or candidate: **2 of 5**" in md
 
 
 def test_broken_verifier_is_caught_by_an_executable_wrong_outcome(env):

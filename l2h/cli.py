@@ -369,10 +369,15 @@ def cmd_evidence(a, ws: Workspace) -> Result:
     sm = evidence_mod.summary(ev)
     d = {"id": a.id, "summary": sm, "evidence": ev}
     lines = [f"{a.id}: " + ", ".join(f"{k} {v}" for k, v in sm["counts"].items())]
-    lines.append("starting-file candidates (read before written; complete: yes/no/unknown):")
+    lines.append(
+        "starting-file candidates (read before written; complete / pre_existing: yes/no/unknown):"
+    )
+    yn = {True: "yes", False: "no", None: "unknown"}
     for f in sm["starting_files"][: None if a.full else 30]:
-        c = {True: "yes", False: "no", None: "unknown"}[f["complete"]]
-        lines.append(f"  {f['path']}  complete={c}  steps={','.join(f['refs'][:5])}")
+        lines.append(
+            f"  {f['path']}  complete={yn[f['complete']]}  pre_existing={yn[f['pre_existing']]}"
+            f"  steps={','.join(f['refs'][:5])}"
+        )
     lines.append("outputs (written by the run): " + (", ".join(sm["outputs"][:30]) or "-"))
     lines.append("sources fetched: " + (", ".join(sm["sources"][:20]) or "-"))
     if sm["unknown_tools"]:

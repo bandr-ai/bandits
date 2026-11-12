@@ -122,3 +122,33 @@ def test_broken_interpreter_does_not_hide_the_call():
         assert ev["unknown"] and "boom failed" in ev["unknown"][0]["note"]
     finally:
         evidence._REGISTRY[:] = [e for e in evidence._REGISTRY if e[0] != "boom"]
+
+
+def test_a_file_written_and_read_in_one_command_is_not_a_starting_file():
+    t = Trajectory(
+        {
+            "steps": [
+                step(1, [("bash", {"command": "python gen.py > out.txt && cat out.txt"})], ["42"])
+            ]
+        }
+    )
+    s = evidence.summary(evidence.extract(t))
+    assert "out.txt" not in {f["path"] for f in s["starting_files"]}
+    assert "out.txt" in s["outputs"]
+
+
+def test_files_an_opaque_command_may_have_created_are_not_assumed_pre_existing():
+    t = Trajectory(
+        {
+            "steps": [
+                step(1, [("bash", {"command": "cat README.md"})], ["hi"]),
+                step(2, [("bash", {"command": "tar xf src.tar.gz"})], [""]),
+                step(3, [("bash", {"command": "cat src/main.c"})], ["int main"]),
+                step(4, [("bash", {"command": "make && cat build.log"})], ["ok"]),
+            ]
+        }
+    )
+    files = {f["path"]: f for f in evidence.starting_files(evidence.extract(t))}
+    assert files["README.md"]["pre_existing"] is True  # nothing ran before that could create it
+    assert files["src/main.c"]["pre_existing"] is None  # tar may have created it
+    assert files["build.log"]["pre_existing"] is None  # make may have, in the same command

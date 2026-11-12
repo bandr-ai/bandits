@@ -25,14 +25,15 @@ runs against: the oracle (solve.sh) must pass; doing nothing must fail; each wro
 `Outcome` script must fail; each alternative must pass. An `Outcome` runs in place of solve.sh, so it
 can do real bad work (a broken build, a wrong service). With no oracle (`oracle_kind="none"`) the
 other gates still run and `exec` is `no_oracle`: the task stays `generated`. Runner is `local` (no Docker): result rows record it.
-Verifier crashes, missing reward files and timeouts are **errors**, not failures, and never block a task.
+Verifier crashes, missing reward files, timeouts and Harbor build/agent errors are **infra errors**,
+not task failures: the task stays `generated` (never `exec_failed` or `blocked`) until a clean run.
 
-A type whose sample fails blocks its unvalidated tasks and uses one fix attempt
+A type whose sample fails marks its unvalidated tasks `exec_failed` and uses one fix attempt
 (`--max-fix-attempts`, default 3). After that, stop and report. Fix, `l2h run generate`, `l2h validate`.
 
 Level 3: `l2h validate --level 3` lists a seeded sample per type. Read them with `l2h task show`.
 Record `l2h decide "..." --kind audit --verdict pass|fail --type T --task ID --why ...`.
-A fail blocks the type until regenerated. Also record `--kind derivability` after checking the
+A fail marks the type's tasks `exec_failed` until regenerated. Also record `--kind derivability` after checking the
 answer can really be derived from the visible inputs.
 
 Status: `validated` = exec gates passed, oracle included, in a real Harbor run (host-local passes

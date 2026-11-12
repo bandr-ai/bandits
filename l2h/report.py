@@ -119,16 +119,27 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
         "Each full job's own tasks only; subtasks and decisions are listed per type below and "
         "never count as covering a full job.",
         "",
-        "| job | task types | tasks | validated | ready | candidates | env | oracle | grading | gaps |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| job | task types | tasks | validated | ready | candidates | blocked | errors | env | oracle | grading | gaps |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     missing = []
+    covered_src: set = set()
+    covered_ids: set = set()
     for jid, j in jobs.items():
         if j["scope"] != "full_job":
             continue
         names = full_types.get(jid, [])
         rs = [r for n in names for r in by_type.get(n, [])]
         cands = [q for q in queue if q["type"] in names and q["kind"] == "candidate"]
+        n_blocked = sum(1 for q in queue if q["type"] in names and q["kind"] == "blocked")
+        n_err = sum(1 for q in queue if q["type"] in names and q["kind"] == "exception")
+        covered_src.update(x for r in rs for x in r["sources"])
+        covered_ids.update(
+            i
+            for q in queue
+            if q["type"] in names and q["kind"] in ("candidate", "blocked")
+            for i in q["trajectory_ids"]
+        )
         provs = [r.get("provenance") or {} for r in rs]
         env = Counter(p.get("env_source") or "evidence" for p in provs)
         orc = Counter(p.get("oracle") or "answer" for p in provs)
@@ -149,7 +160,8 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
         n_val = sum(1 for r in rs if r["status"] == "validated")
         L.append(
             f"| {jid} | {', '.join(names) or '**none**'} | {len(rs)} | {n_val} | {n_ready} | "
-            f"{len(cands)} | {fmt(env)} | {fmt(orc)} | {fmt(grad)} | {fmt(gaps)} |"
+            f"{len(cands)} | {n_blocked} | {n_err} | {fmt(env)} | {fmt(orc)} | {fmt(grad)} | "
+            f"{fmt(gaps)} |"
         )
         if not rs and not cands:
             missing.append(jid)
@@ -163,6 +175,19 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
             "",
             "**Full jobs with no task and no candidate (every full job needs at least a "
             f"candidate):** {', '.join(missing)}",
+        ]
+    if ws.trajectories.exists():
+        trajs = load_trajectories(ws)
+        uncovered = [
+            t["id"]
+            for t in trajs
+            if t["id"] not in covered_ids and not (set(source_strings([t])) & covered_src)
+        ]
+        L += [
+            "",
+            f"Trajectories with no full-job task or candidate: **{len(uncovered)} of {len(trajs)}**"
+            + (f" (e.g. {', '.join(uncovered[:10])})" if uncovered else "")
+            + ". Each logged run was doing some job: map it, build it, or say why in a decision.",
         ]
     L += [
         "",
