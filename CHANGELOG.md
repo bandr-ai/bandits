@@ -12,6 +12,9 @@ change the command line or the artifact format; such changes are called out.
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.
   Existing experimental workspaces and parser scripts must be regenerated or
   migrated to these names; the old command/import are removed.
+- `mint validate` runs gate runs in parallel (`-j/--jobs`, config `validate_jobs`, default 4)
+  and saves each task's result as soon as it finishes; a rerun skips tasks whose package and
+  runner evidence are current. Per-task progress on stderr and wall time in the summary.
 
 
 ### Added

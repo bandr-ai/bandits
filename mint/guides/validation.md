@@ -50,3 +50,13 @@ Runners (`mint validate --runner auto|harbor|local`): `harbor` runs each gate wi
 alternative answer), so images are built and the answer reaches the separate verifier. `auto`
 uses it when `harbor` and `docker` are on PATH, otherwise the fast host-local runner, whose passes
 leave tasks `generated`. Harbor build/timeout/agent errors are infra errors, not task failures.
+
+Parallel and resumable: `mint validate -j N` (`--jobs`; config `validate_jobs` in mint.json, default 4;
+`-j 1` = one run at a time) runs the independent gate runs (oracle, no-op, each wrong answer and
+alternative) of all sampled tasks on one thread pool. Results and ordering are the same as `-j 1`.
+Each task is saved (`out/results.jsonl` + `.mint/gates/<id>.json`) the moment its gates finish and
+progress is printed per task on stderr, so a killed run keeps its finished tasks. Re-run `mint validate`
+to continue: a task whose package, wrong answers and alternatives are unchanged and whose saved pass/fail
+came from the same runner is not run again (`--task` still re-runs the ids you name). A saved failure
+from an interrupted run is counted against the type's fix budget once, on the next run. The summary
+shows wall seconds. Keep `-j` within what Docker and the machine can build at once.
