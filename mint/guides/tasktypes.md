@@ -1,7 +1,9 @@
 # Task types
 
 Every type rebuilds one job end to end: `SPEC["job"]` is its id from `jobs.json`. Mint builds whole
-jobs only (no subtasks, no decision-from-evidence tasks).
+jobs only: no subtasks and no *extracted intermediate* decision tasks (a step's or sub-agent's
+decision pulled out of a larger job). A job whose whole assignment is a classification/decision is a
+normal job: an answer-file task.
 
 A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new tasktype <name>`).
 
@@ -25,11 +27,16 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
 - Starting state = the world at the agent's first action in this task. `mint evidence <id>` lists what
   each run read (complete only when proven), wrote, ran and fetched, with step refs.
   - Environment: files named in the request or read before anything could have created them
-    (`pre_existing`), OS/runtime shown by version output (smallest matching base), and setup done
-    before the agent started (harness, image).
+    (`pre_existing`), OS/runtime shown by version/OS queries, and setup done before the agent
+    started (harness, image). Base image: a supplied Dockerfile/harness wins; otherwise choose one
+    consistent with the observed facts and record as gaps only the unknowns that matter for the job
+    (not every package).
   - Not environment: whatever the agent installed, configured, downloaded, built or wrote. That is
     the job: it goes in the solution (`replay`), never the Dockerfile.
-  - `command not found` / a missing module: the agent didn't have it; don't pre-install it.
+  - `not_on_path` / `module_missing` facts with `before_agent_setup`: the agent didn't have it at
+    the start; don't pre-install it. Later ones only describe that moment. `Unable to locate package`
+    (`package_lookup_failed`) is a failed lookup, not absence. System facts come only from
+    version/OS query commands, never from the contents of files the agent read.
   - Unknown → a gap (`affects: fidelity`), not a convenient guess.
 - Wrong answers / alternatives: strings for answer-file tasks; `Outcome(script="...")` for any task
   (a bash script run in the environment instead of solve.sh). Wrong ones must be *meaningful* (a

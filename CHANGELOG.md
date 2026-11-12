@@ -12,6 +12,11 @@ change the command line or the artifact format; such changes are called out.
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.
   Existing experimental workspaces and parser scripts must be regenerated or
   migrated to these names; the old command/import are removed.
+- `mint evidence`: starting-state facts keep their command, step, tool and
+  `before_agent_setup`. System facts only come from version/OS query commands;
+  absence is `not_on_path` / `module_missing`; `Unable to locate package` is
+  `package_lookup_failed`. The "smallest matching base image" rule is gone. A job
+  whose whole assignment is a decision is a normal answer-file job.
 
 
 ### Added
