@@ -345,8 +345,8 @@ def package_hash(task_dir: Path, meta: dict | None = None) -> str:
         if p.is_file():
             h.append(f"{p.relative_to(task_dir).as_posix()}:{sha(p.read_bytes())}")
     if meta and (meta.get("wrong_answers") or meta.get("alternatives")):
-        h.append("wrong:" + json.dumps(meta.get("wrong_answers", [])))
-        h.append("alt:" + json.dumps(meta.get("alternatives", [])))
+        h.append("wrong:" + json.dumps(meta.get("wrong_answers", []), sort_keys=True, default=str))
+        h.append("alt:" + json.dumps(meta.get("alternatives", []), sort_keys=True, default=str))
     return sha("\n".join(h))
 
 

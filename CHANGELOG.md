@@ -7,6 +7,13 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+- Mint skill cut to a four-step workflow (read and group, build, check and fix,
+  report); source notes, spot-checks and decisions are optional. Build scaffolds
+  with connection points for missing data instead of stopping at candidates.
+  Interaction guidance (scripted or model-backed customer, no future consent
+  upfront). Grader guidance: enforce only supported requirements, exact money
+  (reject NaN/inf), history checks only where needed. Package hash sorts outcome
+  keys so regeneration keeps validation.
 - Rename the logs-to-tasks tool from `l2h` to **Mint**: command/import `mint`,
   bundled skill `mint`, workspace `mint.json`, `MINT_*` environment variables,
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.

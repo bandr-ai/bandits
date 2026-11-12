@@ -46,6 +46,14 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   - Check the outcome the request asks for (a computed result, real behaviour), never a printed
     marker or a file's mere presence: a fake binary that echoes the expected text must fail.
   - Accept valid alternatives (layout, naming, approach); do not hard-code one path or one tool.
+  - Enforce only what the original job or its policy supports: no added authentication steps,
+    minimality, naming or whole-state equality rules unless the original requires them. Don't merge
+    values the original treats as different (e.g. two distinct reason codes).
+  - Check action history only where the requirement depends on it (consent before a mutation).
+  - Money and numbers: reject NaN/inf; compare exact units (integer cents or exact decimals).
+  - Don't add a separate answer/report the solver must write when tool results already are the outcome.
+  - "No change" targets (correct refusal/escalation): no-op may pass only if the response or
+    escalation is also checked.
   - Give wrong outcomes that try the obvious shortcut (a stub printing the expected text, hard-coding
     the expected value) and alternatives that do the job differently. Add `source="..."` to each
     `Outcome` (free text: "logged attempt X, outcome known from ...", "synthetic shortcut").
