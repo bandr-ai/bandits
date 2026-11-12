@@ -225,9 +225,11 @@ def _stage_report(ws: Workspace) -> dict:
         blockers.append(f"{p['records_in_no_trajectory']} raw records landed in no trajectory")
     q = read_jsonl(ws.queue)
     if q:
-        blockers.append(f"{len(q)} queued blocked/exception groups (out/queue.jsonl)")
+        blockers.append(f"{len(q)} queued candidate/blocked/exception groups (out/queue.jsonl)")
     if sc["blocked"]:
-        blockers.append(f"{sc['blocked']} blocked tasks")
+        blockers.append(f"{sc['blocked']} blocked tasks (leak/secret)")
+    if sc["exec_failed"]:
+        blockers.append(f"{sc['exec_failed']} tasks whose package does not work (exec_failed)")
     errs = [r["task_id"] for r in rows if r["gates"]["exec"] == "error"]
     if errs:
         blockers.append(f"{len(errs)} tasks with infrastructure errors in exec gates")

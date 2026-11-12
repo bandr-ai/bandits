@@ -222,7 +222,7 @@ def test_report_lists_jobs_and_unbuilt_ones(env):
     env.run("run", "generate")
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert "## Jobs" in md and "| main | full_job |  | addnums |" in md
+    assert "## Jobs" in md and "| main | full_job |  | addnums (decision) |" in md
     assert "Jobs with no task type yet (say why in a decision): sub" in md
 
 

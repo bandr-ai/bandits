@@ -45,6 +45,18 @@ class Runner:
     def run_solution(self, task_dir: Path) -> RunOutcome: ...
     def run_verifier(self, task_dir: Path, answer: dict[str, str] | None) -> RunOutcome: ...
 
+    def run_script(self, task_dir: Path, script: str) -> RunOutcome:
+        """Run an executable outcome: a copy of the task whose solve.sh is `script`."""
+        with tempfile.TemporaryDirectory(prefix="l2h-outcome-") as tmp:
+            copy = Path(tmp) / task_dir.name
+            shutil.copytree(task_dir, copy)
+            solve = copy / "solution" / "solve.sh"
+            solve.parent.mkdir(exist_ok=True)
+            body = script if script.startswith("#!") else "#!/bin/bash\n" + script
+            solve.write_text(body.rstrip("\n") + "\n")
+            solve.chmod(0o755)
+            return self.run_solution(copy)
+
 
 @dataclass
 class LocalRunner(Runner):
@@ -250,29 +262,47 @@ def derive_wrong(expected_canonical: str, check: str) -> str:
     return expected_canonical + " (wrong)"
 
 
+def _try(runner: Runner, task_dir: Path, answer_file: str | None, item) -> tuple[dict, RunOutcome]:
+    """Run one wrong answer / alternative: a string goes in the answer file, an Outcome runs."""
+    if isinstance(item, dict):
+        out = runner.run_script(task_dir, item["script"])
+        return {"script": item.get("note") or item["script"][:80]}, out
+    if not answer_file:
+        return {"answer": str(item)}, RunOutcome(
+            "infra_error", detail="a string answer needs an answer file; use an Outcome script"
+        )
+    return {"answer": str(item)}, runner.run_verifier(task_dir, {answer_file: str(item)})
+
+
 def run_exec_gates(
     runner: Runner,
     task_dir: Path,
-    answer_file: str,
-    wrong: list[str],
-    alternatives: list[str],
+    answer_file: str | None,
+    wrong: list,
+    alternatives: list,
     auto_wrong: bool,
 ) -> dict:
-    """Run oracle / no-op / wrong-answer / alternatives. Value = gate satisfied?"""
+    """Run oracle / no-op / wrong outcomes / alternatives. Value = gate satisfied?
+
+    No solution/solve.sh (oracle_kind none): the oracle is not run and, if every other gate
+    passes, exec is `no_oracle` (the task can be generated, never validated)."""
     detail: dict[str, dict] = {}
 
     outs: list[RunOutcome] = []
-    o = runner.run_solution(task_dir)
-    outs.append(o)
-    detail["oracle"] = {"gate": verdict(o, True), **o.to_dict()}
+    if (task_dir / "solution" / "solve.sh").is_file():
+        o = runner.run_solution(task_dir)
+        outs.append(o)
+        detail["oracle"] = {"gate": verdict(o, True), **o.to_dict()}
+    else:
+        detail["oracle"] = {"gate": "not_run", "detail": "no oracle (oracle_kind none)"}
     n = runner.run_verifier(task_dir, {})
     outs.append(n)
     detail["noop"] = {"gate": verdict(n, False), **n.to_dict()}
     wrongs = []
     for w in wrong:
-        r = runner.run_verifier(task_dir, {answer_file: str(w)})
+        label, r = _try(runner, task_dir, answer_file, w)
         outs.append(r)
-        wrongs.append({"answer": str(w), "gate": verdict(r, False), **r.to_dict()})
+        wrongs.append({**label, "gate": verdict(r, False), **r.to_dict()})
     detail["wrong"] = {
         "gate": _combine([w["gate"] for w in wrongs]) if wrongs else "error",
         "auto": auto_wrong,
@@ -280,9 +310,9 @@ def run_exec_gates(
     }
     alts = []
     for a in alternatives:
-        r = runner.run_verifier(task_dir, {answer_file: str(a)})
+        label, r = _try(runner, task_dir, answer_file, a)
         outs.append(r)
-        alts.append({"answer": str(a), "gate": verdict(r, True), **r.to_dict()})
+        alts.append({**label, "gate": verdict(r, True), **r.to_dict()})
     detail["alternatives"] = {
         "gate": _combine([a["gate"] for a in alts]) if alts else "not_run",
         "runs": alts,
@@ -292,6 +322,8 @@ def run_exec_gates(
         exec_state = "fail"
     elif "error" in gates:
         exec_state = "error"
+    elif detail["oracle"]["gate"] == "not_run":
+        exec_state = "no_oracle"
     else:
         exec_state = "pass"
     trials = sorted({x.trial for x in outs if x.trial}) if all(x.trial for x in outs) else []

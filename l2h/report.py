@@ -23,7 +23,7 @@ def outcomes(ws: Workspace) -> dict:
         if set(source_strings([t])) & used_src:
             res["used"] += 1
         elif t["id"] in queued:
-            res["blocked"] += 1
+            res["queued"] += 1
         elif t["id"] in excluded:
             res["excluded"] += 1
         else:
@@ -58,6 +58,7 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     except L2HError as e:
         return ["", "## Jobs", "", f"- job map unavailable: {e.message}"]
     types_of: dict[str, list[str]] = defaultdict(list)
+    scope_of = {t.name: t.spec.get("task_scope") for t in tts}
     for t in tts:
         types_of[t.spec.get("job")].append(t.name)
     L = [
@@ -69,13 +70,106 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     ]
     for jid, j in jobs.items():
         names = types_of.get(jid, [])
-        n = sum(len(by_type.get(t, [])) for t in names)
-        L.append(
-            f"| {jid} | {j['scope']} | {j.get('parent') or ''} | {', '.join(names) or 'none'} | {n} |"
-        )
+        n = ", ".join(f"{len(by_type.get(t, []))} {scope_of.get(t)}" for t in names) or "0"
+        labelled = ", ".join(f"{t} ({scope_of.get(t)})" for t in names) or "none"
+        L.append(f"| {jid} | {j['scope']} | {j.get('parent') or ''} | {labelled} | {n} |")
     unbuilt = [jid for jid in jobs if not types_of.get(jid)]
     if unbuilt:
         L += ["", f"Jobs with no task type yet (say why in a decision): {', '.join(unbuilt)}"]
+    return L
+
+
+# grading trust that is not independent of the logged run: never counted as ready
+WEAK_TRUST = ("imitation", "negative", "none")
+
+
+def ready(row: dict) -> tuple[bool, list[str]]:
+    """Ready = validated, environment not partial, grading trust independent of the logged
+    answer, and no gap affecting execution, fidelity or grading. Computed, never declared."""
+    why = []
+    if row["status"] != "validated":
+        why.append(f"status {row['status']}")
+    prov = row.get("provenance") or {}
+    if prov.get("env_source") == "partial":
+        why.append("environment partial")
+    if row.get("gold") in WEAK_TRUST:
+        why.append(f"grading trust {row.get('gold')}")
+    open_gaps = [g for g in prov.get("gaps") or [] if g.get("affects") != "none"]
+    if open_gaps:
+        why.append(f"{len(open_gaps)} open gap(s)")
+    return not why, why
+
+
+def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
+    """One row per full job in jobs.json: what exists for it, how ready, what is missing.
+    Children never count here."""
+    try:
+        jobs = load_jobs(ws)
+        tts = load_tasktypes(ws)
+    except L2HError as e:
+        return ["## Full jobs", "", f"- job map unavailable: {e.message}", ""]
+    full_types = defaultdict(list)
+    for t in tts:
+        if t.spec.get("task_scope") == "full_job":
+            full_types[t.spec.get("job")].append(t.name)
+    queue = read_jsonl(ws.queue)
+    L = [
+        "## Full jobs",
+        "",
+        "Each full job's own tasks only; subtasks and decisions are listed per type below and "
+        "never count as covering a full job.",
+        "",
+        "| job | task types | tasks | validated | ready | candidates | env | oracle | grading | gaps |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    missing = []
+    for jid, j in jobs.items():
+        if j["scope"] != "full_job":
+            continue
+        names = full_types.get(jid, [])
+        rs = [r for n in names for r in by_type.get(n, [])]
+        cands = [q for q in queue if q["type"] in names and q["kind"] == "candidate"]
+        provs = [r.get("provenance") or {} for r in rs]
+        env = Counter(p.get("env_source") or "evidence" for p in provs)
+        orc = Counter(p.get("oracle") or "answer" for p in provs)
+        grad = Counter(
+            f"{(p.get('grading') or {}).get('method') or '?'}/{r.get('gold')}"
+            for p, r in zip(provs, rs, strict=True)
+        )
+        gaps = Counter(
+            f"{g['affects']}: {g['what']}"
+            for src in [*provs, *cands]
+            for g in src.get("gaps") or []
+        )
+
+        def fmt(c):
+            return ", ".join(f"{k} x{v}" for k, v in c.most_common(3)) or "-"
+
+        n_ready = sum(1 for r in rs if ready(r)[0])
+        n_val = sum(1 for r in rs if r["status"] == "validated")
+        L.append(
+            f"| {jid} | {', '.join(names) or '**none**'} | {len(rs)} | {n_val} | {n_ready} | "
+            f"{len(cands)} | {fmt(env)} | {fmt(orc)} | {fmt(grad)} | {fmt(gaps)} |"
+        )
+        if not rs and not cands:
+            missing.append(jid)
+        for q in cands[:5]:
+            L.append(
+                f"  - candidate {q['group']}: {q['reason']}"
+                + (f"; next: {q['next_action']}" if q.get("next_action") else "")
+            )
+    if missing:
+        L += [
+            "",
+            "**Full jobs with no task and no candidate (every full job needs at least a "
+            f"candidate):** {', '.join(missing)}",
+        ]
+    L += [
+        "",
+        "ready = validated, environment not partial, grading trust not "
+        f"{'/'.join(WEAK_TRUST)}, no open gaps.",
+        "",
+    ]
     return L
 
 
@@ -121,9 +215,14 @@ def build_report(ws: Workspace) -> str:
     if oc:
         L.append(
             f"- outcome per trajectory: used={oc.get('used', 0)}, excluded={oc.get('excluded', 0)}, "
-            f"blocked={oc.get('blocked', 0)}, **unaccounted={oc.get('unaccounted', 0)}**"
+            f"queued (candidate/blocked)={oc.get('queued', 0)}, "
+            f"**unaccounted={oc.get('unaccounted', 0)}**"
         )
     L.append("")
+    by = defaultdict(list)
+    for r in rows:
+        by[r["type"]].append(r)
+    L += _full_job_lines(ws, by)
 
     L += ["## Findings and exclusion rates per check", ""]
     c = st.get("checks", {}).get("summary")
@@ -153,9 +252,6 @@ def build_report(ws: Workspace) -> str:
     L.append("")
 
     L += ["## Tasks per type", ""]
-    by = defaultdict(list)
-    for r in rows:
-        by[r["type"]].append(r)
     if rows:
         try:
             tts = load_tasktypes(ws)
@@ -163,14 +259,17 @@ def build_report(ws: Workspace) -> str:
             tts = []
         scopes = {t.name: t.spec.get("task_scope") for t in tts}
         L += [
-            "| type | scope | tasks | validated | generated | blocked | verified | solved | imitation | negative |",
-            "|---|---|---|---|---|---|---|---|---|---|",
+            "| type | scope | tasks | validated | ready | generated | exec_failed | blocked | gold (trust) |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for t, rs in sorted(by.items()):
             sc, gc = Counter(r["status"] for r in rs), Counter(r["gold"] for r in rs)
             scope = SCOPE_LABEL.get(scopes.get(t), "unknown")
+            n_ready = sum(1 for r in rs if ready(r)[0])
+            gold = ", ".join(f"{k} {v}" for k, v in sorted(gc.items()))
             L.append(
-                f"| {t} | {scope} | {len(rs)} | {sc['validated']} | {sc['generated']} | {sc['blocked']} | {gc['verified']} | {gc['solved']} | {gc['imitation']} | {gc['negative']} |"
+                f"| {t} | {scope} | {len(rs)} | {sc['validated']} | {n_ready} | {sc['generated']} | "
+                f"{sc['exec_failed']} | {sc['blocked']} | {gold} |"
             )
         L += ["", SCOPE_NOTE, "", VALIDATED_NOTE, ""]
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
@@ -225,10 +324,10 @@ def build_report(ws: Workspace) -> str:
         L.append("- none")
     L.append("")
 
-    L += ["## Blocked", ""]
-    blocked = [r for r in rows if r["status"] == "blocked"]
+    L += ["## Blocked, failed and candidates", ""]
+    blocked = [r for r in rows if r["status"] in ("blocked", "exec_failed")]
     for r in blocked[:30]:
-        L.append(f"- task {r['task_id']} ({r['type']}): {r.get('reason')}")
+        L.append(f"- {r['status']} task {r['task_id']} ({r['type']}): {r.get('reason')}")
     for q in read_jsonl(ws.queue):
         L.append(
             f"- {q['kind']} {q['type']}/{q['group']}: {q['reason']}"

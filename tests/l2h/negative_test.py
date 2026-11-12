@@ -64,8 +64,8 @@ def test_negative_task_gates_and_verifier(env):
     env.run("report")
     md = (env.ws / "report.md").read_text()
     assert (
-        "| negative |" in md
-        and "| neg | decision-from-evidence | 4 | 4 | 0 | 0 | 0 | 0 | 0 | 4 |" in md
+        "| gold (trust) |" in md
+        and "| neg | decision-from-evidence | 4 | 4 | 0 | 0 | 0 | 0 | negative 4 |" in md
     )
     assert "validated (negative): 4" in md
 

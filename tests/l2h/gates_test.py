@@ -135,14 +135,14 @@ def test_never_validated_without_exec_gates():
     assert finalize(row(exec_="pass", runner="harbor"))["status"] == "generated"
     assert finalize(row(exec_="pass", runner="other", trials=["t1"]))["status"] == "generated"
     assert finalize(row(exec_="pass", runner="local"))["status"] == "generated"
-    assert finalize(row(exec_="fail", runner="local"))["status"] == "blocked"
+    assert finalize(row(exec_="fail", runner="local"))["status"] == "exec_failed"
     assert finalize(row(leak="fail"))["status"] == "blocked"
     assert finalize(row(secrets="fail"))["status"] == "blocked"
     assert (
         finalize(row(secrets="not_run", exec_="pass", runner="harbor", trials=["t"]))["status"]
         == "generated"
     )
-    assert finalize(row(structure="fail", exec_="pass", runner="local"))["status"] == "blocked"
+    assert finalize(row(structure="fail", exec_="pass", runner="local"))["status"] == "exec_failed"
 
 
 def test_invariant_rejects_forged_validated():
@@ -159,7 +159,7 @@ def test_invariant_rejects_forged_validated():
 def test_blocked_reason_wins():
     r = row(exec_="pass", runner="local")
     r["blocked_reason"] = "batch audit failed"
-    assert derive_status(r) == ("blocked", "batch audit failed")
+    assert derive_status(r) == ("exec_failed", "batch audit failed")
 
 
 def test_materialize_rejects_bad_input(tmp_path):

@@ -15,18 +15,23 @@ import tomllib
 from importlib import resources
 from pathlib import Path
 
-from .models import GOLD_TYPES, Answer, BuildResult, ContractError, safe_id
+from .models import (
+    ENV_SOURCES,
+    GOLD_TYPES,
+    GRADING_METHODS,
+    ORACLE_KINDS,
+    Answer,
+    BuildResult,
+    ContractError,
+    normalize_gaps,
+    normalize_outcome,
+    safe_id,
+)
 
 ANSWER_DIR = "/app/answer"
 SCHEMA_VERSION = "1.4"
 ORG = "l2h"
-REQUIRED = [
-    "task.toml",
-    "instruction.md",
-    "tests/test.sh",
-    "tests/expected.json",
-    "solution/solve.sh",
-]
+REQUIRED = ["task.toml", "instruction.md", "tests/test.sh"]
 
 
 def grade_source() -> str:
@@ -41,11 +46,24 @@ def _toml_list(items) -> str:
     return "[" + ", ".join(_toml_str(str(i)) for i in items) + "]"
 
 
-def task_toml(b: BuildResult, ttype: str, generator: str, sources: list[str]) -> str:
+def task_toml(
+    b: BuildResult,
+    ttype: str,
+    generator: str,
+    sources: list[str],
+    *,
+    separate: bool = True,
+    spec: dict | None = None,
+) -> str:
+    """separate=True: answer-file task, verifier in its own image reading /app/answer.
+    separate=False: custom verifier, runs in the solver's environment (checks its end state)."""
     name = f"{ORG}/{ttype}-{b.task_id}".lower()
-    lines = [
-        f'schema_version = "{SCHEMA_VERSION}"',
-        f"artifacts = [{_toml_str(ANSWER_DIR)}]",
+    spec = spec or {}
+    gaps = [f"{g['affects']}: {g['what']}" for g in b.gaps]
+    lines = [f'schema_version = "{SCHEMA_VERSION}"']
+    if separate:
+        lines.append(f"artifacts = [{_toml_str(ANSWER_DIR)}]")
+    lines += [
         "",
         "[task]",
         f"name = {_toml_str(name)}",
@@ -63,15 +81,27 @@ def task_toml(b: BuildResult, ttype: str, generator: str, sources: list[str]) ->
         f"type = {_toml_str(ttype)}",
         f"generator = {_toml_str(generator)}",
         f"gold = {_toml_str(b.gold_type)}",
+        f"job = {_toml_str(str(spec.get('job', '')))}",
+        f"task_scope = {_toml_str(str(spec.get('task_scope', '')))}",
+        f"oracle = {_toml_str(b.oracle_kind or '')}",
+        f"env_source = {_toml_str(b.env_source or '')}",
+        f"grading_method = {_toml_str(b.grading_method or '')}",
+        f"grading_reason = {_toml_str(b.grading_reason)}",
+        f"gaps = {_toml_list(gaps)}",
         f"sources = {_toml_list(sources)}",
         f"assumptions = {_toml_list(b.assumptions)}",
         "",
         "[verifier]",
         "timeout_sec = 120.0",
-        'environment_mode = "separate"',
-        "",
-        "[verifier.environment]",
-        'network_mode = "no-network"',
+    ]
+    if separate:
+        lines += [
+            'environment_mode = "separate"',
+            "",
+            "[verifier.environment]",
+            'network_mode = "no-network"',
+        ]
+    lines += [
         "",
         "[agent]",
         "timeout_sec = 900.0",
@@ -104,7 +134,9 @@ COPY --chmod=755 . /tests/
 
 ORACLE_NOTE = {
     "verified": "the gold answer, independently verified for this task's scope",
-    "solved": "the answer computed from the task inputs",
+    "computed": "the answer recomputed from the task inputs",
+    "independent": "the expected answer, checked independently of the logged run",
+    "solved": "the answer a fresh solve produced and the verifier accepted",
     "imitation": "the logged answer (imitation gold, not independently checked)",
     "negative": "a valid answer (one of the alternatives; the known-wrong ones are forbidden)",
     "none": "the expected answer",
@@ -116,7 +148,7 @@ def solve_sh(ans: Answer, value: str | None = None, gold_type: str = "imitation"
     note = ORACLE_NOTE.get(gold_type, "the expected answer")
     caveat = (
         "It proves the verifier is wired up."
-        if gold_type in ("verified", "solved")
+        if gold_type in ("verified", "computed", "solved")
         else "It proves the verifier is wired up, not that the answer is derivable from the inputs."
     )
     return (
@@ -136,36 +168,95 @@ def env_dockerfile(has_data: bool) -> str:
     return s
 
 
-def materialize(
-    b: BuildResult, dest: Path, ttype: str, generator: str, sources: list[str]
-) -> list[str]:
-    """Write the task package to dest. Returns relative paths written."""
+def resolve(b: BuildResult) -> None:
+    """Check a BuildResult's grading/oracle/environment contract and fill in what l2h infers.
+
+    Mutates b: wrong_answers/alternatives normalised, gaps normalised, oracle_kind /
+    env_source / grading_method resolved. Raises ContractError on anything inconsistent.
+    """
     safe_id(b.task_id)
     if b.gold_type not in GOLD_TYPES:
         raise ContractError(f"gold_type {b.gold_type!r} must be one of {GOLD_TYPES}")
+    custom = b.answer is None  # no answer file: the generator's own verifier grades the end state
+    if custom and "tests/test.sh" not in b.files:
+        raise ContractError(
+            "BuildResult needs answer=Answer(...) (answer-file verifier) or its own "
+            "files['tests/test.sh'] (custom verifier)"
+        )
+    b.wrong_answers = [normalize_outcome(w) for w in b.wrong_answers]
+    b.alternatives = [normalize_outcome(a) for a in b.alternatives]
+    b.gaps = normalize_gaps(b.gaps)
+    if b.answer is not None:
+        b.answer.validate()
+        if (b.gold_type == "negative") != (b.answer.check == "forbidden"):
+            raise ContractError("gold_type 'negative' and answer.check 'forbidden' go together")
+    if b.answer is None and any(isinstance(x, str) for x in b.wrong_answers + b.alternatives):
+        raise ContractError(
+            "plain-string wrong answers/alternatives need an answer file; "
+            "with a custom verifier use Outcome(script=...)"
+        )
+
+    has_solve = "solution/solve.sh" in b.files
+    kind = b.oracle_kind or ("reference" if has_solve else "answer" if b.answer else "none")
+    if kind not in ORACLE_KINDS:
+        raise ContractError(f"oracle_kind {kind!r} must be one of {ORACLE_KINDS}")
+    if kind == "none" and has_solve:
+        raise ContractError("oracle_kind 'none' but files contain solution/solve.sh")
+    if kind == "answer" and b.answer is None and not has_solve:
+        raise ContractError("oracle_kind 'answer' needs an answer (or your own solve.sh)")
+    if kind in ("replay", "fresh", "reference") and not has_solve:
+        raise ContractError(f"oracle_kind {kind!r} needs files['solution/solve.sh']")
+    b.oracle_kind = kind
+
+    own_env = any(
+        k in b.files for k in ("environment/Dockerfile", "environment/docker-compose.yaml")
+    )
+    env = b.env_source or ("rebuilt" if own_env else "evidence")
+    if env not in ENV_SOURCES:
+        raise ContractError(f"env_source {env!r} must be one of {ENV_SOURCES}")
+    if env == "partial" and not any(g["affects"] != "none" for g in b.gaps):
+        raise ContractError("env_source 'partial' needs gaps saying what is missing")
+    b.env_source = env
+
+    method = b.grading_method or ("behavioral" if custom else b.answer.check)
+    if method not in GRADING_METHODS:
+        raise ContractError(f"grading_method {method!r} must be one of {GRADING_METHODS}")
+    b.grading_method = method
+
+
+def materialize(
+    b: BuildResult,
+    dest: Path,
+    ttype: str,
+    generator: str,
+    sources: list[str],
+    spec: dict | None = None,
+) -> list[str]:
+    """Write the task package to dest. Returns relative paths written."""
+    resolve(b)
+    custom = b.answer is None
     files: dict[str, str | bytes] = {}
-    if b.answer is None:
-        raise ContractError("BuildResult.answer is required: the verifier needs an expected answer")
-    b.answer.validate()
     oracle_value = None
-    if (b.gold_type == "negative") != (b.answer.check == "forbidden"):
-        raise ContractError("gold_type 'negative' and answer.check 'forbidden' go together")
     if b.gold_type == "negative":
-        if not b.alternatives:
+        alts = [a for a in b.alternatives if isinstance(a, str)]
+        if not alts:
             raise ContractError(
                 "a negative task needs `alternatives`: valid answers (the oracle writes the first)"
             )
-        oracle_value = str(b.alternatives[0])
+        oracle_value = alts[0]
         if oracle_value.strip() in [str(x).strip() for x in b.answer.expected]:
             raise ContractError("the oracle's valid answer must differ from the known-wrong ones")
         if b.answer.choices and oracle_value.strip() not in [c.strip() for c in b.answer.choices]:
             raise ContractError("the oracle's valid answer must be one of answer.choices")
-    ans_path = f"{ANSWER_DIR}/{b.answer.file}"
 
     if b.instruction is not None:
         text = b.instruction.rstrip() + "\n"
-        if ans_path not in text:
-            text += f"\nWrite your final answer to `{ans_path}` (just the answer, nothing else).\n"
+        if b.answer is not None and not custom:
+            ans_path = f"{ANSWER_DIR}/{b.answer.file}"
+            if ans_path not in text:
+                text += (
+                    f"\nWrite your final answer to `{ans_path}` (just the answer, nothing else).\n"
+                )
         files["instruction.md"] = text
     for k, v in b.evidence.items():
         if not isinstance(v, str | bytes):
@@ -173,12 +264,17 @@ def materialize(
         files[f"environment/data/{k}"] = v
     files.update(b.files)  # generator overrides win
 
-    files.setdefault("task.toml", task_toml(b, ttype, generator, sources))
-    files.setdefault("tests/expected.json", json.dumps(b.answer.to_dict(), indent=2) + "\n")
-    files.setdefault("tests/grade.py", grade_source())
-    files.setdefault("tests/test.sh", TEST_SH)
-    files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
-    files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value, b.gold_type))
+    files.setdefault(
+        "task.toml", task_toml(b, ttype, generator, sources, separate=not custom, spec=spec)
+    )
+    if b.answer is not None:
+        files.setdefault("tests/expected.json", json.dumps(b.answer.to_dict(), indent=2) + "\n")
+    if not custom:
+        files.setdefault("tests/grade.py", grade_source())
+        files.setdefault("tests/test.sh", TEST_SH)
+        files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
+    if b.oracle_kind == "answer":
+        files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value, b.gold_type))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
 
@@ -214,6 +310,16 @@ def structure_check(task_dir: Path) -> list[str]:
             cfg = tomllib.loads((task_dir / "task.toml").read_text())
         except tomllib.TOMLDecodeError as e:
             problems.append(f"task.toml is not valid TOML: {e}")
+    test_sh = task_dir / "tests/test.sh"
+    if (
+        test_sh.is_file()
+        and "expected.json" in test_sh.read_text(errors="replace")
+        and not (task_dir / "tests/expected.json").is_file()
+    ):
+        problems.append("missing tests/expected.json (tests/test.sh reads it)")
+    oracle = cfg.get("metadata", {}).get("l2h", {}).get("oracle", "")
+    if oracle != "none" and not (task_dir / "solution/solve.sh").is_file():
+        problems.append("missing solution/solve.sh (or set oracle_kind='none')")
     if cfg:
         if not re.match(
             r"^[A-Za-z0-9][\w.\-]*/[A-Za-z0-9][\w.\-]*$", cfg.get("task", {}).get("name", "")

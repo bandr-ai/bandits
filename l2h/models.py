@@ -16,11 +16,22 @@ TASK_SCOPES = ("full_job", "subtask", "decision")
 JOB_SCOPES = ("full_job", "subtask")
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
-GOLD_TYPES = ("verified", "solved", "imitation", "negative", "none")
+# gold = why the grading is trusted (grading trust); see guides/tasktypes.md
+GOLD_TYPES = ("verified", "computed", "independent", "solved", "imitation", "negative", "none")
 CHECK_KINDS = ("exact", "allowed_set", "numeric", "forbidden")
+GRADING_METHODS = (*CHECK_KINDS, "behavioral", "judge")  # how the verifier grades
 NORMALIZERS = ("strip", "lower", "collapse_ws", "percent", "thousands", "sorted_list")
-STATUSES = ("validated", "generated", "blocked")
-GATE_STATES = ("pass", "fail", "error", "not_run")
+STATUSES = ("validated", "generated", "exec_failed", "blocked")
+GATE_STATES = ("pass", "fail", "error", "not_run", "no_oracle")
+# where solution/solve.sh comes from: a logged attempt replayed, a fresh solve, a known-good
+# reference, a script that writes the expected answer (proves grader wiring only), or none
+ORACLE_KINDS = ("replay", "fresh", "reference", "answer", "none")
+# where the starting environment comes from: l2h's default image + evidence files, a supplied
+# harness, rebuilt from the traces, or rebuilt with known gaps
+ENV_SOURCES = ("evidence", "harness", "rebuilt", "partial")
+GAP_AFFECTS = ("execution", "fidelity", "grading", "none")
+# the only reasons a full job may be Blocked; anything else is a Candidate with gaps
+BLOCK_KINDS = ("secret", "leak", "no_instruction")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 
@@ -353,6 +364,49 @@ class Answer:
 
 
 @dataclass
+class Outcome:
+    """An executable outcome for the exec gates: a bash script run in the task environment
+    in place of solution/solve.sh (e.g. start a broken server, build a wrong binary).
+    Used as a wrong outcome (must fail the verifier) or an alternative (must pass)."""
+
+    script: str
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {"script": self.script, "note": self.note}
+
+
+def normalize_outcome(x: Any) -> str | dict:
+    """A wrong answer / alternative: a plain answer string, or an Outcome as a dict."""
+    if isinstance(x, Outcome):
+        x = x.to_dict()
+    if isinstance(x, dict):
+        if not isinstance(x.get("script"), str) or not x["script"].strip():
+            raise ContractError("an Outcome needs a non-empty bash `script`")
+        return {"script": x["script"], "note": str(x.get("note") or "")}
+    if isinstance(x, str | int | float):
+        return str(x)
+    raise ContractError(
+        f"wrong answers / alternatives must be strings or Outcome, got {type(x).__name__}"
+    )
+
+
+def normalize_gaps(gaps: list) -> list[dict]:
+    """Gaps as [{"what", "affects"}]; a bare string is assumed to affect fidelity."""
+    out = []
+    for g in gaps or []:
+        if isinstance(g, str):
+            g = {"what": g, "affects": "fidelity"}
+        if not isinstance(g, dict) or not str(g.get("what") or "").strip():
+            raise ContractError(f"a gap needs a non-empty 'what', got {g!r}")
+        aff = g.get("affects", "fidelity")
+        if aff not in GAP_AFFECTS:
+            raise ContractError(f"gap affects {aff!r} must be one of {GAP_AFFECTS}")
+        out.append({"what": str(g["what"]), "affects": aff})
+    return out
+
+
+@dataclass
 class BuildResult:
     """Returned by a tasktype's build() for one group of trajectories.
 
@@ -360,6 +414,11 @@ class BuildResult:
     generate (task.toml, tests/*, solution/solve.sh, environment/Dockerfile) is
     filled in when absent. `instruction` and `evidence` are conveniences:
     evidence keys land in environment/data/<key> and appear at /app/<key>.
+
+    Grading: either `answer` (l2h writes an answer-file verifier) or your own
+    files["tests/test.sh"] (custom verifier, e.g. behavioural checks on the end state);
+    a custom verifier needs at least one wrong Outcome. Oracle: l2h writes solve.sh for
+    an `answer`; otherwise supply files["solution/solve.sh"] or set oracle_kind="none".
     """
 
     task_id: str
@@ -377,9 +436,29 @@ class BuildResult:
     difficulty: str = "medium"
     tags: list = field(default_factory=list)
     description: str = ""
+    # provenance (see guides/tasktypes.md); None = l2h infers it and checks it is consistent
+    oracle_kind: str | None = None
+    env_source: str | None = None
+    grading_method: str | None = None
+    grading_reason: str = ""
+    gaps: list = field(default_factory=list)
 
 
 @dataclass
 class Blocked:
+    """No task may be built. For a full_job type only `kind` secret / leak / no_instruction
+    is allowed; a job that is merely hard to rebuild is a Candidate with its gaps."""
+
     reason: str
     missing: list = field(default_factory=list)
+    kind: str = "other"
+
+
+@dataclass
+class Candidate:
+    """The job was identified but no runnable package could be built yet: what is missing
+    and what would close it. Kept visible in the queue and the report, never counted as a task."""
+
+    reason: str
+    gaps: list = field(default_factory=list)
+    next_action: str = ""

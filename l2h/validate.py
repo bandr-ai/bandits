@@ -65,16 +65,15 @@ def level1(ws: Workspace, row: dict) -> None:
 def level2_task(ws: Workspace, row: dict, runner: Runner) -> dict:
     d = ws.tasks / row["type"] / row["task_id"]
     m = _meta(ws, row["task_id"])
-    spec = read_json(d / "tests" / "expected.json", {})
+    spec = read_json(d / "tests" / "expected.json", {})  # absent for a custom verifier
     wrong, auto = m["wrong_answers"], False
     if spec.get("check") == "forbidden":
         wrong = [str(x) for x in spec["expected"]]  # the known-wrong answers must fail
-    elif not wrong:
-        canon = (
-            spec["expected"][0] if isinstance(spec.get("expected"), list) else spec.get("expected")
-        )
+    elif not wrong and "expected" in spec:
+        canon = spec["expected"][0] if isinstance(spec["expected"], list) else spec["expected"]
         wrong, auto = [derive_wrong(str(canon), spec.get("check", "exact"))], True
-    return run_exec_gates(runner, d, spec.get("file", "answer.txt"), wrong, m["alternatives"], auto)
+    answer_file = spec.get("file", "answer.txt") if spec else None
+    return run_exec_gates(runner, d, answer_file, wrong, m["alternatives"], auto)
 
 
 def failure_causes(rows_detail: list[tuple[str, dict]]) -> list[dict]:
@@ -199,7 +198,10 @@ def run_validate(
                 # only passes made by the selected runner count; e.g. earlier
                 # host-local passes are re-run when Harbor is selected
                 def counts(r):
-                    return r["gates"]["exec"] == "pass" and r["gates"].get("runner") == runner.name
+                    return (
+                        r["gates"]["exec"] in ("pass", "no_oracle")
+                        and r["gates"].get("runner") == runner.name
+                    )
 
                 validated = [r for r in ok_rows if counts(r)]
                 pending = [r["task_id"] for r in ok_rows if not counts(r)]
@@ -222,14 +224,14 @@ def run_validate(
                     summary["infra_errors"].append({"task_id": r["task_id"], "type": ttype})
             fails = [t for t, res in res_here if res["exec"] == "fail"]
             errs = [t for t, res in res_here if res["exec"] == "error"]
-            passed = [t for t, res in res_here if res["exec"] == "pass"]
+            passed = [t for t, res in res_here if res["exec"] in ("pass", "no_oracle")]
             type_state = "passed"
             if fails:
                 type_state = "failed"
                 attempts[ttype] = attempts.get(ttype, 0) + 1
                 why = f"type failed sampled validation (attempt {attempts[ttype]}/{max_fix}); fix the generator and re-run `l2h run generate`"
                 for r in trs:
-                    if r["gates"]["exec"] != "pass":
+                    if r["gates"]["exec"] not in ("pass", "no_oracle"):
                         r["blocked_reason"] = why
                         finalize(r)
             elif errs:
@@ -240,7 +242,7 @@ def run_validate(
                 type_state = "failed"
             elif passed:
                 attempts[ttype] = 0
-            elif any(r["gates"]["exec"] == "pass" for r in ok_rows):
+            elif any(r["gates"]["exec"] in ("pass", "no_oracle") for r in ok_rows):
                 pass  # already validated earlier; the budget is only refunded by a fresh pass
             else:
                 type_state = "nothing_to_validate"
@@ -258,7 +260,11 @@ def run_validate(
         k = 5
         aud = {}
         for ttype in sorted({r["type"] for r in targets}):
-            ids = [r["task_id"] for r in targets if r["type"] == ttype and r["status"] != "blocked"]
+            ids = [
+                r["task_id"]
+                for r in targets
+                if r["type"] == ttype and r["status"] not in ("blocked", "exec_failed")
+            ]
             aud[ttype] = seeded_sample(ids, k, cfg["seed"], "audit:" + ttype)
         summary["level3_audit_sample"] = aud
 
