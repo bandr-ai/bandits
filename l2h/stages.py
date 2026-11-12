@@ -65,15 +65,29 @@ def _stored(summary: dict) -> dict:
     return {k: v for k, v in summary.items() if k != "changed_since_last_run"}
 
 
-def delta(prev: dict | None, cur: dict) -> dict:
-    """Numeric differences vs the previous run summary (what changed)."""
+def _flat_counts(d: dict, prefix: str = "") -> dict[str, int]:
+    """Integer counts of a summary, nested count dicts flattened (ended.done, by_status.generated)."""
+    out: dict[str, int] = {}
+    for k, v in d.items():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            out[prefix + k] = v
+        elif isinstance(v, dict) and k != "changed_since_last_run":
+            out.update(_flat_counts(v, f"{prefix}{k}."))
+    return out
+
+
+def delta(prev: dict | None, cur: dict, content: dict | None = None) -> dict:
+    """What changed vs the previous run summary: count differences (nested counts included)
+    plus `content` (e.g. how many outputs changed with unchanged counts)."""
     if not prev:
         return {"first_run": True}
-    return {
-        k: cur[k] - prev.get(k, 0)
-        for k in cur
-        if isinstance(cur[k], int) and cur[k] != prev.get(k, 0)
-    }
+    p, c = _flat_counts(prev), _flat_counts(cur)
+    out: dict[str, Any] = {k: c.get(k, 0) - p.get(k, 0) for k in sorted(p.keys() | c.keys())}
+    out = {k: v for k, v in out.items() if v}
+    out.update({k: v for k, v in (content or {}).items() if v})
+    return out or {"none": "same results as last run"}
 
 
 # ------------------------------------------------------------------- parse
@@ -167,6 +181,14 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
         if (f, i) not in covered
     ]
     total = sum(inv.values())
+    n_calls = n_unanswered = 0
+    stack = list(trajs)
+    while stack:
+        t = stack.pop()
+        for c in t.calls():
+            n_calls += 1
+            n_unanswered += c.result is None
+        stack += t.subagents
     summary = {
         "files": len(inv),
         "raw_records": total,
@@ -176,13 +198,24 @@ def run_parse(ws: Workspace, limit: int | None, dry: bool, no_cache: bool) -> di
         "orphan_examples": orphans[:5],
         "key_ref_files_not_counted": sorted(key_files),
         "ended": dict(Counter(t["ended"] for t in trajs)),
+        "tool_calls": n_calls,
+        "tool_calls_unanswered": n_unanswered,
         "error_groups": group_errors(errors),
         "limited": limit is not None,
     }
-    summary["changed_since_last_run"] = delta(
-        {k: v for k, v in st.get("summary", {}).items() if isinstance(v, int)},
-        {k: v for k, v in summary.items() if isinstance(v, int)},
-    )
+    content = {}
+    if st.get("summary") and ws.trajectories.exists():
+        before = {}
+        for line in ws.trajectories.read_text().splitlines():
+            if line.strip():
+                before[str(Trajectory(json.loads(line)).get("id"))] = sha(line.encode())
+        content["trajectories_changed"] = sum(
+            1
+            for t in trajs
+            if t["id"] in before
+            and before[t["id"]] != sha(json.dumps(t, sort_keys=True, default=str).encode())
+        )
+    summary["changed_since_last_run"] = delta(st.get("summary"), summary, content)
     if not dry:
         write_jsonl(ws.trajectories, trajs)
         ws.update_state(
@@ -316,6 +349,8 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     cfg = ws.config()
     old_rows = ws.result_rows()
     old_by_id = {r["task_id"]: r for r in old_rows}
+    # captured now: an unchanged row is reused (and its generator updated) in place below
+    old_sig = {r["task_id"]: (r.get("content_hash"), r.get("generator")) for r in old_rows}
     built_types = [t for t in types if not only_type or t.name == only_type]
     if only_type and not built_types:
         raise L2HError(f"no task type {only_type!r}", "list task types with `l2h status`")
@@ -516,6 +551,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
     counts = Counter(r["status"] for r in new_rows)
     by_type = Counter(r["type"] for r in new_rows)
     prev = ws.state().get("generate", {}).get("summary", {})
+    rebuilt = [(old_sig[r["task_id"]], r) for r in new_rows if r["task_id"] in old_sig]
     summary = {
         "trajectories": len(scope),
         "tasks": len(new_rows),
@@ -535,8 +571,12 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
         "dropped_stale": len(dropped),
     }
     summary["changed_since_last_run"] = delta(
-        {k: v for k, v in prev.items() if isinstance(v, int)},
-        {k: v for k, v in summary.items() if isinstance(v, int)},
+        prev,
+        summary,
+        {
+            "tasks_content_changed": sum(1 for (h, _), r in rebuilt if h != r["content_hash"]),
+            "tasks_generator_changed": sum(1 for (_, g), r in rebuilt if g != r["generator"]),
+        },
     )
     if dry:
         tmp_ctx.cleanup()

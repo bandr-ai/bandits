@@ -14,7 +14,12 @@ older versions are accepted) plus a small l2h block in `extra["l2h"]`. Build it 
   parts), optional `timestamp`, `reasoning_content`, `model_name`. Agent steps carry
   `tool_calls: [{tool_call_id, function_name, arguments}]`; the results go in the same step's
   `observation.results: [{source_call_id, content}]`, where `source_call_id` is the call's
-  `tool_call_id`. Do not invent timestamps, ids or results the logs lack; leave them out.
+  `tool_call_id`. ATIF requires a `tool_call_id`: when the logs have none, synthesise positional
+  ones (`call_1`, `call_2`, ... in log order) and set the matching result's `source_call_id` to the
+  same value; that is expected, not invention. Otherwise do not invent timestamps, ids or results the
+  logs lack; leave them out. (`t.calls()` pairs id-less calls and results of one step by position,
+  but write the ids.) `l2h run parse` warns "N of M tool calls have no matching result": check the
+  pairing before moving on (a cut-off run may leave its last call unanswered).
   Anything ATIF has no field for goes in the step's or document's `extra`.
 - l2h block: `id` (unique), `source_refs`, `ended`, `meta` (what you do not understand, unknown values
   `None`), `attachments`.
@@ -34,7 +39,7 @@ older versions are accepted) plus a small l2h block in `extra["l2h"]`. Build it 
 In checks and task types, `t` has: `t["steps"]`, `t["id"]`, `t["meta"]`, `t["ended"]`, `t["source_refs"]`,
 `t["attachments"]` (also `t.meta`, ...); `t.calls()` yields every tool call as
 `Call(step, id, name, arguments, result)` with `.output` (the matched result text, `None` if
-unanswered); `t.final_message` (text of the last agent step if it made no tool call, else `None`);
+unanswered); `"meta" in t` works like `t["meta"]`; `t.final_message` (text of the last agent step if it made no tool call, else `None`);
 `t.subagents` (same accessors); `message_text(step["message"])` for list-form messages. In
 `l2h query`/`sample`/`show --field`, `r` has the ATIF keys plus `id`, `meta`, `ended`, `source_refs`
 (`r.steps`, `r.meta.model`).

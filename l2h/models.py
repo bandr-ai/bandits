@@ -87,6 +87,11 @@ class Trajectory(dict):
             return ext[key]
         raise KeyError(key)
 
+    def __contains__(self, key: object) -> bool:
+        # `"meta" in t` agrees with t["meta"]; keys()/iteration stay the stored ATIF keys, so
+        # dict(t) / json round-trips do not duplicate the l2h block at top level
+        return dict.__contains__(self, key) or (key in _EXT_FIELDS and key in self._ext())
+
     def get(self, key: str, default: Any = None) -> Any:
         try:
             return self[key]
@@ -132,19 +137,25 @@ class Trajectory(dict):
         return {**self, **self._ext()}
 
     def calls(self) -> list[Call]:
-        """Every tool call in step order, each with its matched observation result."""
+        """Every tool call in step order, each with its matched observation result.
+
+        Results match calls by source_call_id == tool_call_id. In a step where some calls
+        match no result and as many results carry no source_call_id, those pair by position.
+        """
         out = []
         for s in self.get("steps") or []:
-            results = {
-                r.get("source_call_id"): r
-                for r in (s.get("observation") or {}).get("results") or []
-                if r.get("source_call_id")
-            }
-            for c in s.get("tool_calls") or []:
+            calls = [c for c in s.get("tool_calls") or [] if isinstance(c, dict)]
+            res = [
+                r for r in (s.get("observation") or {}).get("results") or [] if isinstance(r, dict)
+            ]
+            by_id = {r["source_call_id"]: r for r in res if r.get("source_call_id")}
+            unkeyed = [r for r in res if not r.get("source_call_id")]
+            loose = [i for i, c in enumerate(calls) if c.get("tool_call_id") not in by_id]
+            by_pos = dict(zip(loose, unkeyed, strict=True)) if len(loose) == len(unkeyed) else {}
+            for i, c in enumerate(calls):
                 cid = c.get("tool_call_id")
-                out.append(
-                    Call(s, cid, c.get("function_name"), c.get("arguments") or {}, results.get(cid))
-                )
+                r = by_id.get(cid) if cid in by_id else by_pos.get(i)
+                out.append(Call(s, cid, c.get("function_name"), c.get("arguments") or {}, r))
         return out
 
     @property

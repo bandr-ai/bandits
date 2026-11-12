@@ -409,11 +409,16 @@ def cmd_run(a, ws: Workspace) -> Result:
             "ended: " + ", ".join(f"{k}={v}" for k, v in sorted(s["ended"].items())),
         ]
         lines += _group_lines(s["error_groups"])
+        if s.get("tool_calls_unanswered"):
+            lines.append(
+                f"warning: {s['tool_calls_unanswered']} of {s['tool_calls']} tool calls have no "
+                "matching result (observation source_call_id must equal the call's tool_call_id; "
+                "a cut-off run may legitimately leave its last call unanswered)"
+            )
         lines.append(f"changed since last run: {s['changed_since_last_run']}")
-        nxt = [
-            "l2h new check <name>  # then `l2h run checks`",
-            "l2h show <trajectory id>  # eyeball the parse",
-        ]
+        # same next step as `l2h status` (e.g. map the jobs before writing checks)
+        nxt = [n for n in _next_for(ws, _stage_report(ws)) if not n.startswith("l2h run parse")]
+        nxt.append("l2h show <trajectory id>  # eyeball the parse")
         if s["records_in_no_trajectory"]:
             nxt.insert(0, f"investigate dropped records, e.g. `l2h show {s['orphan_examples'][0]}`")
     elif a.stage == "checks":
