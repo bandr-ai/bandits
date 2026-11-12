@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from mint import secrets
 
 from .conftest import TASKTYPE_PY
@@ -21,6 +23,39 @@ FAKE = {
 
 def kinds(text):
     return {k for _, k, _ in secrets.scan_text(text)}
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        'DB_PASSWORD="abc def456789!"',
+        "DB_PASSWORD='abc def456789!'",
+        '"DB_PASSWORD": "abc def456789!"',
+        r'DB_PASSWORD="abc \"def456789!"',
+        "DB_PASSWORD_PROD=12345678",
+        "API_TOKEN_STAGING=12345678",
+    ],
+)
+def test_quoted_and_environment_suffixed_credentials(assignment):
+    hits = secrets.scan_text(assignment)
+    assert [kind for _, kind, _ in hits] == ["credential_assignment"]
+    assert "def456789" not in json.dumps(hits)
+    assert "12345678" not in json.dumps(hits)
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        'DB_PASSWORD="abc"',
+        'DB_PASSWORD="${DB_PASSWORD}"',
+        'DB_PASSWORD="<your password>"',
+        "password_min_length=12345678",
+        "TOKEN_COUNT=12345678",
+        'TOKEN_URL="https://auth.example.com/oauth/token"',
+    ],
+)
+def test_quoted_placeholders_and_recognized_settings_are_spared(assignment):
+    assert not secrets.scan_text(assignment)
 
 
 def test_detects_common_secret_shapes_and_redacts():
@@ -95,6 +130,29 @@ def test_secret_in_environment_blocks_task_and_allow_list_is_logged(env):
     r = rows(env)["t_q1"]
     assert r["gates"]["secrets"] == "pass" and r["status"] == "generated"
     assert r["allow"]["secrets"] == ["environment/data/conf.env"]
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        'DB_PASSWORD="abc def456789!"',
+        "DB_PASSWORD_PROD=12345678",
+    ],
+)
+def test_assignment_regressions_block_packaged_tasks(env, credential):
+    env.build_pipeline()
+    env.write(
+        "tasktypes/addnums.py",
+        TASKTYPE_PY.replace(
+            'evidence={"nums.txt": nums}',
+            'evidence={"nums.txt": nums, "conf.env": ' + repr(credential) + "}",
+        ),
+    )
+    code, _, _, result = env.run("run", "generate", "--json")
+    assert code == 0
+    assert result["data"]["by_status"] == {"blocked": 3}
+    assert {r["gates"]["secrets"] for r in rows(env).values()} == {"fail"}
+    assert credential not in json.dumps(rows(env))
 
 
 def test_validate_rescans_secrets_added_after_generate(env):

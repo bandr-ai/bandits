@@ -506,6 +506,9 @@ def cmd_run(a, ws: Workspace) -> Result:
             "mint sample --matching <check>  # spot-check on fresh matches/non-matches",
             "mint new tasktype <name>",
         ]
+        if s["limited"]:
+            lines.append("(limited preview: findings and stage state not saved)")
+            nxt = ["mint run checks  # save findings for all trajectories"]
     else:
         s = stages.run_generate(ws, a.limit, a.dry_run, a.type)
         lines = [

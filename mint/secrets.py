@@ -30,7 +30,8 @@ KEY_PATTERNS = {
 # suffix only after _ or -, so `tokenizer`/`secretary` are not keywords)
 ASSIGN_RE = re.compile(
     r"""(?ix)(?<![A-Za-z0-9])\w*?(?:passw(?:or)?d|pwd|secret|token|api[_-]?key)(?P<suffix>[_-]\w*)?
-    ["']?\s*[:=]\s*["']?(?P<val>[^\s"',;)}\]]{6,})"""
+    ["']?\s*[:=]\s*(?:"(?P<double>(?:\\.|[^"\\])*)"|'(?P<single>(?:\\.|[^'\\])*)'|
+    (?P<val>[^\s"',;)}\]]+))"""
 )
 # prose: "enter X7#kq2 in the Password field" / "type `s3cret!` into the token box"
 PROSE_RE = re.compile(
@@ -69,10 +70,12 @@ def scan_text(text: str) -> list[tuple[int, str, str]]:
             for m in re.finditer(pat, line):
                 hits.append((n, kind, _preview(m.group(0))))
         for m in ASSIGN_RE.finditer(line):
-            val = m.group("val")
+            val = next(v for v in m.group("double", "single", "val") if v is not None)
+            if len(val) < 6:
+                continue
             # token_count: 123456 / password_min_length: 12345678 are settings, not secrets
             suffix = m.group("suffix")
-            if suffix and (re.fullmatch(r"[\d.]+", val) or SETTING_SUFFIX_RE.search(suffix)):
+            if suffix and SETTING_SUFFIX_RE.search(suffix):
                 continue
             if _literal(val):
                 hits.append((n, "credential_assignment", _preview(val)))

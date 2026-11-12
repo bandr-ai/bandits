@@ -3,7 +3,43 @@ partial parses aren't cached as complete, edited packages lose exec evidence."""
 
 import json
 
+from mint.workspace import Workspace
+
 from .validate_test import rows
+
+
+def test_limited_checks_preview_preserves_findings_and_state(env):
+    env.build_pipeline()
+    findings = env.ws / "out/findings.jsonl"
+    state = Workspace(env.ws).state_path
+    before = findings.read_bytes(), state.read_bytes()
+    assert len(before[0].splitlines()) == 10
+    # Changed check code must not be recorded as fresh by a preview run.
+    checks = env.ws / "checks.py"
+    checks.write_text(
+        checks.read_text().replace('Check("has_answer", 1,', 'Check("has_answer", 2,')
+    )
+    code, _, _, result = env.run("run", "checks", "--limit", "1", "--json")
+    assert code == 0
+    assert result["data"]["limited"] and result["data"]["findings"] == 2
+    assert (findings.read_bytes(), state.read_bytes()) == before
+    env.run("run", "generate")
+    assert len(rows(env)) == 3
+
+
+def test_limited_checks_does_not_create_missing_outputs(env):
+    env.build_pipeline()
+    ws = Workspace(env.ws)
+    ws.findings.unlink()
+    state = ws.state()
+    state.pop("checks")
+    ws.state_path.write_text(json.dumps(state))
+    before = ws.state_path.read_bytes()
+    assert env.run("run", "checks", "--limit", "1")[0] == 0
+    assert not ws.findings.exists()
+    assert ws.state_path.read_bytes() == before
+    assert env.run("run", "checks")[0] == 0
+    assert len(ws.findings.read_text().splitlines()) == 10
 
 
 def test_local_runner_passes_stay_generated(env, local_runner):

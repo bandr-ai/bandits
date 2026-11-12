@@ -242,8 +242,9 @@ def load_trajectories(ws: Workspace) -> list[dict]:
 
 
 def run_checks(ws: Workspace, limit: int | None, dry: bool) -> dict:
+    """Evaluate checks; limited runs preview findings without saving stage outputs."""
     trajs = load_trajectories(ws)
-    if limit:
+    if limit is not None:
         trajs = trajs[:limit]
     ld, checks = load_checks(ws)
     rows, errs = [], []
@@ -295,7 +296,7 @@ def run_checks(ws: Workspace, limit: int | None, dry: bool) -> dict:
         "changed_since_last_run": changed or {"none": "same results as last run"},
         "limited": limit is not None,
     }
-    if not dry:
+    if not dry and limit is None:
         write_jsonl(ws.findings, rows)
         ws.update_state(
             checks={
