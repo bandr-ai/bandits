@@ -193,7 +193,7 @@ def _stage_report(ws: Workspace) -> dict:
     sc = Counter(r["status"] for r in rows)
     stages_ = {
         "1_understand": {
-            "done": bool(notes_done and jobs and parse and not stale_parse),
+            "done": bool(jobs and parse and not stale_parse),
             "notes_written": notes_done,
             "job_map": {"jobs": len(jobs), "error": jobs_err} if ws.jobs.exists() else None,
             "parser_exists": ws.parse_py.exists(),
@@ -201,7 +201,7 @@ def _stage_report(ws: Workspace) -> dict:
             "stale": stale_parse,
         },
         "2_findings": {
-            "done": bool(chk and not stale_checks),
+            "done": not ws.checks_py.exists() or bool(chk and not stale_checks),
             "checks_exists": ws.checks_py.exists(),
             "run": bool(chk),
             "stale": stale_checks,
@@ -253,11 +253,9 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
     if not s["1_understand"]["notes_written"] and not s["1_understand"]["parser_exists"]:
         return ["mint sample"]
     if not s["1_understand"]["parser_exists"]:
-        return ["mint new parser  # then fill in parse.py and source_notes.md"]
+        return ["mint new parser  # then fill in parse.py"]
     if s["1_understand"]["stale"] or not s["1_understand"]["parse_run"]:
         return ["mint run parse"]
-    if not s["1_understand"]["notes_written"]:
-        return ["write source_notes.md (what a record is, boundaries, what is missing)"]
     jm = s["1_understand"]["job_map"]
     if not jm:
         return [
@@ -265,9 +263,7 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         ]
     if jm["error"]:
         return [f"fix jobs.json: {jm['error']}"]
-    if not s["2_findings"]["checks_exists"]:
-        return ["mint new check <name>"]
-    if not s["2_findings"]["done"]:
+    if s["2_findings"]["checks_exists"] and not s["2_findings"]["done"]:
         return ["mint run checks"]
     if not s["3_task_types"]["done"]:
         return ["mint new tasktype <name>"]
@@ -305,8 +301,8 @@ def cmd_status(a, ws: Workspace) -> Result:
         lines.append(f"note: {report_mod.VALIDATED_NOTE}")
         if v5["validated_without_decision"]:
             lines.append(
-                f"warning: {len(v5['validated_without_decision'])} validated task(s) have no "
-                "audit/derivability decision (`mint decide ... --kind derivability --task <id>`)"
+                f"note: {len(v5['validated_without_decision'])} validated task(s) not reviewed "
+                "(optional: `mint task show <id>`)"
             )
     if rep["blockers"]:
         lines.append("blockers:")

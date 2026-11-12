@@ -52,8 +52,8 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   - Check action history only where the requirement depends on it (consent before a mutation).
   - Money and numbers: reject NaN/inf; compare exact units (integer cents or exact decimals).
   - Don't add a separate answer/report the solver must write when tool results already are the outcome.
-  - "No change" targets (correct refusal/escalation): no-op may pass only if the response or
-    escalation is also checked.
+  - "No change" targets (correct refusal/escalation): also check the response or escalation, so
+    doing nothing at all still fails the no-op gate.
   - Give wrong outcomes that try the obvious shortcut (a stub printing the expected text, hard-coding
     the expected value) and alternatives that do the job differently. Add `source="..."` to each
     `Outcome` (free text: "logged attempt X, outcome known from ...", "synthetic shortcut").

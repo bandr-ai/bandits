@@ -265,7 +265,7 @@ def build_report(ws: Workspace) -> str:
         ]
         for cid, v in sorted(c["per_check"].items()):
             L.append(
-                f"| {cid} | {v['version']} | {v['pass']} | {v['fail']} | {v['unknown']} | {v['fail_rate']:.1%} | {'yes' if cid in trusted else '**NO**'} |"
+                f"| {cid} | {v['version']} | {v['pass']} | {v['fail']} | {v['unknown']} | {v['fail_rate']:.1%} | {'yes' if cid in trusted else 'no'} |"
             )
         for g in c["error_groups"][:5]:
             L.append(f"- check error x{g['count']}: {g['cause']} (e.g. {', '.join(g['examples'])})")
@@ -379,7 +379,7 @@ def build_report(ws: Workspace) -> str:
     L += ["", f"Validated tasks without a derivability/audit decision: {len(undecided)} of {n_val}"]
     if undecided:
         L.append(
-            "- **WARNING**: not audited, so unknown whether the answer is derivable from the inputs: "
+            "- not reviewed (optional; passing gates does not prove fidelity): "
             + ", ".join(undecided[:20])
             + (f" (+{len(undecided) - 20} more)" if len(undecided) > 20 else "")
         )

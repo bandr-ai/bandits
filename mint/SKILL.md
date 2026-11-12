@@ -65,8 +65,9 @@ add information, not as paperwork.
   `gold_type` names what supports the expected outcome (outside label `verified`, recomputation
   `computed`, end-state check `independent`, fresh solve `solved`, logged answer `imitation`, `none`).
 - **Oracle.** Prefer `replay` of a logged attempt that passes in the built environment, then
-  `reference`; `answer` proves wiring only. Wrong outcomes are plausible real mistakes; when the true
-  target is "no change" (a correct refusal), no-op may pass only if the response/escalation is checked.
+  `reference`; `answer` proves wiring only. Wrong outcomes are plausible real mistakes; no-op must fail.
+  When the target is "no change" (a correct refusal), the verifier also checks the response or
+  escalation, so doing nothing still fails.
 - Instructions never contain the recorded answer; gold lives only in `tests/`.
 
 ## Harbor
