@@ -260,7 +260,7 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         return ["write source_notes.md (what a record is, boundaries, what is missing)"]
     jm = s["1_understand"]["job_map"]
     if not jm:
-        return ["mint new jobs  # map the jobs: full job(s), sub-capabilities, repeats, outcomes"]
+        return ["mint new jobs  # map the jobs the logged agents were given, their repeats and outcomes"]
     if jm["error"]:
         return [f"fix jobs.json: {jm['error']}"]
     if not s["2_findings"]["checks_exists"]:
@@ -421,7 +421,7 @@ def cmd_new(a, ws: Workspace) -> Result:
         atomic_write(path, content)
     nxt = {
         "parser": "fill in parse.py, then `mint run parse --limit 20`",
-        "jobs": "fill in jobs.json: every full job and sub-capability, how repeats and outcomes show",
+        "jobs": "fill in jobs.json: every job the logged agents were given, how repeats and outcomes show",
         "check": "implement the check, then `mint run checks`",
         "tasktype": "implement it, then `mint run generate --limit 5`",
     }[a.kind]
@@ -771,7 +771,7 @@ def schema_data() -> dict:
                 "assumptions": "[str]",
             },
             "Candidate": "Candidate(reason, gaps=[...], next_action='') # job identified, no runnable package yet",
-            "Blocked": f"Blocked(reason, missing=[...], kind) # full_job: kind in {list(BLOCK_KINDS)} only",
+            "Blocked": f"Blocked(reason, missing=[...], kind) # kind in {list(BLOCK_KINDS)} only",
         },
         "mint.json": DEFAULT_CONFIG,
         "results.jsonl row": {

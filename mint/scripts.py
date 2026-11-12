@@ -88,7 +88,7 @@ def group_key(t: Trajectory) -> str:
 
 def build(group: list[Trajectory], out: Path) -> BuildResult | Candidate | Blocked:
     return Candidate("not implemented yet", gaps=["generator not written"])
-    # A full job with its own verifier on the end state:
+    # The whole job, with its own verifier on the end state:
     # return BuildResult(
     #     task_id="...",
     #     instruction="...",                  # the original request; never the recorded answer

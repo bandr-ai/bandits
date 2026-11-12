@@ -28,7 +28,7 @@ ORACLE_KINDS = ("replay", "fresh", "reference", "answer", "none")
 # harness, rebuilt from the traces, or rebuilt with known gaps
 ENV_SOURCES = ("evidence", "harness", "rebuilt", "partial")
 GAP_AFFECTS = ("execution", "fidelity", "grading", "none")
-# the only reasons a full job may be Blocked; anything else is a Candidate with gaps
+# the only reasons a job may be Blocked; anything else is a Candidate with gaps
 BLOCK_KINDS = ("secret", "leak", "no_instruction")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
