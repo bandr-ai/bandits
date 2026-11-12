@@ -373,26 +373,38 @@ def cmd_evidence(a, ws: Workspace) -> Result:
     d = {"id": a.id, "summary": sm, "evidence": ev}
     lines = [f"{a.id}: " + ", ".join(f"{k} {v}" for k, v in sm["counts"].items())]
     lines.append(
-        "starting-file candidates (read before written; complete / pre_existing: yes/no/unknown):"
+        "starting-file candidates (read before written; complete / pre_existing: yes/no/unknown; setup_first = after an agent install):"
     )
     yn = {True: "yes", False: "no", None: "unknown"}
     for f in sm["starting_files"][: None if a.full else 30]:
         lines.append(
             f"  {f['path']}  complete={yn[f['complete']]}  pre_existing={yn[f['pre_existing']]}"
             f"  steps={','.join(f['refs'][:5])}"
+            + ("" if f["before_agent_setup"] else "  setup_first")
         )
     lines.append("outputs (written by the run): " + (", ".join(sm["outputs"][:30]) or "-"))
+
+    def when(x: dict) -> str:
+        return f"@{x['step']} {'before' if x['before_agent_setup'] else 'after'} setup"
+
     lines.append(
-        "system facts (narrow the base image): "
-        + (", ".join(f"{x['fact']} @{x['step']}" for x in sm["system"][:10]) or "-")
+        "system (version/OS queries; 'after setup' only describes that moment): "
+        + (", ".join(f"{x['fact']} {when(x)}" for x in sm["system"][:10]) or "-")
     )
-    lines.append(
-        "absent when first used (don't pre-install): "
-        + (", ".join(f"{x['what']} @{x['step']}" for x in sm["absent_at_first_sight"][:20]) or "-")
-    )
+    lines.append("absent (kind what @step; 'before setup' = the agent lacked it at the start):")
+    lines += [
+        f"  {x['kind']} {x['what']} {when(x)}  via: {x['command']}"
+        for x in sm["absent"][: None if a.full else 20]
+    ] or ["  -"]
+    if sm["package_lookup_failed"]:
+        lines.append("package lookup failed (not absence; index/name problem):")
+        lines += [
+            f"  {x['what']} {when(x)}  via: {x['command']}"
+            for x in sm["package_lookup_failed"][:10]
+        ]
     lines.append("set up by the agent (part of the job: solution, never the environment):")
     lines += [
-        f"  @{x['step']}  {x['command']}" for x in sm["agent_setup"][: None if a.full else 20]
+        f"  {when(x)}  {x['command']}" for x in sm["agent_setup"][: None if a.full else 20]
     ] or ["  -"]
     lines.append("sources fetched: " + (", ".join(sm["sources"][:20]) or "-"))
     if sm["unknown_tools"]:

@@ -17,6 +17,11 @@ change the command line or the artifact format; such changes are called out.
   `answer` oracles are `ready` only with verified/computed trust, execution errors
   reported apart from grading failures; guidance on verifier-only dependencies,
   outcome-based graders and the `verified` label.
+- `mint evidence`: starting-state facts keep their command, step, tool and
+  `before_agent_setup`. System facts only come from version/OS query commands;
+  absence is `not_on_path` / `module_missing`; `Unable to locate package` is
+  `package_lookup_failed`. The "smallest matching base image" rule is gone. A job
+  whose whole assignment is a decision is a normal answer-file job.
 
 
 ### Added

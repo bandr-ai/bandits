@@ -201,20 +201,39 @@ register("fetch", _fetch_tool, first=False)
 
 
 # Starting-state facts read from tool outputs and commands (shell-agnostic patterns only).
-_ABSENT_RES = (
-    re.compile(r"(?:^|[\s:])([\w.+-]+): (?:command )?not found", re.M),
+# Each fact keeps its context: the command (segment) that produced it, step, tool, and
+# `before_agent_setup`: True when no agent_setup action came earlier (earlier call, or earlier
+# in the same command). Facts seen before any setup are starting-state evidence; later ones
+# only describe that moment (the agent had changed the machine by then).
+_NOT_FOUND_RE = re.compile(r"(?:^|[\s:])([\w.+-]+): (?:command )?not found", re.M)
+_MODULE_RES = (
     re.compile(r"No module named ['\"]?([\w.]+)"),
     re.compile(r"Cannot find module ['\"]([^'\"]+)"),
-    re.compile(r"(?:^|\s)(?:E: )?Unable to locate package ([\w.+-]+)", re.M),
 )
-_SYSTEM_RES = (
-    re.compile(r'PRETTY_NAME="([^"]+)"'),
-    re.compile(r"^(Python \d+\.\d+(?:\.\d+)?)", re.M),
-    re.compile(r"^(node v?\d+\.\d+\.\d+|v\d+\.\d+\.\d+)$", re.M),
-    re.compile(r"^(gcc \([^)]*\) \d+\.\d+(?:\.\d+)?)", re.M),
-    re.compile(r"^(go version go\d+\.\d+(?:\.\d+)?)", re.M),
-    re.compile(r"^((?:openjdk|java) (?:version )?\"?\d+[\w.]*)", re.M),
-    re.compile(r"^(Ubuntu \d+\.\d+[\w. ]*|Debian GNU/Linux \d+[\w. ()]*)", re.M),
+# not absence: the package index lookup failed (no index, wrong name, stale lists)
+_PKG_LOOKUP_RE = re.compile(r"(?:^|\s)(?:E: )?Unable to locate package ([\w.+-]+)", re.M)
+_INTERPRETER_RE = re.compile(r"\b(?:python[\d.]*|nodejs?|ruby|perl|php|Rscript|julia|pytest)\b")
+
+# (output pattern, pattern the producing command must match). A system fact needs both: output
+# of other commands (e.g. `cat notes.txt` containing "Python 3.12") says nothing about the system.
+_OS_Q = r"/etc/(?:os-release|issue|debian_version|lsb-release|redhat-release)|\blsb_release\b|\buname\b|\bhostnamectl\b"
+_PY_Q = r"\bpython[\d.]*\b.*(?:--version|\s-V\b|sys\.version|platform\.)"
+_NODE_Q = r"\bnodejs?\b.*(?:\s-v\b|--version|process\.version)"
+_CC_Q = r"\b(?:gcc|g\+\+|cc|c\+\+|clang)\b.*(?:--version|\s-v\b|-dumpversion)"
+_GO_Q = r"\bgo\s+version\b"
+_JAVA_Q = r"\bjava\b.*(?:-version|--version)"
+_SYSTEM_RES = tuple(
+    (re.compile(o, re.M), re.compile(q))
+    for o, q in (
+        (r'PRETTY_NAME="([^"]+)"', _OS_Q),
+        (r"^(Ubuntu \d+\.\d+[\w. ]*|Debian GNU/Linux \d+[\w. ()]*)", _OS_Q),
+        (r"^(Python \d+\.\d+(?:\.\d+)?)", _PY_Q),
+        (r"^(\d+\.\d+\.\d+) \(\w+, ", _PY_Q),  # print(sys.version)
+        (r"^(node v?\d+\.\d+\.\d+|v\d+\.\d+\.\d+)$", _NODE_Q),
+        (r"^(gcc \([^)]*\) \d+\.\d+(?:\.\d+)?)", _CC_Q),
+        (r"^(go version go\d+\.\d+(?:\.\d+)?)", _GO_Q),
+        (r"^((?:openjdk|java) (?:version )?\"?\d+[\w.]*)", _JAVA_Q),
+    )
 )
 # commands by which the agent changes its own machine: part of the job, never the start state
 _SETUP_RE = re.compile(
@@ -227,19 +246,116 @@ _SETUP_RE = re.compile(
 )
 
 
-def _facts(call: Call, ref: dict, ev: dict) -> None:
+def _segments(cmd: str) -> list[str]:
+    """Split a shell command on `&&`, `||`, `;`, `|` and newlines outside quotes."""
+    segs: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "\\" and i + 1 < len(cmd):
+            cur.append(cmd[i : i + 2])
+            i += 2
+            continue
+        elif ch in ";\n|" or cmd.startswith("&&", i):
+            segs.append("".join(cur))
+            cur = []
+            i += 2 if cmd.startswith(("&&", "||"), i) else 1
+            continue
+        cur.append(ch)
+        i += 1
+    segs.append("".join(cur))
+    return [x.strip() for x in segs if x.strip()]
+
+
+class _Ctx:
+    """What one call's command looks like, for ordering facts against agent setup."""
+
+    def __init__(self, call: Call, state: dict):
+        self.state = state
+        self.cmd = _shell_command(call.arguments) if _SHELL_NAMES.search(call.name or "") else None
+        self.segs = _segments(self.cmd) if self.cmd else []
+        self.setup = [i for i, g in enumerate(self.segs) if _SETUP_RE.search(g)]
+
+    def locate(self, needle: str | None, *tiers) -> int | None:
+        """Index of the first segment containing `needle` (or None); tiers are extra filters
+        tried first, each a predicate over a segment."""
+        if not needle and not tiers:
+            return None
+        for ok in tiers:
+            for i, g in enumerate(self.segs):
+                if i not in self.setup and ok(g):
+                    return i
+        for i, g in enumerate(self.segs):
+            if needle and needle in g:
+                return i
+        return None
+
+    def before(self, idx: int | None) -> bool:
+        """True when no agent setup came earlier: in an earlier call, or an earlier segment of
+        this command. An unlocated segment (None) counts as the end of the command."""
+        if self.state["setup_seq"] is not None:
+            return False
+        if idx is None:
+            idx = len(self.segs)
+        return not any(s < idx for s in self.setup)
+
+    def ctx(self, idx: int | None) -> dict:
+        seg = self.segs[idx][:200] if idx is not None and idx < len(self.segs) else None
+        return {
+            "command": seg if seg is not None else (self.cmd or "")[:200] or None,
+            "before_agent_setup": self.before(idx),
+        }
+
+
+def _facts(call: Call, ref: dict, ev: dict, cx: _Ctx) -> None:
     out = call.output or ""
-    for rx in _ABSENT_RES:
+    for m in _NOT_FOUND_RE.finditer(out):
+        name = m.group(1)
+        word = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])")
+        idx = cx.locate(None, lambda g, w=word: bool(w.search(g)))
+        ev["absent"].append(
+            {**ref, "kind": "not_on_path", "what": name, "line": m.group(0).strip()[:160]}
+            | cx.ctx(idx)
+        )
+    for rx in _MODULE_RES:
         for m in rx.finditer(out):
-            ev["absent"].append({**ref, "what": m.group(1), "line": m.group(0).strip()[:160]})
-    for rx in _SYSTEM_RES:
-        for m in rx.finditer(out):
-            ev["system"].append({**ref, "fact": m.group(1).strip()[:120]})
-    cmd = _shell_command(call.arguments) if _SHELL_NAMES.search(call.name or "") else None
-    if cmd:
-        for seg in re.split(r"&&|\|\||;|\n", cmd):
-            if _SETUP_RE.search(seg):
-                ev["agent_setup"].append({**ref, "command": seg.strip()[:200]})
+            name, top = m.group(1), m.group(1).split(".")[0]
+            idx = cx.locate(
+                top,
+                lambda g, t=top: bool(_INTERPRETER_RE.search(g) and t in g),
+                lambda g: bool(_INTERPRETER_RE.search(g)),
+            )
+            ev["absent"].append(
+                {**ref, "kind": "module_missing", "what": name, "line": m.group(0).strip()[:160]}
+                | cx.ctx(idx)
+            )
+    for m in _PKG_LOOKUP_RE.finditer(out):
+        idx = cx.locate(m.group(1))
+        ev["package_lookup_failed"].append(
+            {**ref, "what": m.group(1), "line": m.group(0).strip()[:160]} | cx.ctx(idx)
+        )
+    if cx.cmd:  # system facts only from shell commands that are version/OS queries
+        for out_rx, q_rx in _SYSTEM_RES:
+            idx = next((i for i, g in enumerate(cx.segs) if q_rx.search(g)), None)
+            if idx is None:
+                continue
+            for m in out_rx.finditer(out):
+                ev["system"].append({**ref, "fact": m.group(1).strip()[:120]} | cx.ctx(idx))
+        for i in cx.setup:
+            ev["agent_setup"].append(
+                {**ref, "command": cx.segs[i][:200], "before_agent_setup": cx.before(i)}
+            )
 
 
 def _interpret(call: Call) -> tuple[str | None, list[dict] | None]:
@@ -253,18 +369,29 @@ def _interpret(call: Call) -> tuple[str | None, list[dict] | None]:
     return None, None
 
 
-def extract(t: Trajectory | dict, *, _prefix: str = "", _seq: list | None = None) -> dict:
+def extract(
+    t: Trajectory | dict,
+    *,
+    _prefix: str = "",
+    _seq: list | None = None,
+    _state: dict | None = None,
+) -> dict:
     """Evidence lists for one trajectory (and its subagents, refs prefixed `sub<i>/`).
 
     Every item carries `seq`, the call's position in the run (subagents after the parent),
-    so reads and writes can be ordered. Commands that may create or change files mint can't
-    see are `opaque`; calls to tools without an interpreter are listed under `unknown`.
+    so reads and writes can be ordered, and `before_agent_setup` (no agent_setup action at an
+    earlier seq or earlier in the same command). Commands that may create or change files
+    mint can't see are `opaque`; calls to tools without an interpreter are listed under
+    `unknown`. `absent` (kind `not_on_path` / `module_missing`), `system` (only from shell
+    version/OS queries), `package_lookup_failed` and `agent_setup` are starting-state facts.
     """
     t = t if isinstance(t, Trajectory) else Trajectory(t)
     seq = _seq if _seq is not None else [0]
+    state = _state if _state is not None else {"setup_seq": None}
     ev: dict = {k: [] for k in KINDS} | {
         "unknown": [],
         "absent": [],
+        "package_lookup_failed": [],
         "system": [],
         "agent_setup": [],
     }
@@ -276,16 +403,24 @@ def extract(t: Trajectory | dict, *, _prefix: str = "", _seq: list | None = None
             "tool": c.name,
             "seq": seq[0],
         }
-        _facts(c, ref, ev)
+        cx = _Ctx(c, state)
+        _facts(c, ref, ev, cx)
         by, items = _interpret(c)
-        if not items:
+        if items:
+            for it in items:
+                kind = it.pop("kind")
+                idx = cx.locate(it.get("path") or it.get("url")) if cx.cmd else None
+                if idx is None and cx.cmd:
+                    idx = 0 if kind == "commands" else None
+                ev.setdefault(kind, []).append(
+                    {**ref, "by": by, **it, "before_agent_setup": cx.before(idx)}
+                )
+        else:
             ev["unknown"].append({**ref, "args": sorted(c.arguments)})
-            continue
-        for it in items:
-            kind = it.pop("kind")
-            ev.setdefault(kind, []).append({**ref, "by": by, **it})
+        if cx.setup and state["setup_seq"] is None:
+            state["setup_seq"] = seq[0]
     for i, sub in enumerate(t.subagents):
-        sev = extract(sub, _prefix=f"{_prefix}sub{i}/", _seq=seq)
+        sev = extract(sub, _prefix=f"{_prefix}sub{i}/", _seq=seq, _state=state)
         for k, v in sev.items():
             ev.setdefault(k, []).extend(v)
     return ev
@@ -322,6 +457,7 @@ def starting_files(ev: dict) -> list[dict]:
                 "path": p,
                 "complete": item.get("complete"),
                 "pre_existing": None if opaque_before else True,
+                "before_agent_setup": item.get("before_agent_setup", True),
                 "refs": [item["step"]],
             }
         else:
@@ -342,20 +478,31 @@ def outputs(ev: dict) -> list[str]:
 
 def summary(ev: dict) -> dict:
     """Small overview: counts, candidate starting files, outputs, sources, unknown tools, and the
-    starting-state facts: what the agent lacked, what the system reported, what the agent set up
-    itself (that setup is the job: it belongs in the solution, never the starting environment)."""
-    first = {}
-    for i in ev.get("system", []):
-        first.setdefault(i["fact"], i["step"])
-    absent = {}
-    for i in ev.get("absent", []):
-        absent.setdefault(i["what"], i["step"])
+    starting-state facts. `absent` (kind `not_on_path`: not on PATH for that shell at that step;
+    `module_missing`: the interpreter command raised it), `system` (from version/OS queries only)
+    and `package_lookup_failed` (not absence: the index lookup failed) each carry the producing
+    `command`, `step` and `before_agent_setup`. True = nothing the agent installed or configured
+    came earlier, so it is starting-state evidence; False = it only describes that moment.
+    `agent_setup` is what the agent changed itself: that is the job (solution), never the
+    starting environment."""
+
+    def first(rows: list[dict], key: tuple[str, ...], keep: tuple[str, ...]) -> list[dict]:
+        seen: dict = {}
+        for r in rows:
+            seen.setdefault(tuple(r.get(k) for k in key), {k: r.get(k) for k in keep})
+        return list(seen.values())
+
+    ctx = ("step", "command", "before_agent_setup")
     return {
         "counts": {k: len(ev.get(k, [])) for k in (*KINDS, "unknown")},
-        "absent_at_first_sight": [{"what": k, "step": v} for k, v in absent.items()],
-        "system": [{"fact": k, "step": v} for k, v in first.items()],
+        "absent": first(ev.get("absent", []), ("kind", "what"), ("kind", "what", *ctx)),
+        "system": first(ev.get("system", []), ("fact",), ("fact", *ctx)),
+        "package_lookup_failed": first(
+            ev.get("package_lookup_failed", []), ("what",), ("what", *ctx)
+        ),
         "agent_setup": [
-            {"command": i["command"], "step": i["step"]} for i in ev.get("agent_setup", [])
+            {k: i.get(k) for k in ("command", "step", "before_agent_setup")}
+            for i in ev.get("agent_setup", [])
         ],
         "starting_files": starting_files(ev),
         "outputs": outputs(ev),

@@ -69,18 +69,18 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 
 - **Whole jobs only.** Each task asks a new agent to do what the logged agent was assigned, end to
   end: the original request, its starting state, its tools/action space, its output, graded on the
-  real outcome. No subtasks or decision-from-evidence tasks. Logs only, or logs + an attached harness
-  (use it, fill what it lacks).
+  real outcome. No subtasks, no *extracted intermediate* decision tasks (a step's or sub-agent's
+  decision pulled out of a larger job); a job whose whole assignment is a classification/decision is
+  a normal job (answer-file task). Logs only, or logs + an attached harness (use it, fill gaps).
 - **Starting state = the world at the agent's first action in this task** (`mint evidence <id>`):
-  - environment: files named in the request or read before anything in the run could have made them
-    (content only when the read was complete), the base system shown by OS/version output, and setup
-    done before the agent started (by the harness or image);
-  - never environment: anything the agent installed, configured, downloaded, built or wrote. That is
-    the job (it belongs in the solution), even when it makes the environment easier to rebuild;
-  - absence is evidence: `command not found` / a missing module means the agent didn't have it, so
-    don't pre-install it;
-  - version output narrows the base image, rarely pins it: take the smallest base that matches;
-  - anything still unknown is a gap (`affects: fidelity`), never a convenient guess.
+  - environment: files named in the request or read before the run could have made them (content
+    only when the read was complete), the system shown by version/OS queries, setup done before the
+    agent started;
+  - never environment: what the agent installed, configured, downloaded, built or wrote (the job);
+  - absence (`not_on_path`, `module_missing` with `before_agent_setup`) means don't pre-install it;
+    `Unable to locate package` is a failed lookup, not absence;
+  - base image: a supplied Dockerfile/harness wins; else one consistent with the facts. Gap only
+    unknowns that matter for the job (`affects: fidelity`), never a convenient guess.
 - **Never block a job for being hard.** If a piece is missing, build it with the gap recorded
   (`env_source="partial"`, `gaps=[...]`, `oracle_kind="none"`), or return
   `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only

@@ -196,8 +196,99 @@ def test_starting_state_facts_absence_system_and_agent_setup():
     )
     s = evidence.summary(evidence.extract(t))
     assert {x["fact"] for x in s["system"]} >= {"Debian GNU/Linux 13 (trixie)", "Python 3.13.5"}
-    assert {x["what"] for x in s["absent_at_first_sight"]} == {"pmars", "grpc"}
+    assert {x["what"] for x in s["absent"]} == {"pmars", "grpc"}
     setup = [x["command"] for x in s["agent_setup"]]
     assert any("apt-get install -y build-essential" in c for c in setup)
     assert any("/etc/apt/sources.list.d" in c for c in setup)
     assert not any(c.startswith(("ls", "make", "apt-get update")) for c in setup)
+
+
+def run(*cmds_outputs):
+    return evidence.extract(
+        Trajectory(
+            {
+                "steps": [
+                    step(i, [("bash", {"command": c})], [o])
+                    for i, (c, o) in enumerate(cmds_outputs, 1)
+                ]
+            }
+        )
+    )
+
+
+def test_a_version_string_inside_a_read_file_is_not_a_system_fact():
+    ev = run(
+        ("cat notes.txt", "built with Python 3.12\nPython 3.12.1\nv20.1.0"),
+        ("python3 --version", "Python 3.13.5"),
+    )
+    assert [x["fact"] for x in ev["system"]] == ["Python 3.13.5"]
+    assert ev["system"][0]["command"] == "python3 --version"
+    # non-shell tools never produce system facts
+    t = Trajectory({"steps": [step(1, [("read_file", {"path": "v.txt"})], ["Python 3.12.1"])]})
+    assert evidence.extract(t)["system"] == []
+    # a mixed command only counts for the query's own tool
+    ev = run(("cat notes.txt; gcc --version", "Python 3.12.1\ngcc (Debian 14.2.0) 14.2.0"))
+    assert [x["fact"] for x in ev["system"]] == ["gcc (Debian 14.2.0) 14.2.0"]
+
+
+def test_quoted_semicolons_do_not_split_a_python_version_query():
+    ev = run(
+        (
+            "python3 -c 'import sys; print(sys.version)'",
+            "3.12.3 (main, Nov  6 2025, 13:44:16) [GCC]",
+        )
+    )
+    assert [x["fact"] for x in ev["system"]] == ["3.12.3"]
+
+
+def test_unable_to_locate_package_is_not_absence():
+    ev = run(("apt-get install -y foo", "E: Unable to locate package foo"))
+    assert ev["absent"] == []
+    assert [x["what"] for x in ev["package_lookup_failed"]] == ["foo"]
+    s = evidence.summary(ev)
+    assert s["absent"] == [] and s["package_lookup_failed"][0]["what"] == "foo"
+
+
+def test_command_not_found_is_not_on_path_with_its_command():
+    ev = run(("ls && pmars -b x.red", "a\nbash: line 1: pmars: command not found"))
+    (a,) = ev["absent"]
+    assert (a["kind"], a["what"], a["command"], a["step"]) == (
+        "not_on_path",
+        "pmars",
+        "pmars -b x.red",
+        "1",
+    )
+    assert a["tool"] == "bash" and a["before_agent_setup"] is True
+
+
+def test_missing_module_names_the_interpreter_command():
+    ev = run(
+        ("ls; pip list; python3 run.py && echo done", "ModuleNotFoundError: No module named 'grpc'")
+    )
+    (a,) = ev["absent"]
+    assert (a["kind"], a["what"], a["command"]) == ("module_missing", "grpc", "python3 run.py")
+
+
+def test_facts_after_an_install_are_not_before_agent_setup():
+    ev = run(
+        ("foo --help", "bash: foo: command not found"),
+        ("apt-get install -y foo", "done"),
+        ("bar --help", "bash: bar: command not found"),
+        ("cat /etc/os-release", 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"'),
+        ("pip install x && python3 -c 'import y'", "ModuleNotFoundError: No module named 'y'"),
+    )
+    flags = {a["what"]: a["before_agent_setup"] for a in ev["absent"]}
+    assert flags == {"foo": True, "bar": False, "y": False}
+    assert ev["system"][0]["before_agent_setup"] is False
+    assert [x["before_agent_setup"] for x in ev["agent_setup"]] == [True, False]
+    reads = {i["path"]: i["before_agent_setup"] for i in ev["reads"]}
+    assert reads == {"/etc/os-release": False}  # read after the install
+    s = evidence.summary(ev)
+    assert {x["what"]: x["before_agent_setup"] for x in s["absent"]} == flags
+
+
+def test_order_inside_one_command_counts():
+    ev = run(("foo --version; apt-get install -y foo; foo --version", "foo: command not found"))
+    assert ev["absent"][0]["before_agent_setup"] is True  # located at the first `foo` segment
+    ev = run(("pip install x && python3 -c 'import y'", "No module named y"))
+    assert ev["absent"][0]["before_agent_setup"] is False
