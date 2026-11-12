@@ -96,3 +96,27 @@ def test_changed_since_last_run_reports_content_and_version_changes(env):
     ch = env.run("run", "generate", "--json")[3]["data"]["changed_since_last_run"]
     assert ch == {"tasks_content_changed": 3}, ch
     assert json.dumps(ch)
+
+
+def test_solve_sh_comment_names_the_gold_kind():
+    from l2h.harbor import solve_sh
+    from l2h.models import Answer
+
+    a = Answer(expected="7")
+    assert "the logged answer" in solve_sh(a) and "not that the answer" in solve_sh(a)
+    v = solve_sh(a, gold_type="verified")
+    assert "Oracle (verified gold)" in v and "logged answer" not in v
+    assert "not that the answer" not in v
+    assert "computed from the task inputs" in solve_sh(a, gold_type="solved")
+
+
+def test_skill_documents_missing_runtime_and_jobs_scaffold():
+    from pathlib import Path
+
+    import l2h
+
+    skill = (Path(l2h.__file__).parent / "SKILL.md").read_text()
+    guide = (Path(l2h.__file__).parent / "guides/tasktypes.md").read_text()
+    assert "--allow-missing-runtime" in skill and "`l2h new jobs`" in skill
+    for doc in (skill, guide):
+        assert "`full_job` | `subtask` | `decision`" in doc

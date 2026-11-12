@@ -40,6 +40,17 @@ change the command line or the artifact format; such changes are called out.
   type names its job (`SPEC["job"]`), `task_scope` gains `subtask`, and the report lists jobs with
   nothing built for them. Pre-ATIF parsers get a migration error.
 
+  Review round 2: the secret scan catches env-style names (`DB_PASSWORD=...`,
+  `AWS_SECRET_ACCESS_KEY=...`) and "enter <value> in the password field" prose; the leak scan treats
+  `hint`/`result`/`sum`/`total`/`it's` as answer labels, warns on a bare short hidden value in
+  `instruction.md`, and the giveaway warning also checks `instruction.md`. Tool calls and results
+  without ids pair by position, and `l2h run parse` warns about calls with no matching result
+  (parsers should synthesise `call_1`, ... when the logs lack ids). `"meta" in t` matches `t["meta"]`.
+  "changed since last run" now counts content and generator-version changes, not only counts;
+  `run parse` suggests the same next step as `l2h status`. The task type scaffold leaves
+  `task_scope` as `TODO` (choose `full_job` | `subtask` | `decision`); only the `jobs.json`
+  scaffold's own placeholders are rejected; `solve.sh` comments name the gold kind.
+
 ## [0.3.0] - unreleased
 
 `bandits` is now ingest only. Everything else was removed, to be rebuilt from

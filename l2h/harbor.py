@@ -102,12 +102,27 @@ COPY --chmod=755 . /tests/
 """
 
 
-def solve_sh(ans: Answer, value: str | None = None) -> str:
+ORACLE_NOTE = {
+    "verified": "the gold answer, independently verified for this task's scope",
+    "solved": "the answer computed from the task inputs",
+    "imitation": "the logged answer (imitation gold, not independently checked)",
+    "negative": "a valid answer (one of the alternatives; the known-wrong ones are forbidden)",
+    "none": "the expected answer",
+}
+
+
+def solve_sh(ans: Answer, value: str | None = None, gold_type: str = "imitation") -> str:
     value = ans.canonical() if value is None else value
+    note = ORACLE_NOTE.get(gold_type, "the expected answer")
+    caveat = (
+        "It proves the verifier is wired up."
+        if gold_type in ("verified", "solved")
+        else "It proves the verifier is wired up, not that the answer is derivable from the inputs."
+    )
     return (
         "#!/bin/bash\n"
-        "# Oracle: writes the logged answer. It proves the verifier is wired up,\n"
-        "# not that the answer is derivable from the inputs.\n"
+        f"# Oracle ({gold_type} gold): writes {note}.\n"
+        f"# {caveat}\n"
         'ANSWER_DIR="${L2H_ANSWER_DIR:-/app/answer}"\n'
         'mkdir -p "$ANSWER_DIR"\n'
         f"printf '%s\\n' {shlex.quote(value)} > \"$ANSWER_DIR\"/{shlex.quote(ans.file)}\n"
@@ -163,7 +178,7 @@ def materialize(
     files.setdefault("tests/grade.py", grade_source())
     files.setdefault("tests/test.sh", TEST_SH)
     files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
-    files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value))
+    files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value, b.gold_type))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
 

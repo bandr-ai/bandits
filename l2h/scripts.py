@@ -68,7 +68,7 @@ SPEC = {{
     "unit": "episode",            # episode | subtask
     "env": "static",              # static evidence files in v1
     "job": "TODO",               # a job id from jobs.json
-    "task_scope": "decision",     # full_job | subtask | decision (see `l2h docs --topic tasktypes`)
+    "task_scope": "TODO",         # choose: full_job | subtask | decision (`l2h docs --topic tasktypes`)
     "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
     "gold": "imitation",          # verified | solved | imitation | negative | none
     "hidden": ["answer key", "original final response"],
@@ -127,6 +127,13 @@ JOBS_TEMPLATE = """{
 """
 
 JOB_FIELDS = ("id", "scope", "description", "where", "repeats", "outcome")
+# the scaffold's own placeholder values; any other text (even "build a TODO app") is the user's
+JOB_PLACEHOLDERS = {
+    v.strip()
+    for job in json.loads(JOBS_TEMPLATE)["jobs"]
+    for v in job.values()
+    if isinstance(v, str) and v.startswith("TODO")
+} | {"TODO"}
 
 
 def load_jobs(ws: Workspace) -> dict[str, dict]:
@@ -147,9 +154,11 @@ def load_jobs(ws: Workspace) -> dict[str, dict]:
         missing = [f for f in JOB_FIELDS if not str((j or {}).get(f, "")).strip()]
         if missing:
             raise L2HError(f"jobs.json: job {j.get('id')!r} is missing {missing}", "fill them in")
-        if "TODO" in json.dumps(j):
+        left = [f for f, v in j.items() if isinstance(v, str) and v.strip() in JOB_PLACEHOLDERS]
+        if left:
             raise L2HError(
-                f"jobs.json: job {j['id']!r} still has TODO placeholders", "fill them in"
+                f"jobs.json: job {j['id']!r} still has the scaffold's TODO placeholder in {left}",
+                "fill them in",
             )
         if j["scope"] not in JOB_SCOPES:
             raise L2HError(f"jobs.json: job {j['id']!r} scope must be one of {list(JOB_SCOPES)}")
@@ -271,12 +280,15 @@ def load_tasktypes(ws: Workspace, only: str | None = None) -> list[TaskType]:
                 raise L2HError(f"tasktypes/{p.name} is missing {fn}()", "see `l2h schema`")
         if not isinstance(getattr(ld.module, "SPEC", None), dict):
             raise L2HError(f"tasktypes/{p.name} is missing SPEC", "see `l2h schema`")
-        if ld.module.SPEC.get("task_scope") not in TASK_SCOPES:
+        scope = ld.module.SPEC.get("task_scope")
+        if scope not in TASK_SCOPES:
+            what = "is still the scaffold's TODO" if scope == "TODO" else f"is {scope!r}"
             raise L2HError(
-                f"tasktypes/{p.name}: SPEC['task_scope'] must be one of {list(TASK_SCOPES)}, "
-                f"got {ld.module.SPEC.get('task_scope')!r}",
-                "full_job = the logged agent's whole job rebuilt; decision = evidence given, "
-                "decision asked (`l2h docs --topic tasktypes`)",
+                f"tasktypes/{p.name}: SPEC['task_scope'] {what}; choose one of "
+                f"{' | '.join(TASK_SCOPES)}",
+                "full_job = the logged agent's whole job rebuilt; subtask = one sub-capability "
+                "rebuilt; decision = evidence given, its decision asked "
+                "(`l2h docs --topic tasktypes`)",
             )
         if ld.module.SPEC.get("job") not in jobs:
             raise L2HError(

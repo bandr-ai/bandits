@@ -26,7 +26,9 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 
 ## Default path
 
-1. **Understand the source.** `l2h init <logs> <workspace>`, then `l2h sample`, `l2h sample --unseen`,
+1. **Understand the source.** `l2h init <logs> <workspace>` (add `--allow-missing-runtime` on a
+   machine without Harbor/Docker: generation and host-local checks still work, nothing reaches
+   `validated`), then `l2h sample`, `l2h sample --unseen`,
    `l2h show <id>`, `l2h query '<expr>' --count`. Work out the *requested work* separately from
    what the logged agent *did*; how sessions, calls, tools, sub-agents, attachments relate; what is
    recorded vs missing. Write `source_notes.md` (include which samples you read) and `parse.py`
@@ -68,7 +70,7 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
   output format, graded on its real output. When the starting inputs or tools can't be rebuilt from the
   logs (or a provided harness), a decision task is still valuable: give the evidence the agent gathered
   and ask for its decision. Name and describe it as a decision-from-evidence task, not as the full job,
-  and record which one each task type is (`SPEC["task_scope"]`: `full_job` | `decision`).
+  and record which one each task type is (`SPEC["task_scope"]`: `full_job` | `subtask` | `decision`).
 - Gold: `verified` only with an independent verdict matching this task's exact scope; `imitation` = the
   logged answer; logged success, confidence and model agreement are not ground truth. Label honestly.
 - Instructions describe the task and never include the recorded answer. Gold lives only in `tests/`.
@@ -86,10 +88,10 @@ Generated tasks follow its conventions (`l2h docs --topic harbor`).
 
 | Need | Command |
 |---|---|
-| Start / resume | `l2h init <logs> <ws>` / `l2h status` |
+| Start / resume | `l2h init <logs> <ws> [--allow-missing-runtime]` / `l2h status` |
 | Look at the corpus | `l2h sample [--unseen] [--matching <check>] [--stratify <expr over r> --n N]`, `l2h show <id> [--field p] [--attachments]` |
 | Measure a hunch | `l2h query '<expr over r>' [--count] [--group-by p] [--grep re]` |
-| Scaffold code | `l2h new parser`, `l2h new check <n>`, `l2h new tasktype <n>` |
+| Scaffold code | `l2h new parser`, `l2h new jobs`, `l2h new check <n>`, `l2h new tasktype <n>` |
 | Run it on everything | `l2h run parse`, `l2h run checks`, `l2h run generate [--limit N] [--type T]` |
 | See what the solver sees | `l2h task show <id>`; fast verifier loop: `l2h task try <id> --answer x` |
 | Gates | `l2h validate [--type T] [--task ID] [--level 1,2,3]` |

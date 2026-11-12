@@ -58,7 +58,7 @@ CHECKS = [Check(id, version, fn)]
 def fn(t: Trajectory) -> Finding  # {result: pass|fail|unknown, evidence:[refs], note}
 
 # tasktypes/<type>.py
-SPEC = {unit, env, task_scope (full_job|decision), check, gold, hidden, applies_when}
+SPEC = {unit, env, job, task_scope (full_job|subtask|decision), check, gold, hidden, applies_when}
 def applies(t: Trajectory, findings) -> bool
 def group_key(t: Trajectory) -> str           # attempts sharing a key become one task
 def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked
