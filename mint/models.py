@@ -437,6 +437,12 @@ class BuildResult:
     # the verifier's own time budget in seconds (task.toml [verifier] timeout_sec); None = 120.
     # Give it room for its setup and per-call work; it is not the solver's budget.
     verifier_timeout_sec: float | None = None
+    # run-time env passed into the task environment (task.toml [environment] env), e.g. a user
+    # simulator's model and key as host references: {"USER_SIM_MODEL": "${USER_SIM_MODEL}"}.
+    # Values must be ${VAR} references or plain settings, never literal secrets.
+    runtime_env: dict = field(default_factory=dict)
+    # the solver's time budget (task.toml [agent] timeout_sec); None = 900. Conversations need more.
+    agent_timeout_sec: float | None = None
 
 
 @dataclass

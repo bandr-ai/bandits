@@ -9,6 +9,13 @@ change the command line or the artifact format; such changes are called out.
 
 - Mint: package hash sorts outcome keys, so regenerating an unchanged task keeps
   its validation.
+- Mint: dialogue jobs keep their user: user-simulator tasks (docker-compose
+  sidecar, model/key via `BuildResult.runtime_env` host references, oracle replays
+  tool actions, no model in grading); `agent_timeout_sec`. Guidance: stub the
+  environment, never the grading; grader limits (supported requirements only,
+  exact money, NaN/inf rejected, history checks only where needed); agreed end
+  state of successful repeat attempts as target; checks and decision logging only
+  where they matter.
 - Rename the logs-to-tasks tool from `l2h` to **Mint**: command/import `mint`,
   bundled skill `mint`, workspace `mint.json`, `MINT_*` environment variables,
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.

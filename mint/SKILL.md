@@ -19,7 +19,7 @@ Every command ends with a `next:` hint. After any interruption, run `mint status
 2. Every exclusion and every task traces back to source records (`file#offset`).
 3. Make nothing up: no timestamps, labels, boundaries, pairings or success values. Unknown is valid.
 4. A task is `validated` only if the execution gates passed in a real Harbor run; host-local gate passes (the default fast runner) stay `generated`. Run `mint validate` with Harbor and Docker installed (`--runner harbor` to insist) to reach `validated`. `mint` enforces it; never edit results.jsonl by hand.
-5. Log every decision with its evidence: `mint decide "<what>" --why "<evidence>"`.
+5. Log exclusions and judgement calls with their evidence: `mint decide "<what>" --why "<evidence>"`.
 
 Everything else is yours: reorder steps, loop back (a bad generator may mean a wrong parser),
 rewrite your code as often as needed, use your own tools (shell, grep, Python) instead of `mint`.
@@ -43,7 +43,7 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    its job); jobs you don't build stay listed in the report.
 2. **Findings.** `mint new check <name>`, `mint run checks`. Findings are observations, not exclusions.
    Ask three separate questions: recording quality, execution outcome, usefulness for a task.
-   Failed and partial runs stay usable. Spot-check each check on fresh data:
+   Failed and partial runs stay usable. Checks are optional; spot-check any check that excludes records:
    `mint sample --matching <check>`, then `mint decide "<what>" --kind spot_check --check <id> --verdict pass --why "..."`.
    Guide: `mint docs --topic checks`.
 3. **Task types.** `mint new tasktype <name>`, one per job shape. Each task is one whole job: many
@@ -63,7 +63,8 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    Guide: `mint docs --topic validation`.
 6. **Report.** `mint report`, read `report.md`, then summarise for the user, per job: its task or
    candidate, environment source, grading method and trust, oracle, gaps, and whether it is ready;
-   then exclusions and why, validated vs generated, what is missing.
+   then exclusions and why, validated vs generated, what is missing, numbers you could not
+   verify. Unattended runs stop at the report.
 
 ## Judgment
 
@@ -81,13 +82,12 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
     `Unable to locate package` is a failed lookup, not absence;
   - base image: a supplied Dockerfile/harness wins; else one consistent with the facts. Gap only
     unknowns that matter for the job (`affects: fidelity`), never a convenient guess.
-- **Never block a job for being hard.** If a piece is missing, build it with the gap recorded
-  (`env_source="partial"`, `gaps=[...]`, `oracle_kind="none"`), or return
-  `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only
-  for an unremovable secret/leak or no recoverable instruction. Every job ends with at least a
-  candidate; `mint report` flags any that don't.
-- **Never fake.** Missing data stays a listed gap: no invented files, no solve.sh or verifier made up
-  to satisfy packaging. Mark a read complete only when the log proves it.
+- **Never block a job for being hard; never fake.** Missing data/services: a stub with a connection
+  point (seed path, endpoint, env var), `env_source="partial"`, listed in `gaps`. Never fake the grading:
+  no invented files, solve.sh or verifier made up to satisfy packaging; if no known-good outcome can pass
+  the verifier, return `Candidate(reason, gaps, next_action)`. `Blocked` only for an unremovable
+  secret/leak or no recoverable instruction. Every job ends with at least a candidate. Mark a read
+  complete only when the log proves it.
 - **Grading.** `grading_method` fits the job (own `tests/test.sh` on the end state, recomputation, or
   exact/allowed-set). `gold_type` = why trusted: `verified` needs an outside label for this job (your
   own check is `computed`), `independent`, `solved`, `imitation` (logged answer, last resort), `none`.
@@ -98,7 +98,12 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
   environment), then `fresh` (ask first), then `reference`; `answer` proves wiring only; else `none`.
   Say where it came from in `oracle_source`. **Wrong outcomes are real mistakes:** `Outcome(script=...,
   source=...)` doing plausible bad work (a broken build, a stub printing the expected text); alternatives differ.
-- Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
+- Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Grading is deterministic, no LLM.
+- **Conversations stay conversations.** A dialogue job keeps its user: the solver gets only the opening
+  message; a user simulator answers at run time (reuse a supplied one; model/key from env vars, never
+  called during conversion); the user's goal, facts and choices live in its spec, never in
+  `instruction.md`. Grade end state + required statements; oracle replays a passing attempt's tool
+  actions (no model). No simulator buildable → `Candidate`; never a version without the user.
 - Reassess every exclusion for this task (no inherited filters); ask the user only for their decisions.
 
 ## Harbor
@@ -122,9 +127,3 @@ Use Harbor's `create-task` / `create-adapter` skills; tasks follow its conventio
 
 Every command takes `--json` (result on stdout, progress on stderr), `--full`, `--dry-run`, `--workspace`.
 Exit codes: 0 ok, 1 error or failed validation, 2 bad args/config, 130 interrupted.
-
-## Ending a run
-
-Tell the user, from `report.md` with file paths: each job and how far it got (task or candidate, ready or
-not and why), tasks `validated` vs `generated` vs `exec_failed`, grading trust, exclusions and why,
-what is missing, and which numbers you could not verify. Unattended runs stop at the report.

@@ -201,7 +201,7 @@ def _stage_report(ws: Workspace) -> dict:
             "stale": stale_parse,
         },
         "2_findings": {
-            "done": bool(chk and not stale_checks),
+            "done": not ws.checks_py.exists() or bool(chk and not stale_checks),
             "checks_exists": ws.checks_py.exists(),
             "run": bool(chk),
             "stale": stale_checks,
@@ -265,9 +265,7 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         ]
     if jm["error"]:
         return [f"fix jobs.json: {jm['error']}"]
-    if not s["2_findings"]["checks_exists"]:
-        return ["mint new check <name>"]
-    if not s["2_findings"]["done"]:
+    if s["2_findings"]["checks_exists"] and not s["2_findings"]["done"]:
         return ["mint run checks"]
     if not s["3_task_types"]["done"]:
         return ["mint new tasktype <name>"]
@@ -788,6 +786,8 @@ def schema_data() -> dict:
                 "alternatives": "other valid answers / Outcome scripts the verifier must accept. Outcome(script, note='', source='') source = free text provenance shown in the report",
                 "oracle_source": "free text: which logged attempt/solve solution/solve.sh came from and how its outcome is known",
                 "verifier_timeout_sec": "float > 0, the verifier's own time budget (task.toml [verifier] timeout_sec); default 120",
+                "runtime_env": "{NAME: value} passed into the task environment (task.toml [environment] env); secret-like names must be ${VAR:-} host references (e.g. a user simulator's model/key)",
+                "agent_timeout_sec": "float > 0, the solver's time budget (task.toml [agent] timeout_sec); default 900",
                 "oracle_kind": f"{list(ORACLE_KINDS)}; default reference if files has solution/solve.sh, answer if `answer`, else none (none = can't be validated)",
                 "env_source": f"{list(ENV_SOURCES)}; default evidence, or rebuilt when files has environment/Dockerfile; partial needs gaps",
                 "grading_method": f"{list(GRADING_METHODS)}; default answer.check or behavioral",

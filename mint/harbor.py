@@ -58,6 +58,26 @@ def _verifier_timeout(b: BuildResult) -> float:
     return float(t)
 
 
+_ENV_REF = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\}$")
+_SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.I)
+
+
+def _check_runtime(b: BuildResult) -> None:
+    """runtime_env: names are env names; secret-looking ones must be ${VAR} host references."""
+    if not isinstance(b.runtime_env, dict):
+        raise ContractError("runtime_env must be a dict of NAME -> value")
+    for k, v in b.runtime_env.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k)):
+            raise ContractError(f"runtime_env name {k!r} is not an env var name")
+        if _SECRETISH.search(str(k)) and not _ENV_REF.match(str(v)):
+            raise ContractError(
+                f"runtime_env {k} must be a host reference like ${{{k}:-}}, never a literal value"
+            )
+    t = b.agent_timeout_sec
+    if t is not None and (isinstance(t, bool) or not isinstance(t, int | float) or not t > 0):
+        raise ContractError(f"agent_timeout_sec must be a number > 0, got {t!r}")
+
+
 def task_toml(
     b: BuildResult,
     ttype: str,
@@ -116,15 +136,18 @@ def task_toml(
     lines += [
         "",
         "[agent]",
-        "timeout_sec = 900.0",
+        f"timeout_sec = {float(b.agent_timeout_sec or 900.0)}",
         "",
         "[environment]",
         "build_timeout_sec = 600.0",
         "cpus = 1",
         "memory_mb = 2048",
         "storage_mb = 10240",
-        "",
     ]
+    if b.runtime_env:
+        pairs = ", ".join(f"{k} = {_toml_str(str(v))}" for k, v in sorted(b.runtime_env.items()))
+        lines.append(f"env = {{ {pairs} }}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -198,6 +221,7 @@ def resolve(b: BuildResult) -> None:
     b.alternatives = [normalize_outcome(a) for a in b.alternatives]
     b.gaps = normalize_gaps(b.gaps)
     _verifier_timeout(b)
+    _check_runtime(b)
     if b.answer is not None:
         b.answer.validate()
     if b.answer is None and any(isinstance(x, str) for x in b.wrong_answers + b.alternatives):

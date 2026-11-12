@@ -27,3 +27,25 @@ Checked against harbor-framework/harbor (schema_version 1.4):
 - `[verifier] timeout_sec` defaults to 120; set `BuildResult.verifier_timeout_sec` so the verifier has
   its own sufficient budget (setup included), not a copy of `[agent]`'s. `task.toml` metadata also
   records `oracle_source`.
+
+## Dialogue tasks (user simulator)
+
+For a job that is a conversation with a user (see the skill: conversations stay conversations):
+
+- `environment/docker-compose.yaml`: the solver's `main` service plus a `user-sim` service (and, if
+  the job has tools/state, a service that owns them). Reuse a supplied simulator/runtime when the
+  harness has one.
+- The user's spec (goal, private facts, preferences, what they agree to) lives only inside the
+  `user-sim` service's files, never in `instruction.md` or any file the solver can read.
+- `instruction.md`: the opening message and how to talk to the user (e.g. a `user say "<text>"`
+  command or an HTTP endpoint), plus the tool interface.
+- Model and key: `BuildResult(runtime_env={"USER_SIM_MODEL": "${USER_SIM_MODEL:-}",
+  "USER_SIM_API_KEY": "${USER_SIM_API_KEY:-}"})`. Use `${VAR:-}` so the task still starts without
+  them. The simulator must start without credentials and fail only when asked to reply, so the
+  oracle / no-op / wrong-outcome gates run with no model.
+- Log every turn (user and solver) and every tool call to `/logs/agent/` for the verifier.
+- Verifier: deterministic; checks the end state (and required statements in the transcript). Never
+  grade with a model.
+- Oracle: `solution/solve.sh` replays a passing attempt's tool actions against the tool service (no
+  user turns needed). Wrong outcomes: no-op, a plausible wrong change.
+- `agent_timeout_sec`: conversations need more than the 900 s default.

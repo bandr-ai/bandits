@@ -171,3 +171,30 @@ def test_report_separates_infra_errors_from_grading_failures():
     assert _exec_problems(g("error", oracle="error", wrong="pass")) == ([], ["oracle"])
     assert _exec_problems(g("fail", noop="fail", oracle="error")) == (["noop"], ["oracle"])
     assert _exec_problems(g("pass", oracle="pass")) == ([], [])
+
+
+def test_runtime_env_and_agent_timeout_reach_task_toml():
+    import pytest
+
+    from mint import BuildResult, ContractError
+    from mint.harbor import resolve, task_toml
+
+    b = BuildResult(
+        task_id="t",
+        files={"tests/test.sh": "#!/bin/bash\n"},
+        runtime_env={
+            "USER_SIM_MODEL": "${USER_SIM_MODEL:-}",
+            "USER_SIM_API_KEY": "${USER_SIM_API_KEY:-}",
+        },
+        agent_timeout_sec=3600,
+    )
+    resolve(b)
+    d = tomllib.loads(task_toml(b, "ty", "g", [], separate=False))
+    assert d["environment"]["env"]["USER_SIM_API_KEY"] == "${USER_SIM_API_KEY:-}"
+    assert d["agent"]["timeout_sec"] == 3600.0
+    b.runtime_env = {"USER_SIM_API_KEY": "sk-live-123"}
+    with pytest.raises(ContractError, match="host reference"):
+        resolve(b)
+    b.runtime_env, b.agent_timeout_sec = {}, 0
+    with pytest.raises(ContractError, match="agent_timeout_sec"):
+        resolve(b)

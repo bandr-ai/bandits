@@ -46,6 +46,13 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   - Check the outcome the request asks for (a computed result, real behaviour), never a printed
     marker or a file's mere presence: a fake binary that echoes the expected text must fail.
   - Accept valid alternatives (layout, naming, approach); do not hard-code one path or one tool.
+  - Enforce only what the original job or its policy supports: no added steps (e.g. authentication),
+    minimality or exact-state rules unless the original requires them; don't merge values the
+    original treats as different.
+  - Check action history only where a requirement depends on it (e.g. consent before a change).
+  - Numbers/money: reject NaN/inf; compare exact units (integer cents or exact decimals).
+  - Repeat attempts at the same instance: when the attempts known to succeed end in the same
+    state, that state is a supported target; when they differ, list the gap.
   - Give wrong outcomes that try the obvious shortcut (a stub printing the expected text, hard-coding
     the expected value) and alternatives that do the job differently. Add `source="..."` to each
     `Outcome` (free text: "logged attempt X, outcome known from ...", "synthetic shortcut").
