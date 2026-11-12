@@ -139,8 +139,10 @@ class Trajectory(dict):
     def calls(self) -> list[Call]:
         """Every tool call in step order, each with its matched observation result.
 
-        Results match calls by source_call_id == tool_call_id. In a step where some calls
-        match no result and as many results carry no source_call_id, those pair by position.
+        Results match calls by source_call_id == tool_call_id. Only in a step with no ids at
+        all (no call has tool_call_id, no result has source_call_id) and as many results as
+        calls do they pair by position; any partial ids make position ambiguous, so unmatched
+        calls stay unanswered rather than taking another call's output.
         """
         out = []
         for s in self.get("steps") or []:
@@ -150,8 +152,10 @@ class Trajectory(dict):
             ]
             by_id = {r["source_call_id"]: r for r in res if r.get("source_call_id")}
             unkeyed = [r for r in res if not r.get("source_call_id")]
-            loose = [i for i, c in enumerate(calls) if c.get("tool_call_id") not in by_id]
-            by_pos = dict(zip(loose, unkeyed, strict=True)) if len(loose) == len(unkeyed) else {}
+            no_ids = not by_id and not any(c.get("tool_call_id") for c in calls)
+            by_pos = (
+                dict(enumerate(unkeyed)) if no_ids and calls and len(calls) == len(unkeyed) else {}
+            )
             for i, c in enumerate(calls):
                 cid = c.get("tool_call_id")
                 r = by_id.get(cid) if cid in by_id else by_pos.get(i)

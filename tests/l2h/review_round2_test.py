@@ -50,6 +50,43 @@ def test_calls_without_ids_pair_with_results_by_position():
     assert [c.output for c in t2.calls()] == ["ra", None, None]
 
 
+def test_partial_ids_never_pair_by_position():
+    # c2 has an id but was never answered; the id-less result belongs to something else
+    t = traj(
+        [
+            {
+                "source": "agent",
+                "message": "",
+                "tool_calls": [
+                    {"tool_call_id": "c1", "function_name": "a", "arguments": {}},
+                    {"tool_call_id": "c2", "function_name": "b", "arguments": {}},
+                ],
+                "observation": {
+                    "results": [{"source_call_id": "c1", "content": "ra"}, {"content": "other"}]
+                },
+            }
+        ]
+    )
+    assert [c.output for c in t.calls()] == ["ra", None]
+    # an id-less call next to an id-less result still doesn't pair when any id is present
+    t2 = traj(
+        [
+            {
+                "source": "agent",
+                "message": "",
+                "tool_calls": [
+                    {"tool_call_id": "c1", "function_name": "a", "arguments": {}},
+                    {"function_name": "b", "arguments": {}},
+                ],
+                "observation": {
+                    "results": [{"source_call_id": "c1", "content": "ra"}, {"content": "rb?"}]
+                },
+            }
+        ]
+    )
+    assert [c.output for c in t2.calls()] == ["ra", None]
+
+
 def test_in_agrees_with_getitem_for_l2h_fields():
     t = traj([{"source": "user", "message": "hi"}])
     for k in ("id", "meta", "ended", "source_refs", "attachments", "steps"):
