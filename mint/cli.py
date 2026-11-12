@@ -11,19 +11,25 @@ from importlib import resources
 from pathlib import Path
 
 from . import __version__, explore, stages
+from . import evidence as evidence_mod
+from . import judge as judge_mod
 from . import report as report_mod
 from . import validate as validate_mod
 from .gates import LocalRunner, pick_runner
 from .harbor import ANSWER_DIR
 from .models import (
     ATIF_VERSION,
+    BLOCK_KINDS,
     CHECK_KINDS,
     ENDED,
+    ENV_SOURCES,
+    GAP_AFFECTS,
     GATE_STATES,
     GOLD_TYPES,
+    GRADING_METHODS,
     NORMALIZERS,
+    ORACLE_KINDS,
     STATUSES,
-    TASK_SCOPES,
     ContractError,
 )
 from .output import (
@@ -196,7 +202,7 @@ def _stage_report(ws: Workspace) -> dict:
             "stale": stale_parse,
         },
         "2_findings": {
-            "done": bool(chk and not stale_checks),
+            "done": not ws.checks_py.exists() or bool(chk and not stale_checks),
             "checks_exists": ws.checks_py.exists(),
             "run": bool(chk),
             "stale": stale_checks,
@@ -209,10 +215,10 @@ def _stage_report(ws: Workspace) -> dict:
             "tasks": len(rows),
         },
         "5_validate": {
-            "done": bool(rows) and any(r["status"] == "validated" for r in rows),
+            "done": bool(rows) and any(r["status"] in ("validated", "judged") for r in rows),
             "local_only": bool(rows)
             and not any(r["status"] == "validated" for r in rows)
-            and any(r["gates"]["exec"] == "pass" for r in rows),
+            and any(r["gates"]["exec"] == "pass" and r["status"] != "judged" for r in rows),
             "by_status": dict(sc),
             "by_status_gold": dict(report_mod.status_gold(rows)),
             "validated_without_decision": report_mod.validated_without_decision(ws, rows),
@@ -227,9 +233,11 @@ def _stage_report(ws: Workspace) -> dict:
         blockers.append(f"{p['records_in_no_trajectory']} raw records landed in no trajectory")
     q = read_jsonl(ws.queue)
     if q:
-        blockers.append(f"{len(q)} queued blocked/exception groups (out/queue.jsonl)")
+        blockers.append(f"{len(q)} queued candidate/blocked/exception groups (out/queue.jsonl)")
     if sc["blocked"]:
-        blockers.append(f"{sc['blocked']} blocked tasks")
+        blockers.append(f"{sc['blocked']} blocked tasks (leak/secret)")
+    if sc["exec_failed"]:
+        blockers.append(f"{sc['exec_failed']} tasks whose package does not work (exec_failed)")
     errs = [r["task_id"] for r in rows if r["gates"]["exec"] == "error"]
     if errs:
         blockers.append(f"{len(errs)} tasks with infrastructure errors in exec gates")
@@ -253,12 +261,12 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         return ["write source_notes.md (what a record is, boundaries, what is missing)"]
     jm = s["1_understand"]["job_map"]
     if not jm:
-        return ["mint new jobs  # map the jobs: full job(s), sub-capabilities, repeats, outcomes"]
+        return [
+            "mint new jobs  # map the jobs the logged agents were given, their repeats and outcomes"
+        ]
     if jm["error"]:
         return [f"fix jobs.json: {jm['error']}"]
-    if not s["2_findings"]["checks_exists"]:
-        return ["mint new check <name>"]
-    if not s["2_findings"]["done"]:
+    if s["2_findings"]["checks_exists"] and not s["2_findings"]["done"]:
         return ["mint run checks"]
     if not s["3_task_types"]["done"]:
         return ["mint new tasktype <name>"]
@@ -292,6 +300,8 @@ def cmd_status(a, ws: Workspace) -> Result:
         lines.append(
             "tasks: " + ", ".join(f"{k}={n}" for k, n in sorted(v5["by_status_gold"].items()))
         )
+    if v5["by_status"].get("judged"):
+        lines.append(f"note: {report_mod.JUDGED_NOTE}")
     if v5["by_status"].get("validated"):
         lines.append(f"note: {report_mod.VALIDATED_NOTE}")
         if v5["validated_without_decision"]:
@@ -354,6 +364,62 @@ def cmd_show(a, ws: Workspace) -> Result:
     return Result(d, text, ["mint query '<expr>' --count  # measure how common this is"])
 
 
+def cmd_evidence(a, ws: Workspace) -> Result:
+    ws.config()
+    t = next((t for t in stages.load_trajectories(ws) if t["id"] == a.id), None)
+    if t is None:
+        raise MINTError(f"no trajectory {a.id!r}", "run `mint run parse`; ids: `mint query True`")
+    ev = evidence_mod.extract(t)
+    sm = evidence_mod.summary(ev)
+    d = {"id": a.id, "summary": sm, "evidence": ev}
+    lines = [f"{a.id}: " + ", ".join(f"{k} {v}" for k, v in sm["counts"].items())]
+    lines.append(
+        "starting-file candidates (read before written; complete / pre_existing: yes/no/unknown; setup_first = after an agent install):"
+    )
+    yn = {True: "yes", False: "no", None: "unknown"}
+    for f in sm["starting_files"][: None if a.full else 30]:
+        lines.append(
+            f"  {f['path']}  complete={yn[f['complete']]}  pre_existing={yn[f['pre_existing']]}"
+            f"  steps={','.join(f['refs'][:5])}"
+            + ("" if f["before_agent_setup"] else "  setup_first")
+        )
+    lines.append("outputs (written by the run): " + (", ".join(sm["outputs"][:30]) or "-"))
+
+    def when(x: dict) -> str:
+        return f"@{x['step']} {'before' if x['before_agent_setup'] else 'after'} setup"
+
+    lines.append(
+        "system (version/OS queries; 'after setup' only describes that moment): "
+        + (", ".join(f"{x['fact']} {when(x)}" for x in sm["system"][:10]) or "-")
+    )
+    lines.append("absent (kind what @step; 'before setup' = the agent lacked it at the start):")
+    lines += [
+        f"  {x['kind']} {x['what']} {when(x)}  via: {x['command']}"
+        for x in sm["absent"][: None if a.full else 20]
+    ] or ["  -"]
+    if sm["package_lookup_failed"]:
+        lines.append("package lookup failed (not absence; index/name problem):")
+        lines += [
+            f"  {x['what']} {when(x)}  via: {x['command']}"
+            for x in sm["package_lookup_failed"][:10]
+        ]
+    lines.append("set up by the agent (part of the job: solution, never the environment):")
+    lines += [
+        f"  {when(x)}  {x['command']}" for x in sm["agent_setup"][: None if a.full else 20]
+    ] or ["  -"]
+    lines.append("sources fetched: " + (", ".join(sm["sources"][:20]) or "-"))
+    if sm["unknown_tools"]:
+        lines.append(
+            "tools without an interpreter (read their calls yourself): "
+            + ", ".join(sm["unknown_tools"])
+        )
+    return Result(
+        d,
+        "\n".join(lines),
+        [f"mint show {a.id}  # read the calls behind any item", "mint new tasktype <name>"],
+    )
+
+
 def cmd_query(a, ws: Workspace) -> Result:
     ws.config()
     d = explore.query_corpus(ws, a.expr, a.count, a.group_by, a.grep, a.raw, a.limit)
@@ -382,7 +448,7 @@ def cmd_new(a, ws: Workspace) -> Result:
         atomic_write(path, content)
     nxt = {
         "parser": "fill in parse.py, then `mint run parse --limit 20`",
-        "jobs": "fill in jobs.json: every full job and sub-capability, how repeats and outcomes show",
+        "jobs": "fill in jobs.json: every job the logged agents were given, how repeats and outcomes show",
         "check": "implement the check, then `mint run checks`",
         "tasktype": "implement it, then `mint run generate --limit 5`",
     }[a.kind]
@@ -564,8 +630,10 @@ def cmd_validate(a, ws: Workspace) -> Result:
         a.task or [],
         a.dry_run,
         runner=pick_runner(a.runner, ws.config()),
+        jobs=a.jobs,
+        judge=a.judge,
     )
-    lines = [f"runner: {s['runner']}  levels: {s['levels']}"]
+    lines = [f"runner: {s['runner']}  levels: {s['levels']}  jobs: {s['jobs']}"]
     if s["runner"] == "local":
         lines.append(
             "note: host-local runner (no Harbor+Docker): passes keep tasks `generated`; "
@@ -582,6 +650,11 @@ def cmd_validate(a, ws: Workspace) -> Result:
         lines += _group_lines(v["causes"])
         if v.get("message"):
             lines.append(f"  {v['message']}")
+    if s.get("judge_skipped"):
+        lines.append(
+            f"level 2 skipped {len(s['judge_skipped'])} judge task(s): they cost model calls and "
+            "never become `validated`; opt in with `mint validate --judge`"
+        )
     if "level3_audit_sample" in s:
         lines.append(
             "level 3 audit sample (read these; record the verdict with `mint decide --kind audit`):"
@@ -595,6 +668,7 @@ def cmd_validate(a, ws: Workspace) -> Result:
             "also review: can the answer be DERIVED from the inputs? (the oracle only proves wiring) -> "
             + ", ".join(s["review_for_derivability"][:5])
         )
+    lines.append(f"wall time: {s['wall_seconds']}s")
     if a.dry_run:
         lines.append("(dry-run: results not saved)")
     code = EXIT_ERROR if s["any_failure"] or s["any_infra_error"] else EXIT_OK
@@ -612,6 +686,20 @@ def cmd_validate(a, ws: Workspace) -> Result:
         "mint report",
     ]
     return Result(s, "\n".join(lines), nxt, exit=code)
+
+
+def cmd_judge_calibrate(a, ws: Workspace) -> Result:
+    ws.config()
+    res = judge_mod.calibrate(
+        ws, a.type, a.n, Path(a.answers).expanduser() if a.answers else None, a.dry_run
+    )
+    lines = [e["what"] + f"; {e['why']}" for e in res["types"].values()]
+    lines.append(
+        "recorded as a decision (shown per type in `mint report`)"
+        if not a.dry_run
+        else "(dry-run: not recorded)"
+    )
+    return Result(res, "\n".join(lines), ["mint report"])
 
 
 def cmd_decide(a, ws: Workspace) -> Result:
@@ -706,27 +794,39 @@ def schema_data() -> dict:
             "note": "findings are observations, not exclusions",
         },
         "tasktypes/<type>.py": {
-            "SPEC": f"{{unit, env, job, task_scope in {list(TASK_SCOPES)}, check, gold, hidden, applies_when}}; job = an id from jobs.json; task_scope is required: full_job = the logged agent's whole job rebuilt, subtask = one sub-capability rebuilt, decision = evidence given, its decision asked",
-            "jobs.json": '{"jobs": [{id, scope: full_job|subtask, parent?, description, where, repeats, outcome, notes?}]}: the job map from step 1; task types build from it',
+            "SPEC": "{env, job, check, gold, hidden, applies_when, judge_reason}; judge_reason = required non-empty when check is judge (why no deterministic check works); job = the id from jobs.json this type rebuilds end to end (Mint builds whole jobs only, no subtasks)",
+            "jobs.json": '{"jobs": [{id, description, where, repeats, outcome, notes?}]}: every job the logged agents were given, from step 1; one task (or candidate) per job instance',
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
             "group_key": "def group_key(t) -> str  # attempts sharing a key become one task",
-            "build": "def build(group, out: Path) -> BuildResult | Blocked",
+            "build": "def build(group, out: Path) -> BuildResult | Candidate | Blocked  # the whole job",
             "BuildResult": {
                 "task_id": "str [A-Za-z0-9._-]",
                 "instruction": "str; never the recorded answer",
                 "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>; binary files are skipped by the leak and secret scans",
-                "answer": f"Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, pattern); forbidden = negative gold: expected is the known-wrong answers, any other well-formed answer passes (needs alternatives)",
-                "wrong_answers": "meaningful wrong answers the verifier must reject (else an auto one is used and flagged)",
-                "alternatives": "other valid answers the verifier must accept",
+                "answer": f"optional when files has your own tests/test.sh (custom verifier on the end state). Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, choices)",
+                "wrong_answers": "meaningful wrong answers the verifier must reject: strings (answer-file tasks) or Outcome(script, note) run in the environment instead of solve.sh (else an auto one is used and flagged)",
+                "alternatives": "other valid answers / Outcome scripts the verifier must accept. Outcome(script, note='', source='') source = free text provenance shown in the report",
+                "oracle_source": "free text: which logged attempt/solve solution/solve.sh came from and how its outcome is known",
+                "verifier_timeout_sec": "float > 0, the verifier's own time budget (task.toml [verifier] timeout_sec); default 120",
+                "runtime_env": "{NAME: value} passed into the task environment (task.toml [environment] env); secret-like names must be ${VAR:-} host references (e.g. a user simulator's model/key)",
+                "agent_timeout_sec": "float > 0, the solver's time budget (task.toml [agent] timeout_sec); default 900",
+                "oracle_kind": f"{list(ORACLE_KINDS)}; default reference if files has solution/solve.sh, answer if `answer`, else none (none = can't be validated)",
+                "env_source": f"{list(ENV_SOURCES)}; default evidence, or rebuilt when files has environment/Dockerfile; partial needs gaps",
+                "grading_method": f"{list(GRADING_METHODS)}; default answer.check or behavioral",
+                "grading_reason": "one line: why this grading is trusted",
+                "gaps": f"[{{what, affects in {list(GAP_AFFECTS)}}}]",
+                "rubric": "judge only: 3-6 distinct yes/no criteria written from the instruction and evidence, never the logged answer; answer.expected is then the reference answer (shown to the judge as 'may be wrong'); evidence must be text and is copied to tests/evidence/",
+                "judge_model": "judge only: pinned model name (default: mint.json judge_model); endpoint and key come from MINT_JUDGE_BASE_URL / MINT_JUDGE_API_KEY / MINT_JUDGE_MODEL at verify time",
                 "leak_allow": "[task-relative path] skipped by the leak scan (recorded in results)",
                 "secret_allow": "[task-relative path] skipped by the secret scan (recorded in results)",
                 "hidden": "extra strings that must never appear in instruction.md/environment/ (original final response, ...)",
                 "files": "optional overrides/extras keyed by task-relative path",
-                "gold_type": list(GOLD_TYPES),
+                "gold_type": f"{list(GOLD_TYPES)} = grading trust (why the grading is believed)",
                 "assumptions": "[str]",
             },
-            "Blocked": "Blocked(reason, missing=[...])",
+            "Candidate": "Candidate(reason, gaps=[...], next_action='') # job identified, no runnable package yet",
+            "Blocked": f"Blocked(reason, missing=[...], kind) # kind in {list(BLOCK_KINDS)} only",
         },
         "mint.json": DEFAULT_CONFIG,
         "results.jsonl row": {
@@ -743,15 +843,17 @@ def schema_data() -> dict:
                 "runner": ["local", "harbor"],
                 "trials": "Harbor trial ids; required (with runner=harbor) for `validated`",
             },
+            "check": "present (= judge) only on judge tasks; those end `judged`, never `validated`",
             "status": list(STATUSES),
-            "rule": "validated only if gates.exec == pass from a real Harbor run (runner=harbor with trial ids); host-local passes stay generated",
+            "provenance": "{job, oracle, oracle_source, outcomes{wrong, alternatives}, env_source, grading{method, trust, reason}, gaps}",
+            "rule": "validated only if gates.exec == pass (oracle included) from a real Harbor run (runner=harbor with trial ids); host-local passes and no_oracle stay generated; exec_failed = malformed or gates failed; blocked = leak/secret",
         },
         "task package": [
             "task.toml",
             "instruction.md",
             "environment/",
             "tests/test.sh",
-            "solution/solve.sh",
+            "solution/solve.sh (unless oracle_kind none)",
         ],
         "exit codes": {
             "0": "ok",
@@ -864,6 +966,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--field", help="dotted path, e.g. events.3.content")
     sp.add_argument("--attachments", action="store_true", help="materialise attachments as files")
 
+    sp = add(
+        "evidence",
+        cmd_evidence,
+        "what one trajectory read, wrote, ran and fetched (env rebuild input)",
+    )
+    sp.add_argument("id")
+
     sp = add("query", cmd_query, "count/group/grep across the whole corpus")
     sp.add_argument("expr", help="python expression over `r`, e.g. 'len(r.events) > 10'")
     sp.add_argument("--count", action="store_true")
@@ -903,10 +1012,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-fix-attempts", type=int)
     sp.add_argument("--level", default="1,2", help="comma list of 1,2,3 (default 1,2)")
     sp.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        help="gate runs in parallel (default: validate_jobs in mint.json, 4; 1 = one at a time)",
+    )
+    sp.add_argument(
         "--runner",
         default="auto",
         choices=["auto", "harbor", "local"],
         help="auto = Harbor if harbor+docker are installed, else host-local (tasks stay `generated`)",
+    )
+    sp.add_argument(
+        "--judge",
+        action="store_true",
+        help="also run level 2 on judge tasks (costs model calls; needs MINT_JUDGE_* env vars)",
+    )
+
+    sp = add(
+        "judge-calibrate",
+        cmd_judge_calibrate,
+        "measure how often the judge agrees with a known verdict (costs model calls)",
+    )
+    sp.add_argument("--type", help="deterministic type to calibrate on (its tasks have a verifier)")
+    sp.add_argument("--n", type=int, default=20, help="tasks (or answers with --answers) to sample")
+    sp.add_argument(
+        "--answers", metavar="JSONL", help="externally graded {task_id, answer, true_reward}"
     )
 
     sp = add("decide", cmd_decide, "log a decision with its evidence")

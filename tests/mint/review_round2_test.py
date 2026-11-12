@@ -144,7 +144,8 @@ def test_solve_sh_comment_names_the_gold_kind():
     v = solve_sh(a, gold_type="verified")
     assert "Oracle (verified gold)" in v and "logged answer" not in v
     assert "not that the answer" not in v
-    assert "computed from the task inputs" in solve_sh(a, gold_type="solved")
+    assert "fresh solve" in solve_sh(a, gold_type="solved")
+    assert "recomputed from the task inputs" in solve_sh(a, gold_type="computed")
 
 
 def test_skill_documents_missing_runtime_and_jobs_scaffold():
@@ -156,4 +157,4 @@ def test_skill_documents_missing_runtime_and_jobs_scaffold():
     guide = (Path(mint.__file__).parent / "guides/tasktypes.md").read_text()
     assert "--allow-missing-runtime" in skill and "`mint new jobs`" in skill
     for doc in (skill, guide):
-        assert "`full_job` | `subtask` | `decision`" in doc
+        assert "whole job" in doc.lower() or "end to end" in doc.lower()

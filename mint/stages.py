@@ -12,12 +12,15 @@ from typing import Any
 
 from . import harbor, scan
 from .models import (
+    BLOCK_KINDS,
     Blocked,
     BuildResult,
+    Candidate,
     ContractError,
     ParseError,
     Trajectory,
     normalize_finding,
+    normalize_gaps,
     normalize_trajectory,
 )
 from .output import MINTError, progress
@@ -323,6 +326,17 @@ def source_strings(group: list[dict]) -> list[str]:
     return sorted(set(out))
 
 
+def _outcome_view(x) -> dict:
+    """Report view of a wrong answer / alternative: kind, short text, free-text source."""
+    if isinstance(x, dict):
+        return {
+            "kind": "script",
+            "text": x.get("note") or x["script"][:60],
+            "source": x.get("source", ""),
+        }
+    return {"kind": "answer", "text": str(x)[:60], "source": ""}
+
+
 def package_hash(task_dir: Path, meta: dict | None = None) -> str:
     """Fingerprint of what the gates judged: the package bytes plus the wrong answers and
     alternatives the exec gates try (they live outside the package)."""
@@ -331,8 +345,8 @@ def package_hash(task_dir: Path, meta: dict | None = None) -> str:
         if p.is_file():
             h.append(f"{p.relative_to(task_dir).as_posix()}:{sha(p.read_bytes())}")
     if meta and (meta.get("wrong_answers") or meta.get("alternatives")):
-        h.append("wrong:" + json.dumps(meta.get("wrong_answers", [])))
-        h.append("alt:" + json.dumps(meta.get("alternatives", [])))
+        h.append("wrong:" + json.dumps(meta.get("wrong_answers", []), sort_keys=True, default=str))
+        h.append("alt:" + json.dumps(meta.get("alternatives", []), sort_keys=True, default=str))
     return sha("\n".join(h))
 
 
@@ -415,6 +429,13 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 try:
                     res = tt.loaded.module.build(group, stage)
                     if isinstance(res, Blocked):
+                        if res.kind not in BLOCK_KINDS:
+                            raise ContractError(
+                                f"a job may be Blocked only for {list(BLOCK_KINDS)} "
+                                f"(got kind {res.kind!r}: {res.reason}); return "
+                                "Candidate(reason, gaps=[...], next_action=...) or build it "
+                                "with its gaps instead"
+                            )
                         queue.append(
                             _q(
                                 tt.name,
@@ -426,9 +447,24 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                             )
                         )
                         continue
+                    if isinstance(res, Candidate):
+                        q = _q(
+                            tt.name,
+                            gk,
+                            "candidate",
+                            res.reason,
+                            [t["id"] for t in group],
+                            [g["what"] for g in normalize_gaps(res.gaps)],
+                        )
+                        q["gaps"] = normalize_gaps(res.gaps)
+                        q["next_action"] = res.next_action
+                        q["job"] = tt.spec.get("job")
+                        queue.append(q)
+                        continue
                     if not isinstance(res, BuildResult):
                         raise ContractError(
-                            f"build() returned {type(res).__name__}; expected BuildResult or Blocked"
+                            f"build() returned {type(res).__name__}; "
+                            "expected BuildResult, Candidate or Blocked"
                         )
                     if res.task_id in ids_seen:
                         raise ContractError(
@@ -442,7 +478,11 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                         if p.is_file():
                             extra[p.relative_to(stage).as_posix()] = p.read_bytes()
                     res.files = {**extra, **res.files}
-                    harbor.materialize(res, dest, tt.name, tt.generator, srcs)
+                    if res.answer is not None and res.answer.check == "judge":
+                        # pinned model and the reason a judge is needed come from config / SPEC
+                        res.judge_model = (res.judge_model or cfg.get("judge_model") or "").strip()
+                        res.judge_reason = str(tt.spec.get("judge_reason") or "").strip()
+                    harbor.materialize(res, dest, tt.name, tt.generator, srcs, spec=tt.spec)
                 except Exception as e:
                     detail = f"{type(e).__name__}: {e}"
                     queue.append(
@@ -456,16 +496,35 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     )
                     continue
                 row = new_row(res.task_id, tt.name, srcs, tt.generator, res.gold_type)
+                if res.answer is not None and res.answer.check == "judge":
+                    row["check"], row["judge_reason"] = "judge", res.judge_reason
                 row["assumptions"] = list(res.assumptions)
+                row["provenance"] = {
+                    "job": tt.spec.get("job"),
+                    "oracle": res.oracle_kind,
+                    "oracle_source": res.oracle_source,
+                    "outcomes": {
+                        "wrong": [_outcome_view(x) for x in res.wrong_answers],
+                        "alternatives": [_outcome_view(x) for x in res.alternatives],
+                    },
+                    "env_source": res.env_source,
+                    "grading": {
+                        "method": res.grading_method,
+                        "trust": res.gold_type,
+                        "reason": res.grading_reason,
+                    },
+                    "gaps": res.gaps,
+                }
                 hidden = [str(h) for h in res.hidden]
-                if res.answer.check != "forbidden":  # a negative task has no answer to hide
+                # a custom verifier lists its own hidden values
+                if res.answer is not None:
                     hidden.append(res.answer.canonical())
                     if isinstance(res.answer.expected, list):
                         hidden += [str(x) for x in res.answer.expected]
-                    hidden += [str(a) for a in res.alternatives]
+                    hidden += [a for a in res.alternatives if isinstance(a, str)]
                 meta = {
-                    "wrong_answers": [str(w) for w in res.wrong_answers],
-                    "alternatives": [str(a) for a in res.alternatives],
+                    "wrong_answers": list(res.wrong_answers),
+                    "alternatives": list(res.alternatives),
                     "hidden": hidden,
                     "leak_allow": list(res.leak_allow),
                     "secret_allow": list(res.secret_allow),

@@ -35,7 +35,7 @@ def test_rerun_after_failed_sample_is_not_passed_and_keeps_budget(env):
     t = res["data"]["types"]["addnums"]
     assert code == 1 and t["state"] == "failed" and t["attempts"] == 1  # not reset, not "passed"
     st = {r["status"] for r in rows(env).values()}
-    assert "blocked" in st
+    assert "exec_failed" in st
 
 
 def test_changed_package_reruns_leak_even_with_level_2_only(env):

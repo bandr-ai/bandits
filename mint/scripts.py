@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import JOB_SCOPES, TASK_SCOPES, Check, ContractError, safe_id
+from .models import Check, ContractError, safe_id
 from .output import MINTError, UsageError
 from .workspace import Workspace, sha
 
@@ -62,15 +62,14 @@ CHECKS.append(Check("{name}", 1, check_{name}))
 TASKTYPE_TEMPLATE = '''"""Task type {name}. Contract: `mint schema`. Generators follow Harbor's adapter pattern."""
 from pathlib import Path
 
-from mint import Answer, Blocked, BuildResult, Trajectory
+from mint import Answer, Blocked, BuildResult, Candidate, Outcome, Trajectory
 
 SPEC = {{
-    "unit": "episode",            # episode | subtask
-    "env": "static",              # static evidence files in v1
-    "job": "TODO",               # a job id from jobs.json
-    "task_scope": "TODO",         # choose: full_job | subtask | decision (`mint docs --topic tasktypes`)
-    "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
-    "gold": "imitation",          # verified | solved | imitation | negative | none
+    "env": "evidence",            # evidence | harness | rebuilt | partial
+    "job": "TODO",               # the job id from jobs.json this type rebuilds end to end
+    "check": "exact",             # exact | allowed_set | numeric | judge | behavioral (your own tests/test.sh)
+    "gold": "imitation",          # verified | computed | independent | solved | imitation | none
+    # "judge_reason": "",         # judge only: why no deterministic check can work (required)
     "hidden": ["answer key", "original final response"],
     "applies_when": "describe which records and findings this type can use",
 }}
@@ -88,8 +87,20 @@ def group_key(t: Trajectory) -> str:
     return t["id"]
 
 
-def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked:
-    return Blocked("not implemented", missing=["everything"])
+def build(group: list[Trajectory], out: Path) -> BuildResult | Candidate | Blocked:
+    return Candidate("not implemented yet", gaps=["generator not written"])
+    # The whole job, with its own verifier on the end state:
+    # return BuildResult(
+    #     task_id="...",
+    #     instruction="...",                  # the original request; never the recorded answer
+    #     files={{"environment/Dockerfile": "...", "tests/test.sh": "...",
+    #            "solution/solve.sh": "..."}},  # solve.sh from a passing logged attempt
+    #     env_source="rebuilt", oracle_kind="replay", grading_method="behavioral",
+    #     gold_type="independent", grading_reason="...",
+    #     wrong_answers=[Outcome("bash doing a plausible wrong thing")],
+    #     gaps=[{{"what": "...", "affects": "fidelity"}}],
+    # )
+    # A job whose output is an answer (a label, number or short text):
     # return BuildResult(
     #     task_id="...",
     #     instruction="...",              # what to do; never the recorded answer
@@ -105,28 +116,17 @@ JOBS_TEMPLATE = """{
   "jobs": [
     {
       "id": "whole-run",
-      "scope": "full_job",
       "description": "TODO: the job the logged agent was given, start to end (inputs -> output)",
       "where": "TODO: which trajectories contain it (a query expression over r, or prose)",
       "repeats": "TODO: how attempts at the same instance are recognised (or 'none')",
       "outcome": "TODO: how success/failure is known from the logs (or 'unknown')",
-      "notes": ""
-    },
-    {
-      "id": "TODO-sub-capability",
-      "scope": "subtask",
-      "parent": "whole-run",
-      "description": "TODO: a sub-agent or step with its own inputs, tools and output",
-      "where": "",
-      "repeats": "",
-      "outcome": "",
       "notes": ""
     }
   ]
 }
 """
 
-JOB_FIELDS = ("id", "scope", "description", "where", "repeats", "outcome")
+JOB_FIELDS = ("id", "description", "where", "repeats", "outcome")
 # the scaffold's own placeholder values; any other text (even "build a TODO app") is the user's
 JOB_PLACEHOLDERS = {
     v.strip()
@@ -137,11 +137,11 @@ JOB_PLACEHOLDERS = {
 
 
 def load_jobs(ws: Workspace) -> dict[str, dict]:
-    """The job map (jobs.json): every job the corpus contains, full jobs and sub-capabilities."""
+    """The job map (jobs.json): every job the logged agents were given, each rebuilt end to end."""
     if not ws.jobs.exists():
         raise MINTError(
             "no jobs.json: map the jobs in the corpus before building task types",
-            "`mint new jobs`, then list the full job(s), sub-capabilities, repeats and outcomes",
+            "`mint new jobs`, then list each job the logged agents were given, its repeats and outcome",
         )
     try:
         data = json.loads(ws.jobs.read_text())
@@ -160,14 +160,13 @@ def load_jobs(ws: Workspace) -> dict[str, dict]:
                 f"jobs.json: job {j['id']!r} still has the scaffold's TODO placeholder in {left}",
                 "fill them in",
             )
-        if j["scope"] not in JOB_SCOPES:
-            raise MINTError(f"jobs.json: job {j['id']!r} scope must be one of {list(JOB_SCOPES)}")
+        if j.get("parent") or j.get("scope", "full_job") != "full_job":
+            raise MINTError(
+                f"jobs.json: job {j['id']!r} has a parent or a non-full scope; Mint builds "
+                "end-to-end jobs only",
+                "list only the jobs the logged agents were given, and drop scope/parent",
+            )
         out[safe_id(str(j["id"]))] = j
-    for j in out.values():
-        if j.get("parent") and j["parent"] not in out:
-            raise MINTError(f"jobs.json: job {j['id']!r} has unknown parent {j['parent']!r}")
-    if not any(j["scope"] == "full_job" for j in out.values()):
-        raise MINTError("jobs.json lists no full_job", "name the job the logged agent was given")
     return out
 
 
@@ -280,15 +279,11 @@ def load_tasktypes(ws: Workspace, only: str | None = None) -> list[TaskType]:
                 raise MINTError(f"tasktypes/{p.name} is missing {fn}()", "see `mint schema`")
         if not isinstance(getattr(ld.module, "SPEC", None), dict):
             raise MINTError(f"tasktypes/{p.name} is missing SPEC", "see `mint schema`")
-        scope = ld.module.SPEC.get("task_scope")
-        if scope not in TASK_SCOPES:
-            what = "is still the scaffold's TODO" if scope == "TODO" else f"is {scope!r}"
+        if ld.module.SPEC.get("task_scope", "full_job") != "full_job":
             raise MINTError(
-                f"tasktypes/{p.name}: SPEC['task_scope'] {what}; choose one of "
-                f"{' | '.join(TASK_SCOPES)}",
-                "full_job = the logged agent's whole job rebuilt; subtask = one sub-capability "
-                "rebuilt; decision = evidence given, its decision asked "
-                "(`mint docs --topic tasktypes`)",
+                f"tasktypes/{p.name}: SPEC['task_scope'] is {ld.module.SPEC['task_scope']!r}; "
+                "Mint builds end-to-end jobs only",
+                "rebuild the whole job the logged agent was given and drop task_scope",
             )
         if ld.module.SPEC.get("job") not in jobs:
             raise MINTError(

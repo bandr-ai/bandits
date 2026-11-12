@@ -12,15 +12,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 ATIF_SOURCES = ("system", "user", "agent")
-TASK_SCOPES = ("full_job", "subtask", "decision")
-JOB_SCOPES = ("full_job", "subtask")
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
-GOLD_TYPES = ("verified", "solved", "imitation", "negative", "none")
-CHECK_KINDS = ("exact", "allowed_set", "numeric", "forbidden")
+# gold = why the grading is trusted (grading trust); see guides/tasktypes.md
+GOLD_TYPES = ("verified", "computed", "independent", "solved", "imitation", "none")
+CHECK_KINDS = ("exact", "allowed_set", "numeric", "judge")
+GRADING_METHODS = (*CHECK_KINDS, "behavioral")  # how the verifier grades
 NORMALIZERS = ("strip", "lower", "collapse_ws", "percent", "thousands", "sorted_list")
-STATUSES = ("validated", "generated", "blocked")
-GATE_STATES = ("pass", "fail", "error", "not_run")
+STATUSES = ("validated", "judged", "generated", "exec_failed", "blocked")
+GATE_STATES = ("pass", "fail", "error", "not_run", "no_oracle")
+# where solution/solve.sh comes from: a logged attempt replayed, a fresh solve, a known-good
+# reference, a script that writes the expected answer (proves grader wiring only), or none
+ORACLE_KINDS = ("replay", "fresh", "reference", "answer", "none")
+# where the starting environment comes from: mint's default image + evidence files, a supplied
+# harness, rebuilt from the traces, or rebuilt with known gaps
+ENV_SOURCES = ("evidence", "harness", "rebuilt", "partial")
+GAP_AFFECTS = ("execution", "fidelity", "grading", "none")
+# the only reasons a job may be Blocked; anything else is a Candidate with gaps
+BLOCK_KINDS = ("secret", "leak", "no_instruction")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 
@@ -299,8 +308,8 @@ class Answer:
     normalize: list = field(default_factory=lambda: ["strip"])
     tolerance: float = 0.0
     rel_tolerance: float = 0.0
-    pattern: str = ""  # forbidden only: regex a well-formed answer must fully match ("" = any)
     choices: list = field(default_factory=list)  # label vocabulary shown to the solver, if any
+    # judge: expected is the reference answer shown to the judge as "may be wrong", never the key
 
     def validate(self) -> None:
         if self.check not in CHECK_KINDS:
@@ -310,28 +319,22 @@ class Answer:
             raise ContractError(f"unknown normalizers {bad}; allowed {NORMALIZERS}")
         if self.check == "allowed_set" and not (isinstance(self.expected, list) and self.expected):
             raise ContractError("allowed_set needs a non-empty list as answer.expected")
-        if self.check == "forbidden":
-            if not (isinstance(self.expected, list) and self.expected):
-                raise ContractError(
-                    "forbidden needs a non-empty list of known-wrong answers as answer.expected"
-                )
-            try:
-                re.compile(self.pattern)
-            except re.error as e:
-                raise ContractError(f"answer.pattern is not a valid regex: {e}") from e
         if self.choices:
             if not all(isinstance(c, str) and c.strip() for c in self.choices):
                 raise ContractError("answer.choices must be a list of non-empty strings")
             exp = self.expected if isinstance(self.expected, list) else [self.expected]
             missing = [e for e in exp if str(e).strip() not in [c.strip() for c in self.choices]]
-            if self.check in ("exact", "allowed_set", "forbidden") and missing:
+            if self.check in ("exact", "allowed_set") and missing:
                 raise ContractError(f"answer.expected {missing} not in answer.choices")
-        if self.check == "forbidden" and not (self.pattern or self.choices):
+        if self.check in ("exact", "judge") and isinstance(self.expected, list | dict):
             raise ContractError(
-                "forbidden needs answer.pattern or answer.choices: otherwise any string passes"
+                f"{self.check} needs a scalar expected answer; use allowed_set for lists"
             )
-        if self.check == "exact" and isinstance(self.expected, list | dict):
-            raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
+        if self.check == "judge" and not str(self.expected).strip():
+            raise ContractError(
+                "judge needs a non-empty reference answer as answer.expected (the oracle writes it; "
+                "the judge sees it labelled 'may be wrong')"
+            )
         if not self.file.strip() or "/" in self.file or self.file.startswith("."):
             raise ContractError("answer.file must be a plain file name")
 
@@ -343,13 +346,62 @@ class Answer:
             "normalize": list(self.normalize),
             "tolerance": self.tolerance,
             "rel_tolerance": self.rel_tolerance,
-            "pattern": self.pattern,
             "choices": list(self.choices),
         }
 
     def canonical(self) -> str:
-        """The single value an oracle writes (for `forbidden`, a known-wrong one: see alternatives)."""
+        """The single value an oracle writes."""
         return str(self.expected[0] if isinstance(self.expected, list) else self.expected)
+
+
+@dataclass
+class Outcome:
+    """An executable outcome for the exec gates: a bash script run in the task environment
+    in place of solution/solve.sh (e.g. start a broken server, build a wrong binary).
+    Used as a wrong outcome (must fail the verifier) or an alternative (must pass)."""
+
+    script: str
+    note: str = ""
+    # free text: where this outcome comes from ("logged attempt X, outcome known from ...",
+    # "synthetic shortcut"); shown in `mint report`, never gates anything
+    source: str = ""
+
+    def to_dict(self) -> dict:
+        return {"script": self.script, "note": self.note, "source": self.source}
+
+
+def normalize_outcome(x: Any) -> str | dict:
+    """A wrong answer / alternative: a plain answer string, or an Outcome as a dict."""
+    if isinstance(x, Outcome):
+        x = x.to_dict()
+    if isinstance(x, dict):
+        if not isinstance(x.get("script"), str) or not x["script"].strip():
+            raise ContractError("an Outcome needs a non-empty bash `script`")
+        return {
+            "script": x["script"],
+            "note": str(x.get("note") or ""),
+            "source": str(x.get("source") or ""),
+        }
+    if isinstance(x, str | int | float):
+        return str(x)
+    raise ContractError(
+        f"wrong answers / alternatives must be strings or Outcome, got {type(x).__name__}"
+    )
+
+
+def normalize_gaps(gaps: list) -> list[dict]:
+    """Gaps as [{"what", "affects"}]; a bare string is assumed to affect fidelity."""
+    out = []
+    for g in gaps or []:
+        if isinstance(g, str):
+            g = {"what": g, "affects": "fidelity"}
+        if not isinstance(g, dict) or not str(g.get("what") or "").strip():
+            raise ContractError(f"a gap needs a non-empty 'what', got {g!r}")
+        aff = g.get("affects", "fidelity")
+        if aff not in GAP_AFFECTS:
+            raise ContractError(f"gap affects {aff!r} must be one of {GAP_AFFECTS}")
+        out.append({"what": str(g["what"]), "affects": aff})
+    return out
 
 
 @dataclass
@@ -360,6 +412,11 @@ class BuildResult:
     generate (task.toml, tests/*, solution/solve.sh, environment/Dockerfile) is
     filled in when absent. `instruction` and `evidence` are conveniences:
     evidence keys land in environment/data/<key> and appear at /app/<key>.
+
+    Grading: either `answer` (mint writes an answer-file verifier) or your own
+    files["tests/test.sh"] (custom verifier, e.g. behavioural checks on the end state);
+    a custom verifier needs at least one wrong Outcome. Oracle: mint writes solve.sh for
+    an `answer`; otherwise supply files["solution/solve.sh"] or set oracle_kind="none".
     """
 
     task_id: str
@@ -377,9 +434,46 @@ class BuildResult:
     difficulty: str = "medium"
     tags: list = field(default_factory=list)
     description: str = ""
+    # provenance (see guides/tasktypes.md); None = mint infers it and checks it is consistent
+    oracle_kind: str | None = None
+    env_source: str | None = None
+    grading_method: str | None = None
+    grading_reason: str = ""
+    gaps: list = field(default_factory=list)
+    # which logged attempt / solve the solution came from and how its outcome is known (free text)
+    oracle_source: str = ""
+    # the verifier's own time budget in seconds (task.toml [verifier] timeout_sec); None = 120.
+    # Give it room for its setup and per-call work; it is not the solver's budget.
+    verifier_timeout_sec: float | None = None
+    # run-time env passed into the task environment (task.toml [environment] env), e.g. a user
+    # simulator's model and key as host references: {"USER_SIM_MODEL": "${USER_SIM_MODEL}"}.
+    # Values must be ${VAR} references or plain settings, never literal secrets.
+    runtime_env: dict = field(default_factory=dict)
+    # the solver's time budget (task.toml [agent] timeout_sec); None = 900. Conversations need more.
+    agent_timeout_sec: float | None = None
+    # judge check only: 3-6 yes/no criteria written from the instruction and evidence, not the
+    # logged answer; the pinned model (default: mint.json judge_model). judge_reason comes from the
+    # task type's SPEC and is filled in by mint.
+    rubric: list = field(default_factory=list)
+    judge_model: str = ""
+    judge_reason: str = ""
 
 
 @dataclass
 class Blocked:
+    """No task may be built: only `kind` secret / leak / no_instruction. A job that is merely
+    hard to rebuild is a Candidate with its gaps."""
+
     reason: str
     missing: list = field(default_factory=list)
+    kind: str = "other"
+
+
+@dataclass
+class Candidate:
+    """The job was identified but no runnable package could be built yet: what is missing
+    and what would close it. Kept visible in the queue and the report, never counted as a task."""
+
+    reason: str
+    gaps: list = field(default_factory=list)
+    next_action: str = ""

@@ -7,11 +7,34 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+- Mint: package hash sorts outcome keys, so regenerating an unchanged task keeps
+  its validation.
+- Mint: dialogue jobs keep their user: user-simulator tasks (docker-compose
+  sidecar, model/key via `BuildResult.runtime_env` host references, oracle replays
+  tool actions, no model in grading); `agent_timeout_sec`. Guidance: stub the
+  environment, never the grading; grader limits (supported requirements only,
+  exact money, NaN/inf rejected, history checks only where needed); agreed end
+  state of successful repeat attempts as target; checks and decision logging only
+  where they matter.
 - Rename the logs-to-tasks tool from `l2h` to **Mint**: command/import `mint`,
   bundled skill `mint`, workspace `mint.json`, `MINT_*` environment variables,
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.
   Existing experimental workspaces and parser scripts must be regenerated or
   migrated to these names; the old command/import are removed.
+- `mint` verifier honesty: `BuildResult.verifier_timeout_sec` (own `[verifier]`
+  budget), `oracle_source` and `Outcome.source` provenance shown in `mint report`,
+  `answer` oracles are `ready` only with verified/computed trust, execution errors
+  reported apart from grading failures; guidance on verifier-only dependencies,
+  outcome-based graders and the `verified` label.
+- `mint evidence`: starting-state facts keep their command, step, tool and
+  `before_agent_setup`. System facts only come from version/OS query commands;
+  absence is `not_on_path` / `module_missing`; `Unable to locate package` is
+  `package_lookup_failed`. The "smallest matching base image" rule is gone. A job
+  whose whole assignment is a decision is a normal answer-file job.
+- `mint validate` runs gate runs in parallel (`-j/--jobs`, config `validate_jobs`, default 4)
+  and saves each task's result as soon as it finishes; a rerun skips tasks whose package and
+  runner evidence are current. Per-task progress on stderr and wall time in the summary.
+
 
 ### Added
 
@@ -45,6 +68,18 @@ change the command line or the artifact format; such changes are called out.
   Job map: step 1 writes `jobs.json` (full jobs, sub-capabilities, repeats, outcomes); every task
   type names its job (`SPEC["job"]`), `task_scope` gains `subtask`, and the report lists jobs with
   nothing built for them. Pre-ATIF parsers get a migration error.
+- `mint` full jobs first: a task type can grade the end state with its own
+  `tests/test.sh` (no answer file needed; the verifier runs in the task
+  environment), supply its own environment and oracle, and record provenance
+  (`env_source`, `oracle_kind`, `grading_method`/`grading_reason`, `gaps`, in
+  results and `task.toml`). Wrong answers and alternatives can be executable
+  `Outcome` scripts. `oracle_kind="none"` packages run every other gate and stay
+  `generated`. `Candidate(reason, gaps, next_action)` records a job that can't be
+  packaged yet; a `full_job` may be `Blocked` only for a secret, a leak or no
+  instruction. New `exec_failed` status (malformed or failed gates); `blocked` now
+  means leak/secret. The report leads with full jobs and a computed `ready` count.
+  New `mint evidence <id>` lists what a run read, wrote, ran and fetched. The skill
+  no longer limits tasks to static evidence.
 
   Review round 2: the secret scan catches env-style names (`DB_PASSWORD=...`,
   `AWS_SECRET_ACCESS_KEY=...`) and "enter <value> in the password field" prose; the leak scan treats
@@ -56,6 +91,15 @@ change the command line or the artifact format; such changes are called out.
   `run parse` suggests the same next step as `mint status`. The task type scaffold leaves
   `task_scope` as `TODO` (choose `full_job` | `subtask` | `decision`); only the `jobs.json`
   scaffold's own placeholders are rejected; `solve.sh` comments name the gold kind.
+
+- Mint: LLM judge as a last-resort check (ported from the judge branch): `check="judge"` with 3-6
+  yes/no criteria graded against copied task evidence by an OpenAI-compatible endpoint configured
+  only through `MINT_JUDGE_*` env vars; temperature 0, pinned model and rubric version in
+  `task.toml`, `verifiable = false`, required `SPEC["judge_reason"]`. New `judged` status, never
+  `validated`; judge failures are infra errors. `mint validate --judge` adds opt-in gates (reference
+  passes, empty/wrong fail, alternatives pass, 3x stability, run in parallel with the other gates)
+  and `mint judge-calibrate` records judge-vs-deterministic agreement per type. Skill: verifier
+  comes from what success means for the job, never from the logged agent's final output.
 
 ## [0.3.0] - unreleased
 

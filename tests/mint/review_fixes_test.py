@@ -84,8 +84,8 @@ def _read(env, rel):
 
 
 GROUPED = """
-from mint import Answer, Blocked, BuildResult
-SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "numeric", "gold": "imitation",
+from mint import Answer, BuildResult, Candidate
+SPEC = {"unit": "episode", "env": "static", "job": "main", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 
@@ -97,7 +97,7 @@ def group_key(t):
 
 def build(group, out):
     if group[0]["meta"]["nums"] == "BLOCK":
-        return Blocked("needs a live system", missing=["running service"])
+        return Candidate("needs a live system", gaps=["running service"])
     return BuildResult(
         task_id="t_group",
         instruction="Add up the numbers in /app/nums.txt.",

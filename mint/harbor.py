@@ -8,6 +8,7 @@ Conventions (checked against harbor-framework/harbor, schema_version 1.4):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -15,22 +16,39 @@ import tomllib
 from importlib import resources
 from pathlib import Path
 
-from .models import GOLD_TYPES, Answer, BuildResult, ContractError, safe_id
+from .models import (
+    ENV_SOURCES,
+    GOLD_TYPES,
+    GRADING_METHODS,
+    ORACLE_KINDS,
+    Answer,
+    BuildResult,
+    ContractError,
+    normalize_gaps,
+    normalize_outcome,
+    safe_id,
+)
 
 ANSWER_DIR = "/app/answer"
 SCHEMA_VERSION = "1.4"
 ORG = "mint"
-REQUIRED = [
-    "task.toml",
-    "instruction.md",
-    "tests/test.sh",
-    "tests/expected.json",
-    "solution/solve.sh",
-]
+REQUIRED = ["task.toml", "instruction.md", "tests/test.sh"]
 
 
 def grade_source() -> str:
     return resources.files("mint").joinpath("templates/grade.py").read_text()
+
+
+JUDGE_ENV = ("MINT_JUDGE_BASE_URL", "MINT_JUDGE_API_KEY", "MINT_JUDGE_MODEL")
+RUBRIC_MIN, RUBRIC_MAX = 3, 6
+
+
+def judge_source() -> str:
+    return resources.files("mint").joinpath("templates/judge.py").read_text()
+
+
+def rubric_version(criteria: list) -> str:
+    return hashlib.sha256(json.dumps(criteria).encode()).hexdigest()[:8]
 
 
 def _toml_str(s: str) -> str:
@@ -41,11 +59,57 @@ def _toml_list(items) -> str:
     return "[" + ", ".join(_toml_str(str(i)) for i in items) + "]"
 
 
-def task_toml(b: BuildResult, ttype: str, generator: str, sources: list[str]) -> str:
+DEFAULT_VERIFIER_TIMEOUT = 120.0
+
+
+def _verifier_timeout(b: BuildResult) -> float:
+    t = b.verifier_timeout_sec
+    if t is None:
+        return DEFAULT_VERIFIER_TIMEOUT
+    if isinstance(t, bool) or not isinstance(t, int | float) or not t > 0:
+        raise ContractError(f"verifier_timeout_sec must be a number > 0, got {t!r}")
+    return float(t)
+
+
+_ENV_REF = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\}$")
+_SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.I)
+
+
+def _check_runtime(b: BuildResult) -> None:
+    """runtime_env: names are env names; secret-looking ones must be ${VAR} host references."""
+    if not isinstance(b.runtime_env, dict):
+        raise ContractError("runtime_env must be a dict of NAME -> value")
+    for k, v in b.runtime_env.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k)):
+            raise ContractError(f"runtime_env name {k!r} is not an env var name")
+        if _SECRETISH.search(str(k)) and not _ENV_REF.match(str(v)):
+            raise ContractError(
+                f"runtime_env {k} must be a host reference like ${{{k}:-}}, never a literal value"
+            )
+    t = b.agent_timeout_sec
+    if t is not None and (isinstance(t, bool) or not isinstance(t, int | float) or not t > 0):
+        raise ContractError(f"agent_timeout_sec must be a number > 0, got {t!r}")
+
+
+def task_toml(
+    b: BuildResult,
+    ttype: str,
+    generator: str,
+    sources: list[str],
+    *,
+    separate: bool = True,
+    spec: dict | None = None,
+) -> str:
+    """separate=True: answer-file task, verifier in its own image reading /app/answer.
+    separate=False: custom verifier, runs in the solver's environment (checks its end state)."""
     name = f"{ORG}/{ttype}-{b.task_id}".lower()
-    lines = [
-        f'schema_version = "{SCHEMA_VERSION}"',
-        f"artifacts = [{_toml_str(ANSWER_DIR)}]",
+    judge = b.answer is not None and b.answer.check == "judge"
+    spec = spec or {}
+    gaps = [f"{g['affects']}: {g['what']}" for g in b.gaps]
+    lines = [f'schema_version = "{SCHEMA_VERSION}"']
+    if separate:
+        lines.append(f"artifacts = [{_toml_str(ANSWER_DIR)}]")
+    lines += [
         "",
         "[task]",
         f"name = {_toml_str(name)}",
@@ -63,26 +127,58 @@ def task_toml(b: BuildResult, ttype: str, generator: str, sources: list[str]) ->
         f"type = {_toml_str(ttype)}",
         f"generator = {_toml_str(generator)}",
         f"gold = {_toml_str(b.gold_type)}",
+        f"job = {_toml_str(str(spec.get('job', '')))}",
+        f"oracle = {_toml_str(b.oracle_kind or '')}",
+        f"oracle_source = {_toml_str(b.oracle_source)}",
+        f"env_source = {_toml_str(b.env_source or '')}",
+        f"grading_method = {_toml_str(b.grading_method or '')}",
+        f"grading_reason = {_toml_str(b.grading_reason)}",
+        f"gaps = {_toml_list(gaps)}",
         f"sources = {_toml_list(sources)}",
         f"assumptions = {_toml_list(b.assumptions)}",
+    ]
+    if judge:
+        lines += [
+            "verifiable = false  # graded by a model: an opinion, not ground truth",
+            f"judge_model = {_toml_str(b.judge_model)}",
+            "judge_temperature = 0",
+            f"judge_rubric_version = {_toml_str(rubric_version(b.rubric))}",
+            f"judge_reason = {_toml_str(b.judge_reason)}",
+        ]
+    lines += [
         "",
         "[verifier]",
-        "timeout_sec = 120.0",
-        'environment_mode = "separate"',
-        "",
-        "[verifier.environment]",
-        'network_mode = "no-network"',
+        f"timeout_sec = {300.0 if judge and b.verifier_timeout_sec is None else _verifier_timeout(b)}",
+    ]
+    if separate:
+        lines += ['environment_mode = "separate"', ""]
+        if (
+            judge
+        ):  # the key reaches the verifier from the host environment; it is never written here
+            lines += ["[verifier.env]"]
+            for var in JUDGE_ENV:
+                ref = f"${{{var}:-{b.judge_model}}}" if var == "MINT_JUDGE_MODEL" else f"${{{var}}}"
+                lines.append(f"{var} = {_toml_str(ref)}")
+            lines.append("")
+        lines += [
+            "[verifier.environment]",
+            f'network_mode = "{"public" if judge else "no-network"}"',
+        ]
+    lines += [
         "",
         "[agent]",
-        "timeout_sec = 900.0",
+        f"timeout_sec = {float(b.agent_timeout_sec or 900.0)}",
         "",
         "[environment]",
         "build_timeout_sec = 600.0",
         "cpus = 1",
         "memory_mb = 2048",
         "storage_mb = 10240",
-        "",
     ]
+    if b.runtime_env:
+        pairs = ", ".join(f"{k} = {_toml_str(str(v))}" for k, v in sorted(b.runtime_env.items()))
+        lines.append(f"env = {{ {pairs} }}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -104,9 +200,10 @@ COPY --chmod=755 . /tests/
 
 ORACLE_NOTE = {
     "verified": "the gold answer, independently verified for this task's scope",
-    "solved": "the answer computed from the task inputs",
+    "computed": "the answer recomputed from the task inputs",
+    "independent": "the expected answer, checked independently of the logged run",
+    "solved": "the answer a fresh solve produced and the verifier accepted",
     "imitation": "the logged answer (imitation gold, not independently checked)",
-    "negative": "a valid answer (one of the alternatives; the known-wrong ones are forbidden)",
     "none": "the expected answer",
 }
 
@@ -116,7 +213,7 @@ def solve_sh(ans: Answer, value: str | None = None, gold_type: str = "imitation"
     note = ORACLE_NOTE.get(gold_type, "the expected answer")
     caveat = (
         "It proves the verifier is wired up."
-        if gold_type in ("verified", "solved")
+        if gold_type in ("verified", "computed", "solved")
         else "It proves the verifier is wired up, not that the answer is derivable from the inputs."
     )
     return (
@@ -136,36 +233,100 @@ def env_dockerfile(has_data: bool) -> str:
     return s
 
 
-def materialize(
-    b: BuildResult, dest: Path, ttype: str, generator: str, sources: list[str]
-) -> list[str]:
-    """Write the task package to dest. Returns relative paths written."""
+def resolve(b: BuildResult) -> None:
+    """Check a BuildResult's grading/oracle/environment contract and fill in what mint infers.
+
+    Mutates b: wrong_answers/alternatives normalised, gaps normalised, oracle_kind /
+    env_source / grading_method resolved. Raises ContractError on anything inconsistent.
+    """
     safe_id(b.task_id)
     if b.gold_type not in GOLD_TYPES:
         raise ContractError(f"gold_type {b.gold_type!r} must be one of {GOLD_TYPES}")
+    custom = b.answer is None  # no answer file: the generator's own verifier grades the end state
+    if custom and "tests/test.sh" not in b.files:
+        raise ContractError(
+            "BuildResult needs answer=Answer(...) (answer-file verifier) or its own "
+            "files['tests/test.sh'] (custom verifier)"
+        )
+    b.wrong_answers = [normalize_outcome(w) for w in b.wrong_answers]
+    b.alternatives = [normalize_outcome(a) for a in b.alternatives]
+    b.gaps = normalize_gaps(b.gaps)
+    _verifier_timeout(b)
+    _check_runtime(b)
+    if b.answer is not None:
+        b.answer.validate()
+    if b.answer is None and any(isinstance(x, str) for x in b.wrong_answers + b.alternatives):
+        raise ContractError(
+            "plain-string wrong answers/alternatives need an answer file; "
+            "with a custom verifier use Outcome(script=...)"
+        )
+
+    has_solve = "solution/solve.sh" in b.files
+    kind = b.oracle_kind or ("reference" if has_solve else "answer" if b.answer else "none")
+    if kind not in ORACLE_KINDS:
+        raise ContractError(f"oracle_kind {kind!r} must be one of {ORACLE_KINDS}")
+    if kind == "none" and has_solve:
+        raise ContractError("oracle_kind 'none' but files contain solution/solve.sh")
+    if kind == "answer" and b.answer is None and not has_solve:
+        raise ContractError("oracle_kind 'answer' needs an answer (or your own solve.sh)")
+    if kind in ("replay", "fresh", "reference") and not has_solve:
+        raise ContractError(f"oracle_kind {kind!r} needs files['solution/solve.sh']")
+    b.oracle_kind = kind
+
+    own_env = any(
+        k in b.files for k in ("environment/Dockerfile", "environment/docker-compose.yaml")
+    )
+    env = b.env_source or ("rebuilt" if own_env else "evidence")
+    if env not in ENV_SOURCES:
+        raise ContractError(f"env_source {env!r} must be one of {ENV_SOURCES}")
+    if env == "partial" and not any(g["affects"] != "none" for g in b.gaps):
+        raise ContractError("env_source 'partial' needs gaps saying what is missing")
+    b.env_source = env
+
+    method = b.grading_method or ("behavioral" if custom else b.answer.check)
+    if method not in GRADING_METHODS:
+        raise ContractError(f"grading_method {method!r} must be one of {GRADING_METHODS}")
+    b.grading_method = method
+
+
+def materialize(
+    b: BuildResult,
+    dest: Path,
+    ttype: str,
+    generator: str,
+    sources: list[str],
+    spec: dict | None = None,
+) -> list[str]:
+    """Write the task package to dest. Returns relative paths written."""
+    resolve(b)
+    custom = b.answer is None
     files: dict[str, str | bytes] = {}
-    if b.answer is None:
-        raise ContractError("BuildResult.answer is required: the verifier needs an expected answer")
-    b.answer.validate()
-    oracle_value = None
-    if (b.gold_type == "negative") != (b.answer.check == "forbidden"):
-        raise ContractError("gold_type 'negative' and answer.check 'forbidden' go together")
-    if b.gold_type == "negative":
-        if not b.alternatives:
+    judge = b.answer is not None and b.answer.check == "judge"
+    if judge:
+        crit = b.rubric
+        if not (
+            isinstance(crit, list)
+            and RUBRIC_MIN <= len(crit) <= RUBRIC_MAX
+            and all(isinstance(c, str) and c.strip() for c in crit)
+            and len({c.strip() for c in crit}) == len(crit)
+        ):
             raise ContractError(
-                "a negative task needs `alternatives`: valid answers (the oracle writes the first)"
+                f"a judge task needs a rubric of {RUBRIC_MIN}-{RUBRIC_MAX} distinct yes/no criteria "
+                "(strings), written from the instruction and evidence, not the logged answer"
             )
-        oracle_value = str(b.alternatives[0])
-        if oracle_value.strip() in [str(x).strip() for x in b.answer.expected]:
-            raise ContractError("the oracle's valid answer must differ from the known-wrong ones")
-        if b.answer.choices and oracle_value.strip() not in [c.strip() for c in b.answer.choices]:
-            raise ContractError("the oracle's valid answer must be one of answer.choices")
-    ans_path = f"{ANSWER_DIR}/{b.answer.file}"
+        if not b.wrong_answers:
+            raise ContractError(
+                "a judge task needs `wrong_answers`: plausible mistakes the judge must reject"
+            )
 
     if b.instruction is not None:
         text = b.instruction.rstrip() + "\n"
-        if ans_path not in text:
-            text += f"\nWrite your final answer to `{ans_path}` (just the answer, nothing else).\n"
+        if b.answer is not None and not custom:
+            ans_path = f"{ANSWER_DIR}/{b.answer.file}"
+            if ans_path not in text:
+                text += (
+                    f"\nWrite your final answer to `{ans_path}` (just the answer, nothing else).\n"
+                )
         files["instruction.md"] = text
     for k, v in b.evidence.items():
         if not isinstance(v, str | bytes):
@@ -173,14 +334,21 @@ def materialize(
         files[f"environment/data/{k}"] = v
     files.update(b.files)  # generator overrides win
 
-    files.setdefault("task.toml", task_toml(b, ttype, generator, sources))
-    files.setdefault("tests/expected.json", json.dumps(b.answer.to_dict(), indent=2) + "\n")
-    files.setdefault("tests/grade.py", grade_source())
-    files.setdefault("tests/test.sh", TEST_SH)
-    files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
-    files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value, b.gold_type))
+    files.setdefault(
+        "task.toml", task_toml(b, ttype, generator, sources, separate=not custom, spec=spec)
+    )
+    if b.answer is not None:
+        files.setdefault("tests/expected.json", json.dumps(b.answer.to_dict(), indent=2) + "\n")
+    if not custom:
+        files.setdefault("tests/grade.py", grade_source())
+        files.setdefault("tests/test.sh", TEST_SH)
+        files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
+    if b.oracle_kind == "answer":
+        files.setdefault("solution/solve.sh", solve_sh(b.answer, None, b.gold_type))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
+    if judge:
+        add_judge_files(files, b)
 
     if dest.exists():
         import shutil
@@ -200,6 +368,33 @@ def materialize(
     return written
 
 
+def add_judge_files(files: dict, b: BuildResult) -> None:
+    """tests/ gets what the separate verifier needs: the judge script, the rubric (with the task
+    text and pinned model) and a copy of the evidence. No file here is solver-visible."""
+    instr = files.get("instruction.md")
+    if not isinstance(instr, str) or not instr.strip():
+        raise ContractError("a judge task needs an instruction (the judge grades against it)")
+    ev = {
+        k[len("environment/data/") :]: v
+        for k, v in files.items()
+        if k.startswith("environment/data/")
+    }
+    if not ev:
+        raise ContractError("a judge task needs text evidence: the judge grades against it")
+    if any(not isinstance(v, str) for v in ev.values()):
+        raise ContractError("a judge task supports text evidence only (no bytes)")
+    rubric = {
+        "version": rubric_version(b.rubric),
+        "model": b.judge_model,
+        "task": instr,
+        "criteria": [c.strip() for c in b.rubric],
+    }
+    files["tests/rubric.json"] = json.dumps(rubric, indent=2) + "\n"
+    files["tests/grade.py"] = judge_source()
+    for k, v in ev.items():
+        files[f"tests/evidence/{k}"] = v
+
+
 def structure_check(task_dir: Path) -> list[str]:
     """Level-1 structure gate. Returns a list of problems (empty = pass)."""
     problems: list[str] = []
@@ -214,6 +409,16 @@ def structure_check(task_dir: Path) -> list[str]:
             cfg = tomllib.loads((task_dir / "task.toml").read_text())
         except tomllib.TOMLDecodeError as e:
             problems.append(f"task.toml is not valid TOML: {e}")
+    test_sh = task_dir / "tests/test.sh"
+    if (
+        test_sh.is_file()
+        and "expected.json" in test_sh.read_text(errors="replace")
+        and not (task_dir / "tests/expected.json").is_file()
+    ):
+        problems.append("missing tests/expected.json (tests/test.sh reads it)")
+    oracle = cfg.get("metadata", {}).get("mint", {}).get("oracle", "")
+    if oracle != "none" and not (task_dir / "solution/solve.sh").is_file():
+        problems.append("missing solution/solve.sh (or set oracle_kind='none')")
     if cfg:
         if not re.match(
             r"^[A-Za-z0-9][\w.\-]*/[A-Za-z0-9][\w.\-]*$", cfg.get("task", {}).get("name", "")
@@ -282,4 +487,48 @@ def structure_check(task_dir: Path) -> list[str]:
         task_dir / "instruction.md"
     ).read_text().strip():
         problems.append("instruction.md is empty")
+    if cfg and exp.is_file() and _spec_check(exp) == "judge":
+        problems += judge_problems(task_dir, cfg)
     return problems
+
+
+def _spec_check(exp: Path) -> str:
+    try:
+        return str(json.loads(exp.read_text()).get("check"))
+    except (ValueError, AttributeError):
+        return ""
+
+
+def judge_problems(task_dir: Path, cfg: dict) -> list[str]:
+    """Extra structure rules for judged tasks."""
+    out: list[str] = []
+    meta = cfg.get("metadata", {}).get("mint", {})
+    if not str(meta.get("judge_reason", "")).strip():
+        out.append(
+            "judge task has no judge_reason: set SPEC['judge_reason'] in the task type "
+            "(why no deterministic check can work)"
+        )
+    if meta.get("verifiable") is not False:
+        out.append("judge task must record `verifiable = false` in [metadata.mint]")
+    rub = task_dir / "tests" / "rubric.json"
+    try:
+        r = json.loads(rub.read_text())
+        crit = r["criteria"]
+        if not (
+            isinstance(crit, list)
+            and RUBRIC_MIN <= len(crit) <= RUBRIC_MAX
+            and all(isinstance(c, str) and c.strip() for c in crit)
+        ):
+            out.append(f"tests/rubric.json needs {RUBRIC_MIN}-{RUBRIC_MAX} non-empty criteria")
+        if not str(r.get("model", "")).strip() or meta.get("judge_model") != r.get("model"):
+            out.append(
+                "judge model is not pinned (set judge_model in mint.json or BuildResult.judge_model)"
+            )
+        if not str(r.get("task", "")).strip():
+            out.append("tests/rubric.json has no task text")
+    except (OSError, ValueError, KeyError, TypeError):
+        out.append("tests/rubric.json is missing or invalid")
+    ev = task_dir / "tests" / "evidence"
+    if not (ev.is_dir() and any(p.is_file() for p in ev.rglob("*"))):
+        out.append("tests/evidence/ is empty: the judge needs the task evidence")
+    return out

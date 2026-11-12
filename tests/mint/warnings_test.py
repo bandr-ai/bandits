@@ -7,7 +7,7 @@ from .validate_test import rows
 LABELS_PY = """
 from mint import Answer, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "allowed_set", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "check": "allowed_set", "gold": "imitation",
         "hidden": [], "applies_when": "any"}
 VERSION = 1
 EXTRA = ""

@@ -111,7 +111,7 @@ def test_verifier_fault_blocks_type_with_cause_and_attempt_budget(env):
     assert t["state"] == "failed" and t["attempts"] == 1
     causes = " ".join(c["cause"] for c in t["causes"])
     assert "no-op answer was accepted" in causes and "wrong answer was accepted" in causes
-    assert {r["status"] for r in rows(env).values()} == {"blocked"}
+    assert {r["status"] for r in rows(env).values()} == {"exec_failed"}
     assert "attempt 1/2" in next(iter(rows(env).values()))["reason"]
     # regenerate (unchanged generator) retries: blocked rows are re-evaluated, not preserved
     env.run("run", "generate")
@@ -166,7 +166,7 @@ def test_level3_audit_fail_sends_type_back(env):
         "--json",
     )
     assert code == 0 and res["data"]["effects"]
-    assert {r["status"] for r in rows(env).values()} == {"blocked"}
+    assert {r["status"] for r in rows(env).values()} == {"exec_failed"}
     assert "batch audit failed" in next(iter(rows(env).values()))["reason"]
     assert env.run("decide", "x", "--why", "y", "--kind", "audit", "--verdict", "fail")[0] == 2
 
@@ -196,14 +196,15 @@ def test_decide_dedupes_and_report_lists_everything(env):
         "raw records that landed in no trajectory: 4",
         "has_answer",
         "boom",
-        "| addnums | decision-from-evidence | 3 | 1 | 2 | 0 |",
+        "| addnums | 3 | 1 | 0 | 0 | 2 | 0 | 0 |",
+        "## Jobs",
         "imitation",
         "needs a live system",
         "drop q4",
         "no logged answer",
         "out/tasks/addnums/",
         "unaccounted=0",
-        "used=3, excluded=1, blocked=1",
+        "used=3, excluded=1, queued (candidate/blocked)=1",
     ]:
         assert needle in md, needle
     assert "| has_answer | 1 | 4 | 1 | 0 | 20.0% | yes |" in md

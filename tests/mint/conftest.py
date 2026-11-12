@@ -69,17 +69,15 @@ CHECKS = [Check("has_answer", 1, has_answer), Check("boom", 1, boom)]
 """
 
 JOBS_JSON = """{"jobs": [
-  {"id": "main", "scope": "full_job", "description": "add up the numbers the user gave",
-   "where": "every trajectory", "repeats": "same numbers", "outcome": "logged answer only"},
-  {"id": "sub", "scope": "subtask", "parent": "main", "description": "read the numbers",
-   "where": "every trajectory", "repeats": "none", "outcome": "unknown"}
+  {"id": "main", "description": "add up the numbers the user gave",
+   "where": "every trajectory", "repeats": "same numbers", "outcome": "logged answer only"}
 ]}
 """
 
 TASKTYPE_PY = """
-from mint import Answer, Blocked, BuildResult
+from mint import Answer, BuildResult, Candidate
 
-SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "numeric", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 LEAK = False
@@ -96,7 +94,7 @@ def build(group, out):
     t = group[0]
     nums = t["meta"]["nums"]
     if nums == "BLOCK":
-        return Blocked("needs a live system", missing=["running service"])
+        return Candidate("needs a live system", gaps=["running service"])
     if nums == "CRASH":
         raise ValueError("generator bug for sample 9")
     instr = "Add up the numbers in /app/nums.txt."
@@ -252,3 +250,25 @@ def _harbor_grade_runner(request, monkeypatch):
 
         monkeypatch.setattr(gates, "LocalRunner", _HarborSim)
     monkeypatch.setattr("mint.gates.harbor_available", lambda: False)
+
+
+KEY = "fake-key-not-real"
+
+
+@pytest.fixture
+def judge(monkeypatch):
+    from .fake_judge import FakeJudge
+
+    fj = FakeJudge()
+    monkeypatch.setenv("MINT_JUDGE_BASE_URL", fj.url)
+    monkeypatch.setenv("MINT_JUDGE_API_KEY", KEY)
+    monkeypatch.delenv("MINT_JUDGE_MODEL", raising=False)
+    monkeypatch.setenv("MINT_JUDGE_BACKOFF", "0")
+    yield fj
+    fj.close()
+
+
+@pytest.fixture
+def no_judge_env(monkeypatch):
+    for v in ("MINT_JUDGE_BASE_URL", "MINT_JUDGE_API_KEY", "MINT_JUDGE_MODEL"):
+        monkeypatch.delenv(v, raising=False)

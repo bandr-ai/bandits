@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,18 @@ class Runner:
 
     def run_solution(self, task_dir: Path) -> RunOutcome: ...
     def run_verifier(self, task_dir: Path, answer: dict[str, str] | None) -> RunOutcome: ...
+
+    def run_script(self, task_dir: Path, script: str) -> RunOutcome:
+        """Run an executable outcome: a copy of the task whose solve.sh is `script`."""
+        with tempfile.TemporaryDirectory(prefix="mint-outcome-") as tmp:
+            copy = Path(tmp) / task_dir.name
+            shutil.copytree(task_dir, copy)
+            solve = copy / "solution" / "solve.sh"
+            solve.parent.mkdir(exist_ok=True)
+            body = script if script.startswith("#!") else "#!/bin/bash\n" + script
+            solve.write_text(body.rstrip("\n") + "\n")
+            solve.chmod(0o755)
+            return self.run_solution(copy)
 
 
 @dataclass
@@ -100,9 +113,13 @@ class LocalRunner(Runner):
         log = (cp.stdout or "") + (cp.stderr or "")
         reward_file = scratch / "verifier" / "reward.txt"
         if not reward_file.is_file():
+            why = next(
+                (x for x in log.splitlines() if x.startswith("judge infrastructure error")), ""
+            )
             return RunOutcome(
                 "infra_error",
-                detail=f"verifier exited {cp.returncode} without writing /logs/verifier/reward.txt",
+                detail=f"verifier exited {cp.returncode} without writing /logs/verifier/reward.txt"
+                + (f" ({why})" if why else ""),
                 log=log,
             )
         try:
@@ -250,52 +267,130 @@ def derive_wrong(expected_canonical: str, check: str) -> str:
     return expected_canonical + " (wrong)"
 
 
+def _label(item) -> dict:
+    """How a wrong answer / alternative is named in the evidence."""
+    if isinstance(item, dict):
+        return {"script": item.get("note") or item["script"][:80]}
+    return {"answer": str(item)}
+
+
+def _try(runner: Runner, task_dir: Path, answer_file: str | None, item) -> RunOutcome:
+    """Run one wrong answer / alternative: a string goes in the answer file, an Outcome runs."""
+    if isinstance(item, dict):
+        return runner.run_script(task_dir, item["script"])
+    if not answer_file:
+        return RunOutcome(
+            "infra_error", detail="a string answer needs an answer file; use an Outcome script"
+        )
+    return runner.run_verifier(task_dir, {answer_file: str(item)})
+
+
+def plan_exec_gates(
+    runner: Runner,
+    task_dir: Path,
+    answer_file: str | None,
+    wrong: list,
+    alternatives: list,
+    auto_wrong: bool,
+    reference: str | None = None,
+) -> tuple[list[Callable[[], RunOutcome]], Callable[[list[RunOutcome]], dict]]:
+    """Split the exec gates into independent runs plus a pure `assemble(outcomes)`.
+
+    `calls` are zero-argument callables (oracle if any, no-op, each wrong answer, each
+    alternative, in that order); each is an independent runner call and can run in any
+    order or concurrently. `assemble` takes their outcomes in the same order and builds the
+    exact result `run_exec_gates` returns, so parallel and sequential runs agree.
+    `reference` (judge tasks only) adds a stability gate: the judge scores the reference answer
+    three times (the oracle run counts as one) and any difference in reward is a flip."""
+    has_oracle = (task_dir / "solution" / "solve.sh").is_file()
+    calls: list[Callable[[], RunOutcome]] = []
+    if has_oracle:
+        calls.append(lambda: runner.run_solution(task_dir))
+    calls.append(lambda: runner.run_verifier(task_dir, {}))
+    for w in wrong:
+        calls.append(lambda w=w: _try(runner, task_dir, answer_file, w))
+    for a in alternatives:
+        calls.append(lambda a=a: _try(runner, task_dir, answer_file, a))
+    if reference is not None:
+        for _ in range(2):
+            calls.append(lambda: runner.run_verifier(task_dir, {answer_file: reference}))
+
+    def assemble(outs: list[RunOutcome]) -> dict:
+        it = iter(outs)
+        detail: dict[str, dict] = {}
+        if has_oracle:
+            o = next(it)
+            detail["oracle"] = {"gate": verdict(o, True), **o.to_dict()}
+        else:
+            detail["oracle"] = {"gate": "not_run", "detail": "no oracle (oracle_kind none)"}
+        n = next(it)
+        detail["noop"] = {"gate": verdict(n, False), **n.to_dict()}
+        wrongs = []
+        for w in wrong:
+            r = next(it)
+            wrongs.append({**_label(w), "gate": verdict(r, False), **r.to_dict()})
+        detail["wrong"] = {
+            "gate": _combine([w["gate"] for w in wrongs]) if wrongs else "error",
+            "auto": auto_wrong,
+            "runs": wrongs,
+        }
+        alts = []
+        for a in alternatives:
+            r = next(it)
+            alts.append({**_label(a), "gate": verdict(r, True), **r.to_dict()})
+        detail["alternatives"] = {
+            "gate": _combine([a["gate"] for a in alts]) if alts else "not_run",
+            "runs": alts,
+        }
+        if reference is not None:
+            runs = [detail["oracle"]] if has_oracle else []
+            extra = [next(it), next(it)]
+            states = [r.get("state") for r in runs] + [x.state for x in extra]
+            rewards = [r.get("reward") for r in runs] + [x.reward for x in extra]
+            gate = (
+                "error"
+                if any(s != "ok" for s in states)
+                else "pass"
+                if len(set(rewards)) == 1
+                else "fail"
+            )
+            detail["stability"] = {"gate": gate, "rewards": rewards}
+        gates = [
+            detail[k]["gate"]
+            for k in ("oracle", "noop", "wrong", "alternatives", "stability")
+            if k in detail
+        ]
+        if "fail" in gates:
+            exec_state = "fail"
+        elif "error" in gates:
+            exec_state = "error"
+        elif detail["oracle"]["gate"] == "not_run":
+            exec_state = "no_oracle"
+        else:
+            exec_state = "pass"
+        trials = sorted({x.trial for x in outs if x.trial}) if all(x.trial for x in outs) else []
+        return {"exec": exec_state, "detail": detail, "runner": runner.name, "trials": trials}
+
+    return calls, assemble
+
+
 def run_exec_gates(
     runner: Runner,
     task_dir: Path,
-    answer_file: str,
-    wrong: list[str],
-    alternatives: list[str],
+    answer_file: str | None,
+    wrong: list,
+    alternatives: list,
     auto_wrong: bool,
+    reference: str | None = None,
 ) -> dict:
-    """Run oracle / no-op / wrong-answer / alternatives. Value = gate satisfied?"""
-    detail: dict[str, dict] = {}
+    """Run oracle / no-op / wrong outcomes / alternatives. Value = gate satisfied?
 
-    outs: list[RunOutcome] = []
-    o = runner.run_solution(task_dir)
-    outs.append(o)
-    detail["oracle"] = {"gate": verdict(o, True), **o.to_dict()}
-    n = runner.run_verifier(task_dir, {})
-    outs.append(n)
-    detail["noop"] = {"gate": verdict(n, False), **n.to_dict()}
-    wrongs = []
-    for w in wrong:
-        r = runner.run_verifier(task_dir, {answer_file: str(w)})
-        outs.append(r)
-        wrongs.append({"answer": str(w), "gate": verdict(r, False), **r.to_dict()})
-    detail["wrong"] = {
-        "gate": _combine([w["gate"] for w in wrongs]) if wrongs else "error",
-        "auto": auto_wrong,
-        "runs": wrongs,
-    }
-    alts = []
-    for a in alternatives:
-        r = runner.run_verifier(task_dir, {answer_file: str(a)})
-        outs.append(r)
-        alts.append({"answer": str(a), "gate": verdict(r, True), **r.to_dict()})
-    detail["alternatives"] = {
-        "gate": _combine([a["gate"] for a in alts]) if alts else "not_run",
-        "runs": alts,
-    }
-    gates = [detail[k]["gate"] for k in ("oracle", "noop", "wrong", "alternatives")]
-    if "fail" in gates:
-        exec_state = "fail"
-    elif "error" in gates:
-        exec_state = "error"
-    else:
-        exec_state = "pass"
-    trials = sorted({x.trial for x in outs if x.trial}) if all(x.trial for x in outs) else []
-    return {"exec": exec_state, "detail": detail, "runner": runner.name, "trials": trials}
+    No solution/solve.sh (oracle_kind none): the oracle is not run and, if every other gate
+    passes, exec is `no_oracle` (the task can be generated, never validated)."""
+    calls, assemble = plan_exec_gates(
+        runner, task_dir, answer_file, wrong, alternatives, auto_wrong, reference
+    )
+    return assemble([c() for c in calls])
 
 
 def _combine(states: list[str]) -> str:
@@ -310,6 +405,7 @@ __all__ = [
     "LocalRunner",
     "Runner",
     "RunOutcome",
+    "plan_exec_gates",
     "run_exec_gates",
     "derive_wrong",
     "verdict",
