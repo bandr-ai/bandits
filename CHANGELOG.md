@@ -7,14 +7,20 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+- Rename the logs-to-tasks tool from `l2h` to **Mint**: command/import `mint`,
+  bundled skill `mint`, workspace `mint.json`, `MINT_*` environment variables,
+  and Mint task/trajectory metadata. It remains part of `bandits-cli`.
+  Existing experimental workspaces and parser scripts must be regenerated or
+  migrated to these names; the old command/import are removed.
+
 ### Added
 
-- `l2h`: a standalone logs-to-Harbor tool (library plus CLI, no dependency on
+- `mint`: a standalone logs-to-Harbor tool (library plus CLI, no dependency on
   `bandits`). It samples and queries agent logs, runs agent-written parse,
   check and task-type code over the whole corpus, writes Harbor task packages,
   scans them for answer leaks, and validates them with oracle, no-op and
-  wrong-answer gates. Ships its own skill and guides (`l2h docs`). Plan:
-  `docs/plans/logs-to-harbor.md`.
+  wrong-answer gates. Ships its own skill and guides (`mint docs`). Plan:
+  `docs/plans/mint.md`.
   Review round: `validate` no longer reports `passed` or refunds the fix budget
   while rows stay blocked, resets structure/leak/secret evidence when a package
   changes, and records an exhausted type instead of aborting; attachment paths
@@ -22,18 +28,18 @@ change the command line or the artifact format; such changes are called out.
   (`secret_allow`), label-vocabulary-aware leak scan, binary evidence, warnings
   (giveaway, missing alternatives, dangling `/app` path), `negative` gold kind
   (`forbidden` check), status/report show gold kind and flag unaudited
-  `validated` tasks, and `l2h sample --stratify <expr> --n N`.
+  `validated` tasks, and `mint sample --stratify <expr> --n N`.
   Follow-up: `Answer.choices` declares a label vocabulary (leak scan, giveaway and
   alternatives warnings use it; files that define the labels are not leaks), negative
   tasks need `pattern` or `choices`, and the secret scan ignores code expressions.
   ATIF: a parsed trajectory is now an ATIF (Agent Trajectory Interchange Format,
-  ATIF-v1.8) document plus an `extra["l2h"]` block (`id`, `source_refs`, `ended`, `meta`,
+  ATIF-v1.8) document plus an `extra["mint"]` block (`id`, `source_refs`, `ended`, `meta`,
   `attachments`), built with `Trajectory.from_atif`. It is validated against Harbor's own ATIF
   model when `harbor` is importable (violations are parse errors grouped by cause); logs that are
   already ATIF need a few lines. New accessors `t.calls()`, `t.final_message`, `t.subagents`;
   `t["meta"]`, `r.meta` etc. keep working, but `events` is gone (use `steps`; breaking for
   existing `parse.py`). Task types must set `SPEC["task_scope"]` (`full_job` | `decision`), shown
-  per type in `l2h report`; the skill gains a rule to prefer rebuilding the agent's whole job and to
+  per type in `mint report`; the skill gains a rule to prefer rebuilding the agent's whole job and to
   label decision-from-evidence tasks as such.
 
   Job map: step 1 writes `jobs.json` (full jobs, sub-capabilities, repeats, outcomes); every task
@@ -44,10 +50,10 @@ change the command line or the artifact format; such changes are called out.
   `AWS_SECRET_ACCESS_KEY=...`) and "enter <value> in the password field" prose; the leak scan treats
   `hint`/`result`/`sum`/`total`/`it's` as answer labels, warns on a bare short hidden value in
   `instruction.md`, and the giveaway warning also checks `instruction.md`. Tool calls and results
-  without ids pair by position, and `l2h run parse` warns about calls with no matching result
+  without ids pair by position, and `mint run parse` warns about calls with no matching result
   (parsers should synthesise `call_1`, ... when the logs lack ids). `"meta" in t` matches `t["meta"]`.
   "changed since last run" now counts content and generator-version changes, not only counts;
-  `run parse` suggests the same next step as `l2h status`. The task type scaffold leaves
+  `run parse` suggests the same next step as `mint status`. The task type scaffold leaves
   `task_scope` as `TODO` (choose `full_job` | `subtask` | `decision`); only the `jobs.json`
   scaffold's own placeholders are rejected; `solve.sh` comments name the gold kind.
 
