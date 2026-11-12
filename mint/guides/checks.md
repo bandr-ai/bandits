@@ -6,6 +6,6 @@
 - Use `unknown` when you cannot tell. Never guess to get a clean `pass`.
 - Bump `version` when logic changes; the run output shows what changed since last time.
 - A crashing check is recorded as `unknown` and grouped by cause; fix the crash.
-- Checks are optional. Before trusting one: `mint sample --matching <id>` shows fresh fails and passes. Read them, then
+- Before trusting a check: `mint sample --matching <id>` shows fresh fails and passes. Read them, then
   `mint decide "<what>" --kind spot_check --check <id> --verdict pass --why "<what you saw>"`. The report flags
   unchecked checks.

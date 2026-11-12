@@ -31,10 +31,10 @@ not task failures: the task stays `generated` (never `exec_failed` or `blocked`)
 A type whose sample fails marks its unvalidated tasks `exec_failed` and uses one fix attempt
 (`--max-fix-attempts`, default 3). After that, stop and report. Fix, `mint run generate`, `mint validate`.
 
-Level 3 (optional): `mint validate --level 3` lists a seeded sample per type to read with `mint task show`.
-If you find a real problem, record it with `mint decide "..." --kind audit --verdict fail --type T --why ...`
-(marks the type's tasks `exec_failed` until regenerated). Check that an answer is derivable from the
-visible inputs when that is in doubt.
+Level 3: `mint validate --level 3` lists a seeded sample per type. Read them with `mint task show`.
+Record `mint decide "..." --kind audit --verdict pass|fail --type T --task ID --why ...`.
+A fail marks the type's tasks `exec_failed` until regenerated. Also record `--kind derivability` after checking the
+answer can really be derived from the visible inputs.
 
 Status: `validated` = exec gates passed, oracle included, in a real Harbor run (host-local passes
 and `no_oracle` stay `generated`); `generated` = structure+leak+secrets passed; `exec_failed` = the
@@ -42,7 +42,8 @@ package is malformed or its gates failed (fix and regenerate); `blocked` = leak 
 Reasons are in results.jsonl. `ready` (report only) = validated, environment not partial, grading
 trust not imitation/none, no open gaps.
 `validated` means the gates passed, not that the answer is correct: `status` and `report` show the
-gold kind next to it (`validated (imitation)`) and note which validated tasks nobody reviewed.
+gold kind next to it (`validated (imitation)`) and warn about validated tasks with no audit or
+derivability decision.
 
 Runners (`mint validate --runner auto|harbor|local`): `harbor` runs each gate with `harbor run`
 (oracle agent, nop agent, and an oracle on a scratch copy whose solve.sh writes the wrong or

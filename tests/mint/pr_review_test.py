@@ -135,12 +135,12 @@ def test_status_and_report_show_gold_next_to_status_and_warn_when_unaudited(env)
     }
     _, out, _, _ = env.run("status")
     assert "validated (imitation)=2" in out and "does not mean the answer is correct" in out
-    assert "note: 2 validated task(s) not reviewed" in out
+    assert "warning: 2 validated task(s) have no audit/derivability decision" in out
     env.run("report")
     md = (env.ws / "report.md").read_text()
     assert "- validated (imitation): 2" in md and "does not mean the answer is correct" in md
     assert (
-        "not reviewed (optional" in md
+        "**WARNING**" in md
         and "Validated tasks without a derivability/audit decision: 2 of 2" in md
     )
     done = sorted(t for t, r in rows(env).items() if r["status"] == "validated")
@@ -158,6 +158,4 @@ def test_status_and_report_show_gold_next_to_status_and_warn_when_unaudited(env)
     )
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert (
-        "without a derivability/audit decision: 0 of 2" in md and "not reviewed (optional" not in md
-    )
+    assert "without a derivability/audit decision: 0 of 2" in md and "**WARNING**" not in md

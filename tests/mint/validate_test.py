@@ -208,7 +208,7 @@ def test_decide_dedupes_and_report_lists_everything(env):
     ]:
         assert needle in md, needle
     assert "| has_answer | 1 | 4 | 1 | 0 | 20.0% | yes |" in md
-    assert "| boom | 1 | 0 | 0 | 5 | 0.0% | no |" in md  # unchecked check flagged
+    assert "| boom | 1 | 0 | 0 | 5 | 0.0% | **NO** |" in md  # unchecked check flagged
     assert "check error x" in md
 
 
