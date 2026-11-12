@@ -45,6 +45,33 @@ def test_no_false_alarm_on_ordinary_text():
         assert not secrets.scan_text(t), t
 
 
+def test_env_style_names_and_prose_credentials_are_caught():
+    caught = [
+        "DB_PASSWORD=" + "hunter2hunter2",
+        "AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI/K7MDENG",
+        "export GITHUB_TOKEN=" + "abc123def456",
+        "Enter " + "X7kq2zz9" + " in the Password field",
+    ]
+    for t in caught:
+        assert secrets.scan_text(t), t
+    assert "credential_in_prose" in kinds(caught[-1])
+    spared = [
+        "password = getpass.getpass()",
+        "DB_PASSWORD=${DB_PASSWORD}",
+        "api_key = settings.API_KEY",
+        "tokenizer: bert-base-uncased",
+        "max_tokens = 409600",
+        "token_count: 1234567",
+        "TOKEN_URL=https://auth.example.com/oauth/token",
+        "secretary: JaneDoe1",
+        "Enter your password in the password field",
+        "Enter the code shown in the token field",
+        "enter 2024-01-05 in the date field",
+    ]
+    for t in spared:
+        assert not secrets.scan_text(t), t
+
+
 def test_secret_in_environment_blocks_task_and_allow_list_is_logged(env):
     env.build_pipeline()
     leaky = TASKTYPE_PY.replace(

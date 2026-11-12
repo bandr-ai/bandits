@@ -95,7 +95,7 @@ def test_giveaway_when_exact_answer_is_in_evidence(env):
         "tasktypes/addnums.py",
         TASKTYPE_PY.replace(
             'evidence={"nums.txt": nums}',
-            'evidence={"nums.txt": nums + "\\nsummary total: " + t["meta"]["answer"]}',
+            'evidence={"nums.txt": nums + "\\nsummary line " + t["meta"]["answer"]}',
         ),
     )
     env.run("run", "generate")
@@ -104,3 +104,18 @@ def test_giveaway_when_exact_answer_is_in_evidence(env):
     assert any(w.startswith("giveaway:") and "nums.txt" in w for w in r["warnings"])
     env.run("report")
     assert "giveaway x3" in (env.ws / "report.md").read_text()
+
+
+def test_short_hidden_value_in_instruction_is_a_warning(env):
+    env.build_pipeline()
+    env.write(
+        "tasktypes/addnums.py",
+        TASKTYPE_PY.replace(
+            'evidence={"nums.txt": nums}',
+            'evidence={"nums.txt": nums}, hidden=["Q-17"]',
+        ).replace("instruction=", 'instruction="See case Q-17. " + '),
+    )
+    env.run("run", "generate")
+    r = rows(env)["t_q1"]
+    assert r["gates"]["leak"] == "pass" and r["status"] == "generated"
+    assert any(w.startswith("hidden_value:") and "instruction.md" in w for w in r["warnings"])

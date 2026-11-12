@@ -5,7 +5,8 @@ side does not contain: answer keys / the original final response (`hidden`
 strings), files named like answer keys, or byte-identical copies of anything in
 tests/ or solution/. Legitimate evidence that merely shares words with the
 answer is not flagged: short hidden values only match in labelled context
-("answer: 42"), long ones only as whole-string or long verbatim runs, and a label
+("answer: 42", "total = 42", "hint: it's 42"; a bare one in instruction.md is a level-1
+warning, see scan.warnings_for), long ones only as whole-string or long verbatim runs, and a label
 that belongs to the declared label vocabulary (answer.choices) only in labelled context.
 """
 
@@ -20,7 +21,9 @@ NAME_RE = re.compile(
     r"(^|[_\-./])(answers?|expected|solutions?|solve|gold|ground[_-]?truth|hidden|answer[_-]?key|oracle)([_\-./]|$)",
     re.I,
 )
-LABEL_RE = r"(?:answer|expected|solution|correct|gold|ground[ _-]?truth)"
+LABEL_RE = r"(?:answer|expected|solution|correct|gold|ground[ _-]?truth|hint|result|sum|total|it['\u2019]?s)"
+# what joins a label to its value: "answer: X", "total = X", "result is X", "hint: it's X"
+SEP_RE = r"(?:[:=]|\b(?:is|was|are|equals?|it['\u2019]?s)\b)"
 
 
 @dataclass
@@ -117,7 +120,7 @@ def scan(
                     )
             else:
                 pat = (
-                    rf"\b{LABEL_RE}\b[\w ]{{0,12}}?[\"']?\s*(?:[:=]|\b(?:is|was|are|equals?)\b)"
+                    rf"\b{LABEL_RE}\b[\w ]{{0,12}}?[\"']?(?:\s*{SEP_RE})+"
                     rf"\s*[\"']?\s*{re.escape(nh)}(?![\w])"
                 )
                 if re.search(pat, ntext, re.I):

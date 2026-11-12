@@ -126,3 +126,32 @@ def test_short_label_after_answer_label_is_flagged_even_in_a_listing(tmp_path):
     assert ("instruction.md", "labelled_answer") in kinds(
         scan(d, ["maybe"], vocab=["yes", "no", "maybe"])
     )
+
+
+def test_short_answer_after_hint_result_total_labels_is_caught(tmp_path):
+    for i, instr in enumerate(
+        [
+            "How far is it? (hint: it's 400)",
+            "How far is it? The result is 400.",
+            "Add them up. total = 400",
+            "Add them up; the sum: 400 km",
+        ]
+    ):
+        d = make(tmp_path / str(i), instr, {"a.txt": "x"})
+        assert kinds(scan(d, ["400"])) == {("instruction.md", "labelled_answer")}, instr
+    d = make(tmp_path / "ok", "How far is it? It's 400 km by road, 380 by rail.", {"a.txt": "x"})
+    assert scan(d, ["380"]) == []  # a bare short value is not a leak-gate failure
+
+
+def test_bare_short_hidden_value_and_giveaway_in_instruction_warn(tmp_path):
+    from l2h.scan import warnings_for
+
+    d = make(tmp_path, "Use route 400 to get there.", {"a.txt": "x"})
+    w = warnings_for(d, {"check": "exact", "expected": "B7"}, {"hidden": ["400", "B7"]})
+    assert any(x.startswith("hidden_value:") and "'400'" in x for x in w)
+    assert not any("'B7'" in x for x in w)  # not in the text
+    d2 = make(tmp_path / "b", "Pick the right gate. Try B7.", {"a.txt": "x"})
+    w2 = warnings_for(d2, {"check": "exact", "expected": "B7"}, {"hidden": ["B7"]})
+    assert w2 == ["giveaway: expected answer 'B7' appears verbatim in instruction.md"]
+    d3 = make(tmp_path / "c", "Answer yes or no.", {"a.txt": "x"})
+    assert warnings_for(d3, {"check": "exact", "expected": "yes"}, {"hidden": ["yes"]}) == []
