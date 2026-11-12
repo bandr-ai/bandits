@@ -11,9 +11,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --extra dev
-      - run: uv run ruff check bandits tests
-      - run: uv run ruff format --check bandits tests
-      - run: uv run pytest tests --cov=bandits --cov-report=term-missing
+      - run: uv run ruff check bandits mint tests
+      - run: uv run ruff format --check bandits mint tests
+      - run: uv run pytest tests --cov=bandits --cov=mint --cov-report=term-missing
 
   package:
     # Build what a release would publish and run it from a clean install, so a
