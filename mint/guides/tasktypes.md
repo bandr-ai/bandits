@@ -35,13 +35,31 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   (a bash script run in the environment instead of solve.sh). Wrong ones must be *meaningful* (a
   plausible mistake, not noise); give alternatives when the check might be too strict. `hidden` lists
   strings that must never reach the solver: the original final response, answer keys.
+- Grader quality (custom verifiers especially):
+  - Check the outcome the request asks for (a computed result, real behaviour), never a printed
+    marker or a file's mere presence: a fake binary that echoes the expected text must fail.
+  - Accept valid alternatives (layout, naming, approach); do not hard-code one path or one tool.
+  - Give wrong outcomes that try the obvious shortcut (a stub printing the expected text, hard-coding
+    the expected value) and alternatives that do the job differently. Add `source="..."` to each
+    `Outcome` (free text: "logged attempt X, outcome known from ...", "synthetic shortcut").
+- Verifier dependencies: tools only the verifier needs (python3 for a grader, a test runner) never go
+  in `environment/`: the solver would get them for free. Install them in `tests/test.sh` after the
+  solve, or use a separate verifier image (the answer-file default already does).
+- Verifier time: set `verifier_timeout_sec` (default 120) to cover the verifier's own setup and work, not
+  a copy of the solver's budget; keep per-call timeouts inside tests generous so a correct, slower
+  solution is not rejected.
+- `oracle_source` (free text) says which logged attempt or solve `solution/solve.sh` came from and how
+  its outcome is known. `mint report` shows it, and each wrong/alternative outcome's `source`.
 - Evidence goes in `evidence={"path": text_or_bytes}` and appears at `/app/path`. Use bytes for
   binary evidence such as images (`{"img/chart.png": png_bytes}`); the leak and secret scans skip
   binary files, so a secret or answer inside an image is not caught: review those by eye.
   The solver writes its answer to `/app/answer/<answer.file>`.
-- Gold (`gold_type`) = why the grading is trusted: `verified` (independent label for this exact scope),
+- Gold (`gold_type`) = why the grading is trusted: `verified` (an outside label for this job; mint's
+  own check is `computed`),
   `computed` (recomputed from the inputs), `independent` (end-state/behaviour check not tied to the
   logged answer), `solved` (a fresh solve passed), `imitation` (the logged answer), `none`. `ready` in the
-  report needs validated, a non-partial environment, trust other than imitation/none, and no open gaps.
+  report needs validated, a non-partial environment, trust other than imitation/none, no open gaps,
+  and, for an `answer` oracle, `verified`/`computed` trust. Execution errors are listed apart from
+  grading failures.
 - Bump `VERSION` when the generator changes so changed instances are revalidated.
 - Idempotence: unchanged packages keep their validation state across `mint run generate` reruns.

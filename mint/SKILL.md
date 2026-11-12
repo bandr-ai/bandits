@@ -56,10 +56,10 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
 5. **Validate.** `mint validate` (level 1 on every task: structure + leak scan; level 2 on a seeded
    sample per type: oracle passes, no-op fails, wrong answers/outcomes fail, valid alternatives pass;
    without an oracle the rest still runs and the task stays `generated`).
-   An oracle that writes the expected answer proves wiring only, so *you* also check the answer is
-   derivable from the inputs. Level 3 (`--level 3`) is you reading sampled tasks for fidelity,
-   evidence sufficiency and verifier behavior; a failed audit sends the batch back to step 3.
-   Infrastructure errors are not task failures. Stop after `max_fix_attempts` and report it.
+   An `answer` oracle proves wiring only: *you* also check the answer is derivable from the inputs.
+   Level 3 (`--level 3`) is you reading sampled tasks for fidelity, evidence sufficiency and verifier
+   behavior; a failed audit goes back to step 3. Infra errors are not task failures. Stop after
+   `max_fix_attempts` and report it.
    Guide: `mint docs --topic validation`.
 6. **Report.** `mint report`, read `report.md`, then summarise for the user, per job: its task or
    candidate, environment source, grading method and trust, oracle, gaps, and whether it is ready;
@@ -86,17 +86,18 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
   `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only
   for an unremovable secret/leak or no recoverable instruction. Every job ends with at least a
   candidate; `mint report` flags any that don't.
-- **Never fake.** Missing data stays missing and is listed as a gap: no invented files, no solve.sh or
-  verifier made up to satisfy packaging. Mark a read as complete only when the log proves it.
-- **Grading: how vs why trusted.** `grading_method` fits the job (behaviour on the end state via your
-  own `tests/test.sh`, recomputation, or exact/allowed-set match). `gold_type` says why it is trusted:
-  `verified` (an outside label for this job), `computed`, `independent`, `solved`, `imitation` (the
-  logged answer, last resort), `none`. An unverified logged answer is `imitation` however graded.
+- **Never fake.** Missing data stays a listed gap: no invented files, no solve.sh or verifier made up
+  to satisfy packaging. Mark a read complete only when the log proves it.
+- **Grading.** `grading_method` fits the job (own `tests/test.sh` on the end state, recomputation, or
+  exact/allowed-set). `gold_type` = why trusted: `verified` needs an outside label for this job (your
+  own check is `computed`), `independent`, `solved`, `imitation` (logged answer, last resort), `none`.
+  Check the outcome the request asks for, never a printed marker; accept valid alternatives (layout,
+  naming, approach). Verifier-only tools go in `tests/test.sh` after the solve, never `environment/`;
+  `verifier_timeout_sec` is the verifier's own sufficient budget.
 - **Oracle (`oracle_kind`).** Prefer `replay` of a logged attempt (kept only if it passes in the built
-  environment), then `fresh` (a new solve; ask first), then `reference`. `answer` proves wiring only;
-  no credible oracle → `none` (never `validated`).
-- **Wrong outcomes are real mistakes:** `Outcome(script=...)` doing plausible bad work (a broken build,
-  a wrong server); alternatives do it differently. The gates run them in the environment.
+  environment), then `fresh` (ask first), then `reference`; `answer` proves wiring only; else `none`.
+  Say where it came from in `oracle_source`. **Wrong outcomes are real mistakes:** `Outcome(script=...,
+  source=...)` doing plausible bad work (a broken build, a stub printing the expected text); alternatives differ.
 - Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
 - Reassess every exclusion for this task (no inherited filters); ask the user only for their decisions.
 
@@ -119,12 +120,11 @@ Use Harbor's `create-task` / `create-adapter` skills; tasks follow its conventio
 | Remember / report | `mint decide "<what>" --why "<evidence>"`, `mint report` |
 | Contracts / guides | `mint schema`, `mint docs [--topic parsing\|checks\|tasktypes\|validation\|harbor]` |
 
-Flags on every command: `--json` (one result on stdout, progress on stderr), `--full`, `--dry-run`,
-`--workspace`. Exit codes: 0 ok, 1 error or failed validation, 2 bad args/config, 130 interrupted.
+Every command takes `--json` (result on stdout, progress on stderr), `--full`, `--dry-run`, `--workspace`.
+Exit codes: 0 ok, 1 error or failed validation, 2 bad args/config, 130 interrupted.
 
 ## Ending a run
 
-Tell the user, from `report.md` and with file paths: each job and how far it got (task or
-candidate, ready or not and why), then how many tasks, `validated` vs `generated` vs `exec_failed`,
-grading trust, what was excluded and why (rates per check), what is missing, and which numbers you
-could not verify. Unattended runs stop at the report.
+Tell the user, from `report.md` with file paths: each job and how far it got (task or candidate, ready or
+not and why), tasks `validated` vs `generated` vs `exec_failed`, grading trust, exclusions and why,
+what is missing, and which numbers you could not verify. Unattended runs stop at the report.

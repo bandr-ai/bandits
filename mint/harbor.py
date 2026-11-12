@@ -46,6 +46,18 @@ def _toml_list(items) -> str:
     return "[" + ", ".join(_toml_str(str(i)) for i in items) + "]"
 
 
+DEFAULT_VERIFIER_TIMEOUT = 120.0
+
+
+def _verifier_timeout(b: BuildResult) -> float:
+    t = b.verifier_timeout_sec
+    if t is None:
+        return DEFAULT_VERIFIER_TIMEOUT
+    if isinstance(t, bool) or not isinstance(t, int | float) or not t > 0:
+        raise ContractError(f"verifier_timeout_sec must be a number > 0, got {t!r}")
+    return float(t)
+
+
 def task_toml(
     b: BuildResult,
     ttype: str,
@@ -83,6 +95,7 @@ def task_toml(
         f"gold = {_toml_str(b.gold_type)}",
         f"job = {_toml_str(str(spec.get('job', '')))}",
         f"oracle = {_toml_str(b.oracle_kind or '')}",
+        f"oracle_source = {_toml_str(b.oracle_source)}",
         f"env_source = {_toml_str(b.env_source or '')}",
         f"grading_method = {_toml_str(b.grading_method or '')}",
         f"grading_reason = {_toml_str(b.grading_reason)}",
@@ -91,7 +104,7 @@ def task_toml(
         f"assumptions = {_toml_list(b.assumptions)}",
         "",
         "[verifier]",
-        "timeout_sec = 120.0",
+        f"timeout_sec = {_verifier_timeout(b)}",
     ]
     if separate:
         lines += [
@@ -184,6 +197,7 @@ def resolve(b: BuildResult) -> None:
     b.wrong_answers = [normalize_outcome(w) for w in b.wrong_answers]
     b.alternatives = [normalize_outcome(a) for a in b.alternatives]
     b.gaps = normalize_gaps(b.gaps)
+    _verifier_timeout(b)
     if b.answer is not None:
         b.answer.validate()
     if b.answer is None and any(isinstance(x, str) for x in b.wrong_answers + b.alternatives):

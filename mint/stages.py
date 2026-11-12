@@ -326,6 +326,17 @@ def source_strings(group: list[dict]) -> list[str]:
     return sorted(set(out))
 
 
+def _outcome_view(x) -> dict:
+    """Report view of a wrong answer / alternative: kind, short text, free-text source."""
+    if isinstance(x, dict):
+        return {
+            "kind": "script",
+            "text": x.get("note") or x["script"][:60],
+            "source": x.get("source", ""),
+        }
+    return {"kind": "answer", "text": str(x)[:60], "source": ""}
+
+
 def package_hash(task_dir: Path, meta: dict | None = None) -> str:
     """Fingerprint of what the gates judged: the package bytes plus the wrong answers and
     alternatives the exec gates try (they live outside the package)."""
@@ -485,6 +496,11 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 row["provenance"] = {
                     "job": tt.spec.get("job"),
                     "oracle": res.oracle_kind,
+                    "oracle_source": res.oracle_source,
+                    "outcomes": {
+                        "wrong": [_outcome_view(x) for x in res.wrong_answers],
+                        "alternatives": [_outcome_view(x) for x in res.alternatives],
+                    },
                     "env_source": res.env_source,
                     "grading": {
                         "method": res.grading_method,

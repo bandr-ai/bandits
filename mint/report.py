@@ -39,6 +39,8 @@ VALIDATED_NOTE = (
 
 # grading trust that is not independent of the logged run: never counted as ready
 WEAK_TRUST = ("imitation", "none")
+# an `answer` oracle only counts when the expected answer itself was verified or computed
+STRONG_ANSWER_TRUST = ("verified", "computed")
 
 
 def ready(row: dict) -> tuple[bool, list[str]]:
@@ -52,10 +54,37 @@ def ready(row: dict) -> tuple[bool, list[str]]:
         why.append("environment partial")
     if row.get("gold") in WEAK_TRUST:
         why.append(f"grading trust {row.get('gold')}")
+    elif prov.get("oracle") == "answer" and row.get("gold") not in STRONG_ANSWER_TRUST:
+        # an oracle that writes the expected answer proves wiring only
+        why.append(f"answer oracle with grading trust {row.get('gold')}")
     open_gaps = [g for g in prov.get("gaps") or [] if g.get("affects") != "none"]
     if open_gaps:
         why.append(f"{len(open_gaps)} open gap(s)")
     return not why, why
+
+
+def _exec_problems(r: dict) -> tuple[list[str], list[str]]:
+    """(grading failures, execution/infra errors) as gate names, kept apart: a gate that
+    could not run says nothing about the task."""
+    g = r["gates"]
+    det = g.get("exec_detail") or {}
+    fails = [k for k, v in det.items() if v == "fail"]
+    errs = [k for k, v in det.items() if v == "error"]
+    if g["exec"] == "fail" and not fails:
+        fails = ["exec"]
+    if g["exec"] == "error" and not errs:
+        errs = ["exec"]
+    return fails, errs
+
+
+def _outcome_line(label: str, items: list[dict]) -> str:
+    srcs = Counter(x.get("source") or "no source given" for x in items)
+    shown = "; ".join(f"{x['text']} [{x.get('source') or 'no source given'}]" for x in items[:3])
+    kinds = Counter(x["kind"] for x in items)
+    return (
+        f"  - {label} x{len(items)} ({', '.join(f'{k} {v}' for k, v in sorted(kinds.items()))}; "
+        f"{len(srcs)} source(s)): {shown}{' ...' if len(items) > 3 else ''}"
+    )
 
 
 def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
@@ -73,8 +102,9 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     L = [
         "## Jobs",
         "",
-        "| job | task types | tasks | validated | ready | candidates | blocked | errors | env | oracle | grading | gaps |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| job | task types | tasks | validated | ready | candidates | blocked | errors | "
+        "grading failed | infra errors | env | oracle | grading | gaps |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     missing = []
     covered_src: set = set()
@@ -110,11 +140,30 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
 
         n_ready = sum(1 for r in rs if ready(r)[0])
         n_val = sum(1 for r in rs if r["status"] == "validated")
+        probs = [(r["task_id"], *_exec_problems(r)) for r in rs]
+        n_fail = sum(1 for _, f, _e in probs if f)
+        n_infra = sum(1 for _, _f, e in probs if e)
         L.append(
             f"| {jid} | {', '.join(names) or '**none**'} | {len(rs)} | {n_val} | {n_ready} | "
-            f"{len(cands)} | {n_blocked} | {n_err} | {fmt(env)} | {fmt(orc)} | {fmt(grad)} | "
-            f"{fmt(gaps)} |"
+            f"{len(cands)} | {n_blocked} | {n_err} | {n_fail} | {n_infra} | {fmt(env)} | "
+            f"{fmt(orc)} | {fmt(grad)} | {fmt(gaps)} |"
         )
+        for tid, f, e in probs:
+            if f:
+                L.append(f"  - grading failed {tid}: {', '.join(f)}")
+            if e:
+                L.append(f"  - infra error (not a grading failure) {tid}: {', '.join(e)}")
+        for r, p in list(zip(rs, provs, strict=True))[:10]:
+            L.append(
+                f"  - {r['task_id']}: oracle {p.get('oracle') or 'answer'}, "
+                f"source: {p.get('oracle_source') or 'none given'}"
+            )
+            oc = p.get("outcomes") or {}
+            for label in ("wrong", "alternatives"):
+                if oc.get(label):
+                    L.append("  " + _outcome_line(label, oc[label]))
+        if len(rs) > 10:
+            L.append(f"  - ... {len(rs) - 10} more tasks (see each task's task.toml)")
         if not rs and not cands:
             missing.append(jid)
         for q in cands[:5]:
@@ -144,7 +193,7 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     L += [
         "",
         "ready = validated, environment not partial, grading trust not "
-        f"{'/'.join(WEAK_TRUST)}, no open gaps.",
+        f"{'/'.join(WEAK_TRUST)} (an `answer` oracle also needs verified/computed), no open gaps.",
         "",
     ]
     return L
@@ -257,10 +306,23 @@ def build_report(ws: Workspace) -> str:
     runners = {r["gates"].get("runner") for r in rows if r["gates"]["exec"] != "not_run"}
     if runners:
         L.append(f"- exec gates ran with runner(s): {', '.join(sorted(map(str, runners)))}")
-    if any(r["gates"]["exec"] == "error" for r in rows):
+    if any(_exec_problems(r)[1] for r in rows):
         L.append(
-            "- **infrastructure errors** (not task failures): "
-            + ", ".join(r["task_id"] for r in rows if r["gates"]["exec"] == "error")
+            "- **infrastructure errors** (not grading failures): "
+            + ", ".join(
+                f"{r['task_id']} ({', '.join(_exec_problems(r)[1])})"
+                for r in rows
+                if _exec_problems(r)[1]
+            )
+        )
+    if any(_exec_problems(r)[0] for r in rows):
+        L.append(
+            "- grading failures: "
+            + ", ".join(
+                f"{r['task_id']} ({', '.join(_exec_problems(r)[0])})"
+                for r in rows
+                if _exec_problems(r)[0]
+            )
         )
     auto = [
         r["task_id"]

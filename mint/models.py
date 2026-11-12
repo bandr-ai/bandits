@@ -354,9 +354,12 @@ class Outcome:
 
     script: str
     note: str = ""
+    # free text: where this outcome comes from ("logged attempt X, outcome known from ...",
+    # "synthetic shortcut"); shown in `mint report`, never gates anything
+    source: str = ""
 
     def to_dict(self) -> dict:
-        return {"script": self.script, "note": self.note}
+        return {"script": self.script, "note": self.note, "source": self.source}
 
 
 def normalize_outcome(x: Any) -> str | dict:
@@ -366,7 +369,11 @@ def normalize_outcome(x: Any) -> str | dict:
     if isinstance(x, dict):
         if not isinstance(x.get("script"), str) or not x["script"].strip():
             raise ContractError("an Outcome needs a non-empty bash `script`")
-        return {"script": x["script"], "note": str(x.get("note") or "")}
+        return {
+            "script": x["script"],
+            "note": str(x.get("note") or ""),
+            "source": str(x.get("source") or ""),
+        }
     if isinstance(x, str | int | float):
         return str(x)
     raise ContractError(
@@ -425,6 +432,11 @@ class BuildResult:
     grading_method: str | None = None
     grading_reason: str = ""
     gaps: list = field(default_factory=list)
+    # which logged attempt / solve the solution came from and how its outcome is known (free text)
+    oracle_source: str = ""
+    # the verifier's own time budget in seconds (task.toml [verifier] timeout_sec); None = 120.
+    # Give it room for its setup and per-call work; it is not the solver's budget.
+    verifier_timeout_sec: float | None = None
 
 
 @dataclass

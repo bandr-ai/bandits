@@ -22,3 +22,8 @@ Checked against harbor-framework/harbor (schema_version 1.4):
   locally. If you override `test.sh`, keep those variables.
 - Your own environment: `files["environment/Dockerfile"]` plus its context files, with `env_source`.
   Harbor's `create-task` / `create-adapter` skills cover the package conventions.
+- Verifier-only tools (python3 for a grader, test runners) never go in `environment/`; install them in
+  `tests/test.sh` after the solve, or use a separate verifier image (answer-file tasks already do).
+- `[verifier] timeout_sec` defaults to 120; set `BuildResult.verifier_timeout_sec` so the verifier has
+  its own sufficient budget (setup included), not a copy of `[agent]`'s. `task.toml` metadata also
+  records `oracle_source`.

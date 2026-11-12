@@ -12,6 +12,11 @@ change the command line or the artifact format; such changes are called out.
   and Mint task/trajectory metadata. It remains part of `bandits-cli`.
   Existing experimental workspaces and parser scripts must be regenerated or
   migrated to these names; the old command/import are removed.
+- `mint` verifier honesty: `BuildResult.verifier_timeout_sec` (own `[verifier]`
+  budget), `oracle_source` and `Outcome.source` provenance shown in `mint report`,
+  `answer` oracles are `ready` only with verified/computed trust, execution errors
+  reported apart from grading failures; guidance on verifier-only dependencies,
+  outcome-based graders and the `verified` label.
 
 
 ### Added
