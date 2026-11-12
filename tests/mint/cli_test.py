@@ -209,15 +209,7 @@ def test_scaffolded_templates_load(env):
     assert "main" in load_jobs(ws)
     env.write("jobs.json", JOBS_JSON)
     tt = env.ws / "tasktypes/qa.py"
-    try:  # the scaffold leaves task_scope as a TODO: the author must choose one
-        load_tasktypes(ws)
-    except MINTError as e:
-        assert "task_scope" in e.message and "TODO" in e.message
-        assert "full_job | subtask | decision" in e.message
-    else:
-        raise AssertionError("a task type with the scaffold's task_scope must not load")
-    tt.write_text(tt.read_text().replace('"task_scope": "TODO"', '"task_scope": "subtask"'))
-    try:  # and a task type must name a real job
+    try:  # a task type must name a real job
         load_tasktypes(ws)
     except MINTError as e:
         assert "SPEC['job']" in e.message

@@ -69,17 +69,15 @@ CHECKS = [Check("has_answer", 1, has_answer), Check("boom", 1, boom)]
 """
 
 JOBS_JSON = """{"jobs": [
-  {"id": "main", "scope": "full_job", "description": "add up the numbers the user gave",
-   "where": "every trajectory", "repeats": "same numbers", "outcome": "logged answer only"},
-  {"id": "sub", "scope": "subtask", "parent": "main", "description": "read the numbers",
-   "where": "every trajectory", "repeats": "none", "outcome": "unknown"}
+  {"id": "main", "description": "add up the numbers the user gave",
+   "where": "every trajectory", "repeats": "same numbers", "outcome": "logged answer only"}
 ]}
 """
 
 TASKTYPE_PY = """
-from mint import Answer, Blocked, BuildResult
+from mint import Answer, BuildResult, Candidate
 
-SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "numeric", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "check": "numeric", "gold": "imitation",
         "hidden": ["answer"], "applies_when": "has an answer"}
 VERSION = 1
 LEAK = False
@@ -96,7 +94,7 @@ def build(group, out):
     t = group[0]
     nums = t["meta"]["nums"]
     if nums == "BLOCK":
-        return Blocked("needs a live system", missing=["running service"])
+        return Candidate("needs a live system", gaps=["running service"])
     if nums == "CRASH":
         raise ValueError("generator bug for sample 9")
     instr = "Add up the numbers in /app/nums.txt."

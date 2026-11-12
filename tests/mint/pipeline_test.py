@@ -58,7 +58,7 @@ def test_generate_build_blocked_exception_and_exclusion(env):
     d = res["data"]
     assert d["by_status"] == {"generated": 3} and d["queued"] == 1
     q = [json.loads(x) for x in (env.ws / "out/queue.jsonl").read_text().splitlines()]
-    assert q[0]["kind"] == "blocked" and q[0]["missing"] == ["running service"]
+    assert q[0]["kind"] == "candidate" and q[0]["missing"] == ["running service"]
     ex = [json.loads(x) for x in (env.ws / "out/excluded.jsonl").read_text().splitlines()]
     assert ex[0]["trajectory_id"] == "q4"
     assert "no logged answer" in ex[0]["reason"]

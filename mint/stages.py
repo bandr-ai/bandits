@@ -417,11 +417,10 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 stage.mkdir(parents=True, exist_ok=True)
                 try:
                     res = tt.loaded.module.build(group, stage)
-                    full_job = tt.spec.get("task_scope") == "full_job"
                     if isinstance(res, Blocked):
-                        if full_job and res.kind not in BLOCK_KINDS:
+                        if res.kind not in BLOCK_KINDS:
                             raise ContractError(
-                                f"a full job may be Blocked only for {list(BLOCK_KINDS)} "
+                                f"a job may be Blocked only for {list(BLOCK_KINDS)} "
                                 f"(got kind {res.kind!r}: {res.reason}); return "
                                 "Candidate(reason, gaps=[...], next_action=...) or build it "
                                 "with its gaps instead"
@@ -448,7 +447,6 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                         )
                         q["gaps"] = normalize_gaps(res.gaps)
                         q["next_action"] = res.next_action
-                        q["task_scope"] = tt.spec.get("task_scope")
                         q["job"] = tt.spec.get("job")
                         queue.append(q)
                         continue
@@ -486,7 +484,6 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                 row["assumptions"] = list(res.assumptions)
                 row["provenance"] = {
                     "job": tt.spec.get("job"),
-                    "task_scope": tt.spec.get("task_scope"),
                     "oracle": res.oracle_kind,
                     "env_source": res.env_source,
                     "grading": {
@@ -497,8 +494,8 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                     "gaps": res.gaps,
                 }
                 hidden = [str(h) for h in res.hidden]
-                # a negative task has no answer to hide; a custom verifier lists its own
-                if res.answer is not None and res.answer.check != "forbidden":
+                # a custom verifier lists its own hidden values
+                if res.answer is not None:
                     hidden.append(res.answer.canonical())
                     if isinstance(res.answer.expected, list):
                         hidden += [str(x) for x in res.answer.expected]

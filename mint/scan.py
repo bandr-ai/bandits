@@ -59,7 +59,7 @@ def warnings_for(task_dir: Path, spec: dict, meta: dict, min_len: int = 12) -> l
     files = [instr] if instr.is_file() else []
     if env.is_dir():
         files += sorted(q for q in env.rglob("*") if q.is_file())
-    expected = _expected_values(spec) if check != "forbidden" else []
+    expected = _expected_values(spec)
     for p in files:
         text = leak.read_text(p)
         if text is None:

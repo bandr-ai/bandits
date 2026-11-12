@@ -37,50 +37,8 @@ VALIDATED_NOTE = (
     "in a real Harbor run); it does not mean the answer is correct."
 )
 
-SCOPE_LABEL = {
-    "full_job": "full job",
-    "subtask": "sub-capability",
-    "decision": "decision-from-evidence",
-}
-SCOPE_NOTE = (
-    "scope: `full job` rebuilds the logged agent's whole job (inputs, tools, output format) and grades "
-    "its real output; `sub-capability` rebuilds one sub-agent or step with its own inputs and tools; "
-    "`decision-from-evidence` gives the evidence the agent gathered and asks for its "
-    "decision, not the full job."
-)
-
-
-def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
-    """Jobs from jobs.json and what was built for each: unbuilt jobs stay visible."""
-    try:
-        jobs = load_jobs(ws)
-        tts = load_tasktypes(ws)
-    except MINTError as e:
-        return ["", "## Jobs", "", f"- job map unavailable: {e.message}"]
-    types_of: dict[str, list[str]] = defaultdict(list)
-    scope_of = {t.name: t.spec.get("task_scope") for t in tts}
-    for t in tts:
-        types_of[t.spec.get("job")].append(t.name)
-    L = [
-        "",
-        "## Jobs",
-        "",
-        "| job | scope | parent | task types | tasks |",
-        "|---|---|---|---|---|",
-    ]
-    for jid, j in jobs.items():
-        names = types_of.get(jid, [])
-        n = ", ".join(f"{len(by_type.get(t, []))} {scope_of.get(t)}" for t in names) or "0"
-        labelled = ", ".join(f"{t} ({scope_of.get(t)})" for t in names) or "none"
-        L.append(f"| {jid} | {j['scope']} | {j.get('parent') or ''} | {labelled} | {n} |")
-    unbuilt = [jid for jid in jobs if not types_of.get(jid)]
-    if unbuilt:
-        L += ["", f"Jobs with no task type yet (say why in a decision): {', '.join(unbuilt)}"]
-    return L
-
-
 # grading trust that is not independent of the logged run: never counted as ready
-WEAK_TRUST = ("imitation", "negative", "none")
+WEAK_TRUST = ("imitation", "none")
 
 
 def ready(row: dict) -> tuple[bool, list[str]]:
@@ -100,24 +58,20 @@ def ready(row: dict) -> tuple[bool, list[str]]:
     return not why, why
 
 
-def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
-    """One row per full job in jobs.json: what exists for it, how ready, what is missing.
-    Children never count here."""
+def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
+    """One row per job in jobs.json (each rebuilt end to end): what exists, how ready, what is
+    missing. A job with no task and no candidate is flagged."""
     try:
         jobs = load_jobs(ws)
         tts = load_tasktypes(ws)
     except MINTError as e:
-        return ["## Full jobs", "", f"- job map unavailable: {e.message}", ""]
+        return ["## Jobs", "", f"- job map unavailable: {e.message}", ""]
     full_types = defaultdict(list)
     for t in tts:
-        if t.spec.get("task_scope") == "full_job":
-            full_types[t.spec.get("job")].append(t.name)
+        full_types[t.spec.get("job")].append(t.name)
     queue = read_jsonl(ws.queue)
     L = [
-        "## Full jobs",
-        "",
-        "Each full job's own tasks only; subtasks and decisions are listed per type below and "
-        "never count as covering a full job.",
+        "## Jobs",
         "",
         "| job | task types | tasks | validated | ready | candidates | blocked | errors | env | oracle | grading | gaps |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
@@ -125,9 +79,7 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
     missing = []
     covered_src: set = set()
     covered_ids: set = set()
-    for jid, j in jobs.items():
-        if j["scope"] != "full_job":
-            continue
+    for jid in jobs:
         names = full_types.get(jid, [])
         rs = [r for n in names for r in by_type.get(n, [])]
         cands = [q for q in queue if q["type"] in names and q["kind"] == "candidate"]
@@ -173,8 +125,8 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
     if missing:
         L += [
             "",
-            "**Full jobs with no task and no candidate (every full job needs at least a "
-            f"candidate):** {', '.join(missing)}",
+            "**Jobs with no task and no candidate (every job needs at least a candidate):** "
+            f"{', '.join(missing)}",
         ]
     if ws.trajectories.exists():
         trajs = load_trajectories(ws)
@@ -185,7 +137,7 @@ def _full_job_lines(ws: Workspace, by_type: dict) -> list[str]:
         ]
         L += [
             "",
-            f"Trajectories with no full-job task or candidate: **{len(uncovered)} of {len(trajs)}**"
+            f"Trajectories with no task or candidate: **{len(uncovered)} of {len(trajs)}**"
             + (f" (e.g. {', '.join(uncovered[:10])})" if uncovered else "")
             + ". Each logged run was doing some job: map it, build it, or say why in a decision.",
         ]
@@ -247,7 +199,7 @@ def build_report(ws: Workspace) -> str:
     by = defaultdict(list)
     for r in rows:
         by[r["type"]].append(r)
-    L += _full_job_lines(ws, by)
+    L += _job_lines(ws, by)
 
     L += ["## Findings and exclusion rates per check", ""]
     c = st.get("checks", {}).get("summary")
@@ -278,29 +230,22 @@ def build_report(ws: Workspace) -> str:
 
     L += ["## Tasks per type", ""]
     if rows:
-        try:
-            tts = load_tasktypes(ws)
-        except MINTError:
-            tts = []
-        scopes = {t.name: t.spec.get("task_scope") for t in tts}
         L += [
-            "| type | scope | tasks | validated | ready | generated | exec_failed | blocked | gold (trust) |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| type | tasks | validated | ready | generated | exec_failed | blocked | gold (trust) |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for t, rs in sorted(by.items()):
             sc, gc = Counter(r["status"] for r in rs), Counter(r["gold"] for r in rs)
-            scope = SCOPE_LABEL.get(scopes.get(t), "unknown")
             n_ready = sum(1 for r in rs if ready(r)[0])
             gold = ", ".join(f"{k} {v}" for k, v in sorted(gc.items()))
             L.append(
-                f"| {t} | {scope} | {len(rs)} | {sc['validated']} | {n_ready} | {sc['generated']} | "
+                f"| {t} | {len(rs)} | {sc['validated']} | {n_ready} | {sc['generated']} | "
                 f"{sc['exec_failed']} | {sc['blocked']} | {gold} |"
             )
-        L += ["", SCOPE_NOTE, "", VALIDATED_NOTE, ""]
+        L += ["", VALIDATED_NOTE, ""]
         L += [f"- {k}: {v}" for k, v in sorted(status_gold(rows).items())]
     else:
         L.append("- no tasks generated")
-    L += _job_lines(ws, by)
     L += ["", "## Gate results", ""]
     gc = Counter()
     for r in rows:

@@ -8,6 +8,8 @@ import pytest
 from mint import ContractError, Trajectory, message_text
 from mint.models import ATIF_VERSION, normalize_trajectory
 
+from .conftest import JOBS_JSON
+
 DOC = {
     "agent": {"name": "bot", "version": "unknown", "model_name": "m1"},
     "steps": [
@@ -165,49 +167,41 @@ def test_invalid_atif_becomes_a_parse_error_grouped_by_cause(env):
     assert all(g["cause"].startswith("not ATIF") for g in d["error_groups"])
 
 
-def test_task_scope_is_required_and_shown_in_report(env):
+def test_only_end_to_end_jobs_are_accepted(env):
     env.build_pipeline()
+    tt = env.ws / "tasktypes/addnums.py"
     env.write(
         "tasktypes/addnums.py",
-        (env.ws / "tasktypes/addnums.py")
-        .read_text()
-        .replace('"job": "main", "task_scope": "decision", ', ""),
+        tt.read_text().replace('"job": "main", ', '"job": "main", "task_scope": "decision", '),
     )
-    code, _, err, res = env.run("run", "generate", "--json")
-    assert code == 1 and "task_scope" in res["error"]["message"]
-    env.write(
-        "tasktypes/addnums.py",
-        (env.ws / "tasktypes/addnums.py")
-        .read_text()
-        .replace('"env": "static",', '"env": "static", "job": "main", "task_scope": "everything",'),
-    )
-    assert env.run("run", "generate", "--json")[0] == 1
-    env.write(
-        "tasktypes/addnums.py",
-        (env.ws / "tasktypes/addnums.py")
-        .read_text()
-        .replace(
-            '"job": "main", "task_scope": "everything"', '"job": "main", "task_scope": "full_job"'
-        ),
-    )
+    code, _, _, res = env.run("run", "generate", "--json")
+    assert code == 1 and "end-to-end" in res["error"]["message"]
+    env.write("tasktypes/addnums.py", tt.read_text().replace('"task_scope": "decision", ', ""))
+    jobs = json.loads((env.ws / "jobs.json").read_text())
+    jobs["jobs"].append({**jobs["jobs"][0], "id": "sub", "parent": "main"})
+    env.write("jobs.json", json.dumps(jobs))
+    code, _, _, res = env.run("run", "generate", "--json")
+    assert code == 1 and "end-to-end" in res["error"]["message"]
+    env.write("jobs.json", JOBS_JSON)
     assert env.run("run", "generate", "--json")[0] == 0
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert "| addnums | full job |" in md and "decision-from-evidence" in md
+    assert "## Jobs" in md and "| main | addnums |" in md
+    assert "decision-from-evidence" not in md and "scope" not in md
 
 
 def test_schema_and_scaffolds_describe_atif(env):
     d = env.run("schema", "--json", ws=False)[3]["data"]["parse.py"]["Trajectory"]
     assert ATIF_VERSION in d["format"] and "source_call_id" in json.dumps(d) and "extra.mint" in d
     assert (
-        "task_scope"
+        "end to end"
         in env.run("schema", "--json", ws=False)[3]["data"]["tasktypes/<type>.py"]["SPEC"]
     )
     env.init()
     env.run("new", "parser")
     env.run("new", "tasktype", "x")
     assert "from_atif" in (env.ws / "parse.py").read_text()
-    assert '"task_scope"' in (env.ws / "tasktypes/x.py").read_text()
+    assert '"task_scope"' not in (env.ws / "tasktypes/x.py").read_text()
 
 
 def test_show_field_accepts_mint_shortcuts(env):
@@ -222,8 +216,7 @@ def test_report_lists_jobs_and_unbuilt_ones(env):
     env.run("run", "generate")
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert "## Jobs" in md and "| main | full_job |  | addnums (decision) |" in md
-    assert "Jobs with no task type yet (say why in a decision): sub" in md
+    assert "## Jobs" in md and "| main | addnums |" in md
 
 
 def test_old_events_format_gets_a_migration_error():

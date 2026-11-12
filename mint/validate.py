@@ -67,9 +67,7 @@ def level2_task(ws: Workspace, row: dict, runner: Runner) -> dict:
     m = _meta(ws, row["task_id"])
     spec = read_json(d / "tests" / "expected.json", {})  # absent for a custom verifier
     wrong, auto = m["wrong_answers"], False
-    if spec.get("check") == "forbidden":
-        wrong = [str(x) for x in spec["expected"]]  # the known-wrong answers must fail
-    elif not wrong and "expected" in spec:
+    if not wrong and "expected" in spec:
         canon = spec["expected"][0] if isinstance(spec["expected"], list) else spec["expected"]
         wrong, auto = [derive_wrong(str(canon), spec.get("check", "exact"))], True
     answer_file = spec.get("file", "answer.txt") if spec else None

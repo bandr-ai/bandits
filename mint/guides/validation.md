@@ -40,7 +40,7 @@ Status: `validated` = exec gates passed, oracle included, in a real Harbor run (
 and `no_oracle` stay `generated`); `generated` = structure+leak+secrets passed; `exec_failed` = the
 package is malformed or its gates failed (fix and regenerate); `blocked` = leak or secret found.
 Reasons are in results.jsonl. `ready` (report only) = validated, environment not partial, grading
-trust not imitation/negative/none, no open gaps.
+trust not imitation/none, no open gaps.
 `validated` means the gates passed, not that the answer is correct: `status` and `report` show the
 gold kind next to it (`validated (imitation)`) and warn about validated tasks with no audit or
 derivability decision.

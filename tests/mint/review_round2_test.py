@@ -157,4 +157,4 @@ def test_skill_documents_missing_runtime_and_jobs_scaffold():
     guide = (Path(mint.__file__).parent / "guides/tasktypes.md").read_text()
     assert "--allow-missing-runtime" in skill and "`mint new jobs`" in skill
     for doc in (skill, guide):
-        assert "`full_job` | `subtask` | `decision`" in doc
+        assert "whole job" in doc.lower() or "end to end" in doc.lower()

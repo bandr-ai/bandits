@@ -1,13 +1,10 @@
 """Follow-up regressions from running the fixed tool on real-shaped data:
 exact-label tasks whose rubric defines every label in prose, secret-scan false alarms
-on ordinary code, and negative tasks that would accept any string."""
-
-import json
+on ordinary code."""
 
 from mint import Answer, secrets
 from mint.models import ContractError
 
-from .negative_test import NEG_PY, setup
 from .validate_test import rows
 
 RUBRIC = (
@@ -21,7 +18,7 @@ RUBRIC = (
 EXACT_PY = """
 from mint import Answer, BuildResult
 
-SPEC = {"unit": "episode", "env": "static", "job": "main", "task_scope": "decision", "check": "exact", "gold": "imitation",
+SPEC = {"unit": "episode", "env": "static", "job": "main", "check": "exact", "gold": "imitation",
         "hidden": [], "applies_when": "any"}
 VERSION = 1
 EVIDENCE_EXTRA = ""
@@ -92,28 +89,3 @@ def test_secret_scan_ignores_ordinary_code_but_not_literals():
         assert not secrets.scan_text(line), line
     for line in ["password: Tr0ub4dor3x", 'token = "q9w8e7r6t5y4"', "password=hunter22"]:
         assert secrets.scan_text(line), line
-
-
-def test_negative_task_needs_pattern_or_choices():
-    try:
-        Answer(expected=["13"], check="forbidden").validate()
-    except ContractError as e:
-        assert "pattern or answer.choices" in str(e)
-    else:
-        raise AssertionError("expected a ContractError")
-
-
-def test_negative_task_with_choices_rejects_answers_outside_them(env):
-    py = NEG_PY.replace(
-        "KW = {}",
-        "KW = {'answer': Answer(expected=['red'], check='forbidden', "
-        "choices=['red', 'green', 'blue']), 'alternatives': ['green']}",
-    )
-    setup(env, py)
-    env.run("run", "generate")
-    tid, _ = next(iter(rows(env).items()))
-    for answer, want in (("green", 0), ("red", 1), ("purple", 1), ("", 1)):
-        code, _, _, res = env.run("task", "try", tid, "--answer", answer, "--json")
-        assert res["data"]["reward"] == (1.0 if want == 0 else 0.0), (answer, res)
-    spec = json.loads(next((env.ws / "out/tasks").rglob("expected.json")).read_text())
-    assert spec["choices"] == ["red", "green", "blue"]

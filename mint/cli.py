@@ -29,7 +29,6 @@ from .models import (
     NORMALIZERS,
     ORACLE_KINDS,
     STATUSES,
-    TASK_SCOPES,
     ContractError,
 )
 from .output import (
@@ -746,17 +745,17 @@ def schema_data() -> dict:
             "note": "findings are observations, not exclusions",
         },
         "tasktypes/<type>.py": {
-            "SPEC": f"{{unit, env, job, task_scope in {list(TASK_SCOPES)}, check, gold, hidden, applies_when}}; job = an id from jobs.json; task_scope is required: full_job = the logged agent's whole job rebuilt, subtask = one sub-capability rebuilt, decision = evidence given, its decision asked",
-            "jobs.json": '{"jobs": [{id, scope: full_job|subtask, parent?, description, where, repeats, outcome, notes?}]}: the job map from step 1; task types build from it',
+            "SPEC": "{env, job, check, gold, hidden, applies_when}; job = the id from jobs.json this type rebuilds end to end (Mint builds whole jobs only, no subtasks)",
+            "jobs.json": '{"jobs": [{id, description, where, repeats, outcome, notes?}]}: every job the logged agents were given, from step 1; one task (or candidate) per job instance',
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
             "group_key": "def group_key(t) -> str  # attempts sharing a key become one task",
-            "build": "def build(group, out: Path) -> BuildResult | Candidate | Blocked  # full jobs first",
+            "build": "def build(group, out: Path) -> BuildResult | Candidate | Blocked  # the whole job",
             "BuildResult": {
                 "task_id": "str [A-Za-z0-9._-]",
                 "instruction": "str; never the recorded answer",
                 "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>; binary files are skipped by the leak and secret scans",
-                "answer": f"optional when files has your own tests/test.sh (custom verifier on the end state). Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, pattern); forbidden = negative gold: expected is the known-wrong answers, any other well-formed answer passes (needs alternatives)",
+                "answer": f"optional when files has your own tests/test.sh (custom verifier on the end state). Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, choices)",
                 "wrong_answers": "meaningful wrong answers the verifier must reject: strings (answer-file tasks) or Outcome(script, note) run in the environment instead of solve.sh (else an auto one is used and flagged)",
                 "alternatives": "other valid answers / Outcome scripts the verifier must accept",
                 "oracle_kind": f"{list(ORACLE_KINDS)}; default reference if files has solution/solve.sh, answer if `answer`, else none (none = can't be validated)",

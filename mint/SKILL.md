@@ -37,18 +37,17 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    source_refs, ended and meta. Record how each run actually ended (done / cut_off / error / unknown). A clean
    exit is never success. `mint run parse`; investigate dropped records and parse-error groups.
    Guide: `mint docs --topic parsing`.
-   Then **map the jobs** (`mint new jobs` → `jobs.json`): every full job the logged agents were given,
-   each sub-capability (a sub-agent or step with its own inputs, tools and output), how repeat
-   attempts at the same instance show up, and how success or failure is known. Task types are
-   built *from* this map (each names its job); jobs you don't build stay listed in the report.
+   Then **map the jobs** (`mint new jobs` → `jobs.json`): every job the logged agents were given,
+   end to end (not their internal steps or sub-agents), how repeat attempts at the same instance
+   show up, and how success or failure is known. Task types are built *from* this map (each names
+   its job); jobs you don't build stay listed in the report.
 2. **Findings.** `mint new check <name>`, `mint run checks`. Findings are observations, not exclusions.
    Ask three separate questions: recording quality, execution outcome, usefulness for a task.
    Failed and partial runs stay usable. Spot-check each check on fresh data:
    `mint sample --matching <check>`, then `mint decide "<what>" --kind spot_check --check <id> --verdict pass --why "..."`.
    Guide: `mint docs --topic checks`.
-3. **Task types.** `mint new tasktype <name>`. Group by prompt/job and output shape, then refine by
-   evidence access and completion requirements (one episode can yield several subtasks; many
-   attempts can collapse into one task via `group_key`). Exclude a record only if a finding blocks
+3. **Task types.** `mint new tasktype <name>`, one per job shape. Each task is one whole job: many
+   attempts at the same instance collapse into one task via `group_key` (keep them all as evidence). Exclude a record only if a finding blocks
    building or evaluating *this* task. Build a few varied instances first and fix them before bulk.
    Guide: `mint docs --topic tasktypes`.
 4. **Generate.** `mint run generate --limit 5`, then without the limit. Candidates, blocked and exception
@@ -62,47 +61,48 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    evidence sufficiency and verifier behavior; a failed audit sends the batch back to step 3.
    Infrastructure errors are not task failures. Stop after `max_fix_attempts` and report it.
    Guide: `mint docs --topic validation`.
-6. **Report.** `mint report`, read `report.md`, then summarise for the user, full jobs first: per full
-   job, its task or candidate, environment source, grading method and trust, oracle, gaps, and whether
-   it is ready; then children, exclusions and why, validated vs generated, what is missing.
+6. **Report.** `mint report`, read `report.md`, then summarise for the user, per job: its task or
+   candidate, environment source, grading method and trust, oracle, gaps, and whether it is ready;
+   then exclusions and why, validated vs generated, what is missing.
 
 ## Judgment
 
-- **The full job comes first.** For every `full_job` in `jobs.json`, build a task that asks a new agent to
-  do what the logged agent was assigned: the original request, its starting state, its tools/action
-  space, its output, graded on the real outcome. Do it in both input modes: logs only (rebuild the
-  environment from what the runs read, wrote, ran and fetched: `mint evidence <id>`; installs, source
-  downloads and image pulls are allowed) and logs + harness (use the supplied harness, fill what it
-  lacks). Subtasks and decisions come after as extras (`SPEC["task_scope"]`: `full_job` | `subtask` | `decision`).
-- **Never block a full job for being hard.** If a piece is missing, build it with the gap recorded
+- **Whole jobs only.** Each task asks a new agent to do what the logged agent was assigned, end to
+  end: the original request, its starting state, its tools/action space, its output, graded on the
+  real outcome. No subtasks or decision-from-evidence tasks. Logs only, or logs + an attached harness
+  (use it, fill what it lacks).
+- **Starting state = the world at the agent's first action in this task** (`mint evidence <id>`):
+  - environment: files named in the request or read before anything in the run could have made them
+    (content only when the read was complete), the base system shown by OS/version output, and setup
+    done before the agent started (by the harness or image);
+  - never environment: anything the agent installed, configured, downloaded, built or wrote. That is
+    the job (it belongs in the solution), even when it makes the environment easier to rebuild;
+  - absence is evidence: `command not found` / a missing module means the agent didn't have it, so
+    don't pre-install it;
+  - version output narrows the base image, rarely pins it: take the smallest base that matches;
+  - anything still unknown is a gap (`affects: fidelity`), never a convenient guess.
+- **Never block a job for being hard.** If a piece is missing, build it with the gap recorded
   (`env_source="partial"`, `gaps=[...]`, `oracle_kind="none"`), or return
   `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only
-  for an unremovable secret/leak or no recoverable instruction. Every full job ends with at least a
+  for an unremovable secret/leak or no recoverable instruction. Every job ends with at least a
   candidate; `mint report` flags any that don't.
 - **Never fake.** Missing data stays missing and is listed as a gap: no invented files, no solve.sh or
   verifier made up to satisfy packaging. Mark a read as complete only when the log proves it.
-- **Grading: how vs why trusted.** Pick the method that fits the assignment (`grading_method`): a
-  server or build is checked by behaviour on the end state (your own `tests/test.sh`), a computed
-  output by recomputing it, a label by exact/allowed-set match. Separately, `gold_type` says why the
-  grading is trusted: `verified` (independent label for this exact scope and version), `computed`,
-  `independent` (end-state/behaviour check that doesn't depend on the logged answer), `solved`,
-  `imitation` (the logged answer: last resort), `negative`, `none`. Exact matching is fine when the
-  target has independent support; an unverified logged answer is `imitation` however it is graded.
-- **Oracle (`oracle_kind`).** Prefer `replay` (a logged attempt's actions, kept only if it passes the
-  verifier in the built environment), then `fresh` (a new solve; costs a model run, ask first), then
-  `reference` (writes known-good files). `answer` (writes the expected answer) proves wiring only.
-  With no credible oracle use `none`: the task can be `generated`, never `validated`.
-- **Wrong outcomes are real mistakes.** With a custom verifier give `Outcome(script=...)` wrong
-  outcomes that do plausible bad work (a broken build, a server that answers wrong) and valid
-  alternatives that do it differently; the gates run them in the environment.
+- **Grading: how vs why trusted.** `grading_method` fits the job (behaviour on the end state via your
+  own `tests/test.sh`, recomputation, or exact/allowed-set match). `gold_type` says why it is trusted:
+  `verified` (an outside label for this job), `computed`, `independent`, `solved`, `imitation` (the
+  logged answer, last resort), `none`. An unverified logged answer is `imitation` however graded.
+- **Oracle (`oracle_kind`).** Prefer `replay` of a logged attempt (kept only if it passes in the built
+  environment), then `fresh` (a new solve; ask first), then `reference`. `answer` proves wiring only;
+  no credible oracle → `none` (never `validated`).
+- **Wrong outcomes are real mistakes:** `Outcome(script=...)` doing plausible bad work (a broken build,
+  a wrong server); alternatives do it differently. The gates run them in the environment.
 - Instructions never include the recorded answer; gold lives only in `tests/`. The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
-- Earlier dataset-specific filters are not inherited; reassess every exclusion for the task at hand.
-- Stop and ask the user only for decisions that are theirs (scope, what counts as success), not for routine fixes.
+- Reassess every exclusion for this task (no inherited filters); ask the user only for their decisions.
 
 ## Harbor
 
-Don't re-explain Harbor: use its `create-task` / `create-adapter` skills and `harbor task init`.
-Generated tasks follow its conventions (`mint docs --topic harbor`).
+Use Harbor's `create-task` / `create-adapter` skills; tasks follow its conventions (`mint docs --topic harbor`).
 
 ## Command cheat-sheet
 
@@ -124,7 +124,7 @@ Flags on every command: `--json` (one result on stdout, progress on stderr), `--
 
 ## Ending a run
 
-Tell the user, from `report.md` and with file paths: each full job and how far it got (task or
+Tell the user, from `report.md` and with file paths: each job and how far it got (task or
 candidate, ready or not and why), then how many tasks, `validated` vs `generated` vs `exec_failed`,
 grading trust, what was excluded and why (rates per check), what is missing, and which numbers you
 could not verify. Unattended runs stop at the report.

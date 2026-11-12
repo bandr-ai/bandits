@@ -12,13 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 ATIF_SOURCES = ("system", "user", "agent")
-TASK_SCOPES = ("full_job", "subtask", "decision")
-JOB_SCOPES = ("full_job", "subtask")
 ENDED = ("done", "cut_off", "error", "unknown")
 RESULTS = ("pass", "fail", "unknown")
 # gold = why the grading is trusted (grading trust); see guides/tasktypes.md
-GOLD_TYPES = ("verified", "computed", "independent", "solved", "imitation", "negative", "none")
-CHECK_KINDS = ("exact", "allowed_set", "numeric", "forbidden")
+GOLD_TYPES = ("verified", "computed", "independent", "solved", "imitation", "none")
+CHECK_KINDS = ("exact", "allowed_set", "numeric")
 GRADING_METHODS = (*CHECK_KINDS, "behavioral", "judge")  # how the verifier grades
 NORMALIZERS = ("strip", "lower", "collapse_ws", "percent", "thousands", "sorted_list")
 STATUSES = ("validated", "generated", "exec_failed", "blocked")
@@ -310,7 +308,6 @@ class Answer:
     normalize: list = field(default_factory=lambda: ["strip"])
     tolerance: float = 0.0
     rel_tolerance: float = 0.0
-    pattern: str = ""  # forbidden only: regex a well-formed answer must fully match ("" = any)
     choices: list = field(default_factory=list)  # label vocabulary shown to the solver, if any
 
     def validate(self) -> None:
@@ -321,26 +318,13 @@ class Answer:
             raise ContractError(f"unknown normalizers {bad}; allowed {NORMALIZERS}")
         if self.check == "allowed_set" and not (isinstance(self.expected, list) and self.expected):
             raise ContractError("allowed_set needs a non-empty list as answer.expected")
-        if self.check == "forbidden":
-            if not (isinstance(self.expected, list) and self.expected):
-                raise ContractError(
-                    "forbidden needs a non-empty list of known-wrong answers as answer.expected"
-                )
-            try:
-                re.compile(self.pattern)
-            except re.error as e:
-                raise ContractError(f"answer.pattern is not a valid regex: {e}") from e
         if self.choices:
             if not all(isinstance(c, str) and c.strip() for c in self.choices):
                 raise ContractError("answer.choices must be a list of non-empty strings")
             exp = self.expected if isinstance(self.expected, list) else [self.expected]
             missing = [e for e in exp if str(e).strip() not in [c.strip() for c in self.choices]]
-            if self.check in ("exact", "allowed_set", "forbidden") and missing:
+            if self.check in ("exact", "allowed_set") and missing:
                 raise ContractError(f"answer.expected {missing} not in answer.choices")
-        if self.check == "forbidden" and not (self.pattern or self.choices):
-            raise ContractError(
-                "forbidden needs answer.pattern or answer.choices: otherwise any string passes"
-            )
         if self.check == "exact" and isinstance(self.expected, list | dict):
             raise ContractError("exact needs a scalar expected answer; use allowed_set for lists")
         if not self.file.strip() or "/" in self.file or self.file.startswith("."):
@@ -354,12 +338,11 @@ class Answer:
             "normalize": list(self.normalize),
             "tolerance": self.tolerance,
             "rel_tolerance": self.rel_tolerance,
-            "pattern": self.pattern,
             "choices": list(self.choices),
         }
 
     def canonical(self) -> str:
-        """The single value an oracle writes (for `forbidden`, a known-wrong one: see alternatives)."""
+        """The single value an oracle writes."""
         return str(self.expected[0] if isinstance(self.expected, list) else self.expected)
 
 
@@ -446,8 +429,8 @@ class BuildResult:
 
 @dataclass
 class Blocked:
-    """No task may be built. For a full_job type only `kind` secret / leak / no_instruction
-    is allowed; a job that is merely hard to rebuild is a Candidate with its gaps."""
+    """No task may be built: only `kind` secret / leak / no_instruction. A job that is merely
+    hard to rebuild is a Candidate with its gaps."""
 
     reason: str
     missing: list = field(default_factory=list)

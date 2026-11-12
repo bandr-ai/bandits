@@ -8,7 +8,7 @@ from .validate_test import rows
 FULL_PY = r'''
 from mint import Blocked, BuildResult, Candidate, Outcome
 
-SPEC = {"unit": "episode", "env": "rebuilt", "job": "main", "task_scope": "full_job",
+SPEC = {"unit": "episode", "env": "rebuilt", "job": "main",
         "check": "behavioral", "gold": "independent", "hidden": [], "applies_when": "any"}
 VERSION = 1
 
@@ -71,14 +71,14 @@ def test_full_job_custom_verifier_outcomes_candidates_and_report(env):
         "rebuilt",
         "behavioral",
     )
-    assert (meta["job"], meta["task_scope"]) == ("main", "full_job")
+    assert meta["job"] == "main" and "task_scope" not in meta
     d2 = env.ws / "out/tasks/addnums/full_q2"
     assert not (d2 / "solution/solve.sh").exists()
 
     # a full job blocked for a non-allowed reason is an error, not a silent block
     queue = (env.ws / "out/queue.jsonl").read_text()
     assert '"kind": "candidate"' in queue and "fetch the archive" in queue
-    assert "a full job may be Blocked only for" in queue
+    assert "a job may be Blocked only for" in queue
     assert gen["queued"] == 3  # q3 candidate + two disallowed full-job blocks
 
     # gates: scripts run in place of solve.sh; no oracle -> no_oracle, stays generated
@@ -91,14 +91,14 @@ def test_full_job_custom_verifier_outcomes_candidates_and_report(env):
 
     env.run("report")
     md = (env.ws / "report.md").read_text()
-    assert "## Full jobs" in md
+    assert "## Jobs" in md
     row = next(line for line in md.splitlines() if line.startswith("| main | addnums |"))
     assert "| 2 | 1 | 1 | 1 |" in row  # 2 tasks, 1 validated, 1 ready, 1 candidate
     assert "fidelity: input file seen only in part" in row
     assert "candidate q3: source archive not in the logs" in md
     assert "| 2 | 1 | 1 | 1 | 0 | 2 |" in row  # ...candidates, blocked, errors (2 bad blocks)
     # runs whose full job errored are not covered: they show up instead of disappearing
-    assert "Trajectories with no full-job task or candidate: **2 of 5**" in md
+    assert "Trajectories with no task or candidate: **2 of 5**" in md
 
 
 def test_broken_verifier_is_caught_by_an_executable_wrong_outcome(env):

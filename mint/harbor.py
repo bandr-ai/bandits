@@ -82,7 +82,6 @@ def task_toml(
         f"generator = {_toml_str(generator)}",
         f"gold = {_toml_str(b.gold_type)}",
         f"job = {_toml_str(str(spec.get('job', '')))}",
-        f"task_scope = {_toml_str(str(spec.get('task_scope', '')))}",
         f"oracle = {_toml_str(b.oracle_kind or '')}",
         f"env_source = {_toml_str(b.env_source or '')}",
         f"grading_method = {_toml_str(b.grading_method or '')}",
@@ -138,7 +137,6 @@ ORACLE_NOTE = {
     "independent": "the expected answer, checked independently of the logged run",
     "solved": "the answer a fresh solve produced and the verifier accepted",
     "imitation": "the logged answer (imitation gold, not independently checked)",
-    "negative": "a valid answer (one of the alternatives; the known-wrong ones are forbidden)",
     "none": "the expected answer",
 }
 
@@ -188,8 +186,6 @@ def resolve(b: BuildResult) -> None:
     b.gaps = normalize_gaps(b.gaps)
     if b.answer is not None:
         b.answer.validate()
-        if (b.gold_type == "negative") != (b.answer.check == "forbidden"):
-            raise ContractError("gold_type 'negative' and answer.check 'forbidden' go together")
     if b.answer is None and any(isinstance(x, str) for x in b.wrong_answers + b.alternatives):
         raise ContractError(
             "plain-string wrong answers/alternatives need an answer file; "
@@ -236,18 +232,6 @@ def materialize(
     resolve(b)
     custom = b.answer is None
     files: dict[str, str | bytes] = {}
-    oracle_value = None
-    if b.gold_type == "negative":
-        alts = [a for a in b.alternatives if isinstance(a, str)]
-        if not alts:
-            raise ContractError(
-                "a negative task needs `alternatives`: valid answers (the oracle writes the first)"
-            )
-        oracle_value = alts[0]
-        if oracle_value.strip() in [str(x).strip() for x in b.answer.expected]:
-            raise ContractError("the oracle's valid answer must differ from the known-wrong ones")
-        if b.answer.choices and oracle_value.strip() not in [c.strip() for c in b.answer.choices]:
-            raise ContractError("the oracle's valid answer must be one of answer.choices")
 
     if b.instruction is not None:
         text = b.instruction.rstrip() + "\n"
@@ -274,7 +258,7 @@ def materialize(
         files.setdefault("tests/test.sh", TEST_SH)
         files.setdefault("tests/Dockerfile", TESTS_DOCKERFILE)
     if b.oracle_kind == "answer":
-        files.setdefault("solution/solve.sh", solve_sh(b.answer, oracle_value, b.gold_type))
+        files.setdefault("solution/solve.sh", solve_sh(b.answer, None, b.gold_type))
     has_data = any(k.startswith("environment/data/") for k in files)
     files.setdefault("environment/Dockerfile", env_dockerfile(has_data))
 

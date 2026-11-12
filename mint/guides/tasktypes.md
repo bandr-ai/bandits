@@ -1,18 +1,15 @@
 # Task types
 
-Every type names the job it rebuilds: `SPEC["job"]` is an id from `jobs.json`; `task_scope` is
-`full_job`, `subtask` (one sub-capability) or `decision` (evidence given, decision asked).
+Every type rebuilds one job end to end: `SPEC["job"]` is its id from `jobs.json`. Mint builds whole
+jobs only (no subtasks, no decision-from-evidence tasks).
 
 A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new tasktype <name>`).
 
 - `applies(t, findings)` decides if a record can feed this type. Return `(False, "reason")` to leave a
   recorded exclusion reason. Records no type applies to land in `out/excluded.jsonl`.
 - `group_key(t)`: attempts sharing a key become one task. Merge repeated attempts here.
-- `SPEC["task_scope"]` (required; the scaffold leaves `TODO` so you choose):
-  `full_job` | `subtask` | `decision`. Build each `full_job` first:
-  the original request, starting state, tools/action space and output, graded on the real outcome.
-  Subtasks and decisions are extras with their own honest scope; they never cover a full job.
-  `mint report` lists full jobs first.
+- A task is the original request, the starting state, the tools/action space and the output,
+  graded on the real outcome. `mint report` has one row per job.
 - `build(group, out)` returns one of:
   - `BuildResult`: a package. Either `answer=Answer(...)` (mint writes an answer-file verifier) or your
     own `files["tests/test.sh"]` that checks the end state in the task environment (no `answer`;
@@ -24,12 +21,16 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
     `gaps=[{"what", "affects": execution|fidelity|grading|none}]`.
   - `Candidate(reason, gaps=[...], next_action="...")`: the job is identified but no runnable package is
     possible yet. Kept in the queue and the report; never counted as a task.
-  - `Blocked(reason, missing, kind=...)`: for a `full_job`, only `kind` `secret`, `leak` or
-    `no_instruction`. For optional children any reason is fine.
-- Environment input: `mint evidence <id>` lists what each run read (complete only when proven), wrote,
-  ran and fetched, with step refs. Files read before being written are starting-state candidates;
-  files the run wrote are outputs (hidden reference, not starting state). Logged setup commands are
-  evidence for a Dockerfile, not commands to append blindly.
+  - `Blocked(reason, missing, kind=...)`: only `kind` `secret`, `leak` or `no_instruction`.
+- Starting state = the world at the agent's first action in this task. `mint evidence <id>` lists what
+  each run read (complete only when proven), wrote, ran and fetched, with step refs.
+  - Environment: files named in the request or read before anything could have created them
+    (`pre_existing`), OS/runtime shown by version output (smallest matching base), and setup done
+    before the agent started (harness, image).
+  - Not environment: whatever the agent installed, configured, downloaded, built or wrote. That is
+    the job: it goes in the solution (`replay`), never the Dockerfile.
+  - `command not found` / a missing module: the agent didn't have it; don't pre-install it.
+  - Unknown → a gap (`affects: fidelity`), not a convenient guess.
 - Wrong answers / alternatives: strings for answer-file tasks; `Outcome(script="...")` for any task
   (a bash script run in the environment instead of solve.sh). Wrong ones must be *meaningful* (a
   plausible mistake, not noise); give alternatives when the check might be too strict. `hidden` lists
@@ -40,14 +41,7 @@ A type file has `SPEC`, `VERSION`, `applies`, `group_key`, `build` (`mint new ta
   The solver writes its answer to `/app/answer/<answer.file>`.
 - Gold (`gold_type`) = why the grading is trusted: `verified` (independent label for this exact scope),
   `computed` (recomputed from the inputs), `independent` (end-state/behaviour check not tied to the
-  logged answer), `solved` (a fresh solve passed), `imitation` (the logged answer), `negative` (see
-  below), `none`. `ready` in the report needs validated, a non-partial environment, trust other than
-  imitation/negative/none, and no open gaps.
-- Negative tasks: the logs show a known-wrong answer and no known-right one. Use
-  `gold_type="negative"` with `Answer(expected=[<known-wrong answers>], check="forbidden", pattern=<optional regex a well-formed answer must fully match>)`
-  and at least one valid answer in `alternatives` (the oracle writes the first). The verifier rewards
-  any non-empty, well-formed answer except the known-wrong ones. Level 2 checks: the oracle's
-  different valid answer passes, each known-wrong answer fails, an empty answer fails. The instruction
-  must say what a well-formed answer looks like; the known-wrong answers are not hidden from the scan.
+  logged answer), `solved` (a fresh solve passed), `imitation` (the logged answer), `none`. `ready` in the
+  report needs validated, a non-partial environment, trust other than imitation/none, and no open gaps.
 - Bump `VERSION` when the generator changes so changed instances are revalidated.
 - Idempotence: unchanged packages keep their validation state across `mint run generate` reruns.
