@@ -260,7 +260,9 @@ def _next_for(ws: Workspace, rep: dict) -> list[str]:
         return ["write source_notes.md (what a record is, boundaries, what is missing)"]
     jm = s["1_understand"]["job_map"]
     if not jm:
-        return ["mint new jobs  # map the jobs the logged agents were given, their repeats and outcomes"]
+        return [
+            "mint new jobs  # map the jobs the logged agents were given, their repeats and outcomes"
+        ]
     if jm["error"]:
         return [f"fix jobs.json: {jm['error']}"]
     if not s["2_findings"]["checks_exists"]:
@@ -380,6 +382,18 @@ def cmd_evidence(a, ws: Workspace) -> Result:
             f"  steps={','.join(f['refs'][:5])}"
         )
     lines.append("outputs (written by the run): " + (", ".join(sm["outputs"][:30]) or "-"))
+    lines.append(
+        "system facts (narrow the base image): "
+        + (", ".join(f"{x['fact']} @{x['step']}" for x in sm["system"][:10]) or "-")
+    )
+    lines.append(
+        "absent when first used (don't pre-install): "
+        + (", ".join(f"{x['what']} @{x['step']}" for x in sm["absent_at_first_sight"][:20]) or "-")
+    )
+    lines.append("set up by the agent (part of the job: solution, never the environment):")
+    lines += [
+        f"  @{x['step']}  {x['command']}" for x in sm["agent_setup"][: None if a.full else 20]
+    ] or ["  -"]
     lines.append("sources fetched: " + (", ".join(sm["sources"][:20]) or "-"))
     if sm["unknown_tools"]:
         lines.append(

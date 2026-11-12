@@ -176,7 +176,7 @@ def _shell(call: Call) -> list[dict] | None:
             if not words:
                 continue
             prog, rest = words[0].rsplit("/", 1)[-1], words[1:]
-            files = [w for w in rest if not w.startswith("-") and w not in (">", ">>", "<")]
+            files = [w for w in rest if not w.startswith("-") and not re.search(r"[<>|]", w)]
             if prog not in _NO_CREATE or (prog == "sed" and "-i" in rest):
                 cmd_item["opaque"] = True  # may create or change files we can't see
             if prog == "tee":
@@ -200,6 +200,48 @@ register("file", _file_tool, first=False)
 register("fetch", _fetch_tool, first=False)
 
 
+# Starting-state facts read from tool outputs and commands (shell-agnostic patterns only).
+_ABSENT_RES = (
+    re.compile(r"(?:^|[\s:])([\w.+-]+): (?:command )?not found", re.M),
+    re.compile(r"No module named ['\"]?([\w.]+)"),
+    re.compile(r"Cannot find module ['\"]([^'\"]+)"),
+    re.compile(r"(?:^|\s)(?:E: )?Unable to locate package ([\w.+-]+)", re.M),
+)
+_SYSTEM_RES = (
+    re.compile(r'PRETTY_NAME="([^"]+)"'),
+    re.compile(r"^(Python \d+\.\d+(?:\.\d+)?)", re.M),
+    re.compile(r"^(node v?\d+\.\d+\.\d+|v\d+\.\d+\.\d+)$", re.M),
+    re.compile(r"^(gcc \([^)]*\) \d+\.\d+(?:\.\d+)?)", re.M),
+    re.compile(r"^(go version go\d+\.\d+(?:\.\d+)?)", re.M),
+    re.compile(r"^((?:openjdk|java) (?:version )?\"?\d+[\w.]*)", re.M),
+    re.compile(r"^(Ubuntu \d+\.\d+[\w. ]*|Debian GNU/Linux \d+[\w. ()]*)", re.M),
+)
+# commands by which the agent changes its own machine: part of the job, never the start state
+_SETUP_RE = re.compile(
+    r"\b(?:apt(?:-get)?\s+(?:-\S+\s+)*(?:install|source|build-dep)|dpkg\s+-i|"
+    r"(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+install|uv\s+(?:add|sync)|poetry\s+(?:add|install)|"
+    r"conda\s+install|(?:npm|pnpm|yarn)\s+(?:i|install|add)\b|cargo\s+install|go\s+install|"
+    r"gem\s+install|brew\s+install|apk\s+add|yum\s+install|dnf\s+install|"
+    r"git\s+clone|make\s+install|update-alternatives|systemctl\s+(?:enable|start))"
+    r"|(?:>>?|tee(?:\s+-a)?)\s*/(?:etc|usr|opt)/",
+)
+
+
+def _facts(call: Call, ref: dict, ev: dict) -> None:
+    out = call.output or ""
+    for rx in _ABSENT_RES:
+        for m in rx.finditer(out):
+            ev["absent"].append({**ref, "what": m.group(1), "line": m.group(0).strip()[:160]})
+    for rx in _SYSTEM_RES:
+        for m in rx.finditer(out):
+            ev["system"].append({**ref, "fact": m.group(1).strip()[:120]})
+    cmd = _shell_command(call.arguments) if _SHELL_NAMES.search(call.name or "") else None
+    if cmd:
+        for seg in re.split(r"&&|\|\||;|\n", cmd):
+            if _SETUP_RE.search(seg):
+                ev["agent_setup"].append({**ref, "command": seg.strip()[:200]})
+
+
 def _interpret(call: Call) -> tuple[str | None, list[dict] | None]:
     for name, fn in _REGISTRY:
         try:
@@ -220,7 +262,12 @@ def extract(t: Trajectory | dict, *, _prefix: str = "", _seq: list | None = None
     """
     t = t if isinstance(t, Trajectory) else Trajectory(t)
     seq = _seq if _seq is not None else [0]
-    ev: dict = {k: [] for k in KINDS} | {"unknown": []}
+    ev: dict = {k: [] for k in KINDS} | {
+        "unknown": [],
+        "absent": [],
+        "system": [],
+        "agent_setup": [],
+    }
     for c in t.calls():
         seq[0] += 1
         ref = {
@@ -229,6 +276,7 @@ def extract(t: Trajectory | dict, *, _prefix: str = "", _seq: list | None = None
             "tool": c.name,
             "seq": seq[0],
         }
+        _facts(c, ref, ev)
         by, items = _interpret(c)
         if not items:
             ev["unknown"].append({**ref, "args": sorted(c.arguments)})
@@ -293,9 +341,22 @@ def outputs(ev: dict) -> list[str]:
 
 
 def summary(ev: dict) -> dict:
-    """Small overview: counts, candidate starting files, outputs, sources, unknown tools."""
+    """Small overview: counts, candidate starting files, outputs, sources, unknown tools, and the
+    starting-state facts: what the agent lacked, what the system reported, what the agent set up
+    itself (that setup is the job: it belongs in the solution, never the starting environment)."""
+    first = {}
+    for i in ev.get("system", []):
+        first.setdefault(i["fact"], i["step"])
+    absent = {}
+    for i in ev.get("absent", []):
+        absent.setdefault(i["what"], i["step"])
     return {
         "counts": {k: len(ev.get(k, [])) for k in (*KINDS, "unknown")},
+        "absent_at_first_sight": [{"what": k, "step": v} for k, v in absent.items()],
+        "system": [{"fact": k, "step": v} for k, v in first.items()],
+        "agent_setup": [
+            {"command": i["command"], "step": i["step"]} for i in ev.get("agent_setup", [])
+        ],
         "starting_files": starting_files(ev),
         "outputs": outputs(ev),
         "sources": sorted({i["url"] for i in ev.get("sources", []) if i.get("url")}),

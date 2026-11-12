@@ -152,3 +152,52 @@ def test_files_an_opaque_command_may_have_created_are_not_assumed_pre_existing()
     assert files["README.md"]["pre_existing"] is True  # nothing ran before that could create it
     assert files["src/main.c"]["pre_existing"] is None  # tar may have created it
     assert files["build.log"]["pre_existing"] is None  # make may have, in the same command
+
+
+def test_starting_state_facts_absence_system_and_agent_setup():
+    t = Trajectory(
+        {
+            "steps": [
+                step(
+                    1,
+                    [("bash", {"command": "cat /etc/os-release; python3 --version"})],
+                    ['PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nPython 3.13.5'],
+                ),
+                step(
+                    2,
+                    [("bash", {"command": "pmars -b x.red"})],
+                    ["bash: line 1: pmars: command not found"],
+                ),
+                step(
+                    3,
+                    [("bash", {"command": "apt-get update && apt-get install -y build-essential"})],
+                    [""],
+                ),
+                step(
+                    4,
+                    [
+                        (
+                            "bash",
+                            {
+                                "command": "echo 'deb-src http://x trixie main' > /etc/apt/sources.list.d/s.list"
+                            },
+                        )
+                    ],
+                    [""],
+                ),
+                step(
+                    5,
+                    [("bash", {"command": "python3 -c 'import grpc'"})],
+                    ["ModuleNotFoundError: No module named 'grpc'"],
+                ),
+                step(6, [("bash", {"command": "ls /app && make"})], ["a.c"]),
+            ]
+        }
+    )
+    s = evidence.summary(evidence.extract(t))
+    assert {x["fact"] for x in s["system"]} >= {"Debian GNU/Linux 13 (trixie)", "Python 3.13.5"}
+    assert {x["what"] for x in s["absent_at_first_sight"]} == {"pmars", "grpc"}
+    setup = [x["command"] for x in s["agent_setup"]]
+    assert any("apt-get install -y build-essential" in c for c in setup)
+    assert any("/etc/apt/sources.list.d" in c for c in setup)
+    assert not any(c.startswith(("ls", "make", "apt-get update")) for c in setup)
