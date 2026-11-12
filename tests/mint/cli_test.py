@@ -231,4 +231,4 @@ def test_schema_and_docs_ship_with_package(env):
     assert "oracle" in env.run("docs", "--topic", "validation")[1]
     assert env.run("docs", "--topic", "nope")[0] == 2
     skill = res["data"]["skill"]
-    assert 60 <= len(skill.splitlines()) <= 150
+    assert 60 <= len(skill.splitlines()) <= 160

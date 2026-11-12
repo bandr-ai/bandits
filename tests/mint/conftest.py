@@ -224,6 +224,22 @@ def env(tmp_path, capsys):
     return Env(tmp_path, capsys)
 
 
+@pytest.fixture(autouse=True)
+def _block_telemetry(monkeypatch, tmp_path_factory):
+    """Keep the suite off the network and off the developer's real config."""
+    xdg = tmp_path_factory.mktemp("mint-xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    called = {"n": 0}
+
+    def boom(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("telemetry posted during tests")
+
+    monkeypatch.setattr("mint.telemetry.post", boom)
+    yield xdg
+    assert called["n"] == 0
+
+
 @dataclass
 class _HarborSim(LocalRunner):
     """Stands in for a real Harbor run in tests: host execution, but its outcomes carry

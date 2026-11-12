@@ -13,6 +13,11 @@ Before guessing a command or contract: `mint schema`, `mint docs --topic <name>`
 Output is short by default; `--json` for exact data, `--full` for everything.
 Every command ends with a `next:` hint. After any interruption, run `mint status`.
 
+## Telemetry
+
+mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, report, and task try: version, OS, command, duration, and outcome. No paths, prompts, task ids, queries, or log contents.
+Turn it off with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state.
+
 ## Hard rules (the only fixed ones)
 
 1. Raw logs are read-only. Never copy them into good/bad folders. Reference them.
@@ -140,6 +145,7 @@ Use Harbor's `create-task` / `create-adapter` skills; tasks follow its conventio
 | Gates | `mint validate [--type T] [--task ID] [--level 1,2,3] [--judge]` |
 | Trust a judge | `mint judge-calibrate --type T [--n 20] [--answers f.jsonl]` (costs calls) |
 | Remember / report | `mint decide "<what>" --why "<evidence>"`, `mint report` |
+| Telemetry | `mint telemetry status`, `mint telemetry on`, `mint telemetry off` |
 | Contracts / guides | `mint schema`, `mint docs [--topic parsing\|checks\|tasktypes\|validation\|harbor]` |
 
 Every command takes `--json` (result on stdout, progress on stderr), `--full`, `--dry-run`, `--workspace`.
