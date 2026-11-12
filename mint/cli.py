@@ -629,8 +629,9 @@ def cmd_validate(a, ws: Workspace) -> Result:
         a.task or [],
         a.dry_run,
         runner=pick_runner(a.runner, ws.config()),
+        jobs=a.jobs,
     )
-    lines = [f"runner: {s['runner']}  levels: {s['levels']}"]
+    lines = [f"runner: {s['runner']}  levels: {s['levels']}  jobs: {s['jobs']}"]
     if s["runner"] == "local":
         lines.append(
             "note: host-local runner (no Harbor+Docker): passes keep tasks `generated`; "
@@ -660,6 +661,7 @@ def cmd_validate(a, ws: Workspace) -> Result:
             "also review: can the answer be DERIVED from the inputs? (the oracle only proves wiring) -> "
             + ", ".join(s["review_for_derivability"][:5])
         )
+    lines.append(f"wall time: {s['wall_seconds']}s")
     if a.dry_run:
         lines.append("(dry-run: results not saved)")
     code = EXIT_ERROR if s["any_failure"] or s["any_infra_error"] else EXIT_OK
@@ -983,6 +985,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sample-size", type=int)
     sp.add_argument("--max-fix-attempts", type=int)
     sp.add_argument("--level", default="1,2", help="comma list of 1,2,3 (default 1,2)")
+    sp.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        help="gate runs in parallel (default: validate_jobs in mint.json, 4; 1 = one at a time)",
+    )
     sp.add_argument(
         "--runner",
         default="auto",

@@ -22,6 +22,9 @@ change the command line or the artifact format; such changes are called out.
   absence is `not_on_path` / `module_missing`; `Unable to locate package` is
   `package_lookup_failed`. The "smallest matching base image" rule is gone. A job
   whose whole assignment is a decision is a normal answer-file job.
+- `mint validate` runs gate runs in parallel (`-j/--jobs`, config `validate_jobs`, default 4)
+  and saves each task's result as soon as it finishes; a rerun skips tasks whose package and
+  runner evidence are current. Per-task progress on stderr and wall time in the summary.
 
 
 ### Added
