@@ -51,31 +51,52 @@ rewrite your code as often as needed, use your own tools (shell, grep, Python) i
    attempts can collapse into one task via `group_key`). Exclude a record only if a finding blocks
    building or evaluating *this* task. Build a few varied instances first and fix them before bulk.
    Guide: `l2h docs --topic tasktypes`.
-4. **Generate.** `l2h run generate --limit 5`, then without the limit. `Blocked` and exception groups
-   land in `out/queue.jsonl`: investigate them, never resolve them by inventing data.
+4. **Generate.** `l2h run generate --limit 5`, then without the limit. Candidates, blocked and exception
+   groups land in `out/queue.jsonl`: investigate them, never resolve them by inventing data.
    Look at what the solver gets: `l2h task show <id>`. Try answers fast: `l2h task try <id> --answer x`.
 5. **Validate.** `l2h validate` (level 1 on every task: structure + leak scan; level 2 on a seeded
-   sample per type: oracle passes, no-op fails, wrong answer fails, valid alternatives pass).
+   sample per type: oracle passes, no-op fails, wrong answers/outcomes fail, valid alternatives pass;
+   without an oracle the rest still runs and the task stays `generated`).
    An oracle that writes the expected answer proves wiring only, so *you* also check the answer is
    derivable from the inputs. Level 3 (`--level 3`) is you reading sampled tasks for fidelity,
    evidence sufficiency and verifier behavior; a failed audit sends the batch back to step 3.
    Infrastructure errors are not task failures. Stop after `max_fix_attempts` and report it.
    Guide: `l2h docs --topic validation`.
-6. **Report.** `l2h report`, read `report.md`, then summarise for the user: counts, what was
-   excluded and why, validated vs generated, verified vs imitation, what is blocked and what is missing.
+6. **Report.** `l2h report`, read `report.md`, then summarise for the user, full jobs first: per full
+   job, its task or candidate, environment source, grading method and trust, oracle, gaps, and whether
+   it is ready; then children, exclusions and why, validated vs generated, what is missing.
 
 ## Judgment
 
-- Prefer rebuilding the logged agent's whole job: its starting inputs, its tools/action space, and its
-  output format, graded on its real output. When the starting inputs or tools can't be rebuilt from the
-  logs (or a provided harness), a decision task is still valuable: give the evidence the agent gathered
-  and ask for its decision. Name and describe it as a decision-from-evidence task, not as the full job,
-  and record which one each task type is (`SPEC["task_scope"]`: `full_job` | `subtask` | `decision`).
-- Gold: `verified` only with an independent verdict matching this task's exact scope; `imitation` = the
-  logged answer; logged success, confidence and model agreement are not ground truth. Label honestly.
+- **The full job comes first.** For every `full_job` in `jobs.json`, build a task that asks a new agent to
+  do what the logged agent was assigned: the original request, its starting state, its tools/action
+  space, its output, graded on the real outcome. Do it in both input modes: logs only (rebuild the
+  environment from what the runs read, wrote, ran and fetched: `l2h evidence <id>`; installs, source
+  downloads and image pulls are allowed) and logs + harness (use the supplied harness, fill what it
+  lacks). Subtasks and decisions come after, as extras; they never cover a full job.
+- **Never block a full job for being hard.** If a piece is missing, build it with the gap recorded
+  (`env_source="partial"`, `gaps=[...]`, `oracle_kind="none"`), or return
+  `Candidate(reason, gaps, next_action)` when no runnable package is possible yet. `Blocked` is only
+  for an unremovable secret/leak or no recoverable instruction. Every full job ends with at least a
+  candidate; `l2h report` flags any that don't.
+- **Never fake.** Missing data stays missing and is listed as a gap: no invented files, no solve.sh or
+  verifier made up to satisfy packaging. Mark a read as complete only when the log proves it.
+- **Grading: how vs why trusted.** Pick the method that fits the assignment (`grading_method`): a
+  server or build is checked by behaviour on the end state (your own `tests/test.sh`), a computed
+  output by recomputing it, a label by exact/allowed-set match. Separately, `gold_type` says why the
+  grading is trusted: `verified` (independent label for this exact scope and version), `computed`,
+  `independent` (end-state/behaviour check that doesn't depend on the logged answer), `solved`,
+  `imitation` (the logged answer: last resort), `negative`, `none`. Exact matching is fine when the
+  target has independent support; an unverified logged answer is `imitation` however it is graded.
+- **Oracle (`oracle_kind`).** Prefer `replay` (a logged attempt's actions, kept only if it passes the
+  verifier in the built environment), then `fresh` (a new solve; costs a model run, ask first), then
+  `reference` (writes known-good files). `answer` (writes the expected answer) proves wiring only.
+  With no credible oracle use `none`: the task can be `generated`, never `validated`.
+- **Wrong outcomes are real mistakes.** With a custom verifier give `Outcome(script=...)` wrong
+  outcomes that do plausible bad work (a broken build, a server that answers wrong) and valid
+  alternatives that do it differently; the gates run them in the environment.
 - Instructions describe the task and never include the recorded answer. Gold lives only in `tests/`.
 - The verifier checks the outcome, not a replay of the logged steps. Deterministic only, no LLM.
-- v1 is static evidence. A type needing a live system is `Blocked` with what is missing.
 - Earlier dataset-specific filters are not inherited; reassess every exclusion for the task at hand.
 - Stop and ask the user only for decisions that are theirs (scope, what counts as success), not for routine fixes.
 
@@ -89,6 +110,7 @@ Generated tasks follow its conventions (`l2h docs --topic harbor`).
 | Need | Command |
 |---|---|
 | Start / resume | `l2h init <logs> <ws> [--allow-missing-runtime]` / `l2h status` |
+| What a run read/wrote/ran | `l2h evidence <id>` (environment rebuild input) |
 | Look at the corpus | `l2h sample [--unseen] [--matching <check>] [--stratify <expr over r> --n N]`, `l2h show <id> [--field p] [--attachments]` |
 | Measure a hunch | `l2h query '<expr over r>' [--count] [--group-by p] [--grep re]` |
 | Scaffold code | `l2h new parser`, `l2h new jobs`, `l2h new check <n>`, `l2h new tasktype <n>` |
@@ -103,6 +125,7 @@ Flags on every command: `--json` (one result on stdout, progress on stderr), `--
 
 ## Ending a run
 
-Tell the user, from `report.md` and with file paths: how many tasks, how many `validated` vs
-`generated`, `verified` vs `imitation`, what was excluded and why (rates per check), which types are
-blocked and what is missing, and which numbers you could not verify. Unattended runs stop at the report.
+Tell the user, from `report.md` and with file paths: each full job and how far it got (task or
+candidate, ready or not and why), then how many tasks, `validated` vs `generated` vs `exec_failed`,
+grading trust, what was excluded and why (rates per check), what is missing, and which numbers you
+could not verify. Unattended runs stop at the report.

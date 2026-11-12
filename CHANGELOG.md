@@ -39,6 +39,18 @@ change the command line or the artifact format; such changes are called out.
   Job map: step 1 writes `jobs.json` (full jobs, sub-capabilities, repeats, outcomes); every task
   type names its job (`SPEC["job"]`), `task_scope` gains `subtask`, and the report lists jobs with
   nothing built for them. Pre-ATIF parsers get a migration error.
+- `l2h` full jobs first: a task type can grade the end state with its own
+  `tests/test.sh` (no answer file needed; the verifier runs in the task
+  environment), supply its own environment and oracle, and record provenance
+  (`env_source`, `oracle_kind`, `grading_method`/`grading_reason`, `gaps`, in
+  results and `task.toml`). Wrong answers and alternatives can be executable
+  `Outcome` scripts. `oracle_kind="none"` packages run every other gate and stay
+  `generated`. `Candidate(reason, gaps, next_action)` records a job that can't be
+  packaged yet; a `full_job` may be `Blocked` only for a secret, a leak or no
+  instruction. New `exec_failed` status (malformed or failed gates); `blocked` now
+  means leak/secret. The report leads with full jobs and a computed `ready` count.
+  New `l2h evidence <id>` lists what a run read, wrote, ran and fetched. The skill
+  no longer limits tasks to static evidence.
 
   Review round 2: the secret scan catches env-style names (`DB_PASSWORD=...`,
   `AWS_SECRET_ACCESS_KEY=...`) and "enter <value> in the password field" prose; the leak scan treats

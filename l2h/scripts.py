@@ -62,15 +62,15 @@ CHECKS.append(Check("{name}", 1, check_{name}))
 TASKTYPE_TEMPLATE = '''"""Task type {name}. Contract: `l2h schema`. Generators follow Harbor's adapter pattern."""
 from pathlib import Path
 
-from l2h import Answer, Blocked, BuildResult, Trajectory
+from l2h import Answer, Blocked, BuildResult, Candidate, Outcome, Trajectory
 
 SPEC = {{
     "unit": "episode",            # episode | subtask
-    "env": "static",              # static evidence files in v1
+    "env": "evidence",            # evidence | harness | rebuilt | partial
     "job": "TODO",               # a job id from jobs.json
     "task_scope": "TODO",         # choose: full_job | subtask | decision (`l2h docs --topic tasktypes`)
     "check": "exact",             # exact | allowed_set | numeric | forbidden (negative tasks)
-    "gold": "imitation",          # verified | solved | imitation | negative | none
+    "gold": "imitation",          # verified | computed | independent | solved | imitation | negative | none
     "hidden": ["answer key", "original final response"],
     "applies_when": "describe which records and findings this type can use",
 }}
@@ -88,8 +88,20 @@ def group_key(t: Trajectory) -> str:
     return t["id"]
 
 
-def build(group: list[Trajectory], out: Path) -> BuildResult | Blocked:
-    return Blocked("not implemented", missing=["everything"])
+def build(group: list[Trajectory], out: Path) -> BuildResult | Candidate | Blocked:
+    return Candidate("not implemented yet", gaps=["generator not written"])
+    # A full job with its own verifier on the end state:
+    # return BuildResult(
+    #     task_id="...",
+    #     instruction="...",                  # the original request; never the recorded answer
+    #     files={{"environment/Dockerfile": "...", "tests/test.sh": "...",
+    #            "solution/solve.sh": "..."}},  # solve.sh from a passing logged attempt
+    #     env_source="rebuilt", oracle_kind="replay", grading_method="behavioral",
+    #     gold_type="independent", grading_reason="...",
+    #     wrong_answers=[Outcome("bash doing a plausible wrong thing")],
+    #     gaps=[{{"what": "...", "affects": "fidelity"}}],
+    # )
+    # An answer-file task (label, number, short text):
     # return BuildResult(
     #     task_id="...",
     #     instruction="...",              # what to do; never the recorded answer

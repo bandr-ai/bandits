@@ -11,17 +11,23 @@ from importlib import resources
 from pathlib import Path
 
 from . import __version__, explore, stages
+from . import evidence as evidence_mod
 from . import report as report_mod
 from . import validate as validate_mod
 from .gates import LocalRunner, pick_runner
 from .harbor import ANSWER_DIR
 from .models import (
     ATIF_VERSION,
+    BLOCK_KINDS,
     CHECK_KINDS,
     ENDED,
+    ENV_SOURCES,
+    GAP_AFFECTS,
     GATE_STATES,
     GOLD_TYPES,
+    GRADING_METHODS,
     NORMALIZERS,
+    ORACLE_KINDS,
     STATUSES,
     TASK_SCOPES,
     ContractError,
@@ -352,6 +358,33 @@ def cmd_show(a, ws: Workspace) -> Result:
             f"  {x['name']}: {x['path']} ({x['source']})" for x in d["attachments"]
         )
     return Result(d, text, ["l2h query '<expr>' --count  # measure how common this is"])
+
+
+def cmd_evidence(a, ws: Workspace) -> Result:
+    ws.config()
+    t = next((t for t in stages.load_trajectories(ws) if t["id"] == a.id), None)
+    if t is None:
+        raise L2HError(f"no trajectory {a.id!r}", "run `l2h run parse`; ids: `l2h query True`")
+    ev = evidence_mod.extract(t)
+    sm = evidence_mod.summary(ev)
+    d = {"id": a.id, "summary": sm, "evidence": ev}
+    lines = [f"{a.id}: " + ", ".join(f"{k} {v}" for k, v in sm["counts"].items())]
+    lines.append("starting-file candidates (read before written; complete: yes/no/unknown):")
+    for f in sm["starting_files"][: None if a.full else 30]:
+        c = {True: "yes", False: "no", None: "unknown"}[f["complete"]]
+        lines.append(f"  {f['path']}  complete={c}  steps={','.join(f['refs'][:5])}")
+    lines.append("outputs (written by the run): " + (", ".join(sm["outputs"][:30]) or "-"))
+    lines.append("sources fetched: " + (", ".join(sm["sources"][:20]) or "-"))
+    if sm["unknown_tools"]:
+        lines.append(
+            "tools without an interpreter (read their calls yourself): "
+            + ", ".join(sm["unknown_tools"])
+        )
+    return Result(
+        d,
+        "\n".join(lines),
+        [f"l2h show {a.id}  # read the calls behind any item", "l2h new tasktype <name>"],
+    )
 
 
 def cmd_query(a, ws: Workspace) -> Result:
@@ -709,22 +742,28 @@ def schema_data() -> dict:
             "VERSION": "int, bump when the generator changes (generator = <type>@<VERSION>)",
             "applies": "def applies(t, findings) -> bool | (bool, reason)",
             "group_key": "def group_key(t) -> str  # attempts sharing a key become one task",
-            "build": "def build(group, out: Path) -> BuildResult | Blocked",
+            "build": "def build(group, out: Path) -> BuildResult | Candidate | Blocked  # full jobs first",
             "BuildResult": {
                 "task_id": "str [A-Za-z0-9._-]",
                 "instruction": "str; never the recorded answer",
                 "evidence": "{relative path: str|bytes} -> environment/data/<path>, visible at /app/<path>; binary files are skipped by the leak and secret scans",
-                "answer": f"Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, pattern); forbidden = negative gold: expected is the known-wrong answers, any other well-formed answer passes (needs alternatives)",
-                "wrong_answers": "meaningful wrong answers the verifier must reject (else an auto one is used and flagged)",
-                "alternatives": "other valid answers the verifier must accept",
+                "answer": f"optional when files has your own tests/test.sh (custom verifier on the end state). Answer(expected, check in {list(CHECK_KINDS)}, file='answer.txt', normalize subset of {list(NORMALIZERS)}, tolerance, rel_tolerance, pattern); forbidden = negative gold: expected is the known-wrong answers, any other well-formed answer passes (needs alternatives)",
+                "wrong_answers": "meaningful wrong answers the verifier must reject: strings (answer-file tasks) or Outcome(script, note) run in the environment instead of solve.sh (else an auto one is used and flagged)",
+                "alternatives": "other valid answers / Outcome scripts the verifier must accept",
+                "oracle_kind": f"{list(ORACLE_KINDS)}; default reference if files has solution/solve.sh, answer if `answer`, else none (none = can't be validated)",
+                "env_source": f"{list(ENV_SOURCES)}; default evidence, or rebuilt when files has environment/Dockerfile; partial needs gaps",
+                "grading_method": f"{list(GRADING_METHODS)}; default answer.check or behavioral",
+                "grading_reason": "one line: why this grading is trusted",
+                "gaps": f"[{{what, affects in {list(GAP_AFFECTS)}}}]",
                 "leak_allow": "[task-relative path] skipped by the leak scan (recorded in results)",
                 "secret_allow": "[task-relative path] skipped by the secret scan (recorded in results)",
                 "hidden": "extra strings that must never appear in instruction.md/environment/ (original final response, ...)",
                 "files": "optional overrides/extras keyed by task-relative path",
-                "gold_type": list(GOLD_TYPES),
+                "gold_type": f"{list(GOLD_TYPES)} = grading trust (why the grading is believed)",
                 "assumptions": "[str]",
             },
-            "Blocked": "Blocked(reason, missing=[...])",
+            "Candidate": "Candidate(reason, gaps=[...], next_action='') # job identified, no runnable package yet",
+            "Blocked": f"Blocked(reason, missing=[...], kind) # full_job: kind in {list(BLOCK_KINDS)} only",
         },
         "l2h.json": DEFAULT_CONFIG,
         "results.jsonl row": {
@@ -742,14 +781,15 @@ def schema_data() -> dict:
                 "trials": "Harbor trial ids; required (with runner=harbor) for `validated`",
             },
             "status": list(STATUSES),
-            "rule": "validated only if gates.exec == pass from a real Harbor run (runner=harbor with trial ids); host-local passes stay generated",
+            "provenance": "{job, task_scope, oracle, env_source, grading{method, trust, reason}, gaps}",
+            "rule": "validated only if gates.exec == pass (oracle included) from a real Harbor run (runner=harbor with trial ids); host-local passes and no_oracle stay generated; exec_failed = malformed or gates failed; blocked = leak/secret",
         },
         "task package": [
             "task.toml",
             "instruction.md",
             "environment/",
             "tests/test.sh",
-            "solution/solve.sh",
+            "solution/solve.sh (unless oracle_kind none)",
         ],
         "exit codes": {
             "0": "ok",
@@ -861,6 +901,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id")
     sp.add_argument("--field", help="dotted path, e.g. events.3.content")
     sp.add_argument("--attachments", action="store_true", help="materialise attachments as files")
+
+    sp = add(
+        "evidence",
+        cmd_evidence,
+        "what one trajectory read, wrote, ran and fetched (env rebuild input)",
+    )
+    sp.add_argument("id")
 
     sp = add("query", cmd_query, "count/group/grep across the whole corpus")
     sp.add_argument("expr", help="python expression over `r`, e.g. 'len(r.events) > 10'")

@@ -20,9 +20,11 @@ and URLs with embedded credentials. A hit blocks the task and names the file, li
 preview. Allow a legitimate hit with `BuildResult.secret_allow=["environment/data/x"]` and a
 `decide`; allow-lists are recorded in `results.jsonl` (`allow`) and the report.
 
-Level 2 (seeded sample per type + changed instances, `--sample-size N`): in a scratch dir the real
-`tests/test.sh` runs against: the oracle (solve.sh) must pass; an empty answer must fail; each wrong
-answer must fail; each alternative must pass. Runner is `local` (no Docker): result rows record it.
+Level 2 (seeded sample per type + changed instances, `--sample-size N`): the real `tests/test.sh`
+runs against: the oracle (solve.sh) must pass; doing nothing must fail; each wrong answer / wrong
+`Outcome` script must fail; each alternative must pass. An `Outcome` runs in place of solve.sh, so it
+can do real bad work (a broken build, a wrong service). With no oracle (`oracle_kind="none"`) the
+other gates still run and `exec` is `no_oracle`: the task stays `generated`. Runner is `local` (no Docker): result rows record it.
 Verifier crashes, missing reward files and timeouts are **errors**, not failures, and never block a task.
 
 A type whose sample fails blocks its unvalidated tasks and uses one fix attempt
@@ -33,8 +35,11 @@ Record `l2h decide "..." --kind audit --verdict pass|fail --type T --task ID --w
 A fail blocks the type until regenerated. Also record `--kind derivability` after checking the
 answer can really be derived from the visible inputs.
 
-Status: `validated` = exec gates passed in a real Harbor run (host-local passes stay `generated`); `generated` = structure+leak passed;
-`blocked` = reason in results.jsonl.
+Status: `validated` = exec gates passed, oracle included, in a real Harbor run (host-local passes
+and `no_oracle` stay `generated`); `generated` = structure+leak+secrets passed; `exec_failed` = the
+package is malformed or its gates failed (fix and regenerate); `blocked` = leak or secret found.
+Reasons are in results.jsonl. `ready` (report only) = validated, environment not partial, grading
+trust not imitation/negative/none, no open gaps.
 `validated` means the gates passed, not that the answer is correct: `status` and `report` show the
 gold kind next to it (`validated (imitation)`) and warn about validated tasks with no audit or
 derivability decision.
