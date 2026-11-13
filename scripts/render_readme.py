@@ -21,14 +21,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs/assets/readme"
-SIZE = (1440, 760)
+SIZE = (1440, 530)
 THEMES = {
     "dark": {
         "bg": "#0A0A0B",
         "panel": "#101012",
         "ink": "#F5F5F7",
         "muted": "#99999F",
-        "line": "#2B2B31",
+        "line": "#44444C",
         "accent": "#8C9DFF",
     },
     "light": {
@@ -36,7 +36,7 @@ THEMES = {
         "panel": "#FFFFFF",
         "ink": "#161619",
         "muted": "#67676F",
-        "line": "#DCDCE3",
+        "line": "#C6C6CF",
         "accent": "#3448D5",
     },
 }
@@ -74,74 +74,132 @@ def ease(value: float) -> float:
 
 
 def render(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) -> Image.Image:
-    """One persistent canvas: four visible stages and a returning trace."""
+    """A visual loop: trace sheets, task folder, model network, verifier check."""
+    import math
+
+    from PIL import ImageColor
+
     im = Image.new("RGB", SIZE, theme["bg"])
     d = ImageDraw.Draw(im)
+    phase = int(seconds / 1.8) % 4
+    fraction = (seconds % 1.8) / 1.8
+    centers = (200, 536, 872, 1208)
 
-    def text(x, y, value, size=25, tone="ink", code=False, bold=False, centered=False):
+    def color(name, opacity=1.0):
+        foreground, background = ImageColor.getrgb(theme[name]), ImageColor.getrgb(theme["bg"])
+        return tuple(
+            round(a * opacity + b * (1 - opacity))
+            for a, b in zip(foreground, background, strict=True)
+        )
+
+    def line(points, tone="ink", width=3, opacity=1.0):
+        d.line(points, fill=color(tone, opacity), width=width, joint="curve")
+
+    def text(x, y, value, size, centered=False):
         d.text(
-            (round(x), round(y)),
+            (x, y),
             value,
-            font=face(mono if code else sans, size, bold),
-            fill=theme[tone],
+            font=face(sans, size, True),
+            fill=theme["ink"],
             anchor="mt" if centered else "lt",
         )
 
-    def arrow(points, upward=False):
-        d.line(points, fill=theme["line"], width=2)
-        x, y = points[-1]
-        head = (x - 6, y + 8, x, y, x + 6, y + 8) if upward else (x - 8, y - 6, x, y, x - 8, y + 6)
-        d.line(head, fill=theme["line"], width=2)
+    def paper(x, y, width=94, height=122, tone="ink", opacity=1.0, contents=True):
+        # Folded paper, not a text panel. Payloads use the same silhouette.
+        fold = max(5, round(width * 0.23))
+        points = [
+            (x, y),
+            (x + width - fold, y),
+            (x + width, y + fold),
+            (x + width, y + height),
+            (x, y + height),
+            (x, y),
+        ]
+        d.polygon(points, fill=theme["bg"])
+        line(points, tone, 2 if width < 40 else 3, opacity)
+        line(
+            [(x + width - fold, y), (x + width - fold, y + fold), (x + width, y + fold)],
+            tone,
+            2,
+            opacity,
+        )
+        if contents:
+            for index, length in enumerate((0.60, 0.72, 0.43)):
+                yy = y + height * 0.43 + index * height * 0.16
+                line([(x + width * 0.17, yy), (x + width * length, yy)], "muted", 2, opacity)
 
-    d.rectangle((64, 48, 73, 57), fill=theme["accent"])
-    text(88, 39, "bandr", 31, bold=True)
-    text(64, 130, "Build the task. Run the model. Grade the result.", 54, bold=True)
-    text(
-        66,
-        210,
-        "Agent traces become Harbor tasks. Each new attempt leaves more traces.",
-        27,
-        "muted",
-    )
+    d.rectangle((64, 44, 72, 52), fill=theme["accent"])
+    text(88, 35, "bandr", 31)
 
-    phase = int(seconds / 1.8) % 4
-    fraction = (seconds % 1.8) / 1.8
-    xs = (64, 400, 736, 1072)
-    titles = ("Traces", "Harbor task", "Model attempt", "Verifier")
-    for index, (x, title) in enumerate(zip(xs, titles, strict=True)):
-        text(x, 308, f"0{index + 1}", 20, "accent" if phase == index else "muted", code=True)
-        text(x, 350, title, 31, bold=True)
-        d.line((x, 555, x + 272, 555), fill=theme["accent" if phase == index else "line"], width=2)
+    # Traces: a stack of records, with one record in focus.
+    paper(142, 155, 94, 122, "muted", 0.55)
+    paper(153, 166, 94, 122, "muted", 0.75)
+    paper(164, 177, 94, 122)
+    if phase == 0:
+        yy = 177 + 122 * 0.43
+        line([(180, yy), (225, yy)], "accent", 3, 0.55 + 0.45 * math.sin(math.pi * fraction))
 
-    # Keep all stage content visible. Motion belongs to the connections only.
-    text(64, 419, "The original job", 24)
-    text(64, 460, "Files + context", 24, "muted")
-    text(64, 507, "attempts.jsonl", 21, "muted", code=True)
+    # Harbor package: a folder carrying the task's instruction and assets.
+    paper(485, 155, 62, 85, "muted", contents=False)
+    paper(517, 163, 62, 85, "ink", contents=False)
+    folder = [
+        (448, 186),
+        (448, 170),
+        (510, 170),
+        (529, 188),
+        (624, 188),
+        (624, 294),
+        (448, 294),
+        (448, 186),
+    ]
+    d.polygon(folder, fill=theme["bg"])
+    line(folder, "accent" if phase == 1 else "ink")
+    line([(448, 207), (624, 207)], "muted", 2)
+    # A small package tab ties the contents together without listing filenames.
+    line([(519, 246), (553, 246)], "muted", 3)
 
-    for index, path in enumerate(("instruction.md", "environment/", "tests/test.sh", "task.toml")):
-        text(400, 414 + index * 32, path, 21, code=True)
+    # Model: simple connected layers, with an activation travelling through them.
+    left = [(824, 196), (824, 260)]
+    middle = [(872, 178), (872, 228), (872, 278)]
+    right = [(920, 196), (920, 260)]
+    for a in left:
+        for b in middle:
+            line([a, b], "line", 2)
+    for a in middle:
+        for b in right:
+            line([a, b], "line", 2)
+    for layer, nodes in enumerate((left, middle, right)):
+        active = phase == 2 and abs(fraction * 3 - (layer + 0.5)) < 0.65
+        for x, y in nodes:
+            d.ellipse((x - 7, y - 7, x + 7, y + 7), fill=theme["accent" if active else "ink"])
 
-    text(736, 419, "Read. Act. Answer.", 24)
-    text(736, 460, "In the task environment", 23, "muted")
-    text(736, 507, f"answer.txt → {evidence['answer']}", 21, "muted", code=True)
+    # Verifier: the task's outcome check, rather than another screen of prose.
+    d.ellipse((1144, 164, 1272, 292), outline=theme["line"], width=3)
+    check = [(1178, 228), (1200, 250), (1240, 204)]
+    line(check, "accent" if phase == 3 else "ink", 5)
+    if phase == 3:
+        d.arc(
+            (1144, 164, 1272, 292),
+            start=-90,
+            end=-90 + max(1, round(360 * ease(fraction))),
+            fill=theme["accent"],
+            width=3,
+        )
 
-    text(1072, 419, "tests/test.sh", 21, "muted", code=True)
-    text(1072, 459, f"{evidence['reward']:.1f}", 64, "accent", bold=True)
-    text(1190, 495, "reward", 23, "muted")
+    for x, title in zip(centers, ("Traces", "Harbor task", "Model", "Verifier"), strict=True):
+        text(x, 341, title, 32, centered=True)
 
-    connectors = []
-    for start in (315, 651, 987):
-        points = [(start, 368), (start + 65, 368)]
-        arrow(points)
-        connectors.append(points)
+    # Arrows sit in the gaps. The document itself moves continuously through
+    # every stage, then returns along the lower path to the trace stack.
+    for start, end in ((270, 436), (636, 800), (940, 1130)):
+        points = [(start, 228), (end, 228)]
+        line(points, "line", 2)
+        line([(end - 8, 222), (end, 228), (end - 8, 234)], "line", 2)
 
-    # A single return line makes the loop visible even in a still frame.
-    path = []
-
-    def bezier(a, b, c, e, samples=40):
+    def curve(points, a, b, c, e, samples=40):
         for step in range(samples + 1):
             t = step / samples
-            path.append(
+            points.append(
                 tuple(
                     (1 - t) ** 3 * a[k]
                     + 3 * (1 - t) ** 2 * t * b[k]
@@ -151,19 +209,23 @@ def render(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) ->
                 )
             )
 
-    bezier((1208, 575), (1208, 605), (1208, 615), (1168, 615))
-    path.extend((1168 - step * (992 / 160), 615) for step in range(161))
-    bezier((176, 615), (136, 615), (136, 605), (136, 575))
-    arrow(path, upward=True)
-
+    # Leave the check on its right edge, then run below the labels.
+    path = []
+    curve(path, (1208, 228), (1248, 228), (1272, 248), (1296, 292), 14)
+    visible = []
+    curve(visible, (1296, 292), (1340, 360), (1324, 449), (1164, 449))
+    visible.extend((1164 - step * (920 / 160), 449) for step in range(161))
+    curve(visible, (244, 449), (200, 449), (200, 420), (200, 395))
+    line(visible, "line", 2)
+    line([(194, 403), (200, 395), (206, 403)], "line", 2)
+    path.extend(visible)
     if phase < 3:
-        start, end = connectors[phase]
-        x = start[0] + (end[0] - start[0]) * ease(fraction)
-        y = start[1]
+        progress = (phase + ease(fraction)) / 3
+        x = 250 + (1208 - 250) * progress
+        y = 228
     else:
         x, y = path[min(len(path) - 1, round(ease(fraction) * (len(path) - 1)))]
-    d.ellipse((x - 4, y - 4, x + 4, y + 4), fill=theme["accent"])
-    text(720, 658, "New attempt traces feed the next conversion.", 24, "muted", centered=True)
+    paper(round(x) - 9, round(y) - 12, 18, 24, "accent", contents=False)
     return im
 
 

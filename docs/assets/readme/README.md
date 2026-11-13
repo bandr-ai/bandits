@@ -9,8 +9,8 @@ The opening follows four stages:
 
 The first stage uses the package produced from the
 [net-revenue example](../../../examples/mint/net-revenue). The renderer asserts
-the displayed paths exist. Numeric rewards are read from that example's actual
-local gate results and saved in `mint-loop-evidence.json`. The model-attempt
+the displayed paths exist. The example's actual
+local gate results are saved in `mint-loop-evidence.json`. The model-attempt
 segment is schematic: no live model solve is performed or claimed by the renderer.
 The measured reward is from the local reference/wrong-answer gates.
 
@@ -18,14 +18,15 @@ The return path means new run traces can feed another conversion. It does not
 mean Mint automatically starts a training job or changes model weights. Harbor
 executes the downstream agent; Mint constructs and checks the task package.
 
-The loop uses one persistent, side-by-side layout. Traces, the Harbor package,
-the model attempt, and the verifier are visible in every frame. Only the flow
-markers and active-stage underline move. A return path carries the new trace
-back to the input. There are no scene cuts, crossfades, or changing pages.
+The loop is one fixed canvas with four large visual objects: trace sheets,
+a task folder, a model network, and a verifier check. Its only visible wording
+is the bandr name and four stage labels. There are no headlines, paragraphs,
+file inventories, numeric rewards, or captions inside the graphic.
 
-Motion uses 25 fps timing. GIFs share one palette to avoid color flicker. The
-static/reduced-motion version shows the same complete loop. Text is shortened
-to keep stage headings and essential artifacts readable at README width.
+A small document travels between the objects and returns to the trace stack.
+The model's nodes activate and the verifier's ring fills as work reaches them.
+All stages stay visible. Motion uses 25 fps timing, and GIFs share a palette.
+The shorter canvas keeps the icons prominent when scaled to README width.
 
 This is a designed animation of the included synthetic fixture, not a recording
 of conversion speed. Local verifier passes remain generated; no real Harbor run

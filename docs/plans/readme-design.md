@@ -71,3 +71,12 @@ show the cycle without hiding context or replacing the page. The verifier values
 from the runnable fixture's local gate evidence. The model segment is schematic.
 The loop links artifacts and executions; it does not imply automatic model
 training, automatic launches by Mint, or an observed model-improvement metric.
+
+## Visual reduction
+
+Replace the text panels with four large symbols: trace sheets, task folder,
+model network, and verifier check. Keep only the brand and stage labels.
+A document flows between objects and returns to the input, while the model and
+verifier activate. Remove the headline, descriptive paragraphs, file lists,
+reward number, step numbers, and return caption from the image. The README's
+surrounding text and accessibility description carry the detailed explanation.
