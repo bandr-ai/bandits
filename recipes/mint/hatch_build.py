@@ -18,6 +18,6 @@ class CustomBuildHook(BuildHookInterface):
                     path.is_file()
                     and not path.is_symlink()
                     and not any(part.startswith(".") or part == "__pycache__" for part in rel.parts)
-                    and path.suffix in {".py", ".md", ".json"}
+                    and path.suffix in {".py", ".md"}
                 ):
                     build_data["force_include"][str(path)] = "mint/" + rel.as_posix()
