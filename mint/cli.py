@@ -6,11 +6,12 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from collections import Counter
 from importlib import resources
 from pathlib import Path
 
-from . import __version__, explore, stages
+from . import __version__, explore, stages, telemetry
 from . import evidence as evidence_mod
 from . import judge as judge_mod
 from . import report as report_mod
@@ -36,6 +37,7 @@ from .output import (
     EXIT_ERROR,
     EXIT_INTERRUPTED,
     EXIT_OK,
+    EXIT_USAGE,
     MINTError,
     Result,
     UsageError,
@@ -869,6 +871,22 @@ def schema_data() -> dict:
     }
 
 
+def cmd_telemetry(a, _ws) -> Result:
+    if a.telemetry_command == "on":
+        telemetry.set_enabled(True)
+    elif a.telemetry_command == "off":
+        telemetry.set_enabled(False)
+    info = telemetry.status()
+    text = (
+        f"effective: {'on' if info['effective'] else 'off'} ({info['reason']})\n"
+        f"persisted: {info['persisted']}\n"
+        f"notice shown: {'yes' if info['notice_shown'] else 'no'}\n"
+        f"config: {info['config']}"
+    )
+    nxt = "mint telemetry off" if info["effective"] else "mint telemetry on"
+    return Result(info, text, [nxt])
+
+
 def cmd_schema(a, ws) -> Result:
     d = schema_data()
     return Result(d, json.dumps(d, indent=2), ["mint docs  # guides"])
@@ -1062,19 +1080,70 @@ def build_parser() -> argparse.ArgumentParser:
     add("schema", cmd_schema, "print the contracts and config schemas")
     sp = add("docs", cmd_docs, "print the bundled guides")
     sp.add_argument("--topic")
+
+    tp = sub.add_parser("telemetry", help="anonymous usage telemetry", parents=[common])
+    tsub = tp.add_subparsers(dest="telemetry_command", required=True, parser_class=Parser)
+    for name, help_ in (
+        ("status", "show whether anonymous usage telemetry is on"),
+        ("on", "turn anonymous usage telemetry on"),
+        ("off", "turn anonymous usage telemetry off"),
+    ):
+        sp = tsub.add_parser(name, help=help_, parents=[common])
+        sp.set_defaults(fn=cmd_telemetry)
     return p
 
 
+def _exit_class_from_result(res: Result) -> str:
+    if res.exit == EXIT_OK:
+        return "ok"
+    if res.exit == EXIT_USAGE:
+        return "usage"
+    if res.exit == EXIT_INTERRUPTED:
+        return "interrupted"
+    return "error"
+
+
+def _exit_class_from_error(err: MINTError) -> str:
+    if isinstance(err, UsageError) or err.code == EXIT_USAGE:
+        return "usage"
+    if err.code == EXIT_INTERRUPTED:
+        return "interrupted"
+    return "error"
+
+
+def _command_name(args) -> str:
+    if args.command == "task":
+        return f"task {args.task_command}"
+    if args.command == "telemetry":
+        return f"telemetry {args.telemetry_command}"
+    return args.command
+
+
 def main(argv: list[str] | None = None) -> int:
+    started = time.monotonic()
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv
     command = next((x for x in argv if not x.startswith("-")), "mint")
+    milestone: str | None = None
+    exit_class: str | None = None
+    parsed = None
+    result: Result | None = None
+    ws: Workspace | None = None
     try:
         args = build_parser().parse_args(argv)
+        parsed = args
         as_json = getattr(args, "json", False)
         args.full = getattr(args, "full", False)
         args.dry_run = getattr(args, "dry_run", False)
-        command = args.command + (f" {args.task_command}" if args.command == "task" else "")
+        command = _command_name(args)
+        if command in telemetry.MILESTONES:
+            milestone = command
+        if args.command == "telemetry":
+            res = args.fn(args, None)
+            result = res
+            exit_class = _exit_class_from_result(res)
+            print(render(command, res, as_json))
+            return res.exit
         if args.command == "init":
             ws = Workspace(
                 Path(
@@ -1084,9 +1153,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ws = find_workspace(getattr(args, "workspace", None))
         res = args.fn(args, ws)
+        result = res
+        exit_class = _exit_class_from_result(res)
         print(render(command, res, as_json))
         return res.exit
     except MINTError as e:
+        exit_class = _exit_class_from_error(e)
         if as_json:
             print(render_error(command, e, True))
             print(f"error: {e.message}\nfix: {e.fix}", file=sys.stderr)
@@ -1094,6 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
             print(render_error(command, e, False), file=sys.stderr)
         return e.code
     except ContractError as e:
+        exit_class = "contract"
         err = MINTError(str(e), "fix the agent-written code (see `mint schema`)")
         print(
             render_error(command, err, as_json) if as_json else render_error(command, err, False),
@@ -1101,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_ERROR
     except KeyboardInterrupt:
+        exit_class = "interrupted"
         print(
             "interrupted; nothing is left half-written (writes are atomic). Re-run to resume: `mint status`",
             file=sys.stderr,
@@ -1108,6 +1182,22 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_INTERRUPTED
     except SystemExit as e:  # --help / --version
         return int(e.code or 0)
+    except Exception:
+        if milestone:
+            exit_class = "error"
+        raise
+    finally:
+        if milestone and exit_class:
+            try:
+                extra = telemetry.extra_for(milestone, parsed, result, ws)
+            except Exception:
+                extra = {}
+            telemetry.emit(
+                milestone,
+                exit_class,
+                max(0, int((time.monotonic() - started) * 1000)),
+                extra,
+            )
 
 
 if __name__ == "__main__":
