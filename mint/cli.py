@@ -11,7 +11,7 @@ from collections import Counter
 from importlib import resources
 from pathlib import Path
 
-from . import __version__, explore, stages, telemetry
+from . import __version__, explore, skill, stages, telemetry
 from . import evidence as evidence_mod
 from . import judge as judge_mod
 from . import report as report_mod
@@ -206,7 +206,8 @@ def _stage_report(ws: Workspace) -> dict:
             "stale": stale_parse,
         },
         "2_findings": {
-            "done": not ws.checks_py.exists() or bool(chk and not stale_checks),
+            "done": bool(chk and not stale_checks),
+            "optional": True,
             "checks_exists": ws.checks_py.exists(),
             "run": bool(chk),
             "stale": stale_checks,
@@ -294,6 +295,8 @@ def cmd_status(a, ws: Workspace) -> Result:
     lines = []
     for k, v in rep["stages"].items():
         flags = []
+        if v.get("optional") and not v["done"]:
+            flags.append("optional; not run")
         if v.get("stale"):
             flags.append("STALE: inputs changed, re-run")
         lines.append(
@@ -918,6 +921,10 @@ def cmd_docs(a, ws) -> Result:
     return Result({"topic": a.topic, "text": body}, body, ["mint docs  # other topics"])
 
 
+def cmd_skill(a, ws) -> Result:
+    return skill.install(project=a.project, force=a.force, dry_run=a.dry_run)
+
+
 # -------------------------------------------------------------------- parser
 
 
@@ -1081,6 +1088,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("docs", cmd_docs, "print the bundled guides")
     sp.add_argument("--topic")
 
+    sk = sub.add_parser("skill", help="install the Mint skill for Claude Code", parents=[common])
+    sksub = sk.add_subparsers(dest="skill_command", required=True, parser_class=Parser)
+    sp = sksub.add_parser("install", help="install the bundled skill", parents=[common])
+    sp.add_argument("--project", action="store_true", help="install into ./.claude/skills/mint")
+    sp.add_argument("--force", action="store_true", help="replace a different SKILL.md")
+    sp.set_defaults(fn=cmd_skill)
+
     tp = sub.add_parser("telemetry", help="anonymous usage telemetry", parents=[common])
     tsub = tp.add_subparsers(dest="telemetry_command", required=True, parser_class=Parser)
     for name, help_ in (
@@ -1116,6 +1130,8 @@ def _command_name(args) -> str:
         return f"task {args.task_command}"
     if args.command == "telemetry":
         return f"telemetry {args.telemetry_command}"
+    if args.command == "skill":
+        return f"skill {args.skill_command}"
     return args.command
 
 
@@ -1138,7 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
         command = _command_name(args)
         if command in telemetry.MILESTONES:
             milestone = command
-        if args.command == "telemetry":
+        if args.command in ("telemetry", "skill"):
             res = args.fn(args, None)
             result = res
             exit_class = _exit_class_from_result(res)

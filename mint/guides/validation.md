@@ -10,14 +10,19 @@ a lone mention, the original final response and copies of `tests/` files are sti
 Allow a legitimate flagged file with `BuildResult.leak_allow=["environment/data/x"]` and a `decide`.
 
 Level 1 also records non-blocking **warnings** on the row (shown by `validate` and in the report):
-`giveaway` (the exact expected answer appears verbatim in an evidence file), `alternatives`
+`giveaway` (the exact expected answer appears verbatim in the instruction; an answer
+appearing in source data alone is normal for lookup tasks), `alternatives`
 (allowed-set check with no `alternatives` given), `missing_file` (instruction.md references an
 `/app/...` path the package does not contain).
 
 The secret scan (also level 1) covers `instruction.md`, `task.toml` and `environment/`: API-key and
 token shapes, private keys, bearer tokens, `password`/`secret`/`token` followed by a literal value,
 and URLs with embedded credentials. A hit blocks the task and names the file, line and a redacted
-preview. Allow a legitimate hit with `BuildResult.secret_allow=["environment/data/x"]` and a
+preview. Credential-blocked packages are removed from `out/tasks` and their rows
+remain blocked across validation reruns. Fix the generator and run `mint run generate`
+to restore a package. Raw logs, parsed trajectories, internal metadata, binary files,
+and explicitly allowed files may still contain sensitive data; this is a best-effort
+text scan, not a complete secret audit. Allow a legitimate hit with `BuildResult.secret_allow=["environment/data/x"]` and a
 `decide`; allow-lists are recorded in `results.jsonl` (`allow`) and the report.
 
 Level 2 (seeded sample per type + changed instances, `--sample-size N`): the real `tests/test.sh`
