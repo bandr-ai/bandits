@@ -61,7 +61,7 @@ share it; shared configs share it; deleting the config resets it. Concurrent fir
 invocations can race to initialize it. Funnels therefore describe approximate
 installation activity, not a guaranteed project conversion funnel.
 
-Delivery is one synchronous attempt with a 0.2-second socket timeout, no retry,
+Delivery is one synchronous attempt with a 2-second socket timeout, no retry,
 queue, or background process. The socket timeout is not a total wall-time deadline.
 Offline events and failed requests are discarded, so counts underreport usage.
 `telemetry status` reports permission to attempt capture, not delivery health.
