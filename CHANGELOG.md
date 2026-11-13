@@ -7,6 +7,13 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-13
+
+- Mint telemetry requests time out after two seconds instead of 0.2 seconds.
+- Releases are automatic: merging a version bump to `main` publishes it to PyPI
+  and creates the tag and GitHub release. Ordinary merges publish nothing.
+- The source distribution no longer includes `recipes/`.
+
 ## [0.3.0] - 2026-11-13
 
 - Publish the distribution as `bandr`; the command remains `mint`. Align
@@ -175,6 +182,7 @@ Historical release preparation; this version was not published to PyPI.
   instead of shortened ones they did not. The `derivation` column appears only
   when a corpus has one, so the table fits an 80-column terminal.
 
-[Unreleased]: https://github.com/bandr-ai/bandits/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bandr-ai/bandits/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/bandr-ai/bandits/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bandr-ai/bandits/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bandr-ai/bandits/releases/tag/v0.2.0

@@ -1,35 +1,74 @@
 name: release
 
-# Push a tag like v0.3.0 to publish that version to PyPI and create the GitHub
-# release. Publishing uses PyPI trusted publishing, so no token is stored here.
-# See docs/releasing.md.
+# Automatic releases. On every push to main, read the version in
+# bandits/__init__.py. If no tag v<version> exists yet, run the checks, build,
+# publish to PyPI, then create the tag and the GitHub release. Otherwise do
+# nothing, so ordinary merges never publish.
+#
+# To release: merge a PR that bumps the version (and dates its CHANGELOG
+# section). Publishing uses PyPI trusted publishing, so no token is stored
+# here. See docs/releasing.md.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # Re-run a release that failed part-way (e.g. PyPI was down).
+  workflow_dispatch:
 
 permissions: {}
 
+# Never run two releases at once; a later push waits for the earlier one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  build:
+  detect:
+    # Releases only ever come from main, even when re-run by hand.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Is this version already released?
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' bandits/__init__.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" --silent 2>/dev/null; then
+            echo "v$version is already tagged; nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new; releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
 
-      - name: Tag, package version and changelog agree
+      - name: Changelog has a dated section for this version
         run: |
-          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' bandits/__init__.py)"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match bandits/__init__.py version $version"
-            exit 1
-          fi
-          if ! grep -q "^## \[$version\] - [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md needs a dated '## [$version] - YYYY-MM-DD' section"
+          if ! grep -q "^## \[$VERSION\] - [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md needs a dated '## [$VERSION] - YYYY-MM-DD' section"
             exit 1
           fi
 
@@ -58,7 +97,7 @@ jobs:
           path: dist/
 
   publish:
-    needs: build
+    needs: [detect, build]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -70,13 +109,19 @@ jobs:
         with:
           name: dist
           path: dist/
+      # skip-existing: a re-run after a half-done release doesn't fail on
+      # files PyPI already has.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   github-release:
-    needs: publish
+    needs: [detect, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,18 +130,17 @@ jobs:
         with:
           name: dist
           path: dist/
-      - name: Create the GitHub release from the changelog section
+      - name: Tag the released commit and create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '
+          awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
             on && /^## \[/ { exit }
             on && /^\[.*\]: / { exit }
             on { print }
           ' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "bandr $version" \
-            --notes-file notes.md \
-            --verify-tag
+          gh release create "v$VERSION" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "bandr $VERSION" \
+            --notes-file notes.md

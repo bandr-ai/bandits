@@ -49,7 +49,20 @@ path = "bandits/__init__.py"
 packages = ["bandits", "mint"]
 
 [tool.hatch.build.targets.sdist]
-include = ["bandits", "mint", "docs/plans", "docs/assets/readme", "scripts/render_readme.py", "examples/mint", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
+# Leading "/" anchors each entry at the root; bare names such as "tests" or
+# "README.md" would also match files under recipes/.
+include = [
+    "/bandits",
+    "/mint",
+    "/docs/plans",
+    "/docs/assets/readme",
+    "/scripts/render_readme.py",
+    "/examples/mint",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
 
 # PyPI renders the README away from the repo, so relative links and images
 # would break there. Point them at GitHub in the published copy only.

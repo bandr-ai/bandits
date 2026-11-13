@@ -1,64 +1,52 @@
 # Releasing
 
-The distribution is named `bandr`. The first planned PyPI release is **0.3.0**;
-it has not been published yet.
-The command is `mint`. Python imports remain
-`bandits` and `mint`.
+The distribution is [`bandr`](https://pypi.org/project/bandr/) on PyPI. The
+command is `mint`; Python imports are `bandits` and `mint`.
 
-The first Bandr release requires a new trusted publisher for `bandr`; the old
-`bandits-cli` publisher does not authorize publishing this distribution.
+Releases are automatic. Merging a PR that changes the version publishes it;
+ordinary merges publish nothing.
 
-## One-time setup
+## How to release
 
-1. On PyPI, add a trusted publisher for `bandr` (as a *pending* publisher
-   until the first upload creates the project):
-   owner `bandr-ai`, repository `bandits`, workflow `release.yml`,
-   environment `pypi`.
-2. In this repo's settings, create the `pypi` environment. Requiring a
-   reviewer there means nothing is published without a click.
+In a PR:
 
-No PyPI token is stored anywhere.
+1. Set the same new version in `bandits/__init__.py`, `mint/__init__.py` and
+   `recipes/mint/pyproject.toml` (the release fails if they differ).
+2. In `CHANGELOG.md`, move the `Unreleased` notes under
+   `## [X.Y.Z] - YYYY-MM-DD` and add its compare link at the bottom.
 
-Before tagging 0.3.0, confirm the pending publisher exists on PyPI and that the
-GitHub `pypi` environment has a required reviewer. Laxman owns the PyPI step.
-Do not push the release tag until both are ready. A pending publisher configures
-a future publication; it does not guarantee a package name is reserved.
+Merge it. That's all.
 
-## Each release
+## What happens on merge
 
-1. In a PR:
-   - set matching versions in `bandits/__init__.py`, `mint/__init__.py`, and
-     `recipes/mint/pyproject.toml`;
-   - in `CHANGELOG.md`, move the `Unreleased` notes under
-     `## [X.Y.Z] - YYYY-MM-DD` and add its compare link at the bottom.
-2. After it merges, tag `main` and push the tag:
+On every push to `main`, `.github/workflows/release.yml` reads the version in
+`bandits/__init__.py`:
 
-   ```bash
-   git checkout main && git pull
-   git tag vX.Y.Z
-   git push origin vX.Y.Z
-   ```
+- If tag `vX.Y.Z` already exists, it stops. Nothing is published.
+- Otherwise it checks the changelog and versions, runs lint and the tests,
+  builds, installs the wheel in a clean environment and runs it, publishes to
+  PyPI, then creates tag `vX.Y.Z` on that commit and the GitHub release with the
+  changelog section as its notes.
 
-3. `.github/workflows/release.yml` checks that the tag, the version and the
-   changelog agree, runs the tests, builds, installs the wheel in a clean
-   environment and runs it, publishes to PyPI, and creates the GitHub release
-   with that changelog section as its notes.
+There is no approval step: a green build publishes. A version on PyPI cannot be
+replaced or reused, so fix mistakes by releasing the next patch version.
 
-If a step fails before publishing, fix it, delete the tag
-(`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`) and tag again. Once a
-version is on PyPI it cannot be replaced; release the next patch version.
+## When something fails
+
+- **Before publishing** (changelog, tests, build): nothing reached PyPI and no
+  tag was created. Fix it in a new PR; merging it retries the same version.
+- **Publishing or the GitHub release failed** (e.g. PyPI was down): re-run the
+  failed jobs in Actions, or run the `release` workflow on `main` by hand.
+  Files PyPI already has are skipped.
+
+## Setup (already done)
+
+- PyPI trusted publisher for `bandr`: owner `bandr-ai`, repository `bandits`,
+  workflow `release.yml`, environment `pypi`. No PyPI token is stored anywhere.
+- GitHub environment `pypi`: deploys only from `main`, no required reviewers.
 
 ## What a version number means
 
 Before 1.0, a minor version (0.2 → 0.3) may change the command line or the
 artifact format and says so in the changelog. A patch version (0.2.0 → 0.2.1)
 does not.
-
-## After publication
-
-In a fresh virtual environment outside the checkout, install `bandr==0.3.0`, run
-`mint --version`, `mint schema`, and `mint skill install --project`, then run the
-[synthetic example](../examples/mint). Run Harbor validation with a working Docker
-engine before claiming container execution evidence. Check the PyPI metadata and
-GitHub release assets. Remove the README's release-preparation notice only after
-the install from PyPI succeeds.
