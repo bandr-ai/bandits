@@ -18,10 +18,14 @@ The return path means new run traces can feed another conversion. It does not
 mean Mint automatically starts a training job or changes model weights. Harbor
 executes the downstream agent; Mint constructs and checks the task package.
 
-The loop preserves the monochrome typography and blue accent. Movement and
-crossfades use 25 fps timing, with reading holds. GIFs share one palette to avoid
-color flicker. Static and reduced-motion versions retain the conversion scene
-and show all four stages in the navigation rail.
+The loop uses one persistent, side-by-side layout. Traces, the Harbor package,
+the model attempt, and the verifier are visible in every frame. Only the flow
+markers and active-stage underline move. A return path carries the new trace
+back to the input. There are no scene cuts, crossfades, or changing pages.
+
+Motion uses 25 fps timing. GIFs share one palette to avoid color flicker. The
+static/reduced-motion version shows the same complete loop. Text is shortened
+to keep stage headings and essential artifacts readable at README width.
 
 This is a designed animation of the included synthetic fixture, not a recording
 of conversion speed. Local verifier passes remain generated; no real Harbor run

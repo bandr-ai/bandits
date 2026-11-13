@@ -65,8 +65,9 @@ conversion-speed, or Harbor-validation claim is made by the animation.
 
 Keep the approved conversion composition, then continue with a model/agent
 attempt inside Harbor, a verifier reward, and the resulting run traces returning
-to the next conversion. Each stage gets its own readable scene instead of
-squeezing four panels into the README width. The verifier values are sourced
+to the next conversion. All four stages share a persistent canvas. Shorten the labels and artifacts
+rather than shrinking the previous full scenes. Flow markers and a return path
+show the cycle without hiding context or replacing the page. The verifier values are sourced
 from the runnable fixture's local gate evidence. The model segment is schematic.
 The loop links artifacts and executions; it does not imply automatic model
 training, automatic launches by Mint, or an observed model-improvement metric.

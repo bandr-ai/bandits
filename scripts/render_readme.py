@@ -73,204 +73,104 @@ def ease(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
-def render(
-    theme: dict, seconds: float, sans: str, mono: str, phase: int = 0, evidence: dict | None = None
-) -> Image.Image:
-    """Conversion, downstream model attempt, grading, and the next trace."""
-    from PIL import ImageColor
-
+def render(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) -> Image.Image:
+    """One persistent canvas: four visible stages and a returning trace."""
     im = Image.new("RGB", SIZE, theme["bg"])
     d = ImageDraw.Draw(im)
 
-    def color(name, alpha=1.0):
-        foreground, background = ImageColor.getrgb(theme[name]), ImageColor.getrgb(theme["bg"])
-        return tuple(
-            round(a * alpha + b * (1 - alpha)) for a, b in zip(foreground, background, strict=True)
-        )
-
-    def text(x, y, value, size=25, tone="ink", code=False, alpha=1.0, bold=False, right=False):
+    def text(x, y, value, size=25, tone="ink", code=False, bold=False, centered=False):
         d.text(
             (round(x), round(y)),
             value,
             font=face(mono if code else sans, size, bold),
-            fill=color(tone, alpha),
-            anchor="rt" if right else "lt",
+            fill=theme[tone],
+            anchor="mt" if centered else "lt",
         )
 
-    # Editorial typography and open space, rather than a dashboard of boxes.
+    def arrow(points, upward=False):
+        d.line(points, fill=theme["line"], width=2)
+        x, y = points[-1]
+        head = (x - 6, y + 8, x, y, x + 6, y + 8) if upward else (x - 8, y - 6, x, y, x - 8, y + 6)
+        d.line(head, fill=theme["line"], width=2)
+
     d.rectangle((64, 48, 73, 57), fill=theme["accent"])
     text(88, 39, "bandr", 31, bold=True)
-    evidence = evidence or {"answer": "100", "reward": 1.0, "wrong": "140", "wrong_reward": 0.0}
-    headings = [
-        ("Agent logs in.", "Harbor tasks out."),
-        ("A Harbor task.", "A model attempts it."),
-        ("Model output.", "Verifier grade."),
-        ("A new attempt.", "A new trace."),
-    ]
-    subtitles = [
-        ("Your tasks, reconstructed with", "instructions, environments and verifiers."),
-        ("The agent gets the original job", "and works in the task environment."),
-        ("The task's verifier checks the outcome", "and assigns a reward."),
-        ("The run records what the model did.", "Use its traces for the next conversion."),
-    ]
-    for y, value in zip((146, 237), headings[phase], strict=True):
-        text(64, y, value, 65 if phase == 1 else 77, bold=True)
-    for y, value in zip((350, 389), subtitles[phase], strict=True):
-        text(68, y, value, 28, "muted")
+    text(64, 130, "Build the task. Run the model. Grade the result.", 54, bold=True)
+    text(
+        66,
+        210,
+        "Agent traces become Harbor tasks. Each new attempt leaves more traces.",
+        27,
+        "muted",
+    )
 
-    previews = [
-        (
-            "attempts.jsonl",
-            'request   "Calculate net revenue..."',
-            "input     sales.csv",
-            "source    attempts.jsonl#0",
-        ),
-        (
-            "net-revenue/",
-            "job       Calculate net revenue",
-            "files     sales.csv",
-            "runtime   Harbor",
-        ),
-        (
-            "answer.txt",
-            f"answer    {evidence['answer']}",
-            "checked by the task's verifier",
-            "tests/test.sh",
-        ),
-        (
-            "agent/trajectory.json",
-            "request   the original job",
-            "steps     the model's actions",
-            "result    verifier reward",
-        ),
-    ]
-    d.line((68, 466, 616, 466), fill=theme["line"], width=1)
-    for index, value in enumerate(previews[phase]):
-        text(
-            68,
-            (490, 535, 575, 615)[index],
-            value,
-            20 if index == 0 else 21,
-            "muted" if index in (0, 3) else "ink",
-            code=True,
-        )
+    phase = int(seconds / 1.8) % 4
+    fraction = (seconds % 1.8) / 1.8
+    xs = (64, 400, 736, 1072)
+    titles = ("Traces", "Harbor task", "Model attempt", "Verifier")
+    for index, (x, title) in enumerate(zip(xs, titles, strict=True)):
+        text(x, 308, f"0{index + 1}", 20, "accent" if phase == index else "muted", code=True)
+        text(x, 350, title, 31, bold=True)
+        d.line((x, 555, x + 272, 555), fill=theme["accent" if phase == index else "line"], width=2)
 
-    if phase == 0:
-        # One document, with the actual paths materialize() writes. No invented commands.
-        text(824, 140, "HARBOR TASK", 18, "muted", code=True)
-        text(824, 178, "net-revenue/", 37, bold=True)
-        d.line((824, 240, 1376, 240), fill=theme["line"], width=1)
-        rows = [
-            ("instruction.md", "the original job"),
-            ("environment/", "starting state"),
-            ("tests/test.sh", "outcome verifier"),
-            ("solution/solve.sh", "reference answer"),
-            ("task.toml", "runtime + provenance"),
-        ]
-        for index, (path, description) in enumerate(rows):
-            amount = ease((seconds - 0.35 - index * 0.56) / 0.65)
-            y = 279 + index * 72 + (1 - amount) * 13
-            opacity = 0.22 + 0.78 * amount
-            # Small file glyph; no faux application chrome.
-            x = 827
-            d.line(
-                (x, y + 1, x + 12, y + 1, x + 19, y + 8, x + 19, y + 24, x, y + 24, x, y + 1),
-                fill=color("muted", opacity),
-                width=1,
+    # Keep all stage content visible. Motion belongs to the connections only.
+    text(64, 419, "The original job", 24)
+    text(64, 460, "Files + context", 24, "muted")
+    text(64, 507, "attempts.jsonl", 21, "muted", code=True)
+
+    for index, path in enumerate(("instruction.md", "environment/", "tests/test.sh", "task.toml")):
+        text(400, 414 + index * 32, path, 21, code=True)
+
+    text(736, 419, "Read. Act. Answer.", 24)
+    text(736, 460, "In the task environment", 23, "muted")
+    text(736, 507, f"answer.txt → {evidence['answer']}", 21, "muted", code=True)
+
+    text(1072, 419, "tests/test.sh", 21, "muted", code=True)
+    text(1072, 459, f"{evidence['reward']:.1f}", 64, "accent", bold=True)
+    text(1190, 495, "reward", 23, "muted")
+
+    connectors = []
+    for start in (315, 651, 987):
+        points = [(start, 368), (start + 65, 368)]
+        arrow(points)
+        connectors.append(points)
+
+    # A single return line makes the loop visible even in a still frame.
+    path = []
+
+    def bezier(a, b, c, e, samples=40):
+        for step in range(samples + 1):
+            t = step / samples
+            path.append(
+                tuple(
+                    (1 - t) ** 3 * a[k]
+                    + 3 * (1 - t) ** 2 * t * b[k]
+                    + 3 * (1 - t) * t * t * c[k]
+                    + t**3 * e[k]
+                    for k in (0, 1)
+                )
             )
-            text(863, y, path, 25, code=True, alpha=opacity)
-            text(863, y + 35, description, 19, "muted", alpha=opacity)
 
-    elif phase == 1:
-        text(824, 140, "MODEL ATTEMPT", 18, "muted", code=True)
-        text(824, 178, "A fresh agent run", 37, bold=True)
-        d.line((824, 240, 1376, 240), fill=theme["line"], width=1)
-        actions = [
-            ("Read the instruction", "instruction.md"),
-            ("Work in the environment", "sales.csv + tools"),
-            ("Submit an answer", f"answer.txt  →  {evidence['answer']}"),
-        ]
-        for index, (label, detail) in enumerate(actions):
-            y = 287 + index * 105
-            text(824, y, label, 28)
-            text(824, y + 43, detail, 23, "muted", code=True)
-    elif phase == 2:
-        text(824, 140, "TASK VERIFIER", 18, "muted", code=True)
-        text(824, 178, "tests/test.sh", 37, bold=True)
-        d.line((824, 240, 1376, 240), fill=theme["line"], width=1)
-        text(824, 285, "answer", 22, "muted", code=True)
-        text(1130, 285, "reward", 22, "muted", code=True)
-        text(824, 332, evidence["answer"], 80, bold=True)
-        text(1130, 332, f"{evidence['reward']:.1f}", 80, "accent", bold=True)
-        text(824, 456, "Expected outcome matched.", 29)
-        text(
-            824,
-            517,
-            f"Wrong answer {evidence['wrong']} → reward {evidence['wrong_reward']:.1f}",
-            23,
-            "muted",
-            code=True,
-        )
-        text(824, 584, "The verifier grades the result.", 24, "muted")
+    bezier((1208, 575), (1208, 605), (1208, 615), (1168, 615))
+    path.extend((1168 - step * (992 / 160), 615) for step in range(161))
+    bezier((176, 615), (136, 615), (136, 605), (136, 575))
+    arrow(path, upward=True)
+
+    if phase < 3:
+        start, end = connectors[phase]
+        x = start[0] + (end[0] - start[0]) * ease(fraction)
+        y = start[1]
     else:
-        text(824, 140, "RUN OUTPUT", 18, "muted", code=True)
-        text(824, 178, "New attempt traces", 37, bold=True)
-        d.line((824, 240, 1376, 240), fill=theme["line"], width=1)
-        text(824, 295, "agent/trajectory.json", 27, code=True)
-        text(824, 338, "The model's steps and observations", 24, "muted")
-        text(824, 415, "result.json", 27, code=True)
-        text(824, 458, "The verifier's result", 24, "muted")
-        text(824, 564, "Traces for the next conversion.", 28)
-
-    # A thin continuous connection, with a packet that eases into the package.
-    curve = []
-    for step in range(81):
-        t = step / 80
-        x = (1 - t) ** 3 * 630 + 3 * (1 - t) ** 2 * t * 724 + 3 * (1 - t) * t * t * 720 + t**3 * 794
-        y = (1 - t) ** 3 * 564 + 3 * (1 - t) ** 2 * t * 564 + 3 * (1 - t) * t * t * 421 + t**3 * 421
-        curve.append((x, y))
-    d.line(curve, fill=theme["line"], width=2)
-    if phase == 0 and seconds < 3.9 or phase == 3:
-        amount = ease(seconds / 1.2) if phase == 3 else ease((seconds % 0.78) / 0.78)
-        index = min(79, int(amount * 80))
-        if phase == 3:
-            index = 79 - index
-        x, y = curve[index]
-        d.ellipse((x - 3, y - 3, x + 3, y + 3), fill=theme["accent"])
-    arrow = (639, 557, 630, 564, 639, 571) if phase == 3 else (785, 414, 794, 421, 785, 428)
-    d.line(arrow, fill=theme["line"], width=2)
-
-    labels = ["01  Traces to task", "02  Model attempt", "03  Verifier grade", "04  New traces"]
-    for index, label in enumerate(labels):
-        x = 64 + index * 336
-        d.line((x, 686, x + 300, 686), fill=theme["accent" if index == phase else "line"], width=2)
-        text(x, 710, label, 20, "ink" if index == phase else "muted")
+        x, y = path[min(len(path) - 1, round(ease(fraction) * (len(path) - 1)))]
+    d.ellipse((x - 4, y - 4, x + 4, y + 4), fill=theme["accent"])
+    text(720, 658, "New attempt traces feed the next conversion.", 24, "muted", centered=True)
     return im
 
 
 def animation(theme, sans, mono, evidence):
-    """Four readable scenes, 25 fps eased transitions, and a returning trace."""
-    frames = [render(theme, frame / 25, sans, mono, evidence=evidence) for frame in range(101)]
-    durations = [40] * len(frames)
-    durations[0], durations[-1] = 700, 1000
-
-    def transition(target):
-        previous = frames[-1]
-        for index in range(1, 16):
-            frames.append(Image.blend(previous, target, ease(index / 15)))
-            durations.append(40)
-
-    for phase in (1, 2, 3):
-        target = render(theme, 0, sans, mono, phase, evidence)
-        transition(target)
-        durations[-1] = 2100 if phase < 3 else 700
-        if phase == 3:
-            for index in range(1, 33):
-                frames.append(render(theme, index / 25, sans, mono, phase, evidence))
-                durations.append(40)
-            durations[-1] = 1000
-    transition(frames[0])
-    return frames, durations
+    """25 fps loop, fixed layout, no scene cuts, fades or page changes."""
+    frames = [render(theme, frame / 25, sans, mono, evidence) for frame in range(180)]
+    return frames, [40] * len(frames)
 
 
 def capture_example(
@@ -394,7 +294,7 @@ def main():
     )
     for name, theme in THEMES.items():
         frames, durations = animation(theme, sans, mono, evidence)
-        poster = frames[100]
+        poster = frames[155]
         poster.save(OUT / f"mint-workflow-{name}.png", optimize=True)
         frames[0].save(
             OUT / f"mint-workflow-{name}.webp",
@@ -418,7 +318,7 @@ def main():
             disposal=1,
         )
         del frames, gif
-        print(f"Rendered {name}: 25 fps transitions, WebP + GIF + static poster.")
+        print(f"Rendered {name}: 25 fps continuous flow, WebP + GIF + static poster.")
         render_checks(theme, mono, transcript, counts).save(
             OUT / f"mint-checks-{name}.png", optimize=True
         )
