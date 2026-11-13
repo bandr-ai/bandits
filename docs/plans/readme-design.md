@@ -29,9 +29,9 @@ longer describes Mint, but its concrete visual storytelling is worth retaining.
 
 ## Applied direction
 
-Centered title, short outcome statement, three useful badges, and four navigation
-links. A full-width original animation restores the old terminal typography and
-orange accent. Dark graphite and warm off-white variants use the same content.
+Centered title, a direct conversion promise, two useful badges, and four navigation
+links. The opening uses large type and a live reveal of a Harbor package. Black
+and white variants share a restrained blue accent and identical content.
 
 Keep the primary install path and skill prompt short. Put installer alternatives,
 full status definitions, and developer details into disclosures. Use an honest
@@ -39,20 +39,24 @@ use-case table, a four-step workflow, an inspectable package tree, and a capture
 CLI excerpt from the bundled example. Do not invent benchmarks, integrations,
 community channels, or publication badges.
 
-The hero is explicitly an illustrated workflow. The CLI excerpt comes from an
-actual local run. The example is synthetic and intentionally small. Local gate
+The animation follows the real package-writing contract. Its source and fixture
+are linked for inspection. The separate CLI excerpt comes from an actual local run. The example is synthetic and intentionally small. Local gate
 passes stay generated; no Harbor execution is implied. The renderer reruns the
 example, asserts those results, and emits static alternatives alongside the loop.
 A production-job recording can replace the synthetic example once a reproducible,
 shareable source and real runtime validation are available.
 
-## Opening revision
+## Current opening
 
-The initial three-panel workflow explained internal steps before establishing
-why a reader should care. Replace it with one failed job becoming an eval:
-net revenue, a refund wrongly counted as income, and a verifier accepting 100
-while rejecting 140. Use larger text, two readable panels, and a single moving
-connection. Show the failure, restore the job, then reveal the outcome check.
-The name in the artwork is only bandr; remove presentation labels from the
-opening. Link directly to the runnable example and keep source/provenance notes
-in the asset documentation. The fixture and gate results are executable.
+Re-read PRs #154–#158 and the parser/generator/materializer contracts before this
+revision. Center the product on whole-job conversion into Harbor format, without
+reducing it to failure analysis or numerical answer checking. The visible paths
+are the actual materializer outputs. The bundled revenue fixture supplies the
+source request and starting file; its arithmetic is not the marketing story.
+
+Use large type and an open composition, black/white surfaces, and a restrained
+blue accent. Keep only bandr as the brand. Reveal the Harbor package with smooth
+25 fps eased motion; hold the finished result and crossfade the loop. Export
+actual GIFs, lossless WebPs, and static/reduced-motion alternatives. Verify the
+example and the displayed package paths while rendering. No model-solve,
+conversion-speed, or Harbor-validation claim is made by the animation.

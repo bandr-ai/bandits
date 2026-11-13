@@ -1,14 +1,20 @@
 # README artwork
 
-The opening follows [one failed net-revenue job](../../../examples/mint/net-revenue).
-A 120-dollar sale and a -20-dollar refund produced a logged answer of 140. The
-rebuilt task accepts 100 and rejects 140. The loop shows the failure, the restored
-job, and the outcome check. Only the bandr name appears in the opening artwork.
+The opening shows the jobs captured in agent logs becoming Harbor task packages.
+It follows the source request and starting file from the bundled
+[net-revenue example](../../../examples/mint/net-revenue) into the real files
+written by `mint.harbor.materialize`: instruction, environment, verifier, optional
+oracle, and runtime/provenance configuration.
 
-This is a designed animation of a synthetic fixture, not a recording of a model
-solve or a conversion-speed claim. The renderer runs the actual task generator
-and local verifier gates before producing the assets. Light and dark variants
-share the story; the static alternative shows the final outcome.
+The visual uses black/white typography, a restrained blue accent, and an open
+layout. File rows fade and slide into place with eased transitions at **25 fps**.
+It holds the completed package for reading, then crossfades back to the opening.
+There are no low-frame-rate stepped position jumps.
+
+This is a designed animation of the included synthetic fixture, not a recording
+of conversion speed or a model solve. The renderer actually builds the example,
+asserts that the displayed output files exist, and checks the local verifier
+gates. Local passes remain generated; no Harbor execution is implied.
 
 The CLI panel is an excerpt captured by actually running the supplied parser,
 generator, local validation, and report in a temporary workspace. Its text is
@@ -22,14 +28,15 @@ uv sync --extra dev
 uv run --with pillow python scripts/render_readme.py
 ```
 
-The renderer uses installed Helvetica/Menlo fonts on macOS or DejaVu fonts on
+The renderer uses installed Helvetica Neue/Menlo fonts on macOS or DejaVu fonts on
 Linux. Supply `--sans-font /path/to/font.ttf --mono-font /path/to/mono.ttf` to
 choose other fonts. Font files are not bundled. Pillow is needed only to rebuild
 these assets, not to use Bandr.
 
 Assets:
 
-- `mint-workflow-{dark,light}.webp`: looping workflow illustration.
+- `mint-workflow-{dark,light}.gif`: the README loop, with a shared palette to avoid flicker.
+- `mint-workflow-{dark,light}.webp`: lossless versions of the same animation.
 - `mint-workflow-{dark,light}.png`: static alternatives.
 - `mint-checks-{dark,light}.png`: actual local CLI output excerpt.
 

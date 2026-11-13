@@ -2,9 +2,9 @@
 
 # bandr
 
-### Turn agent failures into your next eval.
+### Agent logs in. Harbor tasks out.
 
-Bring your traces. Get runnable tasks with starting environments and verifiers.
+Rebuild the jobs in your traces as runnable tasks for evaluation and training.
 
 [![CI](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml/badge.svg)](https://github.com/bandr-ai/bandits/actions/workflows/quality.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-59636e)](pyproject.toml)
@@ -16,23 +16,22 @@ Bring your traces. Get runnable tasks with starting environments and verifiers.
 <picture>
   <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.png">
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/readme/mint-workflow-light.png">
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.webp">
-  <img src="docs/assets/readme/mint-workflow-light.webp" alt="bandr turns an agent failure into a reusable eval. The agent counts a refund as income and reports 140 dollars. The rebuilt task preserves the original job and sales data, with a verifier that accepts 100 dollars and rejects 140 dollars." width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.gif">
+  <img src="docs/assets/readme/mint-workflow-light.gif" alt="bandr converts jobs captured in agent logs into Harbor task packages. The source request and starting data become instruction.md and environment/, alongside tests/test.sh, an optional solution/solve.sh, and task.toml." width="100%">
 </picture>
 
-<p align="center"><sub><a href="examples/mint/net-revenue">Run this example</a> &nbsp;·&nbsp; <a href="docs/assets/readme/mint-workflow-light.png">Still image</a></sub></p>
+<p align="center"><sub><a href="docs/assets/readme/mint-workflow-light.gif">Open GIF</a> &nbsp;·&nbsp; <a href="examples/mint/net-revenue">Run the example</a> &nbsp;·&nbsp; <a href="docs/assets/readme/mint-workflow-light.png">Still image</a></sub></p>
 
-An agent failure tells you where to test next. bandr helps your coding agent turn
-that run into a task another agent can attempt: **the original job, its starting
-environment, and a verifier for the outcome.**
+bandr helps your coding agent turn the jobs captured in your logs into
+**runnable [Harbor task packages](https://github.com/harbor-framework/harbor)**:
+the original instruction, starting environment, outcome verifier, and an oracle
+when one is available.
 
-In the example above, an agent counts a refund as revenue. The rebuilt task gives
-the next agent the same data and checks the signed total. The original mistake
-becomes a repeatable test. [The full example is included](examples/mint/net-revenue).
-
-Tasks use [Harbor's open format](https://github.com/harbor-framework/harbor), so you
-can use them for agent evaluation or training rollouts. Successful runs are useful
-too; you can group repeat attempts and keep their evidence together.
+Bring logs and any existing harness or starting-state files. The coding agent
+writes source-specific parsers and generators; Mint runs them over the corpus,
+writes the packages, checks them, and records their provenance and gaps.
+Successful, failed, and partial runs can all contribute. Repeat attempts at the
+same instance become one task with their evidence kept together.
 
 ## Quickstart
 
