@@ -102,9 +102,7 @@ def test_init_payload_has_no_paths(env, sent, monkeypatch):
     _open(monkeypatch)
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     logs = str(env.logs)
-    code, out, err, _ = env.run(
-        "init", logs, str(env.ws), "--allow-missing-runtime", "--json"
-    )
+    code, out, err, _ = env.run("init", logs, str(env.ws), "--allow-missing-runtime", "--json")
     assert code == 0
     assert json.loads(out)["ok"] is True
     assert len(sent) == 1
@@ -190,7 +188,9 @@ def test_persisted_off_and_corrupt_config(env, sent, monkeypatch):
     _open(monkeypatch)
     path = _cfg()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"anonymous_id": "keep-me", "enabled": False, "notice_shown": False}))
+    path.write_text(
+        json.dumps({"anonymous_id": "keep-me", "enabled": False, "notice_shown": False})
+    )
     code, _, _, _ = env.run("init", str(env.logs), str(env.ws), "--allow-missing-runtime")
     assert code == 0 and sent == []
     assert json.loads(path.read_text())["enabled"] is False

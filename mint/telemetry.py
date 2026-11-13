@@ -46,7 +46,7 @@ NOTICE = (
 _DEFAULT_HOST = "https://us.i.posthog.com"
 _TIMEOUT = 0.2
 # Public project write key. Replaced at build time from the local project token.
-_EMBEDDED_KEY = 'phc_CvhAGavirL5hbBfgmGzacMUV7v8w4gHpi749P7KJ4XnG'
+_EMBEDDED_KEY = "phc_CvhAGavirL5hbBfgmGzacMUV7v8w4gHpi749P7KJ4XnG"
 _RUN_STAGES = frozenset({"parse", "checks", "generate"})
 _RUNNERS = frozenset({"local", "harbor"})
 _COUNT_KEYS = ("validated", "generated", "blocked", "exec_failed")
@@ -327,7 +327,9 @@ def _prepare(command: str) -> str | None:
     return anon
 
 
-def emit(command: str, exit_class: str, duration_ms: int, extra: dict[str, Any] | None = None) -> None:
+def emit(
+    command: str, exit_class: str, duration_ms: int, extra: dict[str, Any] | None = None
+) -> None:
     try:
         anon = _prepare(command)
         if not anon:
