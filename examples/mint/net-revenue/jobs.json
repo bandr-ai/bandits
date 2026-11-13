@@ -1,0 +1,1 @@
+{"jobs":[{"id":"net-revenue","description":"Calculate net revenue from the supplied sales CSV, subtracting refunds.","where":"The synthetic revenue-1 trace","repeats":"One attempt at one instance","outcome":"Recompute signed amounts from the complete CSV. Completion does not establish success."}]}
