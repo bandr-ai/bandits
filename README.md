@@ -179,4 +179,4 @@ recipes are retained for reference.
 
 </details>
 
-<sub>Anonymous command usage is enabled by default. No log contents or paths are sent. Disable it with <code>mint telemetry off</code> or <code>MINT_TELEMETRY_DISABLED=1</code>. <a href="mint/telemetry.py">Details</a>.</sub>
+<sub>Anonymous command usage is enabled by default. No log contents or paths are sent. Disable it with <code>mint telemetry off</code> or <code>MINT_TELEMETRY_DISABLED=1</code>. <a href="docs/telemetry.md">Captured fields and limits</a>.</sub>
