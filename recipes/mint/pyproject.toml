@@ -17,5 +17,3 @@ only-include = []
 
 [tool.hatch.build.hooks.custom]
 
-[tool.hatch.build.targets.sdist.force-include]
-"../../mint" = "mint"
