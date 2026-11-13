@@ -109,7 +109,7 @@ def test_full_job_custom_verifier_outcomes_candidates_and_report(env):
     assert "wrong x1 (script 1; 1 source(s)): off by one [synthetic shortcut]" in md
     assert "alternatives x1" in md and "[no source given]" in md
     # runs whose full job errored are not covered: they show up instead of disappearing
-    assert "Trajectories with no task or candidate: **2 of 5**" in md
+    assert "Trajectories with no task, candidate, or recorded exclusion: **2 of 5**" in md
 
 
 def test_broken_verifier_is_caught_by_an_executable_wrong_outcome(env):

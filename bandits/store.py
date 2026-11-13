@@ -61,8 +61,8 @@ class ArtifactEnvelope(Contract):
     redaction_count: int | None = None
 
 
-# The distribution was called "bandits" before it was published as "bandits-cli".
-_OWN_NAMES = ("bandits-cli", "bandits")
+# Recognize the current distribution and its historical names.
+_OWN_NAMES = ("bandr", "bandits-cli", "bandits")
 
 
 @functools.cache

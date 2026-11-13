@@ -78,8 +78,15 @@ def _exec_problems(r: dict) -> tuple[list[str], list[str]]:
 
 
 def _outcome_line(label: str, items: list[dict]) -> str:
-    srcs = Counter(x.get("source") or "no source given" for x in items)
-    shown = "; ".join(f"{x['text']} [{x.get('source') or 'no source given'}]" for x in items[:3])
+    srcs = Counter(
+        x.get("source")
+        or ("generator-supplied answer" if x["kind"] == "answer" else "no source given")
+        for x in items
+    )
+    shown = "; ".join(
+        f"{x['text']} [{x.get('source') or ('generator-supplied answer' if x['kind'] == 'answer' else 'no source given')}]"
+        for x in items[:3]
+    )
     kinds = Counter(x["kind"] for x in items)
     return (
         f"  - {label} x{len(items)} ({', '.join(f'{k} {v}' for k, v in sorted(kinds.items()))}; "
@@ -108,12 +115,14 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
     ]
     missing = []
     covered_src: set = set()
-    covered_ids: set = set()
+    covered_ids: set = {e["trajectory_id"] for e in read_jsonl(ws.excluded)}
     for jid in jobs:
         names = full_types.get(jid, [])
         rs = [r for n in names for r in by_type.get(n, [])]
         cands = [q for q in queue if q["type"] in names and q["kind"] == "candidate"]
-        n_blocked = sum(1 for q in queue if q["type"] in names and q["kind"] == "blocked")
+        n_blocked = sum(r["status"] == "blocked" for r in rs) + sum(
+            1 for q in queue if q["type"] in names and q["kind"] == "blocked"
+        )
         n_err = sum(1 for q in queue if q["type"] in names and q["kind"] == "exception")
         covered_src.update(x for r in rs for x in r["sources"])
         covered_ids.update(
@@ -186,7 +195,7 @@ def _job_lines(ws: Workspace, by_type: dict) -> list[str]:
         ]
         L += [
             "",
-            f"Trajectories with no task or candidate: **{len(uncovered)} of {len(trajs)}**"
+            f"Trajectories with no task, candidate, or recorded exclusion: **{len(uncovered)} of {len(trajs)}**"
             + (f" (e.g. {', '.join(uncovered[:10])})" if uncovered else "")
             + ". Each logged run was doing some job: map it, build it, or say why in a decision.",
         ]
@@ -396,6 +405,8 @@ def build_report(ws: Workspace) -> str:
     blocked = [r for r in rows if r["status"] in ("blocked", "exec_failed")]
     for r in blocked[:30]:
         L.append(f"- {r['status']} task {r['task_id']} ({r['type']}): {r.get('reason')}")
+        if r.get("withheld"):
+            L.append(f"  - {r['withheld']}")
     for q in read_jsonl(ws.queue):
         L.append(
             f"- {q['kind']} {q['type']}/{q['group']}: {q['reason']}"

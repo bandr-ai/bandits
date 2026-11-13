@@ -1,6 +1,6 @@
 [project]
 name = "bandr-mint"
-version = "0.1.0"
+version = "0.3.0"
 readme = "README.md"
 description = "Standalone Mint workflow and Harbor task gates for hosted integrations"
 requires-python = ">=3.11"

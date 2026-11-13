@@ -564,6 +564,7 @@ def run_generate(ws: Workspace, limit: int | None, dry: bool, only_type: str | N
                             row.pop(k, None)
                 elif old:
                     row["changed"] = True  # same id, new content: revalidate
+                scan.withhold_secrets(dest, row)
                 taskmeta[res.task_id] = meta
                 new_rows.append(finalize(row))
     finally:
