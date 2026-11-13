@@ -1,9 +1,14 @@
 # README artwork
 
-The workflow animation is a technical illustration of the bundled synthetic
-example, not a terminal recording or a claim about conversion speed. Its first
-frame contains the complete workflow; the animation highlights its stages.
-Light and dark versions use the same content.
+The opening follows [one failed net-revenue job](../../../examples/mint/net-revenue).
+A 120-dollar sale and a -20-dollar refund produced a logged answer of 140. The
+rebuilt task accepts 100 and rejects 140. The loop shows the failure, the restored
+job, and the outcome check. Only the bandr name appears in the opening artwork.
+
+This is a designed animation of a synthetic fixture, not a recording of a model
+solve or a conversion-speed claim. The renderer runs the actual task generator
+and local verifier gates before producing the assets. Light and dark variants
+share the story; the static alternative shows the final outcome.
 
 The CLI panel is an excerpt captured by actually running the supplied parser,
 generator, local validation, and report in a temporary workspace. Its text is
