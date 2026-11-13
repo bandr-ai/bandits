@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mint import cli
+from mint import cli, telemetry
 from mint.cli import main
 from mint.models import ContractError
 from mint.output import Result
@@ -65,7 +65,7 @@ def test_bucket_edges():
 def test_closed_gates_do_not_send_or_create_a_file(monkeypatch, env, sent):
     _open(monkeypatch)
     cases = [
-        {"MINT_POSTHOG_API_KEY": None},
+        {"MINT_POSTHOG_API_KEY": ""},
         {"MINT_POSTHOG_API_KEY": "phx_personal"},
         {"CI": "true"},
         {"DO_NOT_TRACK": "1"},
@@ -258,7 +258,8 @@ def test_telemetry_status_without_a_workspace_and_dry_run_still_persists(sent, c
 
 
 def test_status_reports_the_earlier_gate(monkeypatch, capsys):
-    monkeypatch.delenv("MINT_POSTHOG_API_KEY", raising=False)
+    monkeypatch.setenv("MINT_POSTHOG_API_KEY", "")
+    monkeypatch.delenv("POSTHOG_PROJECT_TOKEN", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     code, _, _, res = _json(["telemetry", "status", "--json"], capsys)
     assert code == 0 and res["data"]["reason"] == "no API key"
@@ -370,6 +371,17 @@ def test_validate_usage_still_records_judge(env, sent, monkeypatch):
     assert props["judge"] is True
     assert "runner" not in props
     assert "levels" not in props
+
+
+def test_unset_env_uses_embedded_project_key(env, sent, monkeypatch):
+    _open(monkeypatch)
+    monkeypatch.delenv("MINT_POSTHOG_API_KEY", raising=False)
+    monkeypatch.delenv("POSTHOG_PROJECT_TOKEN", raising=False)
+    code, _, _, _ = env.run("init", str(env.logs), str(env.ws), "--allow-missing-runtime")
+    assert code == 0 and len(sent) == 1
+    sent_key = sent[0][1]["api_key"]
+    assert sent_key.startswith("phc_") and sent_key != KEY
+    assert sent_key == telemetry.project_key()
 
 
 def test_skill_carries_the_notice():

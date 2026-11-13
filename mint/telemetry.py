@@ -1,6 +1,8 @@
 """Anonymous usage telemetry for milestone commands. Stdlib only.
 
-Sends nothing unless ``MINT_POSTHOG_API_KEY`` is a project key (``phc_``).
+The embedded value is the PostHog project write key (``phc_``). A personal key
+(``phx_``) is rejected. ``MINT_POSTHOG_API_KEY`` or ``POSTHOG_PROJECT_TOKEN``,
+when set, replaces it. An empty value turns capture off.
 Never includes paths, prompts, task ids, queries, or log contents.
 """
 
@@ -43,6 +45,8 @@ NOTICE = (
 
 _DEFAULT_HOST = "https://us.i.posthog.com"
 _TIMEOUT = 0.2
+# Public project write key. Replaced at build time from the local project token.
+_EMBEDDED_KEY = 'phc_CvhAGavirL5hbBfgmGzacMUV7v8w4gHpi749P7KJ4XnG'
 _RUN_STAGES = frozenset({"parse", "checks", "generate"})
 _RUNNERS = frozenset({"local", "harbor"})
 _COUNT_KEYS = ("validated", "generated", "blocked", "exec_failed")
@@ -107,12 +111,21 @@ def _write(path: Path, data: dict) -> None:
     atomic_write(path, json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 
+def project_key() -> str:
+    """Env override, then the embedded project write key. Empty means off."""
+    if "MINT_POSTHOG_API_KEY" in os.environ:
+        return os.environ["MINT_POSTHOG_API_KEY"].strip()
+    if "POSTHOG_PROJECT_TOKEN" in os.environ:
+        return os.environ["POSTHOG_PROJECT_TOKEN"].strip()
+    return _EMBEDDED_KEY.strip()
+
+
 def _early_block() -> str | None:
     """Gate steps that must not touch the config file. ``None`` means keep going."""
-    key = os.environ.get("MINT_POSTHOG_API_KEY")
-    if key is None or not key.strip():
+    key = project_key()
+    if not key:
         return "no API key"
-    if not key.strip().startswith("phc_"):
+    if not key.startswith("phc_"):
         return "API key is not a project key"
     ci = os.environ.get("CI")
     if ci is not None and ci.strip().lower() not in _FALSE_CI:
@@ -319,7 +332,7 @@ def emit(command: str, exit_class: str, duration_ms: int, extra: dict[str, Any] 
         anon = _prepare(command)
         if not anon:
             return
-        key = os.environ.get("MINT_POSTHOG_API_KEY", "").strip()
+        key = project_key()
         payload = {
             "api_key": key,
             "event": "command_finished",
