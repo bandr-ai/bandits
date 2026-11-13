@@ -1,0 +1,1 @@
+{"id":"revenue-1","request":"Calculate net revenue from /app/sales.csv. Refunds reduce revenue. Write the result in whole dollars to /app/answer/answer.txt.","starting_file":"kind,amount\nsale,120\nrefund,-20\n","answer":"140","ended":"done"}

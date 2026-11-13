@@ -1,26 +1,29 @@
-"""Render the README's illustrated Mint workflow (not a terminal recording).
+"""Render the bandr README animation and captured example output.
 
 Run: uv run --with pillow python scripts/render_readme.py
 Font paths can be supplied with --sans-font and --mono-font. No runtime dependency.
-The numbers and answers are read from the bundled synthetic fixture.
+The hook uses the bundled net-revenue fixture and verifies it with the local runner.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "docs/assets/readme"
-SIZE = (1600, 690)
+SIZE = (1600, 770)
 THEMES = {
     "dark": {
         "bg": "#0D1117",
@@ -61,110 +64,96 @@ def font_path(supplied: str | None, mono: bool) -> str:
     raise SystemExit("Supply --sans-font and --mono-font pointing to installed font files.")
 
 
-def render(theme: dict, stage: int, pulse: int, sans: str, mono: str, records: list) -> Image.Image:
+def render(theme: dict, stage: int, pulse: int, sans: str, mono: str, record: dict) -> Image.Image:
+    """Show the failed job becoming a reusable eval, one idea at a time."""
     im = Image.new("RGB", SIZE, theme["bg"])
     d = ImageDraw.Draw(im)
 
-    def text(x, y, value, size=24, color="ink", code=False, right=False):
+    def text(x, y, value, size=28, color="ink", code=False, right=False):
         font = ImageFont.truetype(mono if code else sans, size)
         d.text((x, y), value, font=font, fill=theme[color], anchor="rt" if right else "lt")
 
-    def line(coords, color="line", width=2):
-        d.line(coords, fill=theme[color], width=width)
+    def line(points, color="line", width=2):
+        d.line(points, fill=theme[color], width=width)
 
-    def pill(x, y, value, width, color="muted", fill="panel", size=20):
-        d.rounded_rectangle((x, y, x + width, y + 42), radius=8, fill=theme[fill])
-        text(x + 14, y + 10, value, size, color, code=True)
+    text(60, 35, "bandr", 34, "accent")
+    text(60, 100, "A failed run becomes a test for the next agent.", 51)
+    text(
+        60,
+        169,
+        "The same job. The original starting data. A verifier for the outcome.",
+        27,
+        "muted",
+    )
 
-    text(48, 33, "BANDR  /  MINT", 20, "accent", code=True)
-    text(1552, 35, "ILLUSTRATED WORKFLOW", 18, "muted", code=True, right=True)
-    text(48, 78, "From recorded attempts to reusable tasks.", 42)
-
-    xs = [48, 580, 1112]
-    labels = ["The source", "The reconstruction", "The output"]
-    subs = ["01 / AGENT LOGS", "02 / CODING AGENT + MINT", "03 / HARBOR TASKS"]
-    for i, x in enumerate(xs):
-        active = min(stage, 2) == i and stage < 3
+    for x, active in ((60, stage == 0), (900, stage > 0)):
         d.rounded_rectangle(
-            (x, 161, x + 440, 505),
-            radius=15,
+            (x, 239, x + 640, 616),
+            radius=16,
             fill=theme["panel"],
             outline=theme["accent" if active else "line"],
             width=2,
         )
-        text(x + 24, 186, subs[i], 18, "accent" if active else "muted", code=True)
-        text(x + 24, 222, labels[i], 30)
-        line((x + 24, 267, x + 416, 267))
-        if active:
-            line((x + 24, 161, x + 130 + pulse * 42, 161), "accent", 4)
+    text(92, 267, "THE FAILED RUN", 20, "muted", code=True)
+    text(932, 267, "THE REUSABLE EVAL", 20, "muted", code=True)
+    text(92, 308, "Calculate net revenue.", 32)
+    text(932, 308, "Calculate net revenue.", 32)
 
-    for a in [506, 1038]:
-        line((a, 325, a + 54, 325), "accent" if stage > (a > 600) else "line", 2)
-        line((a + 47, 318, a + 54, 325, a + 47, 332), "accent", 2)
+    text(92, 367, "sale", 28, "muted", code=True)
+    text(666, 363, f"+${record['_sale']}", 35, code=True, right=True)
+    text(92, 412, "refund", 28, "muted", code=True)
+    text(666, 408, f"-${abs(record['_refund'])}", 35, code=True, right=True)
+    line((92, 465, 668, 465))
+    text(92, 489, "Agent answer", 23, "muted")
+    text(92, 530, f"${record['answer']}", 53, "accent")
+    text(270, 548, "Refund counted as income.", 23, "accent")
 
-    # The actual fixture has repeat attempts with conflicting logged answers.
-    a, retry, b = records
-    text(72, 290, f"{a['instance']}   17 + 25", 24, code=True)
-    text(88, 328, f"attempt 1  recorded: {a['answer']}", 22, "muted", code=True)
-    text(88, 362, f"attempt 2  recorded: {retry['answer']}", 22, "muted", code=True)
-    text(72, 411, f"{b['instance']}    3 + 4", 24, code=True)
-    text(88, 449, f"attempt 1  recorded: {b['answer']}", 22, "muted", code=True)
+    # Motion carries the job from its log to the task without implying an elapsed runtime.
+    line((741, 430, 858, 430), "accent", 3)
+    line((847, 419, 858, 430, 847, 441), "accent", 3)
+    position = 746 + pulse * 17
+    d.ellipse((position - 4, 426, position + 4, 434), fill=theme["ink"])
 
-    middle = [
-        "Read the starting evidence",
-        "Group repeat attempts",
-        "Build the whole job",
-        "Recompute expected answers",
-    ]
-    for i, value in enumerate(middle):
-        y = 291 + i * 47
-        text(604, y, f"{i + 1:02}", 19, "accent", code=True)
-        text(647, y, value, 23)
+    if stage == 0:
+        text(932, 367, "sales.csv", 29, code=True)
+        text(932, 414, "Original starting data", 25, "muted")
+        line((932, 465, 1508, 465))
+        text(932, 498, "A new agent can try the job.", 27)
+        text(932, 546, "A verifier checks its answer.", 25, "muted")
+    elif stage == 1:
+        text(932, 367, "sales.csv", 27, code=True)
+        text(1508, 367, "restored", 24, "accent", code=True, right=True)
+        text(932, 414, "instruction.md", 27, code=True)
+        text(1508, 414, "same job", 24, "accent", code=True, right=True)
+        line((932, 465, 1508, 465))
+        text(932, 498, "tests/test.sh", 27, code=True)
+        text(932, 546, "Check that refunds reduce revenue.", 24, "muted")
+    else:
+        text(932, 370, f"${record['_expected']}", 54, "pass")
+        text(1508, 388, "PASS", 27, "pass", code=True, right=True)
+        text(932, 446, f"${record['answer']}", 54, "accent")
+        text(1508, 464, "FAIL", 27, "accent", code=True, right=True)
+        line((932, 523, 1508, 523))
+        text(932, 555, "Let the next agent find its own solution.", 23, "muted")
 
-    text(1136, 291, "sum-a/", 27, code=True)
-    text(1136, 332, "sum-b/", 27, code=True)
-    text(1136, 384, "instruction  /  environment", 20, "muted", code=True)
-    text(1136, 418, "verifier  /  oracle", 20, "muted", code=True)
-    pill(1136, 447, "2 tasks / generated", 300, "accent", "soft")
-
-    text(48, 524, "LOCAL VERIFIER GATES", 18, "muted", code=True)
-    checks = [
-        ("oracle", "accepted"),
-        ("no-op", "rejected"),
-        ("wrong answer", "rejected"),
-        ("alternative", "accepted"),
-    ]
-    for i, (label, outcome) in enumerate(checks):
-        x = 48 + i * 382
-        d.rounded_rectangle(
-            (x, 561, x + 358, 611),
-            radius=9,
-            fill=theme["panel"],
-            outline=theme["pass" if stage == 3 else "line"],
-            width=1,
-        )
-        text(x + 15, 579, label, 19, "muted", code=True)
-        text(
-            x + 343,
-            579,
-            outcome if stage == 3 else "pending",
-            19,
-            "pass" if stage == 3 else "muted",
-            code=True,
-            right=True,
-        )
+    line((60, 658, 1540, 658))
     notes = [
-        "01  Start with what was requested, the starting files, and every attempt.",
-        "02  Rebuild the job. A logged answer is evidence, not ground truth.",
-        "03  Package the instruction, environment, verifier, and answer oracle.",
-        "04  Local checks pass. Harbor execution is still needed for validated.",
+        "A log records the failure. bandr makes it repeatable.",
+        "Restore the starting data. Build a test for the right outcome.",
+        "Use the task to evaluate agents or run training rollouts.",
     ]
-    text(48, 645, notes[stage], 21, "muted")
+    text(60, 695, notes[stage], 29)
+    for step in range(3):
+        x = 1372 + step * 60
+        line((x, 708, x + 38, 708), "accent" if step == stage else "line", 4)
     return im
 
 
-def capture_example() -> tuple[list[str], dict[str, int]]:
+def capture_example(
+    example: Path | None = None, expected_count: int = 2
+) -> tuple[list[str], dict[str, int]]:
     """Run the shipped example; fail the build if the illustrated result stops being true."""
+    example = example or ROOT / "examples/mint"
     with tempfile.TemporaryDirectory(prefix="mint-readme-") as temporary:
         workspace = Path(temporary) / "workspace"
         environment = {**os.environ, "MINT_TELEMETRY_DISABLED": "1"}
@@ -179,11 +168,12 @@ def capture_example() -> tuple[list[str], dict[str, int]]:
                 check=True,
             ).stdout
 
-        run("init", str(ROOT / "examples/mint/logs"), str(workspace), "--allow-missing-runtime")
+        run("init", str(example / "logs"), str(workspace), "--allow-missing-runtime")
         for name in ("parse.py", "jobs.json", "source_notes.md"):
-            shutil.copy(ROOT / "examples/mint" / name, workspace / name)
+            shutil.copy(example / name, workspace / name)
         (workspace / "tasktypes").mkdir(exist_ok=True)
-        shutil.copy(ROOT / "examples/mint/tasktypes/sum.py", workspace / "tasktypes/sum.py")
+        for tasktype in (example / "tasktypes").glob("*.py"):
+            shutil.copy(tasktype, workspace / "tasktypes" / tasktype.name)
         run("run", "parse", cwd=workspace)
         run("run", "generate", cwd=workspace)
         output = run("validate", "--runner", "local", cwd=workspace)
@@ -191,7 +181,7 @@ def capture_example() -> tuple[list[str], dict[str, int]]:
         rows = [
             json.loads(line) for line in (workspace / "out/results.jsonl").read_text().splitlines()
         ]
-        assert len(rows) == 2
+        assert len(rows) == expected_count
         assert all(row["status"] == "generated" and row["gates"]["exec"] == "pass" for row in rows)
         excerpt = [
             line
@@ -217,7 +207,7 @@ def render_checks(theme: dict, mono: str, lines: list[str], counts: dict) -> Ima
             (x, y), value, font=ImageFont.truetype(mono, size), fill=theme[color], anchor="lt"
         )
 
-    text(62, 49, "ACTUAL CLI OUTPUT / BUNDLED EXAMPLE / EXCERPT", 18, "muted")
+    text(62, 49, "Local verifier checks", 18, "muted")
     text(62, 91, "$ mint validate --runner local", 26, "accent")
     for index, value in enumerate(lines):
         text(62, 146 + index * 36, value, 23, "ink")
@@ -237,11 +227,15 @@ def main():
     parser.add_argument("--mono-font")
     args = parser.parse_args()
     sans, mono = font_path(args.sans_font, False), font_path(args.mono_font, True)
-    records = [
-        json.loads(line)
-        for line in (ROOT / "examples/mint/logs/attempts.jsonl").read_text().splitlines()
-    ]
-    assert len(records) == 3 and len({r["instance"] for r in records}) == 2
+    hero_example = ROOT / "examples/mint/net-revenue"
+    record = json.loads((hero_example / "logs/attempts.jsonl").read_text())
+    entries = list(csv.DictReader(io.StringIO(record["starting_file"])))
+    record["_sale"] = sum(Decimal(row["amount"]) for row in entries if row["kind"] == "sale")
+    record["_refund"] = sum(Decimal(row["amount"]) for row in entries if row["kind"] == "refund")
+    record["_expected"] = record["_sale"] + record["_refund"]
+    assert Decimal(record["answer"]) == record["_sale"] + abs(record["_refund"])
+    assert record["_expected"] != Decimal(record["answer"])
+    capture_example(hero_example, expected_count=1)
     OUT.mkdir(parents=True, exist_ok=True)
     transcript, counts = capture_example()
     (OUT / "mint-checks.txt").write_text(
@@ -249,21 +243,21 @@ def main():
     )
     for name, theme in THEMES.items():
         frames = [
-            render(theme, stage, pulse, sans, mono, records)
-            for stage in range(4)
-            for pulse in range(4)
+            render(theme, stage, pulse, sans, mono, record)
+            for stage in range(3)
+            for pulse in range(6)
         ]
         frames[-1].save(OUT / f"mint-workflow-{name}.png", optimize=True)
         frames[0].save(
             OUT / f"mint-workflow-{name}.webp",
             save_all=True,
             append_images=frames[1:],
-            duration=[450] * 15 + [3600],
+            duration=[450] * 17 + [3600],
             loop=0,
             lossless=True,
             method=6,
         )
-        print(f"Rendered {name} workflow: 16 frames, illustrated synthetic example.")
+        print(f"Rendered {name} workflow: 18 source frames, net-revenue example.")
         render_checks(theme, mono, transcript, counts).save(
             OUT / f"mint-checks-{name}.png", optimize=True
         )

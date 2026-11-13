@@ -45,3 +45,14 @@ passes stay generated; no Harbor execution is implied. The renderer reruns the
 example, asserts those results, and emits static alternatives alongside the loop.
 A production-job recording can replace the synthetic example once a reproducible,
 shareable source and real runtime validation are available.
+
+## Opening revision
+
+The initial three-panel workflow explained internal steps before establishing
+why a reader should care. Replace it with one failed job becoming an eval:
+net revenue, a refund wrongly counted as income, and a verifier accepting 100
+while rejecting 140. Use larger text, two readable panels, and a single moving
+connection. Show the failure, restore the job, then reveal the outcome check.
+The name in the artwork is only bandr; remove presentation labels from the
+opening. Link directly to the runnable example and keep source/provenance notes
+in the asset documentation. The fixture and gate results are executable.
