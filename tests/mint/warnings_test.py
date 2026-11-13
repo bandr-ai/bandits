@@ -89,7 +89,7 @@ def test_missing_referenced_file_warns(env):
     assert not any("/app/ticket.txt" in w or "/app/answer" in w for w in r["warnings"])
 
 
-def test_giveaway_when_exact_answer_is_in_evidence(env):
+def test_lookup_answers_in_evidence_are_not_automatically_giveaways(env):
     env.build_pipeline()
     env.write(
         "tasktypes/addnums.py",
@@ -101,9 +101,9 @@ def test_giveaway_when_exact_answer_is_in_evidence(env):
     env.run("run", "generate")
     r = rows(env)["t_q1"]
     assert r["gates"]["leak"] == "pass" and r["status"] == "generated"
-    assert any(w.startswith("giveaway:") and "nums.txt" in w for w in r["warnings"])
+    assert not any(w.startswith("giveaway:") for w in r.get("warnings", []))
     env.run("report")
-    assert "giveaway x3" in (env.ws / "report.md").read_text()
+    assert "giveaway x3" not in (env.ws / "report.md").read_text()
 
 
 def test_short_hidden_value_in_instruction_is_a_warning(env):

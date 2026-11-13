@@ -1,0 +1,4 @@
+$ mint validate --runner local
+runner: local  levels: [1, 2]  jobs: 4
+level 1: 2 checked, 0 failed
+level 2 sum: passed (sampled 2, passed 2, failed 0, infra errors 0; attempts 0/3)

@@ -41,6 +41,9 @@ def seeded_sample(items: list, k: int, seed: int, salt: str) -> list:
 def refresh_evidence(ws: Workspace, row: dict) -> None:
     """Drop gate evidence if the package on disk no longer matches what was gated."""
     d = ws.tasks / row["type"] / row["task_id"]
+    if not d.is_dir() and row.get("withheld"):
+        finalize(row)  # preserve the failing secret gate until regeneration
+        return
     if not d.is_dir():  # deleted package: nothing it passed still counts
         row["gates"].update(structure="not_run", leak="not_run", secrets="not_run", exec="not_run")
         for k in ("runner", "trials", "exec_detail"):
@@ -61,11 +64,14 @@ def refresh_evidence(ws: Workspace, row: dict) -> None:
 def level1(ws: Workspace, row: dict) -> None:
     """Structure + leak for one task row (mutates row)."""
     d = ws.tasks / row["type"] / row["task_id"]
+    if not d.is_dir() and row.get("withheld"):
+        return
     if not d.is_dir():
         row["gates"]["structure"] = "fail"
         row["problems"] = ["task directory is missing; re-run `mint run generate`"]
         return
     scan.apply(row, scan.scan_task(d, _meta(ws, row["task_id"]), ws.config()))
+    scan.withhold_secrets(d, row)
 
 
 def _plan_task(
@@ -199,6 +205,14 @@ def failure_causes(rows_detail: list[tuple[str, dict]]) -> list[dict]:
                     "alternatives": "valid alternative answer was rejected (verifier too strict)",
                     "stability": "judge unstable: the same answer got different rewards across 3 runs",
                 }[gate]
+                if gate in ("wrong", "alternatives"):
+                    failed = [r for r in det[gate].get("runs", []) if r.get("gate") == "fail"]
+                    labels = [
+                        str(r.get("answer", r.get("script", "unknown outcome")))[:120]
+                        for r in failed
+                    ]
+                    if labels:
+                        msg += ": " + "; ".join(labels[:3])
                 items.append((msg, tid))
     return group_errors(items)
 

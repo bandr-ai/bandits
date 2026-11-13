@@ -5,6 +5,14 @@ description: Turn a folder of agent logs (any format) into Harbor tasks with hon
 
 # Mint
 
+## Setup
+
+Install distribution `bandr` (Python 3.11+) if `mint --version`/`mint --help` fails:
+`uv tool install bandr` or `pipx install bandr`; verify, stop and report errors.
+Harbor and Docker are needed for `validated`; local passes stay `generated`.
+Credential-blocked packages are removed from `out/tasks`: fix and regenerate.
+Raw/parsed logs remain sensitive; see `mint docs --topic validation`.
+
 You read samples, write code, and the code processes every record. No step needs an
 LLM pass over every record. Your effort should track how varied the corpus is, not how big.
 Nothing assumes a source, domain, modality or objective.
@@ -15,7 +23,7 @@ Every command ends with a `next:` hint. After any interruption, run `mint status
 
 ## Telemetry
 
-mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, report, and task try: version, OS, command, duration, and outcome. No paths, prompts, task ids, queries, or log contents.
+mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, report, and task try: version, OS, command, duration, outcome, flags, and bucketed counts. No paths, prompts, task ids, queries, answers, or log contents.
 Turn it off with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state.
 
 ## Hard rules (the only fixed ones)

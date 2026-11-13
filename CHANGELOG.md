@@ -1,11 +1,19 @@
 # Changelog
 
-All notable changes to `bandits-cli` are listed here. The format follows
+All notable changes to `bandr` (previously `bandits-cli`) are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may
 change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-11-13
+
+- Publish the distribution as `bandr`; the command remains `mint`. Align
+  package versions at 0.3.0 and add `mint skill install` for Claude Code.
+- Count validation-blocked tasks and recorded exclusions consistently in reports.
+  Withhold credential-blocked packages from task exports and identify failed
+  wrong-answer outcomes in diagnostics.
 
 - Mint: package hash sorts outcome keys, so regenerating an unchanged task keeps
   its validation.
@@ -18,7 +26,7 @@ change the command line or the artifact format; such changes are called out.
   where they matter.
 - Rename the logs-to-tasks tool from `l2h` to **Mint**: command/import `mint`,
   bundled skill `mint`, workspace `mint.json`, `MINT_*` environment variables,
-  and Mint task/trajectory metadata. It remains part of `bandits-cli`.
+  and Mint task/trajectory metadata. It ships in `bandr`.
   Existing experimental workspaces and parser scripts must be regenerated or
   migrated to these names; the old command/import are removed.
 - `mint` verifier honesty: `BuildResult.verifier_timeout_sec` (own `[verifier]`
@@ -101,7 +109,7 @@ change the command line or the artifact format; such changes are called out.
   and `mint judge-calibrate` records judge-vs-deterministic agreement per type. Skill: verifier
   comes from what success means for the job, never from the logged agent's final output.
 
-## [0.3.0] - unreleased
+### Ingest cleanup
 
 `bandits` is now ingest only. Everything else was removed, to be rebuilt from
 scratch on top of ingest.
@@ -136,13 +144,13 @@ scratch on top of ingest.
 - `recipes/` is left as it was and is no longer tested in CI. It imports
   modules removed here.
 
-## [0.2.0] - unreleased
+## [0.2.0] - unpublished
 
-The first release on PyPI.
+Historical release preparation; this version was not published to PyPI.
 
 ### Install
 
-- Published as `bandits-cli` (the PyPI name `bandits` belongs to another
+- Prepared as `bandits-cli` (the PyPI name `bandits` belongs to another
   project). The command and the import are still `bandits`:
   `pipx install bandits-cli`.
 - Extras: `llm` (model calls through LiteLLM), `audit` (RLM mining, check
@@ -167,5 +175,6 @@ The first release on PyPI.
   instead of shortened ones they did not. The `derivation` column appears only
   when a corpus has one, so the table fits an 80-column terminal.
 
-[Unreleased]: https://github.com/bandr-ai/bandits/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bandr-ai/bandits/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bandr-ai/bandits/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bandr-ai/bandits/releases/tag/v0.2.0
