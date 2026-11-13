@@ -1,0 +1,8 @@
+{
+  "answer": "100",
+  "reward": 1.0,
+  "wrong": "140",
+  "wrong_reward": 0.0,
+  "runner": "local",
+  "model_attempt": "schematic; no live model run"
+}

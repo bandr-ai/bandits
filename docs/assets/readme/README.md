@@ -1,20 +1,31 @@
 # README artwork
 
-The opening shows the jobs captured in agent logs becoming Harbor task packages.
-It follows the source request and starting file from the bundled
-[net-revenue example](../../../examples/mint/net-revenue) into the real files
-written by `mint.harbor.materialize`: instruction, environment, verifier, optional
-oracle, and runtime/provenance configuration.
+The opening follows four stages:
 
-The visual uses black/white typography, a restrained blue accent, and an open
-layout. File rows fade and slide into place with eased transitions at **25 fps**.
-It holds the completed package for reading, then crossfades back to the opening.
-There are no low-frame-rate stepped position jumps.
+1. **Traces → Harbor task:** the actual package-writing contract.
+2. **Model attempt:** an agent reads the instruction, uses the environment, and submits output.
+3. **Verifier grade:** the task verifier checks the output and produces a reward.
+4. **New traces:** the attempt's `agent/trajectory.json` and `result.json` can be used in a later conversion.
+
+The first stage uses the package produced from the
+[net-revenue example](../../../examples/mint/net-revenue). The renderer asserts
+the displayed paths exist. Numeric rewards are read from that example's actual
+local gate results and saved in `mint-loop-evidence.json`. The model-attempt
+segment is schematic: no live model solve is performed or claimed by the renderer.
+The measured reward is from the local reference/wrong-answer gates.
+
+The return path means new run traces can feed another conversion. It does not
+mean Mint automatically starts a training job or changes model weights. Harbor
+executes the downstream agent; Mint constructs and checks the task package.
+
+The loop preserves the monochrome typography and blue accent. Movement and
+crossfades use 25 fps timing, with reading holds. GIFs share one palette to avoid
+color flicker. Static and reduced-motion versions retain the conversion scene
+and show all four stages in the navigation rail.
 
 This is a designed animation of the included synthetic fixture, not a recording
-of conversion speed or a model solve. The renderer actually builds the example,
-asserts that the displayed output files exist, and checks the local verifier
-gates. Local passes remain generated; no Harbor execution is implied.
+of conversion speed. Local verifier passes remain generated; no real Harbor run
+or live-model result is implied by the numeric example.
 
 The CLI panel is an excerpt captured by actually running the supplied parser,
 generator, local validation, and report in a temporary workspace. Its text is

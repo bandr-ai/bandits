@@ -60,3 +60,13 @@ blue accent. Keep only bandr as the brand. Reveal the Harbor package with smooth
 actual GIFs, lossless WebPs, and static/reduced-motion alternatives. Verify the
 example and the displayed package paths while rendering. No model-solve,
 conversion-speed, or Harbor-validation claim is made by the animation.
+
+## Downstream execution loop
+
+Keep the approved conversion composition, then continue with a model/agent
+attempt inside Harbor, a verifier reward, and the resulting run traces returning
+to the next conversion. Each stage gets its own readable scene instead of
+squeezing four panels into the README width. The verifier values are sourced
+from the runnable fixture's local gate evidence. The model segment is schematic.
+The loop links artifacts and executions; it does not imply automatic model
+training, automatic launches by Mint, or an observed model-improvement metric.

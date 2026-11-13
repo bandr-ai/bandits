@@ -17,7 +17,7 @@ Rebuild the jobs in your traces as runnable tasks for evaluation and training.
   <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.png">
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/readme/mint-workflow-light.png">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.gif">
-  <img src="docs/assets/readme/mint-workflow-light.gif" alt="bandr converts jobs captured in agent logs into Harbor task packages. The source request and starting data become instruction.md and environment/, alongside tests/test.sh, an optional solution/solve.sh, and task.toml." width="100%">
+  <img src="docs/assets/readme/mint-workflow-light.gif" alt="bandr converts traces into a Harbor task. A model attempts the task in its environment, the task verifier grades the output, and the new trajectory and result can feed the next conversion." width="100%">
 </picture>
 
 <p align="center"><sub><a href="docs/assets/readme/mint-workflow-light.gif">Open GIF</a> &nbsp;·&nbsp; <a href="examples/mint/net-revenue">Run the example</a> &nbsp;·&nbsp; <a href="docs/assets/readme/mint-workflow-light.png">Still image</a></sub></p>
@@ -32,6 +32,12 @@ writes source-specific parsers and generators; Mint runs them over the corpus,
 writes the packages, checks them, and records their provenance and gaps.
 Successful, failed, and partial runs can all contribute. Repeat attempts at the
 same instance become one task with their evidence kept together.
+
+**Traces → Harbor task → model attempt → verifier grade → new traces.**
+Harbor can run an agent on the packaged task and grade its output using the task's
+verifier. The resulting trajectory and result can become input for another
+conversion. Use the tasks for evaluation or as environments in a training
+workflow.
 
 ## Quickstart
 
