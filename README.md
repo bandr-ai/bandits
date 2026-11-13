@@ -50,7 +50,7 @@ pip install bandr
 mint skill install
 ```
 
-<sub>First release pending: until Bandr is published on PyPI, install this checkout with <code>pip install .</code>. Python 3.11+.</sub>
+<sub>Python 3.11+. For Mint alone, with no dependencies, install <code>bandr-mint</code> instead; use one or the other, not both.</sub>
 
 Start a new Claude Code session and ask:
 

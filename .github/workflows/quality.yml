@@ -27,3 +27,6 @@ jobs:
       - run: uv build
       - run: uvx twine check --strict dist/*
       - run: scripts/smoke_wheel.sh dist/*.whl
+      - run: uv build recipes/mint --out-dir dist-mint
+      - run: uvx twine check --strict dist-mint/*
+      - run: scripts/smoke_mint_wheel.sh dist-mint/*.whl

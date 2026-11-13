@@ -1,5 +1,10 @@
 # Standalone Mint
 
+```bash
+pip install bandr-mint
+mint skill install
+```
+
 Mint turns agent logs into Harbor tasks with a coding agent. This distribution contains only
 `mint`, its CLI, workflow and content gates, so hosted integrations can use it alongside an older
 Bandits ingestion library. It has no runtime dependencies.

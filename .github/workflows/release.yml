@@ -1,7 +1,8 @@
 name: release
 
-# Push a tag like v0.3.0 to publish that version to PyPI and create the GitHub
-# release. Publishing uses PyPI trusted publishing, so no token is stored here.
+# Push a tag like v0.3.1 to publish that version of both distributions to PyPI
+# (`bandr`, and the Mint-only `bandr-mint` built from recipes/mint) and create
+# the GitHub release. Publishing uses PyPI trusted publishing, so no token is stored here.
 # See docs/releasing.md.
 
 on:
@@ -52,10 +53,18 @@ jobs:
       - run: uvx twine check --strict dist/*
       - run: scripts/smoke_wheel.sh dist/*.whl
 
+      - run: uv build recipes/mint --out-dir dist-mint
+      - run: uvx twine check --strict dist-mint/*
+      - run: scripts/smoke_mint_wheel.sh dist-mint/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-mint
+          path: dist-mint/
 
   publish:
     needs: build
@@ -70,7 +79,22 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-mint
+          path: dist-mint/
+      # Each PyPI project needs its own trusted publisher for this workflow and
+      # environment. skip-existing lets a re-run finish a half-done publish.
+      - name: Publish bandr
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+      - name: Publish bandr-mint
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-mint/
+          skip-existing: true
 
   github-release:
     needs: publish
@@ -85,6 +109,10 @@ jobs:
         with:
           name: dist
           path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-mint
+          path: dist-mint/
       - name: Create the GitHub release from the changelog section
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,7 +124,7 @@ jobs:
             on && /^\[.*\]: / { exit }
             on { print }
           ' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" dist/* dist-mint/* \
             --title "bandr $version" \
             --notes-file notes.md \
             --verify-tag
