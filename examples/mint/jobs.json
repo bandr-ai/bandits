@@ -1,0 +1,1 @@
+{"jobs":[{"id":"sum","description":"Sum all integers in the supplied numbers file and write the answer file.","where":"Every synthetic attempt in attempts.jsonl","repeats":"The instance field identifies repeat attempts at the same starting file.","outcome":"Recompute the sum; the logged answer is evidence of an attempt, not ground truth."}]}

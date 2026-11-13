@@ -1,0 +1,3 @@
+{"id":"sum-a-1","instance":"sum-a","request":"Sum the integers in /app/numbers.txt and write the result to /app/answer/answer.txt.","numbers":"17\n25\n","answer":"41","ended":"done"}
+{"id":"sum-a-2","instance":"sum-a","request":"Sum the integers in /app/numbers.txt and write the result to /app/answer/answer.txt.","numbers":"17\n25\n","answer":"42","ended":"done"}
+{"id":"sum-b-1","instance":"sum-b","request":"Sum the integers in /app/numbers.txt and write the result to /app/answer/answer.txt.","numbers":"3\n4\n","answer":"8","ended":"done"}

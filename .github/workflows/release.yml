@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag like v0.2.0 to publish that version to PyPI and create the GitHub
+# Push a tag like v0.3.0 to publish that version to PyPI and create the GitHub
 # release. Publishing uses PyPI trusted publishing, so no token is stored here.
 # See docs/releasing.md.
 
@@ -33,8 +33,19 @@ jobs:
             exit 1
           fi
 
-      - run: uv sync --extra dev --extra emulate
-      - run: uv run ruff check .
+      - run: uv sync --extra dev
+      - name: Distribution versions agree
+        run: |
+          uv run python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          import bandits
+          import mint
+          recipe = tomllib.loads(Path("recipes/mint/pyproject.toml").read_text())
+          assert bandits.__version__ == mint.__version__ == recipe["project"]["version"]
+          PY
+      - run: uv run ruff check bandits mint tests examples/mint
+      - run: uv run ruff format --check bandits mint tests examples/mint
       - run: uv run pytest
 
       - run: uv build
@@ -51,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/bandits-cli/
+      url: https://pypi.org/project/bandr/
     permissions:
       id-token: write
     steps:
@@ -86,6 +97,6 @@ jobs:
             on { print }
           ' CHANGELOG.md > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "bandits-cli $version" \
+            --title "bandr $version" \
             --notes-file notes.md \
             --verify-tag

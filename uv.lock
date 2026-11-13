@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "bandits-cli"
+name = "bandr"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },

@@ -1,9 +1,8 @@
 [project]
-# The import package and the command are both `bandits`; the PyPI name
-# `bandits` belongs to an unrelated project.
-name = "bandits-cli"
+# Bandr is the distribution; the command and conversion import are mint.
+name = "bandr"
 dynamic = ["version", "readme"]
-description = "Read agent traces from any format into one trace model."
+description = "Turn agent traces into runnable Harbor tasks with verifiers."
 requires-python = ">=3.11"
 authors = [{ name = "Bandr" }]
 keywords = ["agents", "traces", "llm", "opentelemetry", "ingest"]
@@ -50,7 +49,7 @@ path = "bandits/__init__.py"
 packages = ["bandits", "mint"]
 
 [tool.hatch.build.targets.sdist]
-include = ["bandits", "mint", "docs/plans", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
+include = ["bandits", "mint", "docs/plans", "examples/mint", "tests", "README.md", "CHANGELOG.md", "pyproject.toml"]
 
 # PyPI renders the README away from the repo, so relative links and images
 # would break there. Point them at GitHub in the published copy only.

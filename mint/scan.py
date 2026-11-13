@@ -4,6 +4,7 @@ plus non-blocking warnings (giveaways, missing alternatives, dangling /app paths
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def warnings_for(task_dir: Path, spec: dict, meta: dict, min_len: int = 12) -> l
                 continue  # the file lists/defines the label vocabulary
             if is_instr and leak.listed_everywhere(text, nv):
                 continue  # offered as one option of several ("yes or no")
-            if _whole_token(v, text):
+            if is_instr and _whole_token(v, text):
                 out.append(f"giveaway: expected answer {leak.short(v)} appears verbatim in {rel}")
         if is_instr:
             # a short hidden value only fails the leak gate in labelled context; any bare
@@ -136,7 +137,7 @@ def apply(row: dict, res: Level1) -> None:
     probs = (
         res.structure
         + [f"leak: {x.kind} in {x.where}: {x.detail}" for x in res.leaks]
-        + [f"secret: {x.kind} in {x.where}: {x.detail}" for x in res.secrets]
+        + [f"secret scan: {x.kind} in {x.where}: {x.detail}" for x in res.secrets]
     )
     if probs:
         row["problems"] = probs
@@ -146,3 +147,31 @@ def apply(row: dict, res: Level1) -> None:
         row["warnings"] = res.warnings
     else:
         row.pop("warnings", None)
+
+
+def withhold_secrets(task_dir: Path, row: dict) -> None:
+    """Do not leave credential-blocked packages in the export directory.
+
+    Keep the redacted gate findings and provenance; fixing the generator and
+    regenerating is the only way to restore a removed package.
+    """
+    if row["gates"].get("secrets") == "fail":
+        shutil.rmtree(task_dir)
+        row["withheld"] = "secret scan failed; package removed from out/tasks; fix and regenerate"
+
+        # Derived messages can quote instruction fragments (e.g. a missing-file
+        # warning). Do not re-export the detected credential through diagnostics.
+        def scrub(value):
+            if isinstance(value, str):
+                return "[redacted: credential-like text]" if secrets.scan_text(value) else value
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        cleaned = scrub(row)
+        row.clear()
+        row.update(cleaned)
+    else:
+        row.pop("withheld", None)
