@@ -1145,6 +1145,8 @@ def main(argv: list[str] | None = None) -> int:
     parsed = None
     result: Result | None = None
     ws: Workspace | None = None
+    phase = "workspace"
+    error_type: str | None = None
     try:
         args = build_parser().parse_args(argv)
         parsed = args
@@ -1168,13 +1170,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             ws = find_workspace(getattr(args, "workspace", None))
+        phase = "execute"
         res = args.fn(args, ws)
         result = res
         exit_class = _exit_class_from_result(res)
+        if exit_class != "ok":
+            error_type = "operation"
+        phase = "render"
         print(render(command, res, as_json))
+        # A returned failure belongs to execution, after rendering succeeds.
+        phase = "execute"
         return res.exit
     except MINTError as e:
         exit_class = _exit_class_from_error(e)
+        error_type = "usage" if exit_class == "usage" else "operation"
         if as_json:
             print(render_error(command, e, True))
             print(f"error: {e.message}\nfix: {e.fix}", file=sys.stderr)
@@ -1183,6 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
         return e.code
     except ContractError as e:
         exit_class = "contract"
+        error_type = "contract"
         err = MINTError(str(e), "fix the agent-written code (see `mint schema`)")
         print(
             render_error(command, err, as_json) if as_json else render_error(command, err, False),
@@ -1191,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
     except KeyboardInterrupt:
         exit_class = "interrupted"
+        error_type = "interrupted"
         print(
             "interrupted; nothing is left half-written (writes are atomic). Re-run to resume: `mint status`",
             file=sys.stderr,
@@ -1201,11 +1212,15 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         if milestone:
             exit_class = "error"
+            error_type = "internal"
         raise
     finally:
         if milestone and exit_class:
             try:
-                extra = telemetry.extra_for(milestone, parsed, result, ws)
+                extra = telemetry.extra_for(milestone, parsed, result)
+                if exit_class != "ok":
+                    extra["failure_phase"] = phase
+                    extra["error_type"] = error_type
             except Exception:
                 extra = {}
             telemetry.emit(

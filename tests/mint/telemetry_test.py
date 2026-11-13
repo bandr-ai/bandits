@@ -14,8 +14,11 @@ from mint.models import ContractError
 from mint.output import Result
 from mint.telemetry import NOTICE, bucket
 
+REAL_POST = telemetry.post
 KEY = "phc_test_key_not_real"
 COMMON = {
+    "schema_version",
+    "dry_run",
     "mint_version",
     "python_version",
     "os",
@@ -163,14 +166,15 @@ def test_notice_once_on_a_tty_and_report_when_piped(env, sent, monkeypatch):
     assert NOTICE not in env.run("report")[2]
 
 
-def test_host_override_and_failed_post_keeps_exit_code(env, monkeypatch):
+def test_host_override_and_failed_post_keeps_exit_code(env, monkeypatch, sent):
     _open(monkeypatch)
     monkeypatch.setenv("MINT_POSTHOG_API_KEY", KEY)
     monkeypatch.setenv("MINT_POSTHOG_HOST", "https://example.test/")
 
+    attempts = []
+
     def explode(url, body, timeout):
-        assert url == "https://example.test/i/v0/e/"
-        assert timeout == 0.2
+        attempts.append((url, timeout))
         raise OSError("offline")
 
     monkeypatch.setattr("mint.telemetry.post", explode)
@@ -182,6 +186,7 @@ def test_host_override_and_failed_post_keeps_exit_code(env, monkeypatch):
     assert json.loads(out)["command"] == "init"
     assert NOTICE in err
     assert "anonymous usage" not in out
+    assert attempts == [("https://example.test/i/v0/e/", 0.2)]
 
 
 def test_persisted_off_and_corrupt_config(env, sent, monkeypatch):
@@ -278,7 +283,7 @@ def test_decide_and_task_try_drop_text(env, sent, monkeypatch):
     blob = json.dumps(sent[0][1])
     assert "SECRETWHY" not in blob
     assert sent[0][1]["properties"]["command"] == "decide"
-    assert set(sent[0][1]["properties"]) == COMMON
+    assert set(sent[0][1]["properties"]) == COMMON | {"kind"}
     sent.clear()
     env.run("task", "try", "t_q1", "--answer", "SECRETANSWER")
     blob = json.dumps(sent[-1][1])
@@ -290,15 +295,27 @@ def test_decide_and_task_try_drop_text(env, sent, monkeypatch):
 def test_validate_buckets_and_exit_class(env, sent, monkeypatch):
     _open(monkeypatch)
     env.init()
-    rows = [{"status": "validated", "task_id": "SECRET_TASK"}]
-    rows += [{"status": "blocked", "task_id": f"b{i}"} for i in range(10)]
-    rows += [{"status": "exec_failed", "task_id": f"e{i}"} for i in range(1000)]
-    rows += [{"status": "judged", "task_id": "j"}]
-    env.write("out/results.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
 
     def fake(a, ws):
         return Result(
-            {"runner": "local", "levels": [2, 1], "jobs": 4, "task_id": "SECRET_TASK"},
+            {
+                "runner": "local",
+                "levels": [2, 1],
+                "jobs": 4,
+                "task_id": "SECRET_TASK",
+                "level1": {"checked": 1, "failed": 0},
+                "types": {
+                    "SECRET_TYPE": {
+                        "sampled": ["SECRET_TASK"],
+                        "passed": [],
+                        "failed": ["SECRET_TASK"],
+                        "infra_error": [],
+                        "resumed": [],
+                    }
+                },
+                "any_failure": True,
+                "any_infra_error": False,
+            },
             "failed",
             exit=1,
         )
@@ -312,10 +329,15 @@ def test_validate_buckets_and_exit_class(env, sent, monkeypatch):
     assert props["judge"] is True
     assert props["runner"] == "local"
     assert props["levels"] == "1,2"
-    assert props["validated"] == "1"
-    assert props["generated"] == "0"
-    assert props["blocked"] == "10-99"
-    assert props["exec_failed"] == "1000+"
+    assert props["sampled"] == "1"
+    assert props["passed"] == "0"
+    assert props["failed"] == "1"
+    assert props["infra_error"] == "0"
+    assert props["level1_checked"] == "1"
+    assert props["any_failure"] is True
+    assert props["failure_phase"] == "execute"
+    assert props["error_type"] == "operation"
+    assert "validated" not in props
     blob = json.dumps(sent[-1][1])
     assert "SECRET_TASK" not in blob
     assert "judged" not in props
@@ -388,3 +410,152 @@ def test_skill_carries_the_notice():
     skill = Path(cli.__file__).parent.joinpath("SKILL.md").read_text()
     assert NOTICE in skill
     assert "| Telemetry |" in skill
+
+
+def test_real_stage_summaries_expose_partial_failures(env, sent, monkeypatch):
+    _open(monkeypatch)
+    env.build_pipeline()
+    # The fixture includes a deliberately crashing check. CLI success does not
+    # mean every check ran successfully.
+    props = sent[-1][1]["properties"]
+    assert props["stage"] == "checks" and props["exit"] == "ok"
+    assert props["outputs"] != "0" and props["errors"] != "0"
+    assert env.run("run", "generate")[0] == 0
+    props = sent[-1][1]["properties"]
+    assert props["stage"] == "generate" and props["exit"] == "ok"
+    assert props["outputs"] != "0" and props["queued"] != "0"
+    assert "generator bug" not in json.dumps(sent)
+    assert "check bug" not in json.dumps(sent)
+
+
+def test_scoped_validation_dry_run_uses_current_summary(env, sent, monkeypatch, local_runner):
+    _open(monkeypatch)
+    env.build_pipeline()
+    env.run("run", "generate")
+    before = (env.ws / "out/results.jsonl").read_bytes()
+    code, _, _, _ = env.run(
+        "validate", "--runner", "local", "--task", "t_q1", "--level", "1", "--dry-run"
+    )
+    assert code == 0
+    props = sent[-1][1]["properties"]
+    assert props["dry_run"] is True
+    assert props["requested_runner"] == props["runner"] == "local"
+    assert props["level1_checked"] == "1"
+    assert "sampled" not in props  # Level 2 did not run.
+    assert (env.ws / "out/results.jsonl").read_bytes() == before
+    assert "t_q1" not in json.dumps(sent[-1][1])
+
+
+def test_task_try_verifier_fail_is_separate_from_command_success(env, sent, monkeypatch):
+    _open(monkeypatch)
+    env.build_pipeline()
+    env.run("run", "generate")
+    assert env.run("task", "try", "t_q1", "--answer", "99999")[0] == 0
+    props = sent[-1][1]["properties"]
+    assert props["exit"] == "ok" and props["verifier_outcome"] == "fail"
+    assert "99999" not in json.dumps(props)
+
+
+def test_early_failure_keeps_requested_validation_context(env, sent, monkeypatch):
+    _open(monkeypatch)
+    env.init()
+    assert env.run("validate", "--runner", "local", "--level", "3,1")[0] == 1
+    props = sent[-1][1]["properties"]
+    assert props["levels"] == "1,3" and props["requested_runner"] == "local"
+    assert props["failure_phase"] == "execute" and props["error_type"] == "operation"
+    assert "runner" not in props and "level1_checked" not in props
+
+
+def test_bad_extra_values_cannot_leak_text_or_drop_valid_fields(sent, monkeypatch):
+    _open(monkeypatch)
+    telemetry.emit(
+        "validate",
+        "error",
+        1,
+        {
+            "dry_run": True,
+            "levels": "SECRET",
+            "passed": "SECRET",
+            "runner": ["SECRET"],
+            "requested_runner": "auto",
+            "sampled": "2-9",
+            "error_type": "SECRET",
+            "task_id": "SECRET",
+            "failure_phase": "execute",
+        },
+    )
+    props = sent[-1][1]["properties"]
+    assert "SECRET" not in json.dumps(props)
+    assert props["dry_run"] is True and props["sampled"] == "2-9"
+    assert props["requested_runner"] == "auto"
+    assert props["failure_phase"] == "execute"
+
+
+def test_real_transport_posts_json_to_loopback_only(monkeypatch):
+    # Exercise urllib, not the capture stub, without sending production events.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(
+                (
+                    self.path,
+                    self.headers.get_content_type(),
+                    json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
+                )
+            )
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status": 1}')
+
+        def log_message(self, *_args):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.timeout = 2
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        try:
+            REAL_POST(
+                f"http://127.0.0.1:{server.server_port}/i/v0/e/",
+                json.dumps({"event": "command_finished"}).encode(),
+                2,
+            )
+        finally:
+            thread.join(timeout=3)
+    assert received == [("/i/v0/e/", "application/json", {"event": "command_finished"})]
+
+
+@pytest.mark.parametrize("levels", [None, "1,2", 2])
+def test_malformed_summary_levels_preserve_safe_context(env, sent, monkeypatch, levels):
+    _open(monkeypatch)
+    env.init()
+    monkeypatch.setattr(
+        cli, "cmd_validate", lambda *_a: Result({"levels": levels, "types": {}}, "failed", exit=1)
+    )
+    assert env.run("validate", "--runner", "local", "--judge", "--dry-run")[0] == 1
+    props = sent[-1][1]["properties"]
+    assert props["judge"] is True and props["dry_run"] is True
+    assert props["requested_runner"] == "local"
+    assert props["failure_phase"] == "execute" and props["error_type"] == "operation"
+    assert "sampled" not in props
+
+
+def test_render_operation_error_has_render_phase(env, sent, monkeypatch):
+    from mint.output import MINTError
+
+    _open(monkeypatch)
+    env.init()
+
+    def fail_render(*_args):
+        raise MINTError("SECRET rendering error", "retry")
+
+    monkeypatch.setattr(cli, "render", fail_render)
+    assert env.run("report")[0] == 1
+    props = sent[-1][1]["properties"]
+    assert props["failure_phase"] == "render"
+    assert props["error_type"] == "operation"
+    assert "SECRET" not in json.dumps(props)

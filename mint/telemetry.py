@@ -37,8 +37,8 @@ MILESTONES = frozenset(
 
 NOTICE = (
     "mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, "
-    "report, and task try: version, OS, command, duration, and outcome. No paths, prompts, "
-    "task ids, queries, or log contents.\n"
+    "report, and task try: version, OS, command, duration, outcome, flags, and bucketed counts. "
+    "No paths, prompts, task ids, queries, answers, or log contents.\n"
     "Turn it off with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when "
     "CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state."
 )
@@ -49,7 +49,60 @@ _TIMEOUT = 0.2
 _EMBEDDED_KEY = "phc_CvhAGavirL5hbBfgmGzacMUV7v8w4gHpi749P7KJ4XnG"
 _RUN_STAGES = frozenset({"parse", "checks", "generate"})
 _RUNNERS = frozenset({"local", "harbor"})
-_COUNT_KEYS = ("validated", "generated", "blocked", "exec_failed")
+_BUCKETS = frozenset({"0", "1", "2-9", "10-99", "100-999", "1000+"})
+_LEVELS = frozenset({"1", "2", "3", "1,2", "1,3", "2,3", "1,2,3"})
+# All names and string values are static; no user-defined names enter the payload.
+_ENUM_FIELDS = {
+    "stage": _RUN_STAGES,
+    "runner": _RUNNERS,
+    "requested_runner": _RUNNERS | {"auto"},
+    "levels": _LEVELS,
+    "kind": frozenset(
+        {
+            "parser",
+            "jobs",
+            "check",
+            "tasktype",
+            "note",
+            "spot_check",
+            "derivability",
+            "audit",
+            "exclusion",
+        }
+    ),
+    "verdict": frozenset({"pass", "fail"}),
+    "verifier_outcome": frozenset({"pass", "fail"}),
+    "failure_phase": frozenset({"workspace", "execute", "render"}),
+    "error_type": frozenset({"usage", "contract", "interrupted", "operation", "internal"}),
+}
+_BOOL_FIELDS = frozenset(
+    {
+        "dry_run",
+        "docker_present",
+        "harbor_present",
+        "allow_missing_runtime",
+        "judge",
+        "limited",
+        "cached",
+        "any_failure",
+        "any_infra_error",
+    }
+)
+_COUNT_FIELDS = frozenset(
+    {
+        "outputs",
+        "errors",
+        "queued",
+        "blocked",
+        "level1_checked",
+        "level1_failed",
+        "sampled",
+        "passed",
+        "failed",
+        "infra_error",
+        "resumed",
+    }
+)
 _FALSE_CI = frozenset({"", "0", "false", "no"})
 
 
@@ -192,47 +245,90 @@ def set_enabled(enabled: bool) -> None:
     _write(path, {"anonymous_id": anon, "enabled": enabled, "notice_shown": notice})
 
 
-def extra_for(command: str, args: Any, result: Any, ws: Any) -> dict[str, Any]:
-    """Allow-listed properties only. Never copies ``Result.data``."""
+def _levels(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        normalized = ",".join(str(n) for n in sorted({int(x) for x in value.split(",")}))
+    except ValueError:
+        return None
+    return normalized if normalized in _LEVELS else None
+
+
+def extra_for(command: str, args: Any, result: Any) -> dict[str, Any]:
+    """Aggregate the invocation's summary, never the workspace's saved results.
+
+    Unknown/malformed summary fields are omitted rather than reported as zero.
+    """
     if args is None:
         return {}
+    extra: dict[str, Any] = {"dry_run": bool(getattr(args, "dry_run", False))}
+    data = getattr(result, "data", None)
+    data = data if isinstance(data, dict) else {}
+
+    def count(key: str, value: Any) -> None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            extra[key] = bucket(value)
+
     if command == "init":
-        return {
-            "docker_present": bool(shutil.which("docker")),
-            "harbor_present": bool(shutil.which("harbor")),
-            "allow_missing_runtime": bool(getattr(args, "allow_missing_runtime", False)),
-            "dry_run": bool(getattr(args, "dry_run", False)),
-        }
-    if command == "run":
+        extra.update(
+            docker_present=bool(shutil.which("docker")),
+            harbor_present=bool(shutil.which("harbor")),
+            allow_missing_runtime=bool(getattr(args, "allow_missing_runtime", False)),
+        )
+    elif command in ("new", "decide"):
+        extra["kind"] = getattr(args, "kind", None)
+        if command == "decide":
+            extra["verdict"] = getattr(args, "verdict", None)
+    elif command == "run":
         stage = getattr(args, "stage", None)
-        return {"stage": stage} if stage in _RUN_STAGES else {}
-    if command == "validate":
-        extra: dict[str, Any] = {"judge": bool(getattr(args, "judge", False))}
-        if result is None:
-            return extra
-        data = getattr(result, "data", None)
-        if isinstance(data, dict):
-            runner = data.get("runner")
-            if runner in _RUNNERS:
-                extra["runner"] = runner
-            levels = data.get("levels")
-            if isinstance(levels, list) and levels:
-                try:
-                    nums = sorted(int(x) for x in levels)
-                except (TypeError, ValueError):
-                    nums = []
-                if nums:
-                    extra["levels"] = ",".join(str(n) for n in nums)
-        if ws is not None:
-            counts = {key: 0 for key in _COUNT_KEYS}
-            for row in ws.result_rows():
-                status = row.get("status")
-                if status in counts:
-                    counts[status] += 1
-            for key, n in counts.items():
-                extra[key] = bucket(n)
-        return extra
-    return {}
+        extra["stage"] = stage
+        extra["limited"] = getattr(args, "limit", None) is not None or bool(
+            stage == "generate" and getattr(args, "type", None)
+        )
+        if isinstance(data.get("cached"), bool):
+            extra["cached"] = data["cached"]
+        if stage == "parse":
+            count("outputs", data.get("trajectories"))
+            count("errors", data.get("parse_errors"))
+        elif stage == "checks":
+            count("outputs", data.get("findings"))
+            groups = data.get("error_groups")
+            if isinstance(groups, list) and all(
+                isinstance(g, dict) and type(g.get("count")) is int and g["count"] >= 0
+                for g in groups
+            ):
+                count("errors", sum(g["count"] for g in groups))
+        elif stage == "generate":
+            count("outputs", data.get("tasks"))
+            count("queued", data.get("queued"))
+            statuses = data.get("by_status")
+            if isinstance(statuses, dict):
+                count("blocked", statuses.get("blocked", 0))
+    elif command == "validate":
+        extra["judge"] = bool(getattr(args, "judge", False))
+        extra["requested_runner"] = getattr(args, "runner", None)
+        extra["levels"] = _levels(getattr(args, "level", None))
+        extra["runner"] = data.get("runner")
+        for key in ("any_failure", "any_infra_error"):
+            extra[key] = data.get(key)
+        level1 = data.get("level1")
+        if isinstance(level1, dict):
+            count("level1_checked", level1.get("checked"))
+            count("level1_failed", level1.get("failed"))
+        types = data.get("types")
+        # Empty types for level 1/3 does not mean level 2 processed zero tasks.
+        levels = data.get("levels")
+        if isinstance(types, dict) and isinstance(levels, list) and 2 in levels:
+            for key in ("sampled", "passed", "failed", "infra_error", "resumed"):
+                values = [v.get(key, []) for v in types.values() if isinstance(v, dict)]
+                if len(values) == len(types) and all(isinstance(v, list) for v in values):
+                    count(key, sum(len(v) for v in values))
+    elif command == "task try" and data.get("state") == "ok":
+        reward = data.get("reward")
+        if type(reward) in (int, float) and 0 <= reward <= 1:
+            extra["verifier_outcome"] = "pass" if reward >= 1 else "fail"
+    return extra
 
 
 def origin() -> str:
@@ -265,26 +361,38 @@ def _properties(command: str, exit_class: str, duration_ms: int, extra: dict[str
         "$process_person_profile": False,
         "$geoip_disable": True,
     }
+    props["schema_version"] = 2
     allowed = {
-        "init": ("docker_present", "harbor_present", "allow_missing_runtime", "dry_run"),
-        "run": ("stage",),
-        "validate": ("judge", "runner", "levels", *_COUNT_KEYS),
+        "init": ("docker_present", "harbor_present", "allow_missing_runtime"),
+        "new": ("kind",),
+        "run": ("stage", "limited", "cached", "outputs", "errors", "queued", "blocked"),
+        "validate": (
+            "judge",
+            "requested_runner",
+            "runner",
+            "levels",
+            "level1_checked",
+            "level1_failed",
+            "sampled",
+            "passed",
+            "failed",
+            "infra_error",
+            "resumed",
+            "any_failure",
+            "any_infra_error",
+        ),
+        "decide": ("kind", "verdict"),
+        "task try": ("verifier_outcome",),
     }.get(command, ())
-    for key in allowed:
-        if key not in extra:
-            continue
-        value = extra[key]
-        if key in ("docker_present", "harbor_present", "allow_missing_runtime", "dry_run", "judge"):
-            if isinstance(value, bool):
+    for key in (*allowed, "dry_run", "failure_phase", "error_type"):
+        value = extra.get(key)
+        if key in _BOOL_FIELDS and isinstance(value, bool):
+            props[key] = value
+        elif isinstance(value, str):
+            if key in _ENUM_FIELDS and value in _ENUM_FIELDS[key]:
                 props[key] = value
-        elif key == "stage" and value in _RUN_STAGES:
-            props[key] = value
-        elif key == "runner" and value in _RUNNERS:
-            props[key] = value
-        elif key == "levels" and isinstance(value, str):
-            props[key] = value
-        elif key in _COUNT_KEYS and isinstance(value, str):
-            props[key] = value
+            elif key in _COUNT_FIELDS and value in _BUCKETS:
+                props[key] = value
     return props
 
 
@@ -331,6 +439,8 @@ def emit(
     command: str, exit_class: str, duration_ms: int, extra: dict[str, Any] | None = None
 ) -> None:
     try:
+        if command not in MILESTONES:
+            return
         anon = _prepare(command)
         if not anon:
             return
@@ -342,5 +452,5 @@ def emit(
             "properties": _properties(command, exit_class, max(0, int(duration_ms)), extra or {}),
         }
         post(f"{origin()}/i/v0/e/", json.dumps(payload).encode(), _TIMEOUT)
-    except BaseException:
+    except Exception:
         return
