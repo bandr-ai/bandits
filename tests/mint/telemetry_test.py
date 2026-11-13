@@ -111,7 +111,7 @@ def test_init_payload_has_no_paths(env, sent, monkeypatch):
     assert len(sent) == 1
     url, payload, timeout = sent[0]
     assert url == "https://us.i.posthog.com/i/v0/e/"
-    assert timeout == 0.2
+    assert timeout == 2.0
     assert payload["api_key"] == KEY
     assert payload["event"] == "command_finished"
     props = payload["properties"]
@@ -186,7 +186,7 @@ def test_host_override_and_failed_post_keeps_exit_code(env, monkeypatch, sent):
     assert json.loads(out)["command"] == "init"
     assert NOTICE in err
     assert "anonymous usage" not in out
-    assert attempts == [("https://example.test/i/v0/e/", 0.2)]
+    assert attempts == [("https://example.test/i/v0/e/", 2.0)]
 
 
 def test_persisted_off_and_corrupt_config(env, sent, monkeypatch):

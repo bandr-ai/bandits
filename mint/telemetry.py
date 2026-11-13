@@ -44,7 +44,8 @@ NOTICE = (
 )
 
 _DEFAULT_HOST = "https://us.i.posthog.com"
-_TIMEOUT = 0.2
+# Allow time for a fresh HTTPS connection; telemetry remains best-effort.
+_TIMEOUT = 2.0
 # Public project write key. Replaced at build time from the local project token.
 _EMBEDDED_KEY = "phc_CvhAGavirL5hbBfgmGzacMUV7v8w4gHpi749P7KJ4XnG"
 _RUN_STAGES = frozenset({"parse", "checks", "generate"})
