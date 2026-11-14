@@ -4,8 +4,9 @@ Mint sends one `command_finished` event for these milestone commands: `init`,
 `new`, `run`, `validate`, `judge-calibrate`, `decide`, `report`, and `task try`.
 This is small product-usage instrumentation, not execution tracing or error logging.
 
-Disable capture with `mint telemetry off`, `MINT_TELEMETRY_DISABLED=1`, or
-`DO_NOT_TRACK=1`. It is also disabled in CI and pytest. `mint telemetry status`
+Disable all capture with `mint telemetry off`, `MINT_TELEMETRY_DISABLED=1`, or
+`DO_NOT_TRACK=1`. Turn off only the IP-derived location and install profile with
+`mint telemetry location off` (back on with `mint telemetry location on`). It is also disabled in CI and pytest. `mint telemetry status`
 shows the effective setting. A malformed configuration disables capture.
 
 ## Event contract (schema_version 2)
@@ -51,9 +52,17 @@ Version 1's whole-workspace status counts have been removed; filter dashboards b
 
 Property names and string values are allow-listed. Capture excludes paths,
 prompts, queries, answers, task IDs, custom check/type names, log contents,
-exception messages, and stack traces. Person-profile processing and GeoIP
-enrichment are disabled. The network service still receives the connection's IP;
-disabling GeoIP enrichment does not hide it from the server.
+exception messages, and stack traces.
+
+**Location and profile (default on, opt-out).** Once the notice has been shown, events
+set `$process_person_profile: true` and leave GeoIP enabled, so PostHog keeps a person
+profile for the install ID and derives approximate location (country/region/city) from
+the connection IP. Until the notice has been shown (for example a first piped run), or
+after `mint telemetry location off`, events send `$process_person_profile: false` and
+`$geoip_disable: true`. The service still receives the connection's IP either way;
+disabling GeoIP only stops it being turned into a location. Installs that saw the earlier
+notice see the updated one once (`notice_version` 2). Treat IP/location as personal data
+and check your own consent obligations (for example GDPR) before relying on it.
 
 A random UUID persists in the user's Mint config directory. It identifies that
 configuration, not a verified person or an individual project. Different workspaces

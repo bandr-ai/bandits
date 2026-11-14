@@ -26,7 +26,6 @@ COMMON = {
     "duration_ms",
     "exit",
     "$process_person_profile",
-    "$geoip_disable",
 }
 
 
@@ -117,6 +116,7 @@ def test_init_payload_has_no_paths(env, sent, monkeypatch):
     props = payload["properties"]
     assert COMMON <= set(props)
     assert set(props) <= COMMON | {
+        "$geoip_disable",
         "docker_present",
         "harbor_present",
         "allow_missing_runtime",
@@ -126,15 +126,16 @@ def test_init_payload_has_no_paths(env, sent, monkeypatch):
     assert props["exit"] == "ok"
     assert props["allow_missing_runtime"] is True
     assert props["dry_run"] is False
-    assert props["$process_person_profile"] is False
-    assert props["$geoip_disable"] is True
+    # Default: notice was shown on this tty, so location/profile are on.
+    assert props["$process_person_profile"] is True
+    assert "$geoip_disable" not in props
     assert isinstance(props["docker_present"], bool)
     blob = json.dumps(payload)
     assert logs not in blob
     assert str(env.ws) not in blob
     assert socket.gethostname() not in blob
     assert NOTICE in err
-    assert "anonymous usage" not in out
+    assert "usage for init" not in out
 
 
 def test_notice_once_on_a_tty_and_report_when_piped(env, sent, monkeypatch):
@@ -161,7 +162,7 @@ def test_notice_once_on_a_tty_and_report_when_piped(env, sent, monkeypatch):
     assert NOTICE not in out
     report = env.ws / "report.md"
     if report.exists():
-        assert "anonymous usage" not in report.read_text()
+        assert "usage for init" not in report.read_text()
     # a second report does not repeat it
     assert NOTICE not in env.run("report")[2]
 
@@ -185,7 +186,7 @@ def test_host_override_and_failed_post_keeps_exit_code(env, monkeypatch, sent):
     assert code == 0
     assert json.loads(out)["command"] == "init"
     assert NOTICE in err
-    assert "anonymous usage" not in out
+    assert "usage for init" not in out
     assert attempts == [("https://example.test/i/v0/e/", 2.0)]
 
 
@@ -283,7 +284,7 @@ def test_decide_and_task_try_drop_text(env, sent, monkeypatch):
     blob = json.dumps(sent[0][1])
     assert "SECRETWHY" not in blob
     assert sent[0][1]["properties"]["command"] == "decide"
-    assert set(sent[0][1]["properties"]) == COMMON | {"kind"}
+    assert set(sent[0][1]["properties"]) == COMMON | {"kind", "$geoip_disable"}
     sent.clear()
     env.run("task", "try", "t_q1", "--answer", "SECRETANSWER")
     blob = json.dumps(sent[-1][1])
@@ -559,3 +560,41 @@ def test_render_operation_error_has_render_phase(env, sent, monkeypatch):
     assert props["failure_phase"] == "render"
     assert props["error_type"] == "operation"
     assert "SECRET" not in json.dumps(props)
+
+
+def test_location_default_on_and_opt_out(env, sent, monkeypatch):
+    _open(monkeypatch)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    assert env.run("init", str(env.logs), str(env.ws), "--allow-missing-runtime")[0] == 0
+    props = sent[-1][1]["properties"]
+    assert props["$process_person_profile"] is True
+    assert "$geoip_disable" not in props
+
+    assert main(["telemetry", "location", "off", "--json"]) == 0
+    cfg = json.loads(_cfg().read_text())
+    assert cfg["location"] is False and cfg["enabled"] is True
+    assert env.run("new", "parser")[0] in (0, 1, 2)
+    props = sent[-1][1]["properties"]
+    assert props["$process_person_profile"] is False
+    assert props["$geoip_disable"] is True
+
+    assert main(["telemetry", "location", "on", "--json"]) == 0
+    assert json.loads(_cfg().read_text())["location"] is True
+
+
+def test_location_waits_for_the_notice_and_stale_notice_reshows(env, sent, monkeypatch):
+    _open(monkeypatch)
+    # Piped first run: no notice shown yet, so no location/profile is attached.
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+    assert env.run("init", str(env.logs), str(env.ws), "--allow-missing-runtime")[0] == 0
+    props = sent[-1][1]["properties"]
+    assert props["$process_person_profile"] is False and props["$geoip_disable"] is True
+
+    # An install that saw the old (v1) notice sees the new one once.
+    path = _cfg()
+    path.write_text(json.dumps({"anonymous_id": "old", "enabled": True, "notice_shown": True}))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    err = env.run("init", str(env.logs), str(env.ws), "--allow-missing-runtime")[2]
+    assert NOTICE in err
+    assert json.loads(path.read_text())["notice_version"] >= 2
+    assert sent[-1][1]["properties"]["$process_person_profile"] is True

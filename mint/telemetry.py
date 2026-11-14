@@ -35,12 +35,17 @@ MILESTONES = frozenset(
     }
 )
 
+# Bump when NOTICE changes so existing installs see the new text once.
+NOTICE_VERSION = 2
+
 NOTICE = (
-    "mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, "
-    "report, and task try: version, OS, command, duration, outcome, flags, and bucketed counts. "
-    "No paths, prompts, task ids, queries, answers, or log contents.\n"
-    "Turn it off with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when "
-    "CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state."
+    "mint sends usage for init, new, run, validate, judge-calibrate, decide, report, and task try: "
+    "version, OS, command, duration, outcome, flags, and bucketed counts. No paths, prompts, task "
+    "ids, queries, answers, or log contents. By default the analytics service also derives your "
+    "approximate location from your IP and keeps a profile for your install ID.\n"
+    "Turn off location with `mint telemetry location off`, or all telemetry with "
+    "`mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when CI or DO_NOT_TRACK=1 "
+    "is set. `mint telemetry status` shows the current state."
 )
 
 _DEFAULT_HOST = "https://us.i.posthog.com"
@@ -151,17 +156,34 @@ def _read(path: Path) -> tuple[dict | None, str]:
         return None, "unreadable"
     if not isinstance(data, dict):
         return None, "unreadable"
-    if "enabled" in data and not isinstance(data["enabled"], bool):
-        return None, "unreadable"
+    for key in ("enabled", "location"):
+        if key in data and not isinstance(data[key], bool):
+            return None, "unreadable"
     return data, "ok"
+
+
+def _location_on(data: dict | None) -> bool:
+    """IP/location enrichment is on unless the user turned it off."""
+    return not (isinstance(data, dict) and data.get("location") is False)
+
+
+def _notice_current(data: dict | None) -> bool:
+    return (
+        isinstance(data, dict)
+        and data.get("notice_shown") is True
+        and data.get("notice_version") == NOTICE_VERSION
+    )
 
 
 def _write(path: Path, data: dict) -> None:
     body = {
         "anonymous_id": data["anonymous_id"],
         "enabled": data["enabled"] is True,
+        "location": data.get("location") is not False,
         "notice_shown": data.get("notice_shown") is True,
     }
+    if body["notice_shown"]:
+        body["notice_version"] = NOTICE_VERSION
     atomic_write(path, json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 
@@ -212,6 +234,7 @@ def status() -> dict[str, Any]:
     effective, reason = gate()
     path = config_path()
     persisted = "default"
+    location = True
     notice_shown = False
     if path is not None:
         data, kind = _read(path)
@@ -220,30 +243,52 @@ def status() -> dict[str, Any]:
                 persisted = "on"
             elif data.get("enabled") is False:
                 persisted = "off"
-            notice_shown = data.get("notice_shown") is True
+            notice_shown = _notice_current(data)
+            location = _location_on(data)
     return {
         "effective": effective,
         "reason": reason,
         "persisted": persisted,
         "notice_shown": notice_shown,
+        "location": location,
         "config": "" if path is None else str(path),
     }
 
 
-def set_enabled(enabled: bool) -> None:
+def _update_config(*, enabled: bool | None = None, location: bool | None = None) -> None:
     path = config_path()
     if path is None:
         return
     data, kind = _read(path)
     anon = ""
     notice = False
+    cur_enabled = True
+    cur_location = True
     if kind == "ok" and data is not None and isinstance(data.get("anonymous_id"), str):
         anon = data["anonymous_id"].strip()
-        notice = data.get("notice_shown") is True
+        notice = _notice_current(data)
+        cur_enabled = data.get("enabled") is not False
+        cur_location = _location_on(data)
     if not anon:
         anon = str(uuid.uuid4())
         notice = False
-    _write(path, {"anonymous_id": anon, "enabled": enabled, "notice_shown": notice})
+    _write(
+        path,
+        {
+            "anonymous_id": anon,
+            "enabled": cur_enabled if enabled is None else enabled,
+            "location": cur_location if location is None else location,
+            "notice_shown": notice,
+        },
+    )
+
+
+def set_enabled(enabled: bool) -> None:
+    _update_config(enabled=enabled)
+
+
+def set_location(location: bool) -> None:
+    _update_config(location=location)
 
 
 def _levels(value: Any) -> str | None:
@@ -351,7 +396,9 @@ def post(url: str, body: bytes, timeout: float) -> None:
         resp.read()
 
 
-def _properties(command: str, exit_class: str, duration_ms: int, extra: dict[str, Any]) -> dict:
+def _properties(
+    command: str, exit_class: str, duration_ms: int, extra: dict[str, Any], location: bool = True
+) -> dict:
     props: dict[str, Any] = {
         "mint_version": __version__,
         "python_version": platform.python_version(),
@@ -359,9 +406,14 @@ def _properties(command: str, exit_class: str, duration_ms: int, extra: dict[str
         "command": command,
         "duration_ms": duration_ms,
         "exit": exit_class,
-        "$process_person_profile": False,
-        "$geoip_disable": True,
     }
+    if location:
+        # Default: PostHog keeps a person profile for the install ID and enriches
+        # it (and the event) with GeoIP derived from the connection IP.
+        props["$process_person_profile"] = True
+    else:
+        props["$process_person_profile"] = False
+        props["$geoip_disable"] = True
     props["schema_version"] = 2
     allowed = {
         "init": ("docker_present", "harbor_present", "allow_missing_runtime"),
@@ -397,8 +449,8 @@ def _properties(command: str, exit_class: str, duration_ms: int, extra: dict[str
     return props
 
 
-def _prepare(command: str) -> str | None:
-    """Return the anonymous id when the send gate is open, else None."""
+def _prepare(command: str) -> tuple[str, bool] | None:
+    """Return ``(install id, location on)`` when the send gate is open, else None."""
     ok, _reason = gate()
     if not ok:
         return None
@@ -415,6 +467,7 @@ def _prepare(command: str) -> str | None:
         current = {
             "anonymous_id": anon,
             "enabled": True,
+            "location": True,
             "notice_shown": False,
         }
         dirty = True
@@ -423,7 +476,8 @@ def _prepare(command: str) -> str | None:
         current = {
             "anonymous_id": anon,
             "enabled": current.get("enabled") is not False,
-            "notice_shown": current.get("notice_shown") is True,
+            "location": _location_on(current),
+            "notice_shown": _notice_current(current),
         }
         dirty = data is None or "anonymous_id" not in (data or {})
     show = (not current["notice_shown"]) and (sys.stderr.isatty() or command == "report")
@@ -433,7 +487,8 @@ def _prepare(command: str) -> str | None:
         dirty = True
     if dirty:
         _write(path, current)
-    return anon
+    # Location is only attached once the user has actually been shown the notice.
+    return anon, bool(current["location"] and current["notice_shown"])
 
 
 def emit(
@@ -442,15 +497,18 @@ def emit(
     try:
         if command not in MILESTONES:
             return
-        anon = _prepare(command)
-        if not anon:
+        prepared = _prepare(command)
+        if not prepared:
             return
+        anon, location = prepared
         key = project_key()
         payload = {
             "api_key": key,
             "event": "command_finished",
             "distinct_id": anon,
-            "properties": _properties(command, exit_class, max(0, int(duration_ms)), extra or {}),
+            "properties": _properties(
+                command, exit_class, max(0, int(duration_ms)), extra or {}, location
+            ),
         }
         post(f"{origin()}/i/v0/e/", json.dumps(payload).encode(), _TIMEOUT)
     except Exception:
