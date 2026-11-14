@@ -879,10 +879,13 @@ def cmd_telemetry(a, _ws) -> Result:
         telemetry.set_enabled(True)
     elif a.telemetry_command == "off":
         telemetry.set_enabled(False)
+    elif a.telemetry_command == "location":
+        telemetry.set_location(a.location_state == "on")
     info = telemetry.status()
     text = (
         f"effective: {'on' if info['effective'] else 'off'} ({info['reason']})\n"
         f"persisted: {info['persisted']}\n"
+        f"location (IP-derived): {'on' if info['location'] else 'off'}\n"
         f"notice shown: {'yes' if info['notice_shown'] else 'no'}\n"
         f"config: {info['config']}"
     )
@@ -1095,7 +1098,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="replace a different SKILL.md")
     sp.set_defaults(fn=cmd_skill)
 
-    tp = sub.add_parser("telemetry", help="anonymous usage telemetry", parents=[common])
+    tp = sub.add_parser("telemetry", help="usage telemetry", parents=[common])
     tsub = tp.add_subparsers(dest="telemetry_command", required=True, parser_class=Parser)
     for name, help_ in (
         ("status", "show whether anonymous usage telemetry is on"),
@@ -1104,6 +1107,13 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         sp = tsub.add_parser(name, help=help_, parents=[common])
         sp.set_defaults(fn=cmd_telemetry)
+    sp = tsub.add_parser(
+        "location",
+        help="turn IP-derived location and install profile on or off (default: on)",
+        parents=[common],
+    )
+    sp.add_argument("location_state", choices=("on", "off"))
+    sp.set_defaults(fn=cmd_telemetry)
     return p
 
 

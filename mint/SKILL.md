@@ -23,8 +23,8 @@ Every command ends with a `next:` hint. After any interruption, run `mint status
 
 ## Telemetry
 
-mint sends anonymous usage for init, new, run, validate, judge-calibrate, decide, report, and task try: version, OS, command, duration, outcome, flags, and bucketed counts. No paths, prompts, task ids, queries, answers, or log contents.
-Turn it off with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state.
+mint sends usage for init, new, run, validate, judge-calibrate, decide, report, and task try: version, OS, command, duration, outcome, flags, and bucketed counts. No paths, prompts, task ids, queries, answers, or log contents. By default the analytics service also derives your approximate location from your IP and keeps a profile for your install ID.
+Turn off location with `mint telemetry location off`, or all telemetry with `mint telemetry off` or MINT_TELEMETRY_DISABLED=1. It is also off when CI or DO_NOT_TRACK=1 is set. `mint telemetry status` shows the current state.
 
 ## Hard rules (the only fixed ones)
 

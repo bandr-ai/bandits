@@ -7,6 +7,10 @@ change the command line or the artifact format; such changes are called out.
 
 ## [Unreleased]
 
+- Telemetry: add `mint telemetry location on|off`. Location (derived from the
+  connection IP) and an install profile are on by default and can be turned
+  off; the notice and `docs/telemetry.md` describe it.
+
 ## [0.3.1] - 2026-11-13
 
 - Mint telemetry requests time out after two seconds instead of 0.2 seconds.
