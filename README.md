@@ -17,7 +17,7 @@ Rebuild the jobs in your traces as runnable tasks for evaluation and training.
   <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.png">
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/readme/mint-workflow-light.png">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-workflow-dark.gif">
-  <img src="docs/assets/readme/mint-workflow-light.gif" alt="bandr converts traces into a Harbor task. A model attempts the task in its environment, the task verifier grades the output, and the new trajectory and result can feed the next conversion." width="100%">
+  <img src="docs/assets/readme/mint-workflow-light.gif" alt="Agent logs flow through Mint and a coding agent into runnable Harbor task packages." width="100%">
 </picture>
 
 <p align="center"><sub><a href="docs/assets/readme/mint-workflow-light.gif">Open GIF</a> &nbsp;·&nbsp; <a href="examples/mint/net-revenue">Run the example</a> &nbsp;·&nbsp; <a href="docs/assets/readme/mint-workflow-light.png">Still image</a></sub></p>
@@ -33,11 +33,30 @@ writes the packages, checks them, and records their provenance and gaps.
 Successful, failed, and partial runs can all contribute. Repeat attempts at the
 same instance become one task with their evidence kept together.
 
-**Traces → Harbor task → model attempt → verifier grade → new traces.**
-Harbor can run an agent on the packaged task and grade its output using the task's
-verifier. The resulting trajectory and result can become input for another
-conversion. Use the tasks for evaluation or as environments in a training
-workflow.
+**Build the task once. Run new attempts against it.**
+Harbor runs an agent in the task environment; the packaged verifier grades the
+outcome. Those trajectories and scores can support evaluation and training.
+
+<picture>
+  <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-uses-dark.png">
+  <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/readme/mint-uses-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/mint-uses-dark.gif">
+  <img src="docs/assets/readme/mint-uses-light.gif" alt="Harbor task to model rollout to graded attempts, branching into evaluation, curated SFT, rejection sampling, RL or RFT, and preference pairs for DPO. Training requires a separate pipeline." width="100%">
+</picture>
+
+| Use the evidence for | What you do downstream |
+| :--- | :--- |
+| **Evaluation** | Compare agents, track regressions, and measure success on held-out tasks. |
+| **SFT / distillation** | Curate successful trajectories as demonstrations for a student model. |
+| **Rejection sampling / best-of-N** | Generate several attempts; retain or select those that satisfy the verifier. |
+| **RL / reinforcement fine-tuning (RFT)** | Connect the task environment and outcome rewards to a training loop. |
+| **Preference optimization (for example, DPO)** | Build reviewed chosen/rejected pairs from comparable attempts at the same task. |
+
+These are downstream uses, not built-in Mint trainers or automatic dataset
+exports. They require suitable rollout data, filtering, format adapters, and
+an external evaluation or training pipeline. Keep evaluation tasks separate
+from training data. A verifier grade is evidence about an outcome; it does not
+by itself establish that a trajectory is a good training example.
 
 ## Quickstart
 

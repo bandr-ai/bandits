@@ -73,7 +73,7 @@ def ease(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
-def render(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) -> Image.Image:
+def render_icons(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) -> Image.Image:
     """A visual loop: trace sheets, task folder, model network, verifier check."""
     import math
 
@@ -229,9 +229,94 @@ def render(theme: dict, seconds: float, sans: str, mono: str, evidence: dict) ->
     return im
 
 
-def animation(theme, sans, mono, evidence):
-    """25 fps loop, fixed layout, no scene cuts, fades or page changes."""
-    frames = [render(theme, frame / 25, sans, mono, evidence) for frame in range(180)]
+def render(theme, seconds, sans, mono, evidence, downstream=False):
+    """Two honest flows, reusing the original paper, folder and network icons."""
+    source = render_icons(theme, seconds, sans, mono, evidence)
+    image = Image.new("RGB", (1440, 590 if downstream else 390), theme["bg"])
+    draw = ImageDraw.Draw(image)
+
+    def label(x, y, value, size=30, tone="ink"):
+        draw.text((x, y), value, font=face(sans, size), fill=theme[tone], anchor="mt")
+
+    def arrow(x1, x2, y, offset=0):
+        draw.line((x1, y, x2, y), fill=theme["line"], width=2)
+        draw.line([(x2 - 8, y - 6), (x2, y), (x2 - 8, y + 6)], fill=theme["line"], width=2)
+        progress = ((seconds / 2.4) + offset) % 1
+        x = x1 + (x2 - x1) * ease(progress)
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=theme["accent"])
+
+    label(
+        720,
+        28,
+        "Run the task. Use the evidence." if downstream else "Turn agent logs into runnable tasks.",
+        34,
+    )
+    # Crop only the existing icon silhouettes; no old labels or return path.
+    crops = [
+        (130, 145, 265, 310),
+        (440, 145, 632, 310),
+        (810, 145, 934, 310),
+        (1138, 145, 1278, 310),
+    ]
+    order = (1, 2, 3) if downstream else (0, 2, 1)
+    centers = (240, 720, 1200)
+    for center, index in zip(centers, order, strict=True):
+        icon = source.crop(crops[index])
+        image.paste(icon, (center - icon.width // 2, 105))
+    for left, right in ((350, 610), (830, 1090)):
+        arrow(left, right, 185)
+    titles = (
+        ("Harbor task", "Model rollout", "Graded attempts")
+        if downstream
+        else ("Agent logs", "Mint + coding agent", "Harbor tasks")
+    )
+    details = (
+        (
+            "Instruction + environment + verifier",
+            "An agent attempts the job",
+            "Trajectories + outcome scores",
+        )
+        if downstream
+        else (
+            "Successful, failed, partial",
+            "Rebuild the job. Check the package.",
+            "Ready for downstream workflows",
+        )
+    )
+    for x, title, detail in zip(centers, titles, details, strict=True):
+        label(x, 285, title)
+        label(x, 330, detail, 22, "muted")
+    if downstream:
+        # Branch from graded attempts, never from the verifier back to Mint.
+        draw.line([(1200, 370), (1200, 400), (240, 400)], fill=theme["line"], width=2)
+        for x, title, detail in zip(
+            (240, 480, 720, 960, 1200),
+            ("Evaluate", "SFT", "Select", "RL / RFT", "Preferences"),
+            (
+                "Benchmarks + regressions",
+                "Curate passing rollouts",
+                "Rejection sampling",
+                "Train with rewards",
+                "Pairs for DPO",
+            ),
+            strict=True,
+        ):
+            draw.line((x, 400, x, 425), fill=theme["line"], width=2)
+            draw.ellipse((x - 4, 396, x + 4, 404), fill=theme["accent"])
+            label(x, 440, title, 28)
+            label(x, 482, detail, 20, "muted")
+        label(
+            720,
+            545,
+            "Downstream possibilities · training requires a separate pipeline",
+            22,
+            "muted",
+        )
+    return image
+
+
+def animation(theme, sans, mono, evidence, downstream=False):
+    frames = [render(theme, frame / 25, sans, mono, evidence, downstream) for frame in range(60)]
     return frames, [40] * len(frames)
 
 
@@ -355,35 +440,37 @@ def main():
         + "\n"
     )
     for name, theme in THEMES.items():
-        frames, durations = animation(theme, sans, mono, evidence)
-        poster = frames[155]
-        poster.save(OUT / f"mint-workflow-{name}.png", optimize=True)
-        frames[0].save(
-            OUT / f"mint-workflow-{name}.webp",
-            save_all=True,
-            append_images=frames[1:],
-            duration=durations,
-            loop=0,
-            lossless=True,
-            method=4,
-        )
-        # An actual GIF is also provided; a shared palette prevents color flicker.
-        palette = poster.convert("P", palette=Image.Palette.ADAPTIVE, colors=192)
-        gif = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames]
-        gif[0].save(
-            OUT / f"mint-workflow-{name}.gif",
-            save_all=True,
-            append_images=gif[1:],
-            duration=durations,
-            loop=0,
-            optimize=True,
-            disposal=1,
-        )
-        del frames, gif
-        print(f"Rendered {name}: 25 fps continuous flow, WebP + GIF + static poster.")
-        render_checks(theme, mono, transcript, counts).save(
-            OUT / f"mint-checks-{name}.png", optimize=True
-        )
+        for downstream in (False, True):
+            asset = "mint-uses" if downstream else "mint-workflow"
+            frames, durations = animation(theme, sans, mono, evidence, downstream)
+            poster = frames[40]
+            poster.save(OUT / f"{asset}-{name}.png", optimize=True)
+            frames[0].save(
+                OUT / f"{asset}-{name}.webp",
+                save_all=True,
+                append_images=frames[1:],
+                duration=durations,
+                loop=0,
+                lossless=True,
+                method=4,
+            )
+            # An actual GIF is also provided; a shared palette prevents color flicker.
+            palette = poster.convert("P", palette=Image.Palette.ADAPTIVE, colors=192)
+            gif = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames]
+            gif[0].save(
+                OUT / f"{asset}-{name}.gif",
+                save_all=True,
+                append_images=gif[1:],
+                duration=durations,
+                loop=0,
+                optimize=True,
+                disposal=1,
+            )
+            del frames, gif
+            print(f"Rendered {asset}-{name}: 25 fps, WebP + GIF + static poster.")
+            render_checks(theme, mono, transcript, counts).save(
+                OUT / f"mint-checks-{name}.png", optimize=True
+            )
 
 
 if __name__ == "__main__":
